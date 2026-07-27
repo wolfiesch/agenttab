@@ -6,9 +6,17 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   ci:
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.M1_CI_ENABLED == 'true' && '["self-hosted","macOS","ARM64","wolfie-m1","trusted","chrome-bridge"]' || '"macos-latest"') }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,9 +26,19 @@ jobs:
         with:
           node-version: '22'
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run CI gates
+
+      - name: Prepare persistent M1 build cache
+        if: ${{ runner.name == 'wolfie-m1-chrome-bridge' }}
+        shell: bash
+        run: |
+          cache_root="$HOME/Library/Caches/chrome-bridge-ci/rust-1.97"
+          python3 scripts/prepare_ci_cache.py --root "$cache_root"
+          echo "CARGO_TARGET_DIR=$cache_root/cargo-target" >> "$GITHUB_ENV"
+
+      - name: Validate sources and extension mirror
         run: |
           python3 -m pip install -e ./mcp
+          python3 -m unittest scripts/test_prepare_ci_cache.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_brand_shell_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/background_reliability.py scripts/package_release.py
           node --check background.js
           node --check wake.js
@@ -33,6 +51,9 @@ jobs:
           diff -q popup.css extension/popup.css
           diff -q popup.js extension/popup.js
           diff -qr icons extension/icons
+
+      - name: Run bridge contract checks
+        run: |
           PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_broker_contract.py
@@ -47,7 +68,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
-          cargo build --release --manifest-path host-rs/Cargo.toml
+
+      - name: Build the Rust native host
+        run: cargo build --release --locked --manifest-path host-rs/Cargo.toml
+
+      - name: Package and verify the native host
+        run: |
           python3 scripts/package_release.py --version ci --dist /tmp/chrome-bridge-dist
           PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_lease_contract.py
@@ -57,3 +83,10 @@ jobs:
           python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/chrome-bridge-noop.json
           python3 benchmark_harness.py compare --input /tmp/chrome-bridge-noop.json --output /tmp/chrome-bridge-report.md --junit-output /tmp/chrome-bridge-benchmark.xml --github-step-summary "$GITHUB_STEP_SUMMARY"
           grep -q "Claim Discipline" /tmp/chrome-bridge-report.md
+
+      - name: Enforce persistent M1 cache bounds
+        if: ${{ always() && runner.name == 'wolfie-m1-chrome-bridge' }}
+        shell: bash
+        run: |
+          python3 scripts/prepare_ci_cache.py \
+            --root "$HOME/Library/Caches/chrome-bridge-ci/rust-1.97"
