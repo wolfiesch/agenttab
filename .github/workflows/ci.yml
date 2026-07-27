@@ -30,6 +30,11 @@ jobs:
           python_root=/opt/homebrew/opt/python@3.11/libexec/bin
           "$python_root/python3" --version
           echo "$python_root" >> "$GITHUB_PATH"
+          cft_binary="$(find "$HOME/Library/Caches/ms-playwright" \
+            -path '*Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing' \
+            -type f -print -quit)"
+          test -n "$cft_binary"
+          "$cft_binary" --version
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
