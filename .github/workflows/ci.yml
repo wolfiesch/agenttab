@@ -20,8 +20,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: ${{ runner.name != 'wolfie-m1-chrome-bridge' }}
         with:
           python-version: '3.11'
+      - name: Use the provisioned M1 Python
+        if: ${{ runner.name == 'wolfie-m1-chrome-bridge' }}
+        shell: bash
+        run: |
+          python_root=/opt/homebrew/opt/python@3.11/libexec/bin
+          "$python_root/python3" --version
+          echo "$python_root" >> "$GITHUB_PATH"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
