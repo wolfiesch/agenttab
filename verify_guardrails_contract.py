@@ -119,6 +119,9 @@ POLICY_FILE = "/tmp/chrome-bridge-guard-policy.json"
 AUDIT_FILE = "/tmp/chrome-bridge-guard-audit.jsonl"
 SECRETS_FILE = "/tmp/chrome-bridge-guard-secrets.txt"
 TRACE_DIR = "/tmp/chrome-bridge-guard-traces"
+SCHEDULE_FILE = "/tmp/chrome-bridge-guard-schedules.json"
+WORKFLOW_FILE = "/tmp/chrome-bridge-guard-workflow.json"
+BAD_WORKFLOW_FILE = "/tmp/chrome-bridge-guard-workflow-invalid.json"
 
 
 def write_policy(policy):
@@ -621,8 +624,11 @@ def run_against(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("policyCheck", {"action": "getCookies", "payload": {"domain": "mail.google.com"}})
         res = (r or {}).get("result", {})
-        expect(set(res.keys()) == {"allowed", "reason", "confirmationRequired", "redact", "audit", "originDependent"},
+        expect(set(res.keys()) == {"allowed", "reason", "confirmationRequired", "redact", "audit",
+                                   "originDependent", "siteMode"},
                f"{label}: policyCheck result keys = {sorted(res.keys())}")
+        expect(res.get("siteMode") is None,
+               f"{label}: policyCheck with no siteModes configured should report null, got {res}")
         expect(res.get("allowed") is True, f"{label}: policyCheck getCookies should be allowed, got {res}")
         expect(res.get("originDependent") is False,
                f"{label}: policyCheck getCookies should not be originDependent, got {res}")
@@ -636,6 +642,114 @@ def run_against(label, cmd, env):
                f"{label}: policyCheck should write 1 allow event with null requestId, got {pc_events}")
         expect(pc_events and pc_events[0]["targets"] == ["*://mail.google.com"],
                f"{label}: policyCheck targets = {pc_events[0]['targets'] if pc_events else None}")
+
+    # --- siteModes: manual gates a mutation on a matching origin even with an
+    #     empty requireConfirmation, and leaves other origins alone ---
+    write_policy(permissive_with(siteModes={"*://mail.google.com": "manual"}))
+    set_tab_origins({None: "https://github.com", 7: "https://mail.google.com"})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: siteMode manual should gate navigate on the matching origin, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: siteMode manual must not forward before confirmation, got {forwarded_actions()}")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: siteMode manual must not affect a non-matching origin, got {r}")
+        # Non-mutating read on a manual origin stays ungated: manual gates
+        # mutations and high-risk reads, not observation.
+        r = c.req("getHTML", {"tabId": 7})
+        expect(r and r.get("success") is True,
+               f"{label}: siteMode manual should not gate getHTML, got {r}")
+        c.close()
+    set_tab_origins({None: "https://github.com"})
+
+    # --- siteModes: skip waives a listed confirmation, except for the
+    #     non-skippable set, and records the waiver in the audit log ---
+    write_policy(permissive_with(requireConfirmation=["navigate", "getCookies"],
+                                 siteModes={"*://mail.google.com": "skip"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is True and "confirmationToken" not in r,
+               f"{label}: siteMode skip should waive the navigate confirmation without a token, got {r}")
+        r = c.req("getCookies", {"domain": "mail.google.com"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: siteMode skip must never waive non-skippable getCookies, got {r}")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: siteMode skip must not waive a non-matching origin, got {r}")
+        c.close()
+        time.sleep(0.3)
+        waived = [e for e in audit_events() if e["decision"] == "confirmation_waived"]
+        expect(len(waived) == 1 and waived[0]["action"] == "navigate"
+               and waived[0]["reason"] == "siteMode skip",
+               f"{label}: skip-waived confirmation should be audited exactly once, got {waived}")
+
+    # --- siteModes never widen a gate: a denied origin and a denied action both
+    #     outrank skip/manual ---
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"],
+                                 requireConfirmation=["navigate"],
+                                 siteModes={"*://mail.google.com": "skip"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: target denied",
+               f"{label}: denied origin must outrank siteMode skip, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: denied origin must not forward under siteMode skip, got {forwarded_actions()}")
+        c.close()
+    write_policy(permissive_with(deniedActions=["navigate"],
+                                 siteModes={"*://mail.google.com": "manual"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action navigate denied",
+               f"{label}: denied action must outrank siteMode manual, got {r}")
+        c.close()
+
+    # --- siteModes: policyCheck reports the resolved mode, and the most
+    #     specific (longest) matching pattern wins ---
+    write_policy(permissive_with(siteModes={"*://*.google.com": "skip",
+                                            "*://mail.google.com": "manual"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("policyCheck", {"action": "navigate",
+                                  "payload": {"url": "https://mail.google.com/mail"}})
+        res = (r or {}).get("result") or {}
+        expect(res.get("siteMode") == "manual" and res.get("confirmationRequired") is True,
+               f"{label}: longest matching siteModes pattern should win, got {res}")
+        r = c.req("policyCheck", {"action": "navigate",
+                                  "payload": {"url": "https://docs.google.com/d"}})
+        res = (r or {}).get("result") or {}
+        expect(res.get("siteMode") == "skip",
+               f"{label}: wildcard siteModes pattern should apply elsewhere, got {res}")
+        r = c.req("policyCheck", {"action": "getTabs"})
+        res = (r or {}).get("result") or {}
+        expect(res.get("siteMode") is None,
+               f"{label}: siteMode should be null when no origin is known, got {res}")
+        c.close()
+
+    # --- siteModes merge per pattern: a client layer overrides only the pattern
+    #     it names and inherits the rest of the default layer's modes ---
+    write_policy({"default": {"allowedActions": ["*"], "deniedActions": [],
+                              "allowedOrigins": ["*"], "deniedOrigins": [],
+                              "requireConfirmation": [], "redact": True, "audit": True,
+                              "siteModes": {"*://mail.google.com": "manual",
+                                            "*://docs.google.com": "manual"}},
+                 "clients": {"alpha": {"siteModes": {"*://docs.google.com": "auto"}}}})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("confirmationRequired") is True,
+               f"{label}: inherited default siteMode must survive a client override, got {r}")
+        r = c.req("navigate", {"url": "https://docs.google.com/d"})
+        expect(r and r.get("success") is True,
+               f"{label}: client layer should override the same siteModes pattern, got {r}")
+        c.close()
 
     # --- Structured policyDenial companion accompanies action denials ---
     write_policy(permissive_with(deniedActions=["getCookies"]))
@@ -724,6 +838,105 @@ def run_against(label, cmd, env):
         expect(r and r.get("success") is True,
                f"{label}: inherited getTabs must survive CLI allow-action, got {r}")
         c.close()
+
+    # --- CLI `policy site-mode` / `clear-site-mode` write a siteModes entry the
+    #     host honors, and leave the rest of the policy intact ---
+    write_policy({"default": {"allowedActions": ["*"], "deniedActions": [],
+                              "allowedOrigins": ["*"], "deniedOrigins": [],
+                              "requireConfirmation": [], "redact": True, "audit": True}})
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_policy(["test_client.py", "policy", "site-mode",
+                              "*://mail.google.com", "manual"])
+    expect(_rc == 0, f"{label}: CLI policy site-mode should succeed, got rc={_rc}")
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_policy(["test_client.py", "policy", "site-mode",
+                              "*://mail.google.com", "bogus"])
+    expect(_rc == 2, f"{label}: CLI policy site-mode should reject an unknown mode, got rc={_rc}")
+    time.sleep(1.1)  # let the policy file mtime advance for hot-reload
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("confirmationRequired") is True,
+               f"{label}: host should honor a CLI-written manual siteMode, got {r}")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: CLI site-mode must not affect other origins, got {r}")
+        c.close()
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_policy(["test_client.py", "policy", "clear-site-mode",
+                              "*://mail.google.com"])
+    expect(_rc == 0, f"{label}: CLI policy clear-site-mode should succeed, got rc={_rc}")
+    time.sleep(1.1)
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is True,
+               f"{label}: clearing the siteMode should restore auto behavior, got {r}")
+        c.close()
+
+    # --- CLI `schedule`: validates the workflow file contract and writes local
+    #     metadata only. No host action, no daemon, nothing forwarded. ---
+    _tc.SCHEDULE_FILE = SCHEDULE_FILE
+    _forwarded_before = forwarded_actions()
+    if os.path.exists(SCHEDULE_FILE):
+        os.unlink(SCHEDULE_FILE)
+    with open(WORKFLOW_FILE, "w") as f:
+        json.dump({"version": 1, "name": "nightly-report",
+                   "steps": [{"action": "navigate", "payload": {"url": "https://github.com"}},
+                             {"action": "click", "payload": {"tabId": 7}, "wait": 500}],
+                   "policy": {"requiredOrigins": ["https://github.com"]}}, f)
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_schedule(["test_client.py", "schedule", "workflow", WORKFLOW_FILE,
+                                "--interval", "3600"])
+    expect(_rc == 0, f"{label}: schedule workflow --interval should succeed, got rc={_rc}")
+    _registry = json.load(open(SCHEDULE_FILE))
+    _entries = _registry.get("schedules") or []
+    expect(len(_entries) == 1 and _entries[0].get("name") == "nightly-report"
+           and _entries[0].get("trigger") == {"kind": "interval", "seconds": 3600}
+           and _entries[0].get("steps") == 2
+           and _entries[0].get("requiredOrigins") == ["https://github.com"],
+           f"{label}: schedule registry entry = {_entries}")
+    expect("payload" not in json.dumps(_registry),
+           f"{label}: schedule registry must record metadata only, never step payloads")
+    expect(oct(os.stat(SCHEDULE_FILE).st_mode & 0o777) == oct(0o600),
+           f"{label}: schedule registry must be mode 600, got {oct(os.stat(SCHEDULE_FILE).st_mode & 0o777)}")
+    # Exactly one trigger is required, and an unknown flag is rejected.
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_schedule(["test_client.py", "schedule", "workflow", WORKFLOW_FILE,
+                                "--at", "2026-08-01T09:00:00", "--interval", "3600"])
+    expect(_rc == 2, f"{label}: schedule with both triggers should be rejected, got rc={_rc}")
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_schedule(["test_client.py", "schedule", "workflow", WORKFLOW_FILE])
+    expect(_rc == 2, f"{label}: schedule with no trigger should be rejected, got rc={_rc}")
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_schedule(["test_client.py", "schedule", "workflow", WORKFLOW_FILE,
+                                "--interval", "30"])
+    expect(_rc == 2, f"{label}: schedule interval below 60s should be rejected, got rc={_rc}")
+    # An --at schedule replaces the same name rather than duplicating it.
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_schedule(["test_client.py", "schedule", "workflow", WORKFLOW_FILE,
+                                "--at", "2026-08-01T09:00:00Z", "--name", "nightly-report"])
+    expect(_rc == 0, f"{label}: schedule workflow --at should succeed, got rc={_rc}")
+    _entries = (json.load(open(SCHEDULE_FILE)).get("schedules") or [])
+    expect(len(_entries) == 1 and (_entries[0].get("trigger") or {}).get("kind") == "at",
+           f"{label}: re-registering a name should replace it, got {_entries}")
+    # A workflow file that violates the contract is rejected before anything is written.
+    with open(BAD_WORKFLOW_FILE, "w") as f:
+        json.dump({"version": 1, "name": "broken", "steps": [{"payload": {}}]}, f)
+    try:
+        with _ctx.redirect_stdout(_io.StringIO()):
+            _tc.cmd_schedule(["test_client.py", "schedule", "workflow", BAD_WORKFLOW_FILE,
+                              "--interval", "3600"])
+        expect(False, f"{label}: a step with no action should be rejected")
+    except SystemExit as _exc:
+        expect(_exc.code == 2, f"{label}: invalid workflow should exit 2, got {_exc.code}")
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_schedule(["test_client.py", "schedule", "remove", "nightly-report"])
+    expect(_rc == 0, f"{label}: schedule remove should succeed, got rc={_rc}")
+    expect((json.load(open(SCHEDULE_FILE)).get("schedules") or []) == [],
+           f"{label}: schedule remove should empty the registry")
+    expect(forwarded_actions() == _forwarded_before,
+           f"{label}: schedule commands must never forward an action, got {forwarded_actions()}")
 
     # --- Reserved action rejected from socket clients ---
     write_policy(PERMISSIVE)
@@ -928,7 +1141,7 @@ def run_against(label, cmd, env):
         if isinstance(steps, list) and len(steps) == 4:
             expect(all(set(s.keys()) == {"step", "action", "allowed", "reason",
                                          "confirmationRequired", "redact", "audit",
-                                         "originDependent"} for s in steps),
+                                         "originDependent", "siteMode"} for s in steps),
                    f"{label}: plan step verdict keys = {[sorted(s.keys()) for s in steps]}")
             expect([s["step"] for s in steps] == [0, 1, 2, 3],
                    f"{label}: plan steps should be indexed in order, got {steps}")
@@ -957,7 +1170,8 @@ def run_against(label, cmd, env):
                and r.get("wouldForward") is True,
                f"{label}: allowed dry run should report wouldForward, got {r}")
         expect(set(((r or {}).get("verdict") or {}).keys()) ==
-               {"allowed", "reason", "confirmationRequired", "redact", "audit", "originDependent"},
+               {"allowed", "reason", "confirmationRequired", "redact", "audit",
+                "originDependent", "siteMode"},
                f"{label}: dry run verdict keys = {sorted(((r or {}).get('verdict') or {}).keys())}")
         r = c.req("getCookies", {"domain": "x.test"}, extra={"dryRun": True})
         expect(r and r.get("success") is True and r.get("dryRun") is True

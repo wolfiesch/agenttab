@@ -34,6 +34,14 @@ if PACKAGE_STORE_SPEC is None or PACKAGE_STORE_SPEC.loader is None:
 package_extension_store = importlib.util.module_from_spec(PACKAGE_STORE_SPEC)
 PACKAGE_STORE_SPEC.loader.exec_module(package_extension_store)
 
+BROWSER_MANIFEST_SPEC = importlib.util.spec_from_file_location(
+    "generate_browser_manifests", SCRIPT_DIR / "scripts" / "generate_browser_manifests.py"
+)
+if BROWSER_MANIFEST_SPEC is None or BROWSER_MANIFEST_SPEC.loader is None:
+    raise RuntimeError("cannot load scripts/generate_browser_manifests.py")
+generate_browser_manifests = importlib.util.module_from_spec(BROWSER_MANIFEST_SPEC)
+BROWSER_MANIFEST_SPEC.loader.exec_module(generate_browser_manifests)
+
 def expect(cond, msg):
     if not cond:
         failures.append(msg)
@@ -168,6 +176,155 @@ def expect_store_package_contract(dist):
         pass
     else:
         expect(False, "store packaging should reject a manifest missing root permissions")
+
+
+def expect_windows_installer_contract():
+    """Static shape checks for setup-windows.ps1; the script itself needs Windows."""
+    script = SCRIPT_DIR / "setup-windows.ps1"
+    expect(script.exists(), "setup-windows.ps1 should exist")
+    if not script.exists():
+        return
+    text = script.read_text(encoding="utf-8")
+
+    expect('$ChromeRegistryPath = "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\$HostName"' in text,
+           "setup-windows.ps1 should register the Chrome HKCU NativeMessagingHosts key")
+    expect('$EdgeRegistryPath = "HKCU:\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\$HostName"' in text,
+           "setup-windows.ps1 should register the Edge HKCU NativeMessagingHosts key")
+    expect("HKLM:" not in text and "HKEY_LOCAL_MACHINE" not in text,
+           "setup-windows.ps1 must never write machine-wide HKLM registry keys")
+    expect("RunAsAdministrator" not in text and "RunAs" not in text,
+           "setup-windows.ps1 must not request elevation")
+
+    for param in ("[string] $RepoRoot", "[int] $HostPort", "[string] $ExtensionId", "[switch] $UseRustHost"):
+        expect(param in text, f"setup-windows.ps1 should accept {param}")
+
+    expect("bridge-host-launch.cmd" in text,
+           "setup-windows.ps1 should write a .cmd launcher for the native host")
+    expect("host-rs\\target\\release\\bridge-host.exe" in text,
+           "setup-windows.ps1 -UseRustHost should point at the Rust host executable")
+    expect('Write-Output "Existing $Label kept at $Path"' in text,
+           "setup-windows.ps1 must keep existing secrets instead of overwriting them")
+    expect("bridge_policy.example.json" in text,
+           "setup-windows.ps1 should seed the policy from the tracked example")
+
+    leaks = [line.strip() for line in text.splitlines()
+             if "$token" in line and ("Write-Output" in line or "Write-Host" in line)]
+    expect(not leaks, f"setup-windows.ps1 must never print the bridge token: {leaks}")
+    expect(text.count("{") == text.count("}"),
+           "setup-windows.ps1 braces should balance")
+    expect(text.count("(") == text.count(")"),
+           "setup-windows.ps1 parentheses should balance")
+
+    ignored = (SCRIPT_DIR / ".gitignore").read_text(encoding="utf-8")
+    expect("bridge-host-launch.cmd" in ignored,
+           "the generated Windows launcher should be git-ignored")
+
+
+def expect_edge_setup_contract():
+    script = SCRIPT_DIR / "setup-edge.sh"
+    expect(script.exists(), "setup-edge.sh should exist")
+    if not script.exists():
+        return
+    text = script.read_text(encoding="utf-8")
+    expect("Microsoft Edge/NativeMessagingHosts" in text,
+           "setup-edge.sh should register under the macOS Edge native-messaging directory")
+    expect("microsoft-edge/NativeMessagingHosts" in text,
+           "setup-edge.sh should register under the Linux Edge native-messaging directory")
+    expect("scripts/generate_browser_manifests.py" in text,
+           "setup-edge.sh should build its manifest through the shared generator")
+    expect("setup-windows.ps1 -Browser Edge" in text,
+           "setup-edge.sh should point Windows users at the PowerShell installer")
+    for secret in ("secrets.token_hex", "extension_key.pem", "bridge_token.txt"):
+        expect(secret not in text,
+               f"setup-edge.sh must not create or read {secret}; it only adds a registration")
+
+
+def expect_browser_manifest_contract(tmp):
+    gen = generate_browser_manifests
+    host_path = "/tmp/fixture/bridge-host-launch.sh"
+    extension_id = "abcdefghijklmnopabcdefghijklmnop"
+    addon_id = gen.DEFAULT_FIREFOX_ADDON_ID
+    out_dir = tmp / "browsers"
+
+    metadata = gen.generate(out_dir, host_path, extension_id=extension_id)
+
+    edge_manifest = json.loads((out_dir / "edge" / "com.automation.bridge.json").read_text())
+    expect(edge_manifest == {
+        "name": "com.automation.bridge",
+        "description": "Chrome Native Messaging Automation Bridge",
+        "path": host_path,
+        "type": "stdio",
+        "allowed_origins": [f"chrome-extension://{extension_id}/"],
+    }, f"edge host manifest mismatch: {edge_manifest}")
+
+    firefox_manifest = json.loads((out_dir / "firefox" / "com.automation.bridge.json").read_text())
+    expect(firefox_manifest == {
+        "name": "com.automation.bridge",
+        "description": "Chrome Native Messaging Automation Bridge",
+        "path": host_path,
+        "type": "stdio",
+        "allowed_extensions": [addon_id],
+    }, f"firefox host manifest mismatch: {firefox_manifest}")
+
+    staging = out_dir / "firefox" / "extension"
+    expect(visible_names(staging) == ["background.js", "manifest.json", "wake.html", "wake.js"],
+           f"firefox staging dir contents mismatch: {visible_names(staging)}")
+    expect(not package_extension_store.forbidden_matches(visible_names(staging)),
+           "firefox staging dir must not contain local artifacts")
+    for name in ("background.js", "wake.html", "wake.js"):
+        expect((staging / name).read_bytes() == (SCRIPT_DIR / name).read_bytes(),
+               f"firefox staging should copy {name} byte-identically from the canonical root")
+
+    root_manifest = json.loads((SCRIPT_DIR / "manifest.json").read_text())
+    staged = json.loads((staging / "manifest.json").read_text())
+    expect(staged.get("manifest_version") == 3, "firefox staged manifest must stay manifest_version 3")
+    expect("key" not in staged, "firefox staged manifest must not carry a local extension key")
+    expect(staged.get("background") == {"scripts": ["background.js"]},
+           f"firefox staged manifest must use an event page, got {staged.get('background')}")
+    expect(staged.get("browser_specific_settings", {}).get("gecko", {}).get("id") == addon_id,
+           "firefox staged manifest must carry the gecko add-on id")
+    expected_permissions = [p for p in root_manifest["permissions"]
+                            if p not in gen.FIREFOX_UNSUPPORTED_PERMISSIONS]
+    expect(staged.get("permissions") == expected_permissions,
+           f"firefox staged permissions mismatch: {staged.get('permissions')}")
+    expect("nativeMessaging" in staged.get("permissions", []),
+           "firefox staged manifest must keep nativeMessaging")
+    expect(metadata["firefox"]["supported"] is False,
+           "firefox metadata must state that the runtime is unsupported")
+    expect(metadata["firefox"]["extension"]["droppedPermissions"] ==
+           sorted(p for p in root_manifest["permissions"] if p in gen.FIREFOX_UNSUPPORTED_PERMISSIONS),
+           "firefox metadata should report every dropped Chrome-only permission")
+    expect(len(metadata["firefox"]["limitations"]) >= 3,
+           "firefox metadata should name the runtime limitations")
+    expect(root_manifest.get("background") == {"service_worker": "background.js"},
+           "canonical Chrome manifest must keep its service worker unchanged")
+
+    rebuilt = gen.generate(tmp / "browsers-rebuild", host_path, extension_id=extension_id)
+    expect(rebuilt["edge"]["hostManifest"]["sha256"] == metadata["edge"]["hostManifest"]["sha256"],
+           "edge manifest generation should be deterministic")
+    expect([f["sha256"] for f in rebuilt["firefox"]["extension"]["files"]] ==
+           [f["sha256"] for f in metadata["firefox"]["extension"]["files"]],
+           "firefox staging generation should be deterministic")
+
+    bad_inputs = (
+        ({"browser": "edge"}, "edge without an extension id"),
+        ({"browser": "edge", "extension_id": "nope"}, "an invalid extension id"),
+        ({"browser": "firefox", "addon_id": "not-an-id"}, "an invalid add-on id"),
+    )
+    for kwargs, label in bad_inputs:
+        try:
+            gen.generate(tmp / "browsers-bad", host_path, **kwargs)
+        except gen.GenerationError:
+            pass
+        else:
+            expect(False, f"generator should reject {label}")
+    try:
+        gen.generate(tmp / "browsers-bad", "relative/bridge.py",
+                     browser="edge", extension_id=extension_id)
+    except gen.GenerationError:
+        pass
+    else:
+        expect(False, "generator should reject a relative host path")
 
 
 
@@ -372,6 +529,10 @@ def main():
             expect_store_package_contract(dist)
         finally:
             backup.unlink(missing_ok=True)
+
+        expect_windows_installer_contract()
+        expect_edge_setup_contract()
+        expect_browser_manifest_contract(tmp)
     if failures:
         print(f"\n{len(failures)} install contract failure(s).")
         return 1

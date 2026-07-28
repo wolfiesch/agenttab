@@ -465,7 +465,7 @@ fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
 // which the host cannot see, so it blacks out ALL tabs (GLOBAL). Symmetrically,
 // an observation request with no tabId could land on the blacked-out tab, so it
 // is denied by any live handoff. Fail-safe in both directions. Mirrors bridge.py.
-const HANDOFF_BLACKOUT_ACTIONS: [&str; 8] = [
+const HANDOFF_BLACKOUT_ACTIONS: [&str; 11] = [
     "screenshot",
     "extractText",
     "getHTML",
@@ -474,6 +474,9 @@ const HANDOFF_BLACKOUT_ACTIONS: [&str; 8] = [
     "searchTabs",
     "getCurrentState",
     "screencastFrames",
+    "extractStructured",
+    "scanPromptInjection",
+    "consoleMessages",
 ];
 const HANDOFF_BLACKOUT_ERROR: &str = "handoff in progress";
 
@@ -564,11 +567,14 @@ fn sensitive_actions() -> &'static [&'static str] {
 #[allow(dead_code)]
 fn mutating_actions() -> &'static [&'static str] {
     &[
-        "navigate", "click", "type", "fill", "hover", "scroll", "press", "drag",
+        "navigate", "click", "clickAt", "type", "fill", "hover", "scroll", "press", "drag",
         "select", "uploadFile", "activateTab", "closeTab", "reload", "goBack",
-        "goForward", "setViewport", "setGeolocation", "clearGeolocation",
+        "goForward", "windowControl", "setViewport", "setGeolocation", "clearGeolocation",
         "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
-        "setColorScheme", "setUserAgent", "startInterception", "stopInterception",
+        "setColorScheme", "setUserAgent",
+        "setCookie", "deleteCookie", "setStorageItem", "removeStorageItem", "clearStorage",
+        "githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody",
+        "startInterception", "stopInterception",
         "startMonitoring", "stopMonitoring", "startScreencast", "stopScreencast",
         "handleDialog", "downloadUrl", "batch",
         "createTaskSession", "navigateTaskSession", "updateTaskSessionState", "closeTaskSession",
@@ -581,6 +587,37 @@ fn destructive_actions() -> &'static [&'static str] {
         "executeScript", "executeScriptCDP", "startInterception", "downloadUrl",
         "getCookies", "storageState",
     ]
+}
+
+// --- Per-site permission modes (policy key `siteModes`) ---------------------
+// A site mode is attached to an origin pattern, not to an action:
+//   manual - every mutating or high-risk action on a matching origin requires a
+//            confirmation token, even when the action is not in
+//            `requireConfirmation`.
+//   auto   - no change; `requireConfirmation` alone decides.
+//   skip   - pre-approve the confirmation gate for a matching origin.
+// Modes never widen the action or origin gates. Mirrors bridge.py.
+const SITE_MODES: [&str; 3] = ["manual", "auto", "skip"];
+
+/// Confirmation gates that `skip` may never waive: script execution, cookie and
+/// web-storage reads/writes, continuous capture, and coordinate clicks that have
+/// no auditable element identity. Mirrors bridge.py::NON_SKIPPABLE_CONFIRMATIONS.
+fn non_skippable_confirmation(action: &str) -> bool {
+    matches!(
+        action,
+        "executeScript" | "executeScriptCDP" | "getCookies" | "storageState"
+            | "setCookie" | "deleteCookie" | "setStorageItem" | "removeStorageItem"
+            | "clearStorage" | "startScreencast" | "clickAt"
+    )
+}
+
+/// What `manual` gates: anything that changes browser/page/profile state plus
+/// the high-risk reads in the non-skippable set. Mirrors
+/// bridge.py::is_mutating_action.
+fn is_mutating_action(action: &str) -> bool {
+    mutating_actions().contains(&action)
+        || destructive_actions().contains(&action)
+        || non_skippable_confirmation(action)
 }
 
 /// Origin-exempt actions: their policy target is NOT the live tab origin, so the
@@ -638,6 +675,7 @@ fn default_policy() -> Value {
                 "*://[[]::1[]]", "*://[[]::1[]]:*"
             ],
             "requireConfirmation": [],
+            "siteModes": {},
             "redactPatterns": [],
             "secretMaskFile": null,
             "traceDir": null,
@@ -714,6 +752,9 @@ const POLICY_LIST_KEYS: [&str; 6] = [
 const POLICY_BOOL_KEYS: [&str; 2] = ["redact", "audit"];
 /// String-valued policy keys merged like bools: a later layer replaces the value.
 const POLICY_STR_KEYS: [&str; 2] = ["secretMaskFile", "traceDir"];
+/// Map-valued policy keys merged PER KEY: a later layer overrides only the
+/// origin patterns it names and inherits the rest. Mirrors bridge.py.
+const POLICY_MAP_KEYS: [&str; 1] = ["siteModes"];
 
 /// Merge: built-in default -> policy["default"] -> policy["clients"][name].
 fn policy_for_client(policy: &Value, name: &str) -> Value {
@@ -744,6 +785,18 @@ fn policy_for_client(policy: &Value, name: &str) -> Value {
         for key in POLICY_STR_KEYS.iter() {
             if let Some(Value::String(s)) = layer.get(*key) {
                 merged[*key] = Value::String(s.clone());
+            }
+        }
+        for key in POLICY_MAP_KEYS.iter() {
+            if let Some(Value::Object(over)) = layer.get(*key) {
+                let mut base = match merged.get(*key) {
+                    Some(Value::Object(m)) => m.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                for (k, v) in over.iter() {
+                    base.insert(k.clone(), v.clone());
+                }
+                merged[*key] = Value::Object(base);
             }
         }
     }
@@ -925,7 +978,12 @@ fn policy_constrains_origins(policy: &Value, name: &str) -> bool {
         cp.get("allowedOrigins"),
         Some(Value::Array(a)) if a.len() == 1 && a[0].as_str() == Some("*")
     );
-    !allowed_is_star
+    if !allowed_is_star {
+        return true;
+    }
+    // Site modes are origin-keyed, so a configured siteModes map makes the live
+    // tab origin decision-relevant even under an otherwise permissive policy.
+    matches!(cp.get("siteModes"), Some(Value::Object(m)) if !m.is_empty())
 }
 
 fn action_matches(patterns: Option<&Value>, action: &str) -> bool {
@@ -959,9 +1017,61 @@ fn target_matches(patterns: Option<&Value>, targets: &[String]) -> bool {
     false
 }
 
+/// The site mode governing `targets`, or None when no configured pattern
+/// matches (identical in effect to "auto").
+///
+/// Specificity, so overlapping patterns are deterministic in both hosts: among
+/// all matching patterns pick the LONGEST pattern string, breaking a length tie
+/// by the lexicographically smallest pattern. Values outside SITE_MODES are
+/// ignored, so a typo cannot silently pre-approve. Mirrors
+/// bridge.py::resolve_site_mode.
+fn resolve_site_mode(cp: &Value, targets: &[String]) -> Option<String> {
+    if targets.is_empty() {
+        return None;
+    }
+    let modes = match cp.get("siteModes") {
+        Some(Value::Object(m)) => m,
+        _ => return None,
+    };
+    let mut best: Option<(&str, &str)> = None;
+    for (pattern, mode) in modes.iter() {
+        let mode = match mode.as_str() {
+            Some(m) if SITE_MODES.contains(&m) => m,
+            _ => continue,
+        };
+        if !target_matches(Some(&json!([pattern])), targets) {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((bp, _)) => {
+                pattern.len() > bp.len()
+                    || (pattern.len() == bp.len() && pattern.as_str() < bp)
+            }
+        };
+        if better {
+            best = Some((pattern.as_str(), mode));
+        }
+    }
+    best.map(|(_, mode)| mode.to_string())
+}
+
+/// Fold the site mode into the confirmation requirement. `manual` adds a gate,
+/// `skip` removes one, `auto`/None leave requireConfirmation alone. Neither mode
+/// touches the action or origin gates, and `skip` can never waive a
+/// non-skippable action. Mirrors bridge.py::apply_site_mode.
+fn apply_site_mode(site_mode: Option<&str>, action: &str, confirm: bool) -> bool {
+    match site_mode {
+        Some("manual") if is_mutating_action(action) => true,
+        Some("skip") if confirm && !non_skippable_confirmation(action) => false,
+        _ => confirm,
+    }
+}
+
 /// Returns (allowed, reason, confirmation_required, redact_enabled,
 /// audit_enabled, targets). Precedence: denied action -> allowed action ->
-/// denied target -> allowed target -> confirmation requirement.
+/// denied target -> allowed target -> confirmation requirement, with the
+/// matching origin's site mode (`siteModes`) folded into that last step.
 /// ``origins`` maps a tabId key (integer string, or "" for the active tab) to
 /// that tab's live origin; for tab-scoped actions the matching origin is folded
 /// into the site-policy targets so policy applies even with no URL in payload.
@@ -998,7 +1108,14 @@ fn evaluate_policy(
     if !action_matches(cp.get("allowedActions"), action) {
         return (false, Some(format!("action {} not allowed", action)), false, redact_enabled, audit_enabled, targets);
     }
-    let confirm = action_matches(cp.get("requireConfirmation"), action);
+    // Per-site permission mode. Applied to the confirmation requirement only,
+    // and only after the action gates: every deny path below returns
+    // confirm=false explicitly, so a deny still outranks any mode.
+    let confirm = apply_site_mode(
+        resolve_site_mode(&cp, &targets).as_deref(),
+        action,
+        action_matches(cp.get("requireConfirmation"), action),
+    );
 
     if action == "batch" {
         if confirm {
@@ -1062,6 +1179,9 @@ fn policy_verdict(
         "originDependent": !needed.is_empty()
             && policy_constrains_origins(policy, name)
             && !supplied,
+        // The origin's resolved site mode, or null when no origin is known yet
+        // (no target resolved) or no configured pattern matches it.
+        "siteMode": resolve_site_mode(&policy_for_client(policy, name), &targets),
     });
     (verdict, targets)
 }
@@ -1815,7 +1935,17 @@ fn redact_response_patterns(
         }
         return Value::Object(obj);
     }
-    if matches!(action, "getHTML" | "extractText" | "executeScript" | "executeScriptCDP") {
+    if matches!(
+        action,
+        "getHTML"
+            | "extractText"
+            | "executeScript"
+            | "executeScriptCDP"
+            | "searchTabs"
+            | "extractStructured"
+            | "scanPromptInjection"
+            | "consoleMessages"
+    ) {
         let compiled = compile_patterns(patterns);
         if compiled.is_empty() {
             return Value::Object(obj);
@@ -2173,6 +2303,8 @@ fn handle_socket_client(
                 "redact": redact_enabled,
                 "audit": audit_enabled,
                 "originDependent": origin_dependent,
+                "siteMode": resolve_site_mode(
+                    &policy_for_client(&policy_value, &client_name), &targets),
             }});
             audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &targets, "allow", None, None);
             trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
@@ -2306,6 +2438,19 @@ fn handle_socket_client(
         } else {
             (_confirm, targets)
         };
+
+        // A confirmation that a `skip` site mode waived is still recorded: under
+        // an unattended pre-approval the audit log is the only place a human
+        // later sees that no confirmation was asked for. Mirrors bridge.py.
+        if !confirm {
+            let cp = policy_for_client(&policy_value, &client_name);
+            if action_matches(cp.get("requireConfirmation"), &action)
+                && resolve_site_mode(&cp, &targets).as_deref() == Some("skip")
+            {
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets,
+                      "confirmation_waived", Some("siteMode skip"), None);
+            }
+        }
 
         if confirm {
             let confirm_payload = payload.clone().unwrap_or_else(|| json!({}));

@@ -15,17 +15,20 @@ Read-only:
 - `browser_list_tabs`
 - `browser_task_session_list`
 - `browser_snapshot` (compact by default; filter by roles/name/limit or request full details). Every node carries a stable `ref` such as `e12` that any selector argument accepts as `ref=e12`; `diff=True` returns `added`/`removed`/`changed` against the previous snapshot of that tab with `baseEpoch`/`epoch`, and returns the full snapshot with `diffBase: true` when there is no baseline yet
-- `browser_extract_text`
+- `browser_extract_text` - visible page text; `scan_prompt_injection=True` adds an `injectionScan` block (`risk`, bounded `matches`, `scannedChars`) without changing the existing fields
+- `browser_extract_structured` - extract schema-described fields as validated JSON. `schema` is a JSON Schema subset (`object`, `array`, `string`, `number`, `boolean`, plus `enum`, `required`, `properties`, `items`); anything outside it is rejected instead of ignored. Mapping is deterministic and heuristic (labels, headings, table headers, `dl` pairs, `aria-label`, `name` attributes, `Key: value` lines) with no model inference, `selector` scopes the read, unresolved optional fields are omitted, and missing required fields come back in `errors` alongside `data` and `schemaVersion`. Raw page text is never returned; extracted values are still untrusted page content
+- `browser_scan_prompt_injection` - heuristic posture scan for instruction-like page text aimed at an agent, its tools, its secrets, or its policy. Returns `risk` (`low`/`medium`/`high`), `matches` with `kind`, `severity`, and a 160-character snippet cap, and `scannedChars`; full page text is never returned. A hit is a warning, never a permission grant or denial by itself
 - `browser_console_messages` - buffered console entries for a monitored tab (start monitoring first via `browser_action` `startMonitoring`). Each entry carries a `stack` of raw generated frames (`url`, 0-based `lineNumber`/`columnNumber`, `functionName`); `resolve_source_maps=True` adds best-effort `originalLocation` (`source`, `name`, 0-based `lineNumber`/`columnNumber`) or a `sourceMapStatus` of `notFound`, `invalid`, `unmapped`, or `crossOriginRefused`. Only same-origin or inline maps are read and source text is never returned, but resolved `source` paths can expose a site's private build layout
 - `browser_screenshot` (returned inline as an image)
 - `browser_save_pdf` - print a tab to PDF on the background-safe debugger path, write it to a caller-supplied local path, and return only path, MIME type, and byte count (annotated read-only: the page is not mutated)
 - `browser_get_html`, `browser_lease_status`
-- `browser_policy_check` - ask the host what its policy would decide for an action/payload without forwarding it
-- `browser_plan_preview` - preflight a list of up to 50 `{action, origin, payload}` steps against host policy in one call; returns a per-step verdict (`step`, `action`, `allowed`, `reason`, `confirmationRequired`, `redact`, `audit`, `originDependent`) and forwards nothing
+- `browser_policy_check` - ask the host what its policy would decide for an action/payload without forwarding it. The verdict includes `siteMode`: the per-site permission mode (`manual`/`auto`/`skip`, or null when no origin is known or no `siteModes` pattern matches) that the host folded into `confirmationRequired`
+- `browser_plan_preview` - preflight a list of up to 50 `{action, origin, payload}` steps against host policy in one call; returns a per-step verdict (`step`, `action`, `allowed`, `reason`, `confirmationRequired`, `redact`, `audit`, `originDependent`, `siteMode`) and forwards nothing
 - `browser_wait_for` (`mode`: `load|selector|text|url`)
 - `browser_search_tabs` - search visible text across every open http/https tab; returns tab id, origin host, match count, and bounded snippets (snippets are page content, so treat output as sensitive)
 - `browser_screencast_save` - drain the tab's buffered screencast frames to numbered image files plus a `frames.json` manifest in a caller-supplied directory, returning only directory, frame count, dropped count, byte total, and manifest path (annotated read-only: the page is not mutated, and recorded pixels never enter the transcript)
 - `browser_trace_summary` / `browser_trace_tail` - read a local session trace artifact written by the host when policy sets `traceDir`. Summary returns event counts by action and decision, the time range, and duration totals; tail returns the most recent events (`ts`, `action`, `decision`, `reason`, `requestId`, `durationMs`, `targets`, `traceId`, `responseHash`, `snapshotHash`, `success`). Both are metadata only: a trace stores no payload, no response body, and no page content. `trace_dir` overrides the host's configured directory
+- `browser_cache_selectors` (`op`: `list|export|clear|import`) - inspect or manage the extension's semantic-selector resolution cache. An entry maps a `urlPattern` plus a `text=`/`label=`/`role=`/`aria=` selector to the CSS path that last resolved to that element; CSS selectors are never cached and an imported non-semantic entry is rejected. The CLI `chrome-bridge cache selectors` commands own the file-backed copy
 
 Sensitive:
 
@@ -49,6 +52,7 @@ Mutating:
 - `browser_set_cpu_throttling`, `browser_set_network_conditions`, `browser_clear_network_conditions`, `browser_set_color_scheme`, `browser_set_user_agent`
 - `browser_start_screencast`, `browser_stop_screencast` - record a background tab through CDP `Page.startScreencast` without activating it. Frames buffer only in the extension service worker (a worker restart ends the recording) and the buffer is bounded at 600 frames or ~50MB, dropping and counting the oldest frames past either bound. Continuous capture of a real profile is high-exposure, so the example policy confirmation-gates `startScreencast`; drain with `browser_screencast_save` before stopping, because `browser_stop_screencast` discards whatever is still buffered
 - `browser_wait_for_handoff` - pause automation, mark the task group as needing review, focus the real tab with a compact bottom card, and wait for a human to finish login/2FA/captcha before resuming
+- `browser_resolve_cached_selector` - resolve a selector to a stable `ref=eN` plus a concrete CSS path, serving a cached resolution when it still holds and re-resolving the semantic selector with `selfHealed: true` when it does not. Returns element identity only, never element text or page content; `refresh=True` skips the cache, and frame/shadow selectors report `cacheable: false`
 - `browser_confirm_action` - resend an action with a host-issued confirmation token
 - `browser_confirm` - resume the exact pending action from only its host-issued token
 
@@ -58,6 +62,7 @@ Sensitive and mutating (require `BRIDGE_MCP_ALLOW_SENSITIVE=1`, confirmation-gat
 - `browser_delete_cookie` - remove one cookie; destructive, can sign the profile out of a site
 - `browser_set_storage_item`, `browser_remove_storage_item` - write or remove one `local`/`session` storage entry; responses echo scope and key only
 - `browser_clear_storage` - clear `local`, `session`, or `both` for the tab origin; destructive, reports removed key counts only
+- `browser_replay_workflow` - replay a recorded `{version, name, steps, policy}` workflow. **It reproduces real mutating actions**: every step runs through the normal host policy, lease, and confirmation gates, and a step whose live tab origin is not in `policy.requiredOrigins` is refused. Values recorded as `<redacted>` must be supplied in `bindings` keyed `step<N>.<field>`; the whole workflow is refused before any step runs when one is missing. Returns per-step outcomes, `selfHealed` flags, and the refreshed selector cache
 
 Escape hatch (sensitive):
 
@@ -73,9 +78,11 @@ Escape hatch (sensitive):
 The server reads two env flags to scope the exposed surface:
 
 - `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, `browser_confirm_action`, and `browser_action`.
-- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, `browser_search_history`, `browser_search_bookmarks`, the cookie/storage write tools, and the raw `browser_action` escape hatch), which are hidden by default. The host policy remains the enforcement boundary even when this escape hatch is exposed.
+- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, `browser_search_history`, `browser_search_bookmarks`, the cookie/storage write tools, `browser_replay_workflow`, and the raw `browser_action` escape hatch), which are hidden by default. The host policy remains the enforcement boundary even when this escape hatch is exposed.
 
 Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately.
+
+MCP deliberately exposes **no policy-mutation and no scheduling tool**. Reading a verdict (`browser_policy_check`, `browser_plan_preview`) is safe; rewriting the file that produces verdicts is not something an agent should do through the same channel it is being governed by. Change per-site permission modes with `chrome-bridge policy site-mode <originPattern> manual|auto|skip [client]` / `chrome-bridge policy clear-site-mode <originPattern> [client]`, and register scheduled-workflow metadata with `chrome-bridge schedule workflow ... --at|--interval` (which starts nothing - see docs/security.md). Both edit local files under the human's control; the host stays the enforcement boundary either way. If you need the raw escape hatch for a host action, `browser_action` still forwards one action and is still fully policy-gated.
 
 ### Register
 

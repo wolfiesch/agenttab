@@ -18,15 +18,23 @@ extension_id.txt
 # Generated Rust launcher (machine-specific absolute paths)
 bridge-host-launch.sh
 bridge-host-python-launch.sh
+# Generated Windows launcher (machine-specific absolute paths)
+bridge-host-launch.cmd
 bridge_policy*.json
 bridge_policy*.json.*
 !bridge_policy.example.json
+# Local scheduled-workflow metadata (absolute workflow paths, no daemon)
+bridge_schedules.json
 
 # Logs and caches
 bridge_debug.log
 bridge_audit.jsonl
 # Session trace artifacts written by the host when policy sets traceDir
 bridge_traces/
+# Local semantic-selector resolution cache and the last stopped workflow
+# recording (both hold site DOM paths and replayable mutating actions)
+bridge_action_cache.json
+bridge_workflow_last.json
 *.log
 __pycache__/
 *.pyc

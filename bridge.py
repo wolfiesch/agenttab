@@ -295,6 +295,7 @@ def handle_lease_action(action, payload, name):
 HANDOFF_BLACKOUT_ACTIONS = {
     'screenshot', 'extractText', 'getHTML', 'storageState', 'printToPDF',
     'searchTabs', 'getCurrentState', 'screencastFrames',
+    'extractStructured', 'scanPromptInjection', 'consoleMessages',
 }
 HANDOFF_BLACKOUT_ERROR = 'handoff in progress'
 
@@ -359,11 +360,13 @@ SENSITIVE_ACTIONS = {
     'startInterception', 'downloadUrl', 'screencastFrames',
 }
 MUTATING_ACTIONS = {
-    'navigate', 'click', 'type', 'fill', 'hover', 'scroll', 'press', 'drag',
+    'navigate', 'click', 'clickAt', 'type', 'fill', 'hover', 'scroll', 'press', 'drag',
     'select', 'uploadFile', 'activateTab', 'closeTab', 'reload', 'goBack',
-    'goForward', 'setViewport', 'setGeolocation', 'clearGeolocation',
+    'goForward', 'windowControl', 'setViewport', 'setGeolocation', 'clearGeolocation',
     'setCpuThrottling', 'setNetworkConditions', 'clearNetworkConditions',
     'setColorScheme', 'setUserAgent',
+    'setCookie', 'deleteCookie', 'setStorageItem', 'removeStorageItem', 'clearStorage',
+    'githubAttachUploadedFiles', 'githubSubmitComment', 'githubAttachPrBody',
     'startInterception', 'stopInterception', 'startMonitoring', 'stopMonitoring',
     'startScreencast', 'stopScreencast',
     'handleDialog', 'downloadUrl', 'batch',
@@ -373,6 +376,39 @@ DESTRUCTIVE_ACTIONS = {
     'executeScript', 'executeScriptCDP', 'startInterception', 'downloadUrl',
     'getCookies', 'storageState',
 }
+
+# --- Per-site permission modes (policy key ``siteModes``) -------------------
+# A site mode is attached to an origin pattern, not to an action:
+#   manual - every mutating or high-risk action on a matching origin requires a
+#            confirmation token, even when the action is not in
+#            ``requireConfirmation``.
+#   auto   - no change; ``requireConfirmation`` alone decides.
+#   skip   - pre-approve the confirmation gate for a matching origin, so an
+#            action listed in ``requireConfirmation`` runs without a token.
+# Modes never widen the action or origin gates: a denied action or a denied
+# origin still loses, and ``skip`` only relaxes confirmation for actions the
+# policy already allows.
+SITE_MODES = ('manual', 'auto', 'skip')
+
+# Confirmation gates that ``skip`` may never waive. These read or rewrite real
+# profile state (script execution, cookies, web storage, continuous capture) or
+# act without an auditable element identity, so an unattended origin-level
+# pre-approval must not be able to authorize them.
+NON_SKIPPABLE_CONFIRMATIONS = {
+    'executeScript', 'executeScriptCDP', 'getCookies', 'storageState',
+    'setCookie', 'deleteCookie', 'setStorageItem', 'removeStorageItem',
+    'clearStorage', 'startScreencast', 'clickAt',
+}
+
+
+def is_mutating_action(action):
+    # What ``manual`` gates: anything that changes browser/page/profile state
+    # plus the high-risk reads in the non-skippable set. Fail-safe by policy of
+    # the surrounding sets, not by guessing about unknown action names.
+    return (action in MUTATING_ACTIONS
+            or action in DESTRUCTIVE_ACTIONS
+            or action in NON_SKIPPABLE_CONFIRMATIONS)
+
 
 # Origin-exempt actions: their policy target is NOT the live tab origin, so the
 # host must not do a tab-origin lookup for them. navigate/downloadUrl/getCookies
@@ -409,6 +445,7 @@ DEFAULT_POLICY = {
             "*://[[]::1[]]", "*://[[]::1[]]:*",
         ],
         "requireConfirmation": [],
+        "siteModes": {},
         "redactPatterns": [],
         "secretMaskFile": None,
         "traceDir": None,
@@ -467,12 +504,16 @@ _POLICY_LIST_KEYS = (
 _POLICY_BOOL_KEYS = ('redact', 'audit')
 # String-valued policy keys merged like bools: a later layer replaces the value.
 _POLICY_STR_KEYS = ('secretMaskFile', 'traceDir')
+# Map-valued policy keys merged PER KEY: a later layer overrides only the origin
+# patterns it names and inherits the rest, so a client layer can set one site's
+# mode without restating (or silently dropping) the default layer's site modes.
+_POLICY_MAP_KEYS = ('siteModes',)
 
 
 def policy_for_client(policy, name):
     # Merge: built-in default -> policy["default"] -> policy["clients"][name].
     # List overrides replace the inherited list; bool/string overrides replace
-    # the inherited value; unknown keys are ignored.
+    # the inherited value; map overrides merge per key; unknown keys are ignored.
     merged = dict(DEFAULT_POLICY["default"])
     for layer in (policy.get("default"), (policy.get("clients") or {}).get(name)):
         if not isinstance(layer, dict):
@@ -486,6 +527,9 @@ def policy_for_client(policy, name):
         for key in _POLICY_STR_KEYS:
             if isinstance(layer.get(key), str):
                 merged[key] = layer[key]
+        for key in _POLICY_MAP_KEYS:
+            if isinstance(layer.get(key), dict):
+                merged[key] = {**(merged.get(key) or {}), **layer[key]}
     return merged
 
 
@@ -558,6 +602,41 @@ def target_matches(patterns, targets):
     return False
 
 
+def resolve_site_mode(cp, targets):
+    # The site mode governing ``targets``, or None when no configured pattern
+    # matches (which is identical in effect to "auto").
+    #
+    # Specificity, so overlapping patterns are deterministic in both hosts:
+    # among all matching patterns pick the LONGEST pattern string, breaking a
+    # length tie by the lexicographically smallest pattern. That makes an exact
+    # origin ("https://github.com") win over a wildcard ("*://*"). Values
+    # outside SITE_MODES are ignored, so a typo cannot silently pre-approve.
+    site_modes = cp.get('siteModes')
+    if not isinstance(site_modes, dict) or not targets:
+        return None
+    best = None
+    for pattern, mode in site_modes.items():
+        if not isinstance(pattern, str) or mode not in SITE_MODES:
+            continue
+        if not target_matches([pattern], targets):
+            continue
+        if best is None or (-len(pattern), pattern) < (-len(best[0]), best[0]):
+            best = (pattern, mode)
+    return best[1] if best else None
+
+
+def apply_site_mode(site_mode, action, confirm):
+    # Fold the site mode into the confirmation requirement. ``manual`` adds a
+    # gate, ``skip`` removes one, ``auto``/None leave requireConfirmation alone.
+    # Neither mode touches the action or origin gates, and ``skip`` can never
+    # waive a non-skippable action, so an unattended pre-approval stays bounded.
+    if site_mode == 'manual' and is_mutating_action(action):
+        return True
+    if site_mode == 'skip' and confirm and action not in NON_SKIPPABLE_CONFIRMATIONS:
+        return False
+    return confirm
+
+
 def origin_targets(origin):
     # Convert a tab origin ("https://host[:port]") into policy target strings
     # [scheme://host[:port], *://host[:port]] using the same normalizer as URLs.
@@ -577,6 +656,10 @@ def policy_constrains_origins(policy, name):
     if denied:
         return True
     if allowed != ["*"]:
+        return True
+    # Site modes are origin-keyed, so a configured siteModes map makes the live
+    # tab origin decision-relevant even under an otherwise permissive policy.
+    if cp.get('siteModes'):
         return True
     return False
 
@@ -616,7 +699,8 @@ def tab_ids_needed(action, payload):
 def evaluate_policy(policy, name, action, payload, origins=None):
     # Returns (allowed, reason, confirmation_required, redact_enabled,
     # audit_enabled, targets). Precedence: denied action -> allowed action ->
-    # denied target -> allowed target -> confirmation requirement.
+    # denied target -> allowed target -> confirmation requirement, with the
+    # matching origin's site mode (``siteModes``) folded into that last step.
     # ``origins`` maps a tabId (int, or None for the active tab) to that tab's
     # live origin string; for tab-scoped actions the matching origin is folded
     # into the site-policy targets so policy applies even with no URL in payload.
@@ -645,6 +729,10 @@ def evaluate_policy(policy, name, action, payload, origins=None):
     if not action_matches(allowed_actions, action):
         return (False, f"action {action} not allowed", False, redact_enabled, audit_enabled, targets)
     confirm = action_matches(cp.get('requireConfirmation'), action)
+    # Per-site permission mode. Applied to the confirmation requirement only,
+    # and only after the action gates: every deny path below returns
+    # confirm=False explicitly, so a deny still outranks any mode.
+    confirm = apply_site_mode(resolve_site_mode(cp, targets), action, confirm)
 
     # For batch, only inspect steps once the batch action itself is allowed and
     # does not require confirmation.
@@ -695,6 +783,9 @@ def policy_verdict(policy, name, action, payload, origin=None):
         "redact": redact_enabled,
         "audit": audit_enabled,
         "originDependent": bool(needed and policy_constrains_origins(policy, name) and not origins),
+        # The origin's resolved site mode, or null when no origin is known yet
+        # (no target resolved) or no configured pattern matches it.
+        "siteMode": resolve_site_mode(policy_for_client(policy, name), targets),
     }
     return verdict, targets
 
@@ -1347,7 +1438,10 @@ def _redact_response_patterns(action, response, redact_enabled, patterns=None, p
             out['result'] = _redact_storage_value(out['result'])
         return out
     # Content-bearing actions: mask policy redactPatterns in page-derived text.
-    if action in ('getHTML', 'extractText', 'executeScript', 'executeScriptCDP'):
+    if action in (
+        'getHTML', 'extractText', 'executeScript', 'executeScriptCDP',
+        'searchTabs', 'extractStructured', 'scanPromptInjection', 'consoleMessages',
+    ):
         compiled = _compile_patterns(patterns)
         if not compiled:
             return response
@@ -1592,6 +1686,7 @@ def handle_socket_client(client_socket):
                     "redact": redact_enabled,
                     "audit": audit_enabled,
                     "originDependent": origin_dependent,
+                    "siteMode": resolve_site_mode(policy_for_client(policy, name), targets),
                 }}
                 _audit(audit_enabled, name, "policyCheck", targets, "allow", None, None)
                 respond(resp, "allow")
@@ -1708,6 +1803,16 @@ def handle_socket_client(client_socket):
                              "policyDenial": policy_denial(reason, action, targets, name, policy)},
                             "deny", reason)
                     continue
+
+            # A confirmation that a ``skip`` site mode waived is still recorded:
+            # under an unattended pre-approval the audit log is the only place a
+            # human later sees that no confirmation was asked for.
+            if not confirm and action_matches(
+                    policy_for_client(policy, name).get('requireConfirmation'), action):
+                site_mode = resolve_site_mode(policy_for_client(policy, name), targets)
+                if site_mode == 'skip':
+                    _audit(audit_enabled, name, action, targets, "confirmation_waived",
+                           "siteMode skip", None)
 
             if confirm:
                 if consume_confirmation(confirmation_token, name, action, payload, targets):

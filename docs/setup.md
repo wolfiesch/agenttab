@@ -20,6 +20,8 @@ chrome-bridge/
 ├── bridge_policy.example.json          <- explicit opt-in policy template
 ├── com.automation.bridge.json.template <- host-manifest template (setup.sh fills it in)
 ├── setup.sh / setup-rs.sh              <- generates token/policy, deploys extension, registers host
+├── setup-windows.ps1                   <- user-scope (HKCU) native-host registration on Windows
+├── setup-edge.sh                       <- adds a Microsoft Edge registration for an existing install
 ├── setup-broker.sh                     <- installs launchd broker mode on macOS
 ├── uninstall-broker.sh                 <- stops launchd broker mode
 ├── bridge_wake.py                      <- shared wake-page discovery/opening helper
@@ -50,12 +52,23 @@ chrome-bridge/
 | `.github/workflows/release.yml` | Tag-driven release workflow for `v*` tags after the CI command set passes. |
 | `scripts/package_release.py` | Stdlib release packager for source archives, unpacked extension bundles, and Rust host binaries. |
 | `scripts/quick_install.sh` | One-command bootstrap: runs `setup.sh`, probes the bridge, and prints the extension-load and MCP-registration steps. |
+| `scripts/generate_browser_manifests.py` | Deterministic Edge/Firefox native-messaging manifest generator plus the Firefox extension staging directory. Writes into `dist/browsers` and prints metadata only. |
 
 ## Requirements
 
 - Google Chrome, Chrome Beta, or Chromium with Developer mode. The macOS installer also registers Chrome Canary.
 - Python 3.9+ for the core bridge and CLI; Python 3.10+ for the MCP server (`mcp/`, matching `mcp/pyproject.toml`).
-- macOS or Linux for the documented `setup.sh` and `setup-rs.sh` native-host installers. Broker mode and `setup-broker.sh` are macOS-only because they use launchd. Other platforms may be possible with manual Chrome native-host registration, but they are not covered by these installers.
+- macOS or Linux for `setup.sh` and `setup-rs.sh`; Windows for `setup-windows.ps1`. Broker mode and `setup-broker.sh` are macOS-only because they use launchd.
+
+## Platform and browser matrix
+
+| Browser | Platform | Installer | Status |
+|---|---|---|---|
+| Chrome / Chromium | macOS, Linux | `./setup.sh`, `./setup-rs.sh` | Supported. Full action surface, live gates run here. |
+| Chrome | Windows | `setup-windows.ps1` | Supported registration. Same extension and same host code; HKCU registry registration instead of a manifest directory. Broker mode is unavailable (launchd only). |
+| Microsoft Edge (Chromium) | macOS, Linux | `./setup-edge.sh` | Supported registration. Same `chrome-extension://` origin scheme, same MV3 service worker, canonical extension unchanged. |
+| Microsoft Edge (Chromium) | Windows | `setup-windows.ps1 -Browser Edge` | Supported registration under the Edge HKCU key. |
+| Firefox | any | `scripts/generate_browser_manifests.py --browser firefox` | Generated artifacts only. The native-messaging manifest and a staged extension directory are produced deterministically; the runtime is **not supported**. See Firefox limitations below. |
 
 ## Quickstart
 
@@ -112,6 +125,68 @@ cargo build --release --manifest-path host-rs/Cargo.toml
 ```
 
 Use this to register the Rust host with the same extension-ID resolution flow.
+
+### Windows (Chrome or Edge)
+
+Windows has no native-messaging manifest directory; Chrome and Edge read a registry key instead. `setup-windows.ps1` performs that registration for the current user only:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup-windows.ps1
+```
+
+Parameters, all optional: `-RepoRoot <path>` (defaults to the script's directory), `-HostPort <port>` (default `9223`), `-ExtensionId <id>`, `-UseRustHost`, and `-Browser Chrome|Edge|Both` (default `Chrome`).
+
+What it does:
+
+1. Creates `bridge_token.txt`, `bridge_tokens.txt`, and `bridge_policy.json` (from `bridge_policy.example.json`) only when they are absent, and restricts each to the current user with `icacls`. Existing files are never overwritten, and no token value is printed.
+2. Writes `bridge-host-launch.cmd`, a git-ignored launcher that exports `BRIDGE_PORT`, the token/policy paths, and the log paths, then runs `python.exe bridge.py` - or `host-rs\target\release\bridge-host.exe` with `-UseRustHost`. Windows native messaging launches the manifest `path` directly, so the interpreter has to live in a wrapper.
+3. Writes `com.automation.bridge.json` with the resolved launcher path and `chrome-extension://<id>/` origin.
+4. Sets the default value of `HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.automation.bridge` (and the matching `HKCU:\Software\Microsoft\Edge\...` key for `-Browser Edge|Both`) to that manifest path.
+5. Prints metadata only: manifest path, host name, host kind, port, extension ID, and next steps.
+
+The extension ID resolves from `-ExtensionId`, then `extension_id.txt`, then an existing `extension_key.pem`. If none of those exist, load the unpacked extension from `chrome://extensions/` first and re-run with the ID Chrome assigned.
+
+Windows notes: broker mode is macOS-only, so clients talk to the host directly on `BRIDGE_PORT`. Nothing is written to `HKLM` and no elevated shell is required; a machine-wide registration would let any account on the box drive your profile.
+
+### Microsoft Edge (Chromium)
+
+Edge is Chromium: same `chrome-extension://` origin scheme, same MV3 service worker, same extension bytes. Only the native-messaging host directory differs. Run `./setup.sh` first, then add the Edge registration:
+
+```bash
+./setup-edge.sh
+```
+
+`setup-edge.sh` creates no secrets. It reads the extension ID from `extension_id.txt` (or `--extension-id`), reads the host path from the generated `com.automation.bridge.json` (or `--host-path`), regenerates the Edge manifest into `dist/browsers/edge/`, and symlinks it into the Edge, Edge Beta, Edge Dev, and Edge Canary native-messaging directories on macOS, or Edge/Edge Beta/Edge Dev on Linux. Load the same unpacked extension directory from `edge://extensions/` and confirm the ID matches. On Windows use `setup-windows.ps1 -Browser Edge`.
+
+Enable only one bridge extension across all installed browsers; they compete for the same host port.
+
+### Firefox (generated artifacts, unsupported runtime)
+
+Firefox artifacts are generated, not installed:
+
+```bash
+python3 scripts/generate_browser_manifests.py \
+  --browser firefox \
+  --host-path "$PWD/bridge.py" \
+  --addon-id chrome-bridge@wolfie.gg \
+  --out-dir dist/browsers
+```
+
+This writes `dist/browsers/firefox/com.automation.bridge.json` (a Firefox host manifest using `allowed_extensions` instead of `allowed_origins`) and `dist/browsers/firefox/extension/`, a staging directory holding `background.js`, `wake.html`, and `wake.js` byte-identical to the canonical root files plus a manifest that is the canonical manifest with only the Gecko differences applied:
+
+- `browser_specific_settings.gecko.id` and `strict_min_version`;
+- `background: {"scripts": ["background.js"]}` instead of a service worker;
+- the Chrome-only permissions `debugger`, `tabGroups`, and `contentSettings` removed and reported as `droppedPermissions`.
+
+The canonical Chrome `manifest.json` is untouched, and `dist/` is git-ignored. `--browser all` also emits the Edge manifest; `--browser edge` requires `--extension-id`. Output is deterministic: the same inputs produce the same digests. Nothing is registered and no secret is read.
+
+Firefox limitations - these are why the runtime is not supported, not a to-do list:
+
+- Firefox has no `chrome.debugger`/CDP API. Every debugger-backed action is unavailable: background-safe `screenshot`, `printToPDF`, `clickAt`, screencast recording, `executeScriptCDP`, performance metrics, network/CPU throttling, and emulation.
+- Firefox has no `chrome.tabGroups`, so task sessions cannot create named tab groups.
+- Firefox has no `chrome.contentSettings`, so permission and content-setting control is unavailable.
+- Firefox MV3 runs an event page, not a service worker; the keepalive and heartbeat paths in `background.js` are tuned for Chrome's worker lifecycle.
+- No live gate in this repository exercises Firefox. Treat the staged output as material for a future port, not as a working install.
 
 ### Packaged/store extension
 

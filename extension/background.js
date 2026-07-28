@@ -483,10 +483,16 @@ async function dispatchAction(action, payload) {
         result = await printToPDF(payload.tabId, payload);
         break;
       case "extractText":
-        result = await extractText(payload.tabId, payload.maxChars);
+        result = await extractText(payload.tabId, payload.maxChars, payload.scanPromptInjection);
+        break;
+      case "extractStructured":
+        result = await extractStructured(payload.tabId, payload.schema, payload.selector, payload.maxChars);
+        break;
+      case "scanPromptInjection":
+        result = await scanPromptInjection(payload.tabId, payload.selector, payload.maxChars);
         break;
       case "getHTML":
-        result = await getHTML(payload.tabId);
+        result = await getHTML(payload.tabId, payload.scanPromptInjection);
         break;
       case "hover":
         result = await hoverSelector(payload.tabId, payload.selector);
@@ -615,12 +621,31 @@ async function dispatchAction(action, payload) {
       case "searchTabs":
         result = await searchTabs(payload);
         break;
+      case "startWorkflowRecording":
+        result = await startWorkflowRecording(payload);
+        break;
+      case "stopWorkflowRecording":
+        result = stopWorkflowRecording(payload);
+        break;
+      case "replayWorkflow":
+        result = await replayWorkflow(payload);
+        break;
+      case "resolveCachedSelector":
+        result = await resolveCachedSelector(payload);
+        break;
+      case "cacheSelectors":
+        result = cacheSelectors(payload);
+        break;
       case "__tabOrigin":
         result = await tabOrigin(payload.tabId);
         break;
       default:
         throw new Error(`Unsupported action: ${action}`);
     }
+    // ST3: append this dispatch to every matching active recording. Recording
+    // observes bridge traffic only, so nothing a human does in the tab is
+    // captured, and a failed action is never recorded.
+    await recordDispatchedAction(action, payload, result);
     return result;
 }
 
@@ -2004,7 +2029,7 @@ async function printToPDF(tabId, options) {
   });
 }
 
-async function extractText(tabId, maxChars) {
+async function extractText(tabId, maxChars, scanInjection) {
   const limit = maxChars || 20000;
   const results = await chrome.scripting.executeScript({
     target: { tabId },
@@ -2016,20 +2041,583 @@ async function extractText(tabId, maxChars) {
     args: [limit]
   });
   const result = results[0]?.result || { text: '', originalLength: 0 };
-  return {
+  const out = {
     success: true,
     text: result.text,
     truncated: result.originalLength > limit,
     chars: result.text.length
   };
+  if (scanInjection === true) out.injectionScan = scanTextForInjection(out.text);
+  return out;
 }
 
-async function getHTML(tabId) {
+async function getHTML(tabId, scanInjection) {
   const results = await chrome.scripting.executeScript({
     target: { tabId },
     func: () => document.documentElement?.outerHTML || ''
   });
-  return { success: true, html: results[0]?.result || '' };
+  const html = results[0]?.result || '';
+  const out = { success: true, html };
+  if (scanInjection === true) out.injectionScan = scanTextForInjection(html);
+  return out;
+}
+
+// ST6: heuristic prompt-injection signatures. Page text is data, never
+// instruction: these patterns only flag text that *looks* like it is trying to
+// steer an agent, its tools, its secrets, or its policy. A hit is a warning for
+// the operator, never an authorization decision, and a miss is not a clean bill
+// of health.
+const PROMPT_INJECTION_SIGNATURES = [
+  { kind: "instructionOverride", severity: "high", pattern: /(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|earlier|above|preceding)\s+(?:instructions?|prompts?|rules?|directions?|guidance)/ },
+  { kind: "instructionOverride", severity: "medium", pattern: /\b(?:new|updated|revised)\s+(?:system\s+)?instructions?\s*:/ },
+  { kind: "systemPromptDisclosure", severity: "high", pattern: /(?:reveal|show|print|repeat|output|disclose|dump)\s+(?:me\s+)?(?:your\s+|the\s+)?(?:system\s+prompt|initial\s+instructions|hidden\s+(?:prompt|instructions)|developer\s+(?:prompt|message))/ },
+  { kind: "credentialExfiltration", severity: "high", pattern: /(?:send|post|upload|exfiltrate|leak|email|share|transmit)\s+(?:me\s+|us\s+)?(?:the\s+|your\s+|all\s+)?(?:api\s+keys?|access\s+tokens?|tokens?|passwords?|credentials?|secrets?|cookies?|session\s+(?:id|token))/ },
+  { kind: "credentialExfiltration", severity: "high", pattern: /(?:copy|dump|read|grab)\s+(?:the\s+|all\s+|my\s+)?(?:cookies?|local\s?storage|session\s?storage|browser\s+storage|keychain|bridge[_-]?token|\.env)/ },
+  { kind: "shellExecution", severity: "high", pattern: /(?:run|execute|exec|paste)\s+(?:the\s+following\s+|this\s+)?(?:shell|bash|zsh|powershell|terminal|system)?\s*(?:command|script)/ },
+  { kind: "shellExecution", severity: "high", pattern: /curl\s+\S+\s*\|\s*(?:ba|z)?sh/ },
+  { kind: "policyTampering", severity: "high", pattern: /(?:disable|bypass|turn\s+off|skip|remove|relax)\s+(?:the\s+|any\s+|all\s+)?(?:polic(?:y|ies)|safety(?:\s+checks?)?|guardrails?|confirmations?|security\s+checks?|sandbox|allowlist)/ },
+  { kind: "operatorConcealment", severity: "high", pattern: /(?:do\s+not|don't|never)\s+(?:tell|inform|notify|mention\s+(?:this\s+)?to|show|ask)\s+(?:the\s+)?(?:user|human|operator|owner)/ },
+  { kind: "permissionCoercion", severity: "medium", pattern: /(?:click|press|choose|select|tap)\s+(?:on\s+)?(?:the\s+)?["']?(?:allow|accept|approve|confirm|grant|continue|yes)\b/ },
+  { kind: "permissionCoercion", severity: "medium", pattern: /(?:approve|confirm|authorize)\s+(?:this|the)\s+(?:action|request|payment|transfer|purchase)/ },
+  { kind: "toolRedirection", severity: "medium", pattern: /\b(?:ai|agent|assistant|language\s+model|llm|chatgpt|claude|copilot|gemini)\b\s*[,:]?\s*(?:you\s+(?:must|should|shall|will|need\s+to|are\s+required\s+to)|please\s+(?:now\s+)?(?:run|open|navigate|send|call))/ },
+  { kind: "toolRedirection", severity: "medium", pattern: /<\s*\/?\s*(?:system|assistant|developer|instructions?)\s*>/ },
+  { kind: "dataExfiltration", severity: "medium", pattern: /https?:\/\/\S*[?&](?:token|api[_-]?key|secret|password|cookie|session)=/ }
+];
+
+const INJECTION_SNIPPET_CHARS = 160;
+const INJECTION_MATCHES_PER_SIGNATURE = 3;
+const INJECTION_MAX_MATCHES = 25;
+
+// Scans text already inside the extension. Only bounded snippets leave here, so
+// a scan never becomes a second channel for the full page body.
+function scanTextForInjection(text) {
+  const source = typeof text === "string" ? text : "";
+  const matches = [];
+  for (const signature of PROMPT_INJECTION_SIGNATURES) {
+    if (matches.length >= INJECTION_MAX_MATCHES) break;
+    const regex = new RegExp(signature.pattern.source, "gi");
+    let found = 0;
+    let hit;
+    while ((hit = regex.exec(source)) !== null) {
+      if (hit[0].length === 0) {
+        regex.lastIndex += 1;
+        continue;
+      }
+      const start = Math.max(0, hit.index - 24);
+      const snippet = source.slice(start, start + INJECTION_SNIPPET_CHARS).replace(/\s+/g, " ").trim();
+      matches.push({ kind: signature.kind, severity: signature.severity, snippet });
+      found += 1;
+      if (found >= INJECTION_MATCHES_PER_SIGNATURE || matches.length >= INJECTION_MAX_MATCHES) break;
+    }
+  }
+  const risk = matches.some((m) => m.severity === "high")
+    ? "high"
+    : matches.some((m) => m.severity === "medium") ? "medium" : "low";
+  return { risk, matches, scannedChars: source.length };
+}
+
+function scopedTextExpression(locator, maxChars) {
+  return `(() => {
+    ${locator ? locatorResolverSource() : ""}
+    let root = document.body || document.documentElement;
+    ${locator ? `const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    root = resolved.el;` : ""}
+    const raw = root ? (root.innerText || root.textContent || '') : '';
+    const limit = ${JSON.stringify(maxChars)};
+    return { success: true, text: raw.slice(0, limit), originalLength: raw.length };
+  })()`;
+}
+
+function clampChars(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), 200000);
+}
+
+// Reads text from a selector subtree (or the whole body) in the main frame.
+// Cross-origin iframe subtrees are out of reach here; scope to the frame's own
+// tab instead.
+async function extractScopedText(tabId, selector, maxChars) {
+  const limit = clampChars(maxChars, 20000);
+  let locator = null;
+  if (selector) {
+    try {
+      locator = parseActionLocator(selector, tabId);
+    } catch (error) {
+      return locatorError(error);
+    }
+  }
+  return withDebugger(tabId, async (target) => {
+    const result = await evaluateWithDebugger(target, scopedTextExpression(locator, limit));
+    if (!result.success) return result;
+    const value = result.val || {};
+    if (value.success === false) return value;
+    const text = typeof value.text === "string" ? value.text : "";
+    return {
+      success: true,
+      text,
+      chars: text.length,
+      truncated: Number(value.originalLength || 0) > limit
+    };
+  });
+}
+
+async function scanPromptInjection(tabId, selector, maxChars) {
+  const extracted = await extractScopedText(tabId, selector, maxChars);
+  if (extracted.success === false) return extracted;
+  const scan = scanTextForInjection(extracted.text);
+  return {
+    success: true,
+    risk: scan.risk,
+    matches: scan.matches,
+    scannedChars: scan.scannedChars,
+    truncated: extracted.truncated === true
+  };
+}
+
+// ST5: schema-driven extraction. The subset is deliberately tiny (object,
+// array, string, number, boolean, enum, required, properties, items) so both
+// the extractor and the validator stay deterministic and reviewable.
+const STRUCTURED_SCHEMA_VERSION = "json-schema-subset/1";
+const STRUCTURED_SCHEMA_KEYWORDS = new Set(["type", "properties", "required", "items", "enum", "title", "description"]);
+const STRUCTURED_SCALAR_TYPES = new Set(["string", "number", "boolean"]);
+
+function schemaError(path, code, message) {
+  return { path: path || "$", code, message };
+}
+
+// Rejects anything outside the subset up front: an unsupported keyword must not
+// be silently ignored, or callers would believe a constraint was enforced.
+function validateSchemaSubset(schema, path, errors) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    errors.push(schemaError(path, "unsupportedSchema", "Schema nodes must be JSON objects"));
+    return;
+  }
+  for (const keyword of Object.keys(schema)) {
+    if (!STRUCTURED_SCHEMA_KEYWORDS.has(keyword)) {
+      errors.push(schemaError(path, "unsupportedSchema", `Unsupported schema keyword: ${keyword}`));
+    }
+  }
+  const type = schema.type;
+  if (type !== undefined) {
+    if (typeof type !== "string" || !(STRUCTURED_SCALAR_TYPES.has(type) || type === "object" || type === "array")) {
+      errors.push(schemaError(path, "unsupportedSchema", "type must be one of object, array, string, number, boolean"));
+      return;
+    }
+  } else if (!Array.isArray(schema.enum)) {
+    errors.push(schemaError(path, "unsupportedSchema", "Schema nodes require a type (or an enum)"));
+    return;
+  }
+  if (schema.enum !== undefined) {
+    if (!Array.isArray(schema.enum) || schema.enum.length === 0) {
+      errors.push(schemaError(path, "unsupportedSchema", "enum must be a non-empty array"));
+    } else if (schema.enum.some((item) => !["string", "number", "boolean"].includes(typeof item))) {
+      errors.push(schemaError(path, "unsupportedSchema", "enum members must be strings, numbers, or booleans"));
+    }
+  }
+  if (type === "object") {
+    if (schema.properties === undefined || typeof schema.properties !== "object" || Array.isArray(schema.properties)) {
+      errors.push(schemaError(path, "unsupportedSchema", "object schemas require a properties map"));
+      return;
+    }
+    if (schema.required !== undefined) {
+      if (!Array.isArray(schema.required) || schema.required.some((name) => typeof name !== "string")) {
+        errors.push(schemaError(path, "unsupportedSchema", "required must be an array of property names"));
+      } else {
+        for (const name of schema.required) {
+          if (!Object.prototype.hasOwnProperty.call(schema.properties, name)) {
+            errors.push(schemaError(path, "unsupportedSchema", `required names an unknown property: ${name}`));
+          }
+        }
+      }
+    }
+    for (const [name, child] of Object.entries(schema.properties)) {
+      validateSchemaSubset(child, `${path}.${name}`, errors);
+    }
+    return;
+  }
+  if (type === "array") {
+    if (schema.items === undefined) {
+      errors.push(schemaError(path, "unsupportedSchema", "array schemas require items"));
+      return;
+    }
+    validateSchemaSubset(schema.items, `${path}[]`, errors);
+    return;
+  }
+  if (schema.properties !== undefined || schema.items !== undefined || schema.required !== undefined) {
+    errors.push(schemaError(path, "unsupportedSchema", "properties, items, and required apply only to object/array schemas"));
+  }
+}
+
+function normalizeFieldKey(value) {
+  return String(value === undefined || value === null ? "" : value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function fieldAliases(name, schema) {
+  const aliases = new Set();
+  const add = (value) => {
+    const key = normalizeFieldKey(value);
+    if (key) aliases.add(key);
+  };
+  add(name);
+  add(String(name || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2"));
+  if (schema && typeof schema.title === "string") add(schema.title);
+  return aliases;
+}
+
+function coerceScalarValue(schema, raw) {
+  const text = String(raw === undefined || raw === null ? "" : raw).trim();
+  if (!text) return { ok: false, reason: "empty value" };
+  const type = schema.type || (Array.isArray(schema.enum) ? typeof schema.enum[0] : "string");
+  let value;
+  if (type === "number") {
+    const match = text.replace(/[,\u00a0]/g, "").match(/-?\d+(?:\.\d+)?/);
+    if (!match) return { ok: false, reason: `not a number: ${text.slice(0, 40)}` };
+    value = Number(match[0]);
+    if (!Number.isFinite(value)) return { ok: false, reason: `not a number: ${text.slice(0, 40)}` };
+  } else if (type === "boolean") {
+    if (/^(true|yes|y|on|enabled|checked|1)$/i.test(text)) value = true;
+    else if (/^(false|no|n|off|disabled|unchecked|0)$/i.test(text)) value = false;
+    else return { ok: false, reason: `not a boolean: ${text.slice(0, 40)}` };
+  } else {
+    value = text;
+  }
+  if (Array.isArray(schema.enum)) {
+    const member = schema.enum.find((item) => normalizeFieldKey(item) === normalizeFieldKey(value));
+    if (member === undefined) return { ok: false, reason: `value is not in enum: ${text.slice(0, 40)}` };
+    value = member;
+  }
+  return { ok: true, value };
+}
+
+function lookupPairValue(evidence, aliases) {
+  const exact = evidence.pairs.find((pair) => aliases.has(pair.normalizedKey));
+  if (exact) return exact.value;
+  const partial = evidence.pairs.find((pair) => Array.from(aliases).some((alias) => alias.length >= 4 && (pair.normalizedKey.includes(alias) || alias.includes(pair.normalizedKey))));
+  return partial ? partial.value : null;
+}
+
+function extractObjectValue(schema, evidence, path, errors) {
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const data = {};
+  let matched = 0;
+  for (const [name, child] of Object.entries(schema.properties || {})) {
+    const childPath = `${path}.${name}`;
+    const extracted = extractSchemaValue(child, name, evidence, childPath, errors);
+    if (extracted.found) {
+      data[name] = extracted.value;
+      matched += 1;
+      continue;
+    }
+    // Optional fields are omitted rather than guessed; required fields report.
+    if (required.includes(name)) {
+      errors.push(schemaError(childPath, "missingRequired", extracted.reason || `No confident value found for required field ${name}`));
+    }
+  }
+  return { found: matched > 0 || Object.keys(schema.properties || {}).length === 0, value: data };
+}
+
+function extractArrayValue(schema, name, evidence, path, errors) {
+  const items = schema.items || {};
+  if (items.type === "object") {
+    const properties = Object.entries(items.properties || {});
+    const aliasMap = properties.map(([propName, propSchema]) => ({ propName, propSchema, aliases: fieldAliases(propName, propSchema) }));
+    const table = evidence.tables.find((candidate) => candidate.normalizedHeaders.some((header) => aliasMap.some((entry) => entry.aliases.has(header))));
+    if (!table) return { found: false, reason: `No table matched item properties for ${name}` };
+    const required = Array.isArray(items.required) ? items.required : [];
+    const rows = [];
+    table.rows.forEach((cells, index) => {
+      const row = {};
+      let filled = 0;
+      for (const entry of aliasMap) {
+        const column = table.normalizedHeaders.findIndex((header) => entry.aliases.has(header));
+        if (column < 0 || column >= cells.length) continue;
+        const coerced = coerceScalarValue(entry.propSchema, cells[column]);
+        if (!coerced.ok) continue;
+        row[entry.propName] = coerced.value;
+        filled += 1;
+      }
+      if (filled === 0) return;
+      for (const propName of required) {
+        if (!Object.prototype.hasOwnProperty.call(row, propName)) {
+          errors.push(schemaError(`${path}[${index}].${propName}`, "missingRequired", `Row ${index} has no confident value for required field ${propName}`));
+        }
+      }
+      rows.push(row);
+    });
+    if (!rows.length) return { found: false, reason: `Table for ${name} produced no usable rows` };
+    return { found: true, value: rows };
+  }
+  const aliases = fieldAliases(name, schema);
+  const list = evidence.lists.find((candidate) => aliases.has(candidate.normalizedLabel)) ||
+    evidence.lists.find((candidate) => candidate.normalizedLabel && Array.from(aliases).some((alias) => alias.length >= 4 && candidate.normalizedLabel.includes(alias)));
+  let raws = list ? list.items : null;
+  if (!raws) {
+    const pairValue = lookupPairValue(evidence, aliases);
+    if (pairValue) raws = pairValue.split(/\s*[;,\n]\s*/).filter(Boolean);
+  }
+  if (!raws || !raws.length) return { found: false, reason: `No list or delimited value matched ${name}` };
+  const values = [];
+  for (const raw of raws) {
+    const coerced = coerceScalarValue(items, raw);
+    if (coerced.ok) values.push(coerced.value);
+  }
+  if (!values.length) return { found: false, reason: `No item in ${name} matched the item schema` };
+  return { found: true, value: values };
+}
+
+function extractSchemaValue(schema, name, evidence, path, errors) {
+  const type = schema.type || "string";
+  if (type === "object") return extractObjectValue(schema, evidence, path, errors);
+  if (type === "array") return extractArrayValue(schema, name, evidence, path, errors);
+  const aliases = fieldAliases(name, schema);
+  const raw = lookupPairValue(evidence, aliases);
+  if (raw === null) return { found: false, reason: `No labelled value matched ${name}` };
+  const coerced = coerceScalarValue(schema, raw);
+  if (!coerced.ok) {
+    errors.push(schemaError(path, "typeMismatch", coerced.reason));
+    return { found: false, reason: coerced.reason };
+  }
+  return { found: true, value: coerced.value };
+}
+
+// Second pass over the produced data: the extractor is heuristic, the validator
+// is not, so nothing ships that the schema does not describe.
+function validateStructuredData(schema, value, path, errors) {
+  const type = schema.type || (Array.isArray(schema.enum) ? typeof schema.enum[0] : "string");
+  if (type === "object") {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      errors.push(schemaError(path, "typeMismatch", "expected an object"));
+      return;
+    }
+    const properties = schema.properties || {};
+    for (const key of Object.keys(value)) {
+      if (!Object.prototype.hasOwnProperty.call(properties, key)) {
+        errors.push(schemaError(`${path}.${key}`, "unexpectedProperty", "value is not described by the schema"));
+        delete value[key];
+        continue;
+      }
+      validateStructuredData(properties[key], value[key], `${path}.${key}`, errors);
+    }
+    for (const key of Array.isArray(schema.required) ? schema.required : []) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) {
+        errors.push(schemaError(`${path}.${key}`, "missingRequired", "required field is absent from the extracted data"));
+      }
+    }
+    return;
+  }
+  if (type === "array") {
+    if (!Array.isArray(value)) {
+      errors.push(schemaError(path, "typeMismatch", "expected an array"));
+      return;
+    }
+    value.forEach((item, index) => validateStructuredData(schema.items || {}, item, `${path}[${index}]`, errors));
+    return;
+  }
+  if (typeof value !== type) {
+    errors.push(schemaError(path, "typeMismatch", `expected ${type}`));
+    return;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    errors.push(schemaError(path, "enumMismatch", "value is not an enum member"));
+  }
+}
+
+// In-page evidence harvest. Only label/value pairs, table shapes, and list
+// items come back; the raw body text stays in the page.
+function structuredHarvestExpression(locator, maxChars) {
+  return `(() => {
+    ${locator ? locatorResolverSource() : ""}
+    let root = document.body || document.documentElement;
+    ${locator ? `const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    root = resolved.el;` : ""}
+    if (!root) return { success: false, err: 'No document body to extract from' };
+    const limit = ${JSON.stringify(maxChars)};
+    const clean = (value) => String(value == null ? '' : value).replace(/\\s+/g, ' ').trim();
+    const pairs = [];
+    const seen = new Set();
+    const addPair = (key, value, source) => {
+      if (pairs.length >= 500) return;
+      const k = clean(key);
+      const v = clean(value);
+      if (!k || !v || k.length > 120 || v.length > 2000) return;
+      const dedupe = source + '|' + k.toLowerCase() + '|' + v;
+      if (seen.has(dedupe)) return;
+      seen.add(dedupe);
+      pairs.push({ key: k, value: v, source });
+    };
+    const text = (el) => (el ? (el.innerText || el.textContent || '') : '');
+    for (const dt of root.querySelectorAll('dt')) {
+      const dd = dt.nextElementSibling;
+      if (dd && dd.tagName === 'DD') addPair(text(dt), text(dd), 'definitionList');
+    }
+    for (const row of root.querySelectorAll('tr')) {
+      const header = row.querySelector(':scope > th');
+      const cells = Array.from(row.querySelectorAll(':scope > td'));
+      if (header && cells.length === 1) addPair(text(header), text(cells[0]), 'tableRow');
+    }
+    const controlValue = (el) => {
+      if (el.tagName === 'SELECT') {
+        const option = el.selectedOptions && el.selectedOptions[0];
+        return option ? (option.text || option.value) : el.value;
+      }
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (type === 'checkbox' || type === 'radio') return el.checked ? 'true' : 'false';
+      if ('value' in el && typeof el.value === 'string') return el.value;
+      return text(el);
+    };
+    const labelFor = (el) => {
+      const aria = el.getAttribute('aria-label');
+      if (aria) return aria;
+      const id = el.getAttribute('id');
+      if (id) {
+        const label = root.querySelector('label[for="' + CSS.escape(id) + '"]') || document.querySelector('label[for="' + CSS.escape(id) + '"]');
+        if (label) return text(label);
+      }
+      const wrapping = el.closest ? el.closest('label') : null;
+      if (wrapping) return text(wrapping);
+      return el.getAttribute('name') || el.getAttribute('placeholder') || '';
+    };
+    for (const el of root.querySelectorAll('input, textarea, select')) {
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (type === 'password' || type === 'hidden' || type === 'file') continue;
+      addPair(labelFor(el), controlValue(el), 'formControl');
+      const name = el.getAttribute('name');
+      if (name) addPair(name, controlValue(el), 'nameAttribute');
+    }
+    for (const el of root.querySelectorAll('[itemprop], [data-field]')) {
+      const key = el.getAttribute('itemprop') || el.getAttribute('data-field');
+      addPair(key, el.getAttribute('content') || text(el), 'microdata');
+    }
+    for (const el of root.querySelectorAll('[aria-label]')) {
+      if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) continue;
+      addPair(el.getAttribute('aria-label'), text(el), 'ariaLabel');
+    }
+    for (const heading of root.querySelectorAll('h1, h2, h3, h4, h5, h6')) {
+      const next = heading.nextElementSibling;
+      if (next && !/^H[1-6]$/.test(next.tagName)) addPair(text(heading), text(next), 'heading');
+    }
+    const body = (root.innerText || root.textContent || '').slice(0, limit);
+    for (const line of body.split(/\\n+/)) {
+      const match = line.match(/^\\s*([^:\\t]{1,60}?)\\s*:\\s*(.+?)\\s*$/);
+      if (match) addPair(match[1], match[2], 'textLine');
+    }
+    const tables = [];
+    for (const table of root.querySelectorAll('table')) {
+      if (tables.length >= 20) break;
+      const firstRow = table.querySelector('tr');
+      const headerCells = Array.from(table.querySelectorAll('thead th'));
+      const headerRow = headerCells.length ? headerCells : Array.from(firstRow ? firstRow.querySelectorAll('th') : []);
+      const headers = headerRow.map((cell) => clean(text(cell)));
+      if (headers.length < 2) continue;
+      const rows = [];
+      for (const row of table.querySelectorAll('tr')) {
+        const cells = Array.from(row.querySelectorAll(':scope > td'));
+        if (cells.length < 2) continue;
+        rows.push(cells.map((cell) => clean(text(cell))));
+        if (rows.length >= 200) break;
+      }
+      if (rows.length) tables.push({ headers, rows });
+    }
+    const lists = [];
+    for (const list of root.querySelectorAll('ul, ol')) {
+      if (lists.length >= 50) break;
+      const items = Array.from(list.querySelectorAll(':scope > li')).map((li) => clean(text(li))).filter(Boolean).slice(0, 200);
+      if (!items.length) continue;
+      const previous = list.previousElementSibling;
+      const label = list.getAttribute('aria-label') || (previous ? clean(text(previous)) : '');
+      lists.push({ label: clean(label).slice(0, 120), items });
+    }
+    return { success: true, pairs, tables, lists, chars: body.length, truncated: (root.innerText || root.textContent || '').length > limit };
+  })()`;
+}
+
+const STRUCTURED_SOURCE_PRIORITY = ["definitionList", "tableRow", "formControl", "microdata", "ariaLabel", "nameAttribute", "heading", "textLine"];
+
+function buildStructuredEvidence(harvest) {
+  const pairs = (Array.isArray(harvest.pairs) ? harvest.pairs : [])
+    .map((pair, index) => ({
+      normalizedKey: normalizeFieldKey(pair.key),
+      value: typeof pair.value === "string" ? pair.value : "",
+      rank: STRUCTURED_SOURCE_PRIORITY.indexOf(pair.source),
+      index
+    }))
+    .filter((pair) => pair.normalizedKey && pair.value)
+    .sort((a, b) => {
+      const left = a.rank < 0 ? STRUCTURED_SOURCE_PRIORITY.length : a.rank;
+      const right = b.rank < 0 ? STRUCTURED_SOURCE_PRIORITY.length : b.rank;
+      return left === right ? a.index - b.index : left - right;
+    });
+  const tables = (Array.isArray(harvest.tables) ? harvest.tables : []).map((table) => ({
+    normalizedHeaders: (Array.isArray(table.headers) ? table.headers : []).map((header) => normalizeFieldKey(header)),
+    rows: (Array.isArray(table.rows) ? table.rows : []).filter((row) => Array.isArray(row))
+  }));
+  const lists = (Array.isArray(harvest.lists) ? harvest.lists : []).map((list) => ({
+    normalizedLabel: normalizeFieldKey(list.label),
+    items: (Array.isArray(list.items) ? list.items : []).filter((item) => typeof item === "string" && item)
+  }));
+  return { pairs, tables, lists };
+}
+
+async function extractStructured(tabId, schema, selector, maxChars) {
+  const schemaErrors = [];
+  validateSchemaSubset(schema, "$", schemaErrors);
+  if (schemaErrors.length) {
+    return {
+      success: false,
+      err: `Schema is outside the supported subset: ${schemaErrors[0].message}`,
+      errors: schemaErrors,
+      schemaVersion: STRUCTURED_SCHEMA_VERSION
+    };
+  }
+  const limit = clampChars(maxChars, 20000);
+  let locator = null;
+  if (selector) {
+    try {
+      locator = parseActionLocator(selector, tabId);
+    } catch (error) {
+      return locatorError(error);
+    }
+  }
+  const harvest = await withDebugger(tabId, async (target) => {
+    const result = await evaluateWithDebugger(target, structuredHarvestExpression(locator, limit));
+    if (!result.success) return result;
+    const value = result.val || {};
+    if (value.success === false) return value;
+    return { success: true, harvest: value };
+  });
+  if (harvest.success === false) return harvest;
+  const evidence = buildStructuredEvidence(harvest.harvest);
+  const errors = [];
+  const extracted = extractSchemaValue(schema, "$", evidence, "$", errors);
+  const data = extracted.found ? extracted.value : (schema.type === "array" ? [] : (schema.type === "object" ? {} : null));
+  if (!extracted.found && schema.type !== "object") {
+    errors.push(schemaError("$", "missingRequired", extracted.reason || "No confident value found for the root schema"));
+  }
+  // A root scalar that matched nothing is already reported above; re-validating
+  // the null placeholder would only add a redundant type error.
+  if (extracted.found || schema.type === "object" || schema.type === "array") {
+    validateStructuredData(schema, data, "$", errors);
+  }
+  // The extraction pass and the validation pass can flag the same field; report
+  // each path/code once, keeping the more specific extraction message.
+  const seenErrors = new Set();
+  const uniqueErrors = errors.filter((item) => {
+    const key = `${item.path}|${item.code}`;
+    if (seenErrors.has(key)) return false;
+    seenErrors.add(key);
+    return true;
+  });
+  return {
+    success: true,
+    data,
+    errors: uniqueErrors,
+    schemaVersion: STRUCTURED_SCHEMA_VERSION,
+    chars: Number(harvest.harvest.chars || 0),
+    truncated: harvest.harvest.truncated === true
+  };
 }
 
 async function getElementCenter(target, selector) {
@@ -4104,5 +4692,629 @@ async function searchTabs(payload) {
     matchingTabs: matches.length,
     maxMatchesPerTab: maxPerTab,
     matches,
+  };
+}
+
+// --- ST3: bridge-action workflow recording ---------------------------------
+//
+// A recording captures only what the BRIDGE dispatched: every mutating action
+// that successfully returns from dispatchAction is appended to each matching
+// active recording. Human clicks and keystrokes in the tab are never observed,
+// so a workflow can only ever reproduce automation the caller already had the
+// policy grants to perform. Recordings live solely in service-worker memory: a
+// worker restart drops them, which is why `stopWorkflowRecording` returns the
+// serialized workflow for the caller to persist.
+const WORKFLOW_VERSION = 1;
+const WORKFLOW_STEP_LIMIT = 500;
+// A recorded human pause can be minutes long; replay waits at most this per
+// step so a workflow never stalls the bridge on a gap nobody meant to keep.
+const WORKFLOW_MAX_STEP_WAIT_MS = 10000;
+const REDACTED_VALUE = "<redacted>";
+const workflowRecordings = new Map();
+let workflowRecordingCounter = 0;
+// Replay dispatches through the same table, so suppress recording while a
+// replay is running: otherwise replaying into an active recording would append
+// a second copy of every step.
+let workflowReplayDepth = 0;
+
+// Actions worth replaying: they change browser or page state. Read-only
+// actions (observe, extractText, consoleMessages, ...), host-side verbs, and
+// the recording/replay control actions themselves are deliberately absent.
+const RECORDABLE_ACTIONS = new Set([
+  "navigate", "navigateTaskSession", "activateTab", "closeTab", "reload", "goBack", "goForward",
+  "windowControl", "click", "clickAt", "type", "fill", "select", "hover", "scroll", "press", "drag",
+  "uploadFile", "githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody",
+  "executeScript", "executeScriptCDP", "handleDialog", "downloadUrl",
+  "setViewport", "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
+  "setColorScheme", "setUserAgent", "setGeolocation", "clearGeolocation",
+  "setCookie", "deleteCookie", "setStorageItem", "removeStorageItem", "clearStorage",
+  "waitForLoad", "waitForSelector", "waitForText", "waitForUrl"
+]);
+
+// Per-action payload fields holding a value a human typed or stored. Recorded
+// as `<redacted>` unless the call opted in with `recordSensitive: true`.
+const WORKFLOW_SENSITIVE_FIELDS = {
+  type: ["text"],
+  fill: ["text"],
+  setCookie: ["value"],
+  setStorageItem: ["value"],
+  handleDialog: ["promptText"]
+};
+
+// Transport/control keys that describe the request rather than the action.
+const WORKFLOW_SKIPPED_PAYLOAD_KEYS = new Set([
+  "recordSensitive", "bindings", "cache", "workflow", "confirmationToken", "dryRun", "traceId"
+]);
+
+// Any credential-shaped key is redacted regardless of action, so a future
+// action carrying a secret field is covered before anyone remembers to list it.
+const WORKFLOW_SECRET_KEY_PATTERN = /(token|password|passwd|secret|credential|authorization|api[-_]?key)/i;
+
+function workflowBindingKey(stepIndex, field) {
+  return `step${stepIndex}.${field}`;
+}
+
+function isWorkflowSensitiveField(action, key, value) {
+  if (typeof value !== "string" || !value.length) return false;
+  if (WORKFLOW_SECRET_KEY_PATTERN.test(key)) return true;
+  return (WORKFLOW_SENSITIVE_FIELDS[action] || []).includes(key);
+}
+
+// Returns the payload as recorded plus the binding keys replay will demand.
+function scrubRecordedPayload(action, payload, stepIndex, recordSensitive) {
+  const scrubbed = {};
+  const bindingKeys = [];
+  for (const [key, value] of Object.entries(payload && typeof payload === "object" ? payload : {})) {
+    if (WORKFLOW_SKIPPED_PAYLOAD_KEYS.has(key)) continue;
+    if (!recordSensitive && isWorkflowSensitiveField(action, key, value)) {
+      scrubbed[key] = REDACTED_VALUE;
+      bindingKeys.push(workflowBindingKey(stepIndex, key));
+      continue;
+    }
+    scrubbed[key] = value;
+  }
+  return { payload: scrubbed, bindingKeys };
+}
+
+// Shape only: never the returned text, HTML, cookie value, or element content.
+function summarizeRecordedResult(result) {
+  if (result === null || result === undefined) return { success: true, type: "empty" };
+  if (Array.isArray(result)) return { success: true, type: "array", length: result.length };
+  if (typeof result !== "object") return { success: true, type: typeof result };
+  return { success: result.success !== false, type: "object", keys: Object.keys(result).slice(0, 12) };
+}
+
+async function recordingTabOrigin(tabId) {
+  try {
+    const info = await tabOrigin(tabId);
+    return info.origin || null;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function recordDispatchedAction(action, payload, result) {
+  if (!workflowRecordings.size || workflowReplayDepth > 0) return;
+  if (!RECORDABLE_ACTIONS.has(action)) return;
+  if (result && typeof result === "object" && !Array.isArray(result) && result.success === false) return;
+  const tabId = typeof payload?.tabId === "number" ? payload.tabId : null;
+  const origin = tabId === null ? null : await recordingTabOrigin(tabId);
+  const now = Date.now();
+  for (const recording of workflowRecordings.values()) {
+    // A tab-scoped recording keeps tab-scoped steps for its own tab plus
+    // profile-wide steps (setCookie, downloadUrl, ...) that carry no tabId.
+    if (recording.tabId !== null && tabId !== null && recording.tabId !== tabId) continue;
+    if (recording.steps.length >= WORKFLOW_STEP_LIMIT) {
+      recording.truncated = true;
+      continue;
+    }
+    const index = recording.steps.length;
+    // Opt-in is either recording-wide or per call: `recordSensitive: true` in
+    // the action's own payload keeps that one call's typed value verbatim.
+    const keepSensitive = recording.recordSensitive || payload?.recordSensitive === true;
+    const { payload: scrubbed, bindingKeys } = scrubRecordedPayload(action, payload, index, keepSensitive);
+    const step = {
+      action,
+      payload: scrubbed,
+      tsDeltaMs: Math.max(0, now - recording.lastTs),
+      resultSummary: summarizeRecordedResult(result)
+    };
+    if (bindingKeys.length) {
+      step.requiresValue = true;
+      step.bindingKeys = bindingKeys;
+    }
+    recording.steps.push(step);
+    recording.lastTs = now;
+    if (origin) recording.origins.add(origin);
+  }
+}
+
+// Serialized in the shared workflow format: {version, name, steps, policy}.
+// `wait` is the recorded inter-step gap, clamped; the redaction bookkeeping
+// (`requiresValue`, `bindingKeys`) rides along as additive per-step keys.
+function serializeRecording(recording) {
+  const steps = recording.steps.map((step) => {
+    const entry = { action: step.action, payload: step.payload };
+    const wait = Math.min(step.tsDeltaMs, WORKFLOW_MAX_STEP_WAIT_MS);
+    if (wait > 0) entry.wait = wait;
+    if (step.requiresValue) {
+      entry.requiresValue = true;
+      entry.bindingKeys = step.bindingKeys;
+    }
+    return entry;
+  });
+  return {
+    version: WORKFLOW_VERSION,
+    name: recording.name,
+    createdAt: new Date(recording.startedAt).toISOString(),
+    steps,
+    policy: { requiredOrigins: [...recording.origins] }
+  };
+}
+
+async function startWorkflowRecording(payload) {
+  const tabId = typeof payload?.tabId === "number" ? payload.tabId : null;
+  if (tabId !== null) {
+    try {
+      await chrome.tabs.get(tabId);
+    } catch (error) {
+      return { success: false, err: `No such tab ${tabId}` };
+    }
+  }
+  workflowRecordingCounter += 1;
+  const recordingId = `wf${workflowRecordingCounter}-${Date.now().toString(36)}`;
+  const startedAt = Date.now();
+  const recording = {
+    id: recordingId,
+    name: String(payload?.name || `recording-${workflowRecordingCounter}`),
+    tabId,
+    recordSensitive: payload?.recordSensitive === true,
+    startedAt,
+    lastTs: startedAt,
+    steps: [],
+    origins: new Set(),
+    truncated: false
+  };
+  workflowRecordings.set(recordingId, recording);
+  return {
+    success: true,
+    recordingId,
+    name: recording.name,
+    tabId,
+    scope: tabId === null ? "global" : "tab",
+    recordSensitive: recording.recordSensitive,
+    startedAt,
+    stepLimit: WORKFLOW_STEP_LIMIT
+  };
+}
+
+function stopWorkflowRecording(payload) {
+  let recordingId = payload?.recordingId;
+  if (!recordingId && workflowRecordings.size === 1) {
+    recordingId = workflowRecordings.keys().next().value;
+  }
+  const recording = recordingId ? workflowRecordings.get(recordingId) : null;
+  if (!recording) {
+    return {
+      success: false,
+      err: recordingId ? `Unknown recording ${recordingId}` : "stopWorkflowRecording requires a recordingId",
+      active: [...workflowRecordings.keys()]
+    };
+  }
+  workflowRecordings.delete(recording.id);
+  const workflow = serializeRecording(recording);
+  const requiresBindings = workflow.steps.flatMap((step) => step.bindingKeys || []);
+  return {
+    success: true,
+    recordingId: recording.id,
+    name: recording.name,
+    tabId: recording.tabId,
+    stepCount: workflow.steps.length,
+    redactedSteps: workflow.steps.filter((step) => step.requiresValue).length,
+    requiresBindings,
+    requiredOrigins: workflow.policy.requiredOrigins,
+    durationMs: Date.now() - recording.startedAt,
+    truncated: recording.truncated,
+    workflow
+  };
+}
+
+// --- ST4: semantic-selector resolution cache and self-healing --------------
+//
+// Only SEMANTIC selectors (text=, label=, role=, aria=) are cacheable: they
+// describe intent, so re-resolving one after the DOM shifts still targets what
+// the author meant. A CSS selector is a literal address and is never
+// retargeted - a failing CSS step fails, it does not silently pick a different
+// element. The cache maps (urlPattern, semantic selector) to the concrete CSS
+// path last known to resolve to that element.
+const SELECTOR_CACHE_LIMIT = 500;
+const SEMANTIC_SELECTOR_PREFIXES = ["text=", "label=", "role=", "aria="];
+const CACHEABLE_SELECTOR_ACTIONS = new Set(["click", "type", "fill", "select", "hover"]);
+const selectorCache = new Map();
+
+function isSemanticSelector(selector) {
+  const raw = String(selector ?? "").trim();
+  return SEMANTIC_SELECTOR_PREFIXES.some((prefix) => raw.startsWith(prefix));
+}
+
+function selectorCacheKey(urlPattern, selector) {
+  return `${urlPattern}\n${selector}`;
+}
+
+function selectorCacheSet(entry) {
+  const key = selectorCacheKey(entry.urlPattern, entry.selector);
+  selectorCache.delete(key);
+  selectorCache.set(key, entry);
+  while (selectorCache.size > SELECTOR_CACHE_LIMIT) {
+    selectorCache.delete(selectorCache.keys().next().value);
+  }
+}
+
+// Entries supplied by a caller's file-backed cache. Only well-formed semantic
+// entries are merged, so an edited cache file cannot inject a CSS retarget.
+function mergeSelectorCache(entries) {
+  let merged = 0;
+  for (const raw of Array.isArray(entries) ? entries : []) {
+    if (!raw || typeof raw !== "object") continue;
+    const urlPattern = String(raw.urlPattern || "");
+    const selector = String(raw.selector || "");
+    const resolvedSelector = String(raw.resolvedSelector || "");
+    if (!urlPattern || !selector || !resolvedSelector) continue;
+    if (!isSemanticSelector(selector)) continue;
+    selectorCacheSet({
+      urlPattern,
+      selector,
+      resolvedSelector,
+      lastSuccess: Number(raw.lastSuccess) || 0
+    });
+    merged += 1;
+  }
+  return merged;
+}
+
+function selectorCacheEntries() {
+  return [...selectorCache.values()].map((entry) => ({ ...entry }));
+}
+
+// Origin plus pathname: the same page across query strings and fragments, but
+// never a different site or route sharing a control's accessible name.
+async function selectorUrlPattern(tabId, explicit) {
+  if (explicit) return String(explicit);
+  const info = await tabOrigin(tabId);
+  if (!info.url) return info.origin || "";
+  try {
+    const parsed = new URL(info.url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch (error) {
+    return info.origin || "";
+  }
+}
+
+// Derives a document-unique CSS path for the element a locator resolves to,
+// preferring id, then a small set of stable attributes, then an nth-of-type
+// path anchored at the nearest such attribute. Returns success: false rather
+// than an ambiguous path, so a cached selector always addresses one element.
+function stableSelectorExpression(locator) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const escapeCss = (value) => (self.CSS && CSS.escape) ? CSS.escape(String(value)) : String(value).replace(/[^A-Za-z0-9_-]/g, (ch) => '\\\\' + ch);
+    const unique = (sel) => {
+      try { return document.querySelectorAll(sel).length === 1; } catch (e) { return false; }
+    };
+    const anchorFor = (el) => {
+      if (el.id && unique('#' + escapeCss(el.id))) return '#' + escapeCss(el.id);
+      for (const attr of ['data-testid', 'data-test-id', 'data-test', 'name', 'aria-label']) {
+        const value = el.getAttribute ? el.getAttribute(attr) : null;
+        if (!value) continue;
+        const sel = el.tagName.toLowerCase() + '[' + attr + '="' + String(value).replace(/["\\\\]/g, '\\\\$&') + '"]';
+        if (unique(sel)) return sel;
+      }
+      return null;
+    };
+    const direct = anchorFor(resolved.el);
+    if (direct) return { success: true, selector: direct };
+    const parts = [];
+    let node = resolved.el;
+    while (node && node.nodeType === Node.ELEMENT_NODE && node !== document.documentElement) {
+      const anchor = anchorFor(node);
+      if (anchor) {
+        parts.unshift(anchor);
+        break;
+      }
+      let part = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      if (parent) {
+        const twins = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        if (twins.length > 1) part += ':nth-of-type(' + (twins.indexOf(node) + 1) + ')';
+      }
+      parts.unshift(part);
+      node = parent;
+    }
+    const path = parts.join(' > ');
+    if (!path || !unique(path)) return { success: false, err: 'No stable selector for the resolved element' };
+    return { success: true, selector: path };
+  })()`;
+}
+
+// Mints an observe-compatible ref for the resolved element by describing its
+// live CDP node, so a ref handed back here is interchangeable with one from
+// observe and is invalidated by the same navigation/restart rules.
+async function mintRefForLocator(target, tabId, locator, contextId) {
+  const params = {
+    expression: elementObjectExpression(locator),
+    awaitPromise: true,
+    returnByValue: false,
+    allowUnsafeEvalBlockedByCSP: true
+  };
+  if (contextId !== null && contextId !== undefined) params.contextId = contextId;
+  let objectId = null;
+  try {
+    const evaluated = await debuggerCommand(target, "Runtime.evaluate", params);
+    if (evaluated.exceptionDetails) return null;
+    objectId = evaluated.result?.objectId || null;
+    if (!objectId) return null;
+    const described = await debuggerCommand(target, "DOM.describeNode", { objectId });
+    const backendDOMNodeId = described?.node?.backendNodeId || null;
+    if (!backendDOMNodeId) return null;
+    const registry = refRegistry(tabId);
+    const ref = assignRef(registry, { backendDOMNodeId });
+    trimRefRegistry(registry);
+    return ref;
+  } catch (error) {
+    return null;
+  } finally {
+    if (objectId) {
+      try {
+        await debuggerCommand(target, "Runtime.releaseObject", { objectId });
+      } catch (error) {
+        // Releasing the handle is best-effort.
+      }
+    }
+  }
+}
+
+// Resolves one selector and reports the concrete CSS path plus a ref for it.
+// Frame- and shadow-scoped locators resolve normally but are reported
+// `cacheable: false`: their CSS path is relative to another document, so
+// replaying it against the top document would address the wrong element.
+async function resolveSelectorTarget(tabId, selector) {
+  let locator;
+  try {
+    locator = parseActionLocator(selector, tabId);
+  } catch (error) {
+    return locatorError(error);
+  }
+  const scoped = locator.frames.length > 0 || (locator.shadowSegments || []).length > 0;
+  return withDebugger(tabId, async (target) => {
+    const resolved = await resolveActionTarget(tabId, locator, target);
+    if (resolved.success === false) return resolved;
+    const ref = await mintRefForLocator(target, tabId, locator, resolved.contextId);
+    if (scoped) {
+      return { success: true, selector, ref, resolvedSelector: null, cacheable: false, tagName: resolved.tagName || null };
+    }
+    const derived = await evaluateInContext(target, stableSelectorExpression(locator), resolved.contextId);
+    const value = derived.val || derived;
+    if (!derived.success || value.success === false) {
+      return { success: true, selector, ref, resolvedSelector: null, cacheable: false, tagName: resolved.tagName || null };
+    }
+    return { success: true, selector, ref, resolvedSelector: value.selector, cacheable: true, tagName: resolved.tagName || null };
+  });
+}
+
+async function resolveCachedSelector(payload) {
+  const tabId = payload?.tabId;
+  const selector = String(payload?.selector ?? "").trim();
+  if (typeof tabId !== "number") return { success: false, err: "resolveCachedSelector requires a numeric tabId" };
+  if (!selector) return { success: false, err: "resolveCachedSelector requires a selector" };
+  if (Array.isArray(payload.cache)) mergeSelectorCache(payload.cache);
+  const semantic = isSemanticSelector(selector);
+  const urlPattern = await selectorUrlPattern(tabId, payload.urlPattern);
+  const key = selectorCacheKey(urlPattern, selector);
+  const cached = payload.refresh === true ? null : selectorCache.get(key);
+  if (cached) {
+    const hit = await resolveSelectorTarget(tabId, cached.resolvedSelector);
+    if (hit.success !== false) {
+      cached.lastSuccess = Date.now();
+      return {
+        success: true, tabId, urlPattern, selector,
+        resolvedSelector: cached.resolvedSelector, ref: hit.ref,
+        cached: true, selfHealed: false, entry: { ...cached }
+      };
+    }
+    selectorCache.delete(key);
+  }
+  const fresh = await resolveSelectorTarget(tabId, selector);
+  if (fresh.success === false) return fresh;
+  let entry = null;
+  if (semantic && fresh.cacheable && fresh.resolvedSelector) {
+    entry = { urlPattern, selector, resolvedSelector: fresh.resolvedSelector, lastSuccess: Date.now() };
+    selectorCacheSet(entry);
+  }
+  return {
+    success: true, tabId, urlPattern, selector,
+    resolvedSelector: fresh.resolvedSelector, ref: fresh.ref,
+    cacheable: Boolean(fresh.cacheable), cached: false,
+    selfHealed: Boolean(cached), entry: entry ? { ...entry } : null
+  };
+}
+
+function cacheSelectors(payload) {
+  const op = String(payload?.op || "list");
+  if (op === "clear") {
+    const cleared = selectorCache.size;
+    selectorCache.clear();
+    return { success: true, op, cleared };
+  }
+  if (op === "import") {
+    const merged = mergeSelectorCache(payload?.entries);
+    return { success: true, op, merged, entries: selectorCache.size };
+  }
+  if (op === "list" || op === "export") {
+    return { success: true, op, entries: selectorCacheEntries(), limit: SELECTOR_CACHE_LIMIT };
+  }
+  return { success: false, err: `Unknown cacheSelectors op: ${op}` };
+}
+
+// --- ST3/ST4: replay -------------------------------------------------------
+
+function workflowStepBindingKeys(step, index) {
+  if (Array.isArray(step?.bindingKeys) && step.bindingKeys.length) return step.bindingKeys.map(String);
+  const keys = [];
+  for (const [field, value] of Object.entries(step?.payload || {})) {
+    if (value === REDACTED_VALUE) keys.push(workflowBindingKey(index, field));
+  }
+  return keys;
+}
+
+function applyWorkflowBindings(stepPayload, index, bindings) {
+  for (const [field, value] of Object.entries(stepPayload)) {
+    if (value !== REDACTED_VALUE) continue;
+    stepPayload[field] = bindings[workflowBindingKey(index, field)];
+  }
+}
+
+// Replays a semantic selector through the cache. Returns the selector to use
+// plus whether the cached mapping had to be re-resolved. A CSS selector is
+// returned untouched: it is never re-pointed at another element.
+async function selectorForReplay(action, stepPayload) {
+  const selector = stepPayload.selector;
+  if (!CACHEABLE_SELECTOR_ACTIONS.has(action)) return { selector, selfHealed: false };
+  if (typeof stepPayload.tabId !== "number") return { selector, selfHealed: false };
+  if (!isSemanticSelector(selector)) return { selector, selfHealed: false };
+  const resolution = await resolveCachedSelector({ tabId: stepPayload.tabId, selector });
+  if (resolution.success === false) return { selector, selfHealed: false };
+  return {
+    selector: resolution.resolvedSelector || selector,
+    selfHealed: resolution.selfHealed === true,
+    cached: resolution.cached === true,
+    urlPattern: resolution.urlPattern
+  };
+}
+
+async function replayWorkflow(payload) {
+  const workflow = payload?.workflow;
+  if (!workflow || typeof workflow !== "object") {
+    return { success: false, err: "replayWorkflow requires a workflow object" };
+  }
+  if (workflow.version !== undefined && Number(workflow.version) !== WORKFLOW_VERSION) {
+    return { success: false, err: `Unsupported workflow version ${workflow.version}; expected ${WORKFLOW_VERSION}` };
+  }
+  const steps = Array.isArray(workflow.steps) ? workflow.steps : null;
+  if (!steps) return { success: false, err: "workflow.steps must be an array" };
+  if (steps.length > WORKFLOW_STEP_LIMIT) {
+    return { success: false, err: `Workflow has ${steps.length} steps; the limit is ${WORKFLOW_STEP_LIMIT}` };
+  }
+  const bindings = payload.bindings && typeof payload.bindings === "object" ? payload.bindings : {};
+  const defaultTabId = typeof payload.tabId === "number" ? payload.tabId : undefined;
+  if (Array.isArray(payload.cache)) mergeSelectorCache(payload.cache);
+
+  // Refuse the WHOLE workflow before running any step when a redacted value has
+  // no binding: a half-run workflow that stops at the password field has
+  // already mutated the page.
+  const missingBindings = [];
+  steps.forEach((step, index) => {
+    for (const key of workflowStepBindingKeys(step, index)) {
+      if (typeof bindings[key] !== "string") missingBindings.push(key);
+    }
+  });
+  if (missingBindings.length) {
+    return {
+      success: false,
+      error: "missingBindings",
+      err: `Workflow needs values for redacted fields: ${missingBindings.join(", ")}`,
+      missingBindings
+    };
+  }
+
+  const requiredOrigins = Array.isArray(workflow.policy?.requiredOrigins)
+    ? workflow.policy.requiredOrigins.map(String).filter(Boolean)
+    : [];
+  const halt = payload.stopOnError !== false;
+  const results = [];
+  let selfHealedSteps = 0;
+  let failed = 0;
+
+  workflowReplayDepth += 1;
+  try {
+    for (let index = 0; index < steps.length; index++) {
+      const step = steps[index] || {};
+      const entry = { step: index, action: step.action || null };
+      if (!step.action) {
+        results.push({ ...entry, skipped: true });
+        continue;
+      }
+      const wait = Math.min(Math.max(0, Number(step.wait) || 0), WORKFLOW_MAX_STEP_WAIT_MS);
+      if (wait > 0) await sleep(wait);
+      const stepPayload = { ...(step.payload || {}) };
+      // A caller-supplied tabId retargets every tab-scoped step at that tab: a
+      // recorded tab id refers to a tab that is almost certainly gone. Steps
+      // that carry no tabId are profile-wide (setCookie, downloadUrl) and stay
+      // that way, except selector actions, which need a tab to resolve against.
+      if (defaultTabId !== undefined && (stepPayload.tabId !== undefined || CACHEABLE_SELECTOR_ACTIONS.has(step.action))) {
+        stepPayload.tabId = defaultTabId;
+      }
+      applyWorkflowBindings(stepPayload, index, bindings);
+
+      // Origin gate: a recorded workflow reproduces mutating actions, so it may
+      // only run where it was recorded.
+      if (requiredOrigins.length && typeof stepPayload.tabId === "number") {
+        const origin = await recordingTabOrigin(stepPayload.tabId);
+        if (!origin || !requiredOrigins.includes(origin)) {
+          const denial = { ...entry, success: false, error: "originMismatch", err: `Tab origin ${origin || "unknown"} is not in the workflow's requiredOrigins`, origin };
+          results.push(denial);
+          failed += 1;
+          if (halt) break;
+          continue;
+        }
+      }
+
+      const healing = await selectorForReplay(step.action, stepPayload);
+      const originalSelector = stepPayload.selector;
+      if (healing.selector !== undefined) stepPayload.selector = healing.selector;
+      try {
+        let result = await dispatchAction(step.action, stepPayload);
+        let selfHealed = healing.selfHealed === true;
+        const cachedMiss = result && typeof result === "object" && !Array.isArray(result) && result.success === false;
+        // A cached CSS path that resolves but no longer behaves gets one
+        // re-resolution through the original semantic selector.
+        if (cachedMiss && healing.cached && originalSelector !== stepPayload.selector) {
+          const refreshed = await resolveCachedSelector({ tabId: stepPayload.tabId, selector: originalSelector, refresh: true });
+          if (refreshed.success !== false) {
+            stepPayload.selector = refreshed.resolvedSelector || originalSelector;
+            result = await dispatchAction(step.action, stepPayload);
+            selfHealed = true;
+          }
+        }
+        if (result && typeof result === "object" && !Array.isArray(result) && result.success === false) {
+          failed += 1;
+          results.push({ ...entry, success: false, selfHealed, err: result.err || result.error || "step reported success=false" });
+          if (halt) break;
+          continue;
+        }
+        if (selfHealed) selfHealedSteps += 1;
+        results.push({ ...entry, success: true, selfHealed, resultSummary: summarizeRecordedResult(result) });
+      } catch (error) {
+        failed += 1;
+        results.push({ ...entry, success: false, selfHealed: healing.selfHealed === true, err: error.message });
+        if (halt) break;
+      }
+    }
+  } finally {
+    workflowReplayDepth -= 1;
+  }
+
+  return {
+    success: failed === 0,
+    name: workflow.name || null,
+    version: WORKFLOW_VERSION,
+    tabId: defaultTabId ?? null,
+    stepCount: steps.length,
+    ranSteps: results.length,
+    failedSteps: failed,
+    selfHealedSteps,
+    steps: results,
+    cache: selectorCacheEntries()
   };
 }

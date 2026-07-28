@@ -5,6 +5,7 @@
     "allowedOrigins": [],
     "deniedOrigins": ["file://*", "chrome://*", "chrome-extension://*", "*://localhost", "*://localhost:*", "*://127.0.0.1", "*://127.0.0.1:*", "*://0.0.0.0", "*://0.0.0.0:*", "*://*.local", "*://*.local:*", "*://[[]::1[]]", "*://[[]::1[]]:*"],
     "requireConfirmation": [],
+    "siteModes": {},
     "redactPatterns": ["(?i)bearer\\s+[a-z0-9\\-._~+/]+=*", "(?i)(api|access|refresh)[-_]?token\\s*[:=]\\s*[^\\s&]+", "(?i)password\\s*[:=]\\s*[^\\s&]+"],
     "secretMaskFile": null,
     "traceDir": null,
@@ -13,10 +14,11 @@
   },
   "clients": {
     "default": {
-      "allowedActions": ["ping", "getTabs", "createTaskSession", "navigateTaskSession", "getTaskSessions", "updateTaskSessionState", "closeTaskSession", "getCurrentState", "observe", "extractText", "getHTML", "waitForLoad", "waitForSelector", "waitForText", "waitForUrl", "click", "clickAt", "type", "fill", "select", "scroll", "press", "hover", "screenshot", "printToPDF", "uploadFile", "githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody", "navigate", "activateTab", "reload", "goBack", "goForward", "windowControl", "searchTabs", "startScreencast", "screencastFrames", "stopScreencast", "waitForHandoff", "lease", "release", "leaseStatus", "policyCheck", "policyInfo"],
+      "allowedActions": ["ping", "getTabs", "createTaskSession", "navigateTaskSession", "getTaskSessions", "updateTaskSessionState", "closeTaskSession", "getCurrentState", "observe", "extractText", "extractStructured", "scanPromptInjection", "getHTML", "waitForLoad", "waitForSelector", "waitForText", "waitForUrl", "click", "clickAt", "type", "fill", "select", "scroll", "press", "hover", "screenshot", "printToPDF", "uploadFile", "githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody", "navigate", "activateTab", "reload", "goBack", "goForward", "windowControl", "searchTabs", "startScreencast", "screencastFrames", "stopScreencast", "waitForHandoff", "startWorkflowRecording", "stopWorkflowRecording", "replayWorkflow", "resolveCachedSelector", "cacheSelectors", "lease", "release", "leaseStatus", "policyCheck", "policyInfo"],
       "allowedOrigins": ["https://github.com", "https://chatgpt.com", "https://claude.ai", "https://google.com", "https://accounts.google.com"],
       "deniedOrigins": ["file://*", "chrome://*", "chrome-extension://*", "*://localhost", "*://localhost:*", "*://127.0.0.1", "*://127.0.0.1:*", "*://0.0.0.0", "*://0.0.0.0:*", "*://*.local", "*://*.local:*", "*://[[]::1[]]", "*://[[]::1[]]:*"],
-      "requireConfirmation": ["executeScript", "executeScriptCDP", "clickAt", "getCookies", "storageState", "setCookie", "deleteCookie", "setStorageItem", "removeStorageItem", "clearStorage", "searchHistory", "searchBookmarks", "downloadUrl", "startInterception", "setGeolocation", "setUserAgent", "startScreencast", "batch"],
+      "requireConfirmation": ["executeScript", "executeScriptCDP", "clickAt", "getCookies", "storageState", "setCookie", "deleteCookie", "setStorageItem", "removeStorageItem", "clearStorage", "searchHistory", "searchBookmarks", "downloadUrl", "startInterception", "setGeolocation", "setUserAgent", "startScreencast", "startWorkflowRecording", "replayWorkflow", "batch"],
+      "siteModes": {"https://accounts.google.com": "manual"},
       "redactPatterns": ["(?i)bearer\\s+[a-z0-9\\-._~+/]+=*", "(?i)(api|access|refresh)[-_]?token\\s*[:=]\\s*[^\\s&]+", "(?i)password\\s*[:=]\\s*[^\\s&]+"],
       "secretMaskFile": null,
       "traceDir": null,

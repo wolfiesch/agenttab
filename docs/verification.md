@@ -19,7 +19,7 @@ PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
 PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
 python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py scripts/background_reliability.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_mcp_contract.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py scripts/background_reliability.py scripts/generate_browser_manifests.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_mcp_contract.py
 node --check background.js
 node --check wake.js
 diff -q manifest.json extension/manifest.json
@@ -106,3 +106,13 @@ Before writing anything the script fails closed when:
 The archive contains exactly `background.js`, `manifest.json`, `wake.html`, and `wake.js`, written in sorted order with a fixed timestamp, so repeated runs on unchanged inputs produce the same sha256. `verify_install_contract.py` covers this: it packages into a temp directory and asserts the exact member set, the absence of forbidden patterns, `manifest_version` 3, no `key`, root-permission coverage, the fixed timestamp, digest stability across two builds, and rejection of a staged manifest that drops root permissions.
 
 `--source <dir>` packages a prepared staging directory instead of the repository root; the canonical root `manifest.json` is still the permission baseline.
+
+## Cross-platform install verification
+
+`setup-windows.ps1` needs Windows and a live browser, so `verify_install_contract.py` covers it statically instead of running it: the Chrome and Edge `HKCU` registry path strings are present, `HKLM:`/`HKEY_LOCAL_MACHINE` and any elevation request are absent, the `-RepoRoot`/`-HostPort`/`-ExtensionId`/`-UseRustHost` parameters exist, the Rust host path and the `.cmd` launcher are referenced, the launcher is git-ignored, secrets are kept rather than overwritten, the policy is seeded from `bridge_policy.example.json`, no output statement can print the token, and braces and parentheses balance.
+
+`setup-edge.sh` is checked the same way: it references the macOS and Linux Edge native-messaging directories, builds its manifest through `scripts/generate_browser_manifests.py`, points Windows users at the PowerShell installer, and never creates or reads a token, key, or policy.
+
+`scripts/generate_browser_manifests.py` is exercised for real in a temp directory with a fixture host path. The contract asserts the exact Edge and Firefox host-manifest objects, that the Firefox staging directory holds exactly `background.js`, `manifest.json`, `wake.html`, and `wake.js` with no forbidden artifact, that the three copied files are byte-identical to the canonical root files, that the staged manifest keeps `manifest_version` 3 and `nativeMessaging`, carries no `key`, uses `background: {"scripts": [...]}` plus the gecko id, and drops exactly `debugger`, `tabGroups`, and `contentSettings`, that the canonical Chrome manifest still declares its service worker, that a second run reproduces every digest, and that a missing or malformed extension ID, a malformed add-on ID, and a relative host path are all rejected.
+
+No live Firefox or Edge gate exists. Edge shares Chrome's action surface, so the Chrome live gates cover it once registration succeeds; Firefox is generated output only.
