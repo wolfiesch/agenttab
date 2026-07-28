@@ -292,10 +292,19 @@ def handle_lease_action(action, payload, name):
 # which the host cannot see, so it blacks out ALL tabs (GLOBAL). Symmetrically,
 # an observation request with no tabId could land on the blacked-out tab, so it
 # is denied by any live handoff. Fail-safe in both directions.
+# The set covers three families: one-shot observations, the *retrieval* actions
+# of the long-lived collectors (console, network, interception, screencast), and
+# the collector *start* actions. Denying retrieval keeps a collector that was
+# already running before the handoff from handing the handoff interval back;
+# denying start keeps a client from opening a fresh collector mid-handoff and
+# reading it out afterwards. The extension additionally discards the target
+# tab's buffered collector data before showing the handoff banner.
 HANDOFF_BLACKOUT_ACTIONS = {
     'screenshot', 'extractText', 'getHTML', 'storageState', 'printToPDF',
     'searchTabs', 'getCurrentState', 'screencastFrames',
     'extractStructured', 'scanPromptInjection', 'consoleMessages',
+    'observe', 'networkRequests', 'interceptedRequests',
+    'startMonitoring', 'startScreencast', 'startInterception',
 }
 HANDOFF_BLACKOUT_ERROR = 'handoff in progress'
 
@@ -335,6 +344,14 @@ def clear_handoff(handle):
 
 def handoff_blackout(action, payload):
     # True when an in-flight handoff must suppress this observation request.
+    # Composite actions are checked step by step as well: runBatch and
+    # replayWorkflow dispatch their steps inside the extension, so a blacked-out
+    # observation nested in one of them would otherwise never reach this gate.
+    if action in ('batch', 'replayWorkflow'):
+        steps = (_step_payloads(payload) if action == 'batch'
+                 else _workflow_step_payloads(payload))
+        return any(handoff_blackout(s_action, s_payload)
+                   for s_action, s_payload in steps)
     if action not in HANDOFF_BLACKOUT_ACTIONS:
         return False
     tab_id = handoff_tab_id(payload)
@@ -583,6 +600,13 @@ def targets_from_payload(action, payload):
                     targets.extend(targets_from_payload(
                         step.get('action'), step.get('payload') or {}))
         return targets
+    if action == 'replayWorkflow':
+        # Replay reproduces its steps through the extension's dispatch table, so
+        # the outer request's policy targets are the union of its steps'.
+        targets = []
+        for s_action, s_payload in _workflow_step_payloads(payload):
+            targets.extend(targets_from_payload(s_action, s_payload))
+        return targets
     return []
 
 
@@ -679,16 +703,51 @@ def _step_payloads(payload):
             s_payload['tabId'] = default_tab
         yield (step.get('action') or ''), s_payload
 
+# Selector actions that replayWorkflow retargets at the caller's tabId even when
+# the recorded step carried none, because they need a tab to resolve against.
+# Mirrors CACHEABLE_SELECTOR_ACTIONS in background.js.
+WORKFLOW_SELECTOR_ACTIONS = {'click', 'type', 'fill', 'select', 'hover'}
+
+
+def _workflow_step_payloads(payload):
+    # Yield (action, payload) for a replayWorkflow's steps, applying the
+    # extension's replay retargeting: a top-level tabId REPLACES a step's own
+    # tabId and supplies one for selector steps that carry none, so origin policy
+    # cannot be bypassed either by hoisting tabId to the replay payload or by
+    # recording a step against a different tab. Steps with no action are skipped
+    # because the extension never dispatches them.
+    payload = payload if isinstance(payload, dict) else {}
+    workflow = payload.get('workflow')
+    steps = workflow.get('steps') if isinstance(workflow, dict) else None
+    if not isinstance(steps, list):
+        return
+    default_tab = payload.get('tabId')
+    if isinstance(default_tab, bool) or not isinstance(default_tab, int):
+        default_tab = None
+    for step in steps:
+        step = step if isinstance(step, dict) else {}
+        s_action = step.get('action') or ''
+        if not s_action:
+            continue
+        s_payload = dict(step.get('payload') or {})
+        if default_tab is not None and (
+                'tabId' in s_payload or s_action in WORKFLOW_SELECTOR_ACTIONS):
+            s_payload['tabId'] = default_tab
+        yield s_action, s_payload
+
 
 def tab_ids_needed(action, payload):
     # The set of tabId keys (int or None for the active tab) whose live origin
     # the host must resolve to apply site policy to a tab-scoped request. Returns
     # an empty set for origin-exempt actions. ``None`` means "resolve the active
-    # tab". Recurses into batch steps with runBatch tabId defaulting.
+    # tab". Recurses into batch steps with runBatch tabId defaulting and into
+    # replayWorkflow steps with replay tabId retargeting.
     payload = payload if isinstance(payload, dict) else {}
-    if action == 'batch':
+    if action in ('batch', 'replayWorkflow'):
+        steps = (_step_payloads(payload) if action == 'batch'
+                 else _workflow_step_payloads(payload))
         needed = set()
-        for s_action, s_payload in _step_payloads(payload):
+        for s_action, s_payload in steps:
             needed |= tab_ids_needed(s_action, s_payload)
         return needed
     if action in ORIGIN_EXEMPT_ACTIONS:
@@ -748,6 +807,28 @@ def evaluate_policy(policy, name, action, payload, origins=None):
                         redact_enabled, audit_enabled, s_targets)
             step_confirm = step_confirm or s_confirm
         return (True, None, step_confirm, redact_enabled, audit_enabled, targets)
+
+    # replayWorkflow reproduces recorded mutating actions through the extension's
+    # dispatch table, exactly like a batch, so its steps are evaluated here
+    # before anything is forwarded. Two differences from batch:
+    #  - Steps are inspected even when the replay action itself is
+    #    confirmation-gated: an outer replay token approves "replay this
+    #    workflow", never each nested action inside it.
+    #  - There is no aggregate confirmation token for nested steps. A nested step
+    #    that still requires confirmation after its own siteMode is applied fails
+    #    the whole replay, because a single outer token cannot carry per-step
+    #    approval and a half-run workflow has already mutated the page.
+    if action == 'replayWorkflow':
+        for i, (s_action, s_payload) in enumerate(_workflow_step_payloads(payload)):
+            s_allowed, s_reason, s_confirm, _, _, s_targets = evaluate_policy(
+                policy, name, s_action, s_payload, origins=origins)
+            if not s_allowed:
+                return (False, f"workflow step {i}: {s_reason}", False,
+                        redact_enabled, audit_enabled, s_targets)
+            if s_confirm:
+                return (False, f"workflow step {i} requires confirmation", False,
+                        redact_enabled, audit_enabled, s_targets)
+        return (True, None, confirm, redact_enabled, audit_enabled, targets)
 
     # Target (site) policy for non-batch actions.
     denied_origins = cp.get('deniedOrigins')
@@ -814,13 +895,20 @@ def policy_denial(reason, action, targets, name, policy=None):
     # classifies the gate that rejected the request so a client can self-service
     # the right fix.
     batch_step = None
-    m = re.match(r"^batch step (\d+): (.*)$", reason or "")
+    m = re.match(r"^(?:batch|workflow) step (\d+): (.*)$", reason or "")
     if m:
         batch_step = int(m.group(1))
         reason = m.group(2)
+    else:
+        # "workflow step <n> requires confirmation" carries no nested reason to
+        # unwrap, but the step index is still the actionable part.
+        cm = re.match(r"^workflow step (\d+) requires confirmation$", reason or "")
+        if cm:
+            batch_step = int(cm.group(1))
     # For action-type reasons the real action is embedded in the reason text
     # ("action <X> not allowed"/"... denied"); the outer ``action`` may be
-    # "batch" for a denied step, so trust the reason for the action value.
+    # "batch"/"replayWorkflow" for a denied step, so trust the reason for the
+    # action value.
     am = re.match(r"^action (\S+) (?:not allowed|denied)$", reason or "")
     if am:
         action = am.group(1)
@@ -1226,6 +1314,8 @@ def trace_targets(action, payload, response):
     sources = [payload if isinstance(payload, dict) else {}]
     if action == 'batch':
         sources.extend(step_payload for _, step_payload in _step_payloads(payload))
+    if action == 'replayWorkflow':
+        sources.extend(step_payload for _, step_payload in _workflow_step_payloads(payload))
     result = response.get('result') if isinstance(response, dict) else None
     if isinstance(result, dict):
         sources.append(result)

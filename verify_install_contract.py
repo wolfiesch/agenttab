@@ -177,6 +177,28 @@ def expect_store_package_contract(dist):
     else:
         expect(False, "store packaging should reject a manifest missing root permissions")
 
+    # A staged manifest carrying a private extension key must fail closed BEFORE
+    # anything is written: the packager used to strip "key" silently, which
+    # produced a clean-looking upload from a manifest that still had the local
+    # unpacked-extension key on disk.
+    keyed = dist / "staging-keyed"
+    keyed.mkdir()
+    for name in package_extension_store.EXTENSION_FILES:
+        shutil.copy2(SCRIPT_DIR / name, keyed / name)
+    keyed_manifest = json.loads((keyed / "manifest.json").read_text())
+    keyed_manifest["key"] = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AFAKEKEYFORCONTRACT"
+    (keyed / "manifest.json").write_text(json.dumps(keyed_manifest), encoding="utf-8")
+    keyed_out = dist / "store-keyed.zip"
+    try:
+        package_extension_store.build_store_package(keyed_out, source=keyed)
+    except package_extension_store.PackagingError as exc:
+        expect("key" in str(exc),
+               f"key rejection should name the offending field: {exc}")
+    else:
+        expect(False, "store packaging should reject a staged manifest carrying a 'key' field")
+    expect(not keyed_out.exists(),
+           "store packaging must write no archive when the staged manifest carries a 'key'")
+
 
 def expect_windows_installer_contract():
     """Static shape checks for setup-windows.ps1; the script itself needs Windows."""
@@ -194,6 +216,19 @@ def expect_windows_installer_contract():
            "setup-windows.ps1 must never write machine-wide HKLM registry keys")
     expect("RunAsAdministrator" not in text and "RunAs" not in text,
            "setup-windows.ps1 must not request elevation")
+
+    # Chrome/Edge resolve the native host manifest through the registry key's
+    # UNNAMED default value. `Set-ItemProperty -Name "(Default)"` writes a value
+    # literally named "(Default)" instead, leaving the real default empty and the
+    # host unregistered, so the old pattern is rejected outright.
+    expect('-Name "(Default)"' not in text and "-Name '(Default)'" not in text,
+           "setup-windows.ps1 must not write the manifest path with Set-ItemProperty -Name \"(Default)\"")
+    expect("Set-Item -LiteralPath $registryPath -Value $manifestPath" in text,
+           "setup-windows.ps1 should write the manifest path to the key's unnamed default value via Set-Item")
+    expect("(Get-ItemProperty -LiteralPath $registryPath).'(default)'" in text,
+           "setup-windows.ps1 should read back the default value it wrote")
+    expect("throw \"Registry default value at $registryPath is" in text,
+           "setup-windows.ps1 should fail loudly when the default value did not take")
 
     for param in ("[string] $RepoRoot", "[int] $HostPort", "[string] $ExtensionId", "[switch] $UseRustHost"):
         expect(param in text, f"setup-windows.ps1 should accept {param}")

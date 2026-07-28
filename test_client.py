@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import glob
 import json
 import os
 import re
@@ -315,6 +316,39 @@ def save_html(tab_id, output_path):
     return 0
 
 
+# Artifacts a previous screencastSave (or its --mp4 step) wrote into the output
+# directory. Only these names are ever removed: a caller may legitimately point
+# two saves at one notes directory, and unrelated files there are not ours.
+SCREENCAST_ARTIFACT_PATTERNS = ("frame-*.png", "frame-*.jpg", "frames.json", "frames.json.tmp", "screencast.mp4")
+
+
+def prepare_screencast_dir(directory):
+    """Create/validate the output directory and clear prior save artifacts.
+
+    Runs BEFORE the frames are drained: draining consumes the extension's buffer
+    irrecoverably, so a destination that cannot be written must fail while the
+    frames are still in the service worker. Stale ``frame-*`` files from an
+    earlier, longer save are removed so a second shorter save cannot present
+    another recording's tail as part of this one.
+
+    Returns the number of stale artifacts removed. Raises ``OSError`` when the
+    destination cannot be prepared.
+    """
+    if os.path.exists(directory) and not os.path.isdir(directory):
+        raise NotADirectoryError(f"{directory} exists and is not a directory")
+    os.makedirs(directory, exist_ok=True)
+    if not os.access(directory, os.W_OK):
+        raise PermissionError(f"{directory} is not writable")
+    removed = 0
+    for pattern in SCREENCAST_ARTIFACT_PATTERNS:
+        for path in glob.glob(os.path.join(glob.escape(directory), pattern)):
+            if not os.path.isfile(path):
+                continue
+            os.unlink(path)
+            removed += 1
+    return removed
+
+
 def save_screencast(tab_id, output_dir, fps=8, make_mp4=False):
     """Drain the extension's buffered screencast frames to local image files.
 
@@ -322,6 +356,12 @@ def save_screencast(tab_id, output_dir, fps=8, make_mp4=False):
     directory, counts, and byte totals so a recording of the real profile cannot
     leak into a transcript.
     """
+    directory = expand_output_path(output_dir)
+    try:
+        stale_removed = prepare_screencast_dir(directory)
+    except OSError as exc:
+        print(f"Error: cannot prepare screencast output directory: {exc}", file=sys.stderr)
+        return 1
     exit_code, response, stderr = send_command_data("screencastFrames", {"tabId": tab_id, "consume": True})
     if exit_code != 0:
         if response is not None:
@@ -335,8 +375,6 @@ def save_screencast(tab_id, output_dir, fps=8, make_mp4=False):
         print("Error: screencastFrames response did not include a frames list", file=sys.stderr)
         return 1
     extension = "png" if result.get("format") == "png" else "jpg"
-    directory = expand_output_path(output_dir)
-    os.makedirs(directory, exist_ok=True)
     total_bytes = 0
     timestamps = []
     written = 0
@@ -357,8 +395,12 @@ def save_screencast(tab_id, output_dir, fps=8, make_mp4=False):
         written += 1
     manifest_path = os.path.join(directory, "frames.json")
     dropped = result.get("droppedFrames", 0)
-    with open(manifest_path, "w") as f:
+    # Manifest last, written to a temp file and renamed, so a reader never sees a
+    # frame count that does not match the files on disk.
+    manifest_tmp = manifest_path + ".tmp"
+    with open(manifest_tmp, "w") as f:
         json.dump({"count": written, "dropped": dropped, "timestamps": timestamps}, f)
+    os.replace(manifest_tmp, manifest_path)
     summary = {
         "success": True,
         "dir": directory,
@@ -366,6 +408,7 @@ def save_screencast(tab_id, output_dir, fps=8, make_mp4=False):
         "dropped": dropped,
         "bytes": total_bytes,
         "manifest": manifest_path,
+        "staleArtifactsRemoved": stale_removed,
     }
     if make_mp4:
         summary.update(assemble_screencast_mp4(directory, extension, fps, written))
@@ -1847,7 +1890,7 @@ COMMAND_HELP = {
     ),
     "screencastSave": (
         "chrome-bridge screencastSave <tabId> <outputDir> [--fps <rate>] [--mp4]",
-        "Drain buffered frames to numbered image files plus frames.json in outputDir. Prints only the directory, frame count, dropped count, and byte totals; frame data is never printed. With --mp4 the system ffmpeg (never bundled) assembles screencast.mp4 and frames are kept either way.",
+        "Drain buffered frames to numbered image files plus frames.json in outputDir. outputDir is created and checked before any frame is drained, and only a previous save's artifacts (frame-*.png, frame-*.jpg, frames.json, screencast.mp4) are removed first, so a shorter second save never mixes in stale frames. Prints only the directory, frame count, dropped count, byte totals, and staleArtifactsRemoved; frame data is never printed. With --mp4 the system ffmpeg (never bundled) assembles screencast.mp4 and frames are kept either way.",
     ),
     "stopScreencast": (
         "chrome-bridge stopScreencast <tabId>",
@@ -1883,8 +1926,10 @@ COMMAND_HELP = {
     "cache": (
         "chrome-bridge cache selectors list [--sync] | clear [--local-only] | export <path> | import <path>",
         "Manage the file-backed semantic-selector resolution cache (bridge_action_cache.json, mode 600). Each entry maps "
-        "(urlPattern, semantic selector) to the CSS path that last resolved to that element, so replay reuses a known-good target "
-        "and re-resolves the original text=/label=/role=/aria= selector when the page changes. CSS selectors are never cached or "
+        "(urlPattern, semantic selector) to the CSS path that last resolved to that element. On a hit, replay resolves both the "
+        "cached path and the original text=/label=/role=/aria= selector and reuses the cached path only when both land on the same "
+        "live DOM node; a path that still resolves but now points at a replacement element is discarded and the semantic selector "
+        "is re-resolved (selfHealed). CSS selectors are never cached or "
         "retargeted. list prints intent selectors and counts; export writes the resolved paths to a caller path.",
     ),
 }

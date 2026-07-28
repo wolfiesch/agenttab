@@ -175,7 +175,14 @@ def collect_members(source: Path, root: Path) -> dict[str, bytes]:
         manifest = json.loads(read_bytes(source / "manifest.json").decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise PackagingError(f"manifest.json is not valid JSON: {exc}") from exc
-    manifest.pop("key", None)
+    # Fail closed BEFORE the manifest is touched. Silently stripping "key" here
+    # would have produced a clean-looking package from a manifest that still
+    # carries a local unpacked-extension key on disk, hiding exactly the mistake
+    # this packager exists to catch.
+    if "key" in manifest:
+        raise PackagingError(
+            "manifest contains a 'key' field; store uploads must not carry a local extension key"
+        )
     validate_manifest(manifest, root_manifest)
 
     background = read_bytes(source / "background.js")

@@ -84,6 +84,7 @@ PAGE = b"""<!doctype html>
   <button id="alert">Alert</button>
   <button id="mapped">Mapped error</button>
   <button id="mapped-cross">Cross map</button>
+  <button id="early">Early frame</button>
   <select id="kind" name="kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>
   <input id="file" type="file">
   <div id="status">ready</div>
@@ -135,6 +136,7 @@ PAGE = b"""<!doctype html>
   </section>
   <script src="/mapped.js"></script>
   <script src="/crossmap.js"></script>
+  <script src="/earlymap.js"></script>
 </body>
 </html>"""
 
@@ -169,6 +171,28 @@ CROSS_MAPPED_SCRIPT = (
     "//# sourceMappingURL=https://example.invalid/crossmap.js.map\n"
 ).encode("utf-8")
 
+# HI7 regression fixture: the map's only segment on generated line 0 starts at
+# column 60, but the console.error frame is at column 17. A resolver that
+# fell back to the line's first segment would fabricate an original position the
+# map never claimed, so the frame must come back `unmapped`.
+# VLQ "4DAKA" == [60, 0, 5, 0].
+EARLY_SOURCE = "src/fixture-early.js"
+EARLY_SOURCE_MAP = json.dumps({
+    "version": 3,
+    "file": "earlymap.js",
+    "sources": [EARLY_SOURCE],
+    "names": [],
+    "mappings": "4DAKA;",
+}).encode("utf-8")
+EARLY_MAPPED_SCRIPT = (
+    'function early(){console.error("bridge fixture early frame")}\n'
+    'document.querySelector("#early").addEventListener("click",early);\n'
+    "//# sourceMappingURL=data:application/json;base64,"
+    + base64.b64encode(EARLY_SOURCE_MAP).decode("ascii")
+    + "\n"
+).encode("utf-8")
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/data.json"):
@@ -177,8 +201,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(DATA)
             return
-        if self.path.startswith("/mapped.js") or self.path.startswith("/crossmap.js"):
-            body = MAPPED_SCRIPT if self.path.startswith("/mapped.js") else CROSS_MAPPED_SCRIPT
+        if self.path.startswith("/mapped.js") or self.path.startswith("/crossmap.js") or self.path.startswith("/earlymap.js"):
+            if self.path.startswith("/mapped.js"):
+                body = MAPPED_SCRIPT
+            elif self.path.startswith("/crossmap.js"):
+                body = CROSS_MAPPED_SCRIPT
+            else:
+                body = EARLY_MAPPED_SCRIPT
             self.send_response(200)
             self.send_header("Content-Type", "text/javascript; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -641,6 +670,7 @@ def main(quiet=False):
         # 19b. Source-Mapped Console Stacks (HI7)
         run_bridge("click", tab_id, "#mapped")
         run_bridge("click", tab_id, "#mapped-cross")
+        run_bridge("click", tab_id, "#early")
         time.sleep(0.5)
         call = run_bridge("consoleMessages", tab_id, "--source-maps")
         mapped_result = result(call) or {}
@@ -653,11 +683,24 @@ def main(quiet=False):
         refused = [frame for frame in mapped_frames
                    if "crossmap.js" in str(frame.get("url", ""))
                    and frame.get("sourceMapStatus") == "crossOriginRefused"]
+        # A frame LEFT of the line's first mapping segment has no mapping. It must
+        # come back `unmapped`, never pointed at the first segment's original
+        # position, which would be a fabricated location.
+        early = [frame for frame in mapped_frames
+                 if "earlymap.js" in str(frame.get("url", ""))
+                 and frame.get("functionName") == "early"]
+        early_unmapped = [frame for frame in early
+                          if frame.get("sourceMapStatus") == "unmapped"
+                          and "originalLocation" not in frame]
+        early_fabricated = [frame for frame in early
+                            if isinstance(frame.get("originalLocation"), dict)]
         # The map body must never come back through the response.
         leaked = "sourcesContent" in json.dumps(mapped_result)
         record(summary, "consoleMessagesSourceMaps", call, {
             "resolved": len(resolved),
             "crossOriginRefused": len(refused),
+            "beforeFirstSegmentUnmapped": len(early_unmapped),
+            "beforeFirstSegmentFabricated": len(early_fabricated),
             "sourceMapsResolved": mapped_result.get("sourceMapsResolved"),
         })
         require(
@@ -667,6 +710,11 @@ def main(quiet=False):
             and len(refused) >= 1
             and not leaked,
             "consoleMessages --source-maps did not resolve the inline map or refuse the cross-origin map",
+            call,
+        )
+        require(
+            len(early) >= 1 and len(early_unmapped) == len(early) and not early_fabricated,
+            "a frame before the line's first mapping segment was given a fabricated original location",
             call,
         )
 
@@ -1105,6 +1153,29 @@ def main(quiet=False):
             "screencastSave did not write frames plus a manifest with metadata-only stdout",
             call
         )
+
+        # 40b. A second, shorter save into the same directory must contain only its
+        # own frames: the first save's files are cleared before the buffer is
+        # drained, so a shorter recording can never inherit an earlier tail.
+        first_frame_count = len(frame_files)
+        call = run_bridge("screencastSave", tab_id, SCREENCAST_DIR, "--fps", 8)
+        second_saved = call.get("json") or {}
+        second_frame_files = sorted(screencast_path.glob("frame-*"))
+        second_manifest = json.loads(manifest_file.read_text()) if manifest_file.exists() else {}
+        record(summary, "screencastSaveNoStaleFrames", call, {
+            "firstFrameFiles": first_frame_count,
+            "secondFrames": second_saved.get("frames"),
+            "secondFrameFiles": len(second_frame_files),
+            "staleArtifactsRemoved": second_saved.get("staleArtifactsRemoved"),
+        })
+        require(
+            call["exit"] == 0
+            and second_saved.get("staleArtifactsRemoved") == first_frame_count + 1
+            and second_saved.get("frames") == len(second_frame_files)
+            and second_manifest.get("count") == len(second_frame_files),
+            "a second screencastSave kept the previous save's frames or manifest count",
+            call
+        )
         if QUIET_MODE:
             state = run_bridge("getCurrentState", tab_id)
             active = ((result(state) or {}).get("tab") or {}).get("active")
@@ -1298,6 +1369,49 @@ def main(quiet=False):
         require(
             call["exit"] == 0 and "text=Click me" in cached_selectors,
             "the file-backed selector cache did not record the replayed semantic selector",
+            call
+        )
+
+        # 46b. ST4 regression: the cached CSS path still RESOLVES, but the page
+        # replaced the element the semantic selector names. "The old CSS still
+        # matches something" is not evidence that it matches what the author
+        # named, so replay must act on the semantic target (the fresh button),
+        # not on the stale node the cache points at.
+        retarget_script = (
+            "var stale = document.querySelector('#btn-renamed');"
+            " stale.textContent = 'Other action';"
+            " stale.addEventListener('click', function () {"
+            " document.querySelector('#status').textContent = 'clicked:STALE'; });"
+            " var fresh = document.createElement('button');"
+            " fresh.id = 'btn-fresh';"
+            " fresh.textContent = 'Click me';"
+            " fresh.addEventListener('click', function () {"
+            " document.querySelector('#status').textContent = 'clicked:' + document.querySelector('#q').value; });"
+            " stale.parentNode.insertBefore(fresh, stale.nextSibling);"
+            " document.querySelector('#status').textContent = 'ready'; 'retargeted'"
+        )
+        call = run_bridge("executeScriptCDP", tab_id, retarget_script)
+        require(call["exit"] == 0, "failed to stage the cached-selector retarget fixture", call)
+        # The cached path must still be live, or this case proves nothing.
+        probe = run_bridge("executeScriptCDP", tab_id, "String(!!document.querySelector('#btn-renamed'))")
+        stale_still_resolves = (result(probe) or {}).get("val") == "true"
+        call = run_bridge("workflow", "replay", WORKFLOW_PATH, "--tab", tab_id, "--binding", f"{binding_key}=retargeted", timeout=60)
+        retargeted = result(call) or {}
+        retargeted_click = next((step for step in (retargeted.get("steps") or []) if step.get("action") == "click"), None)
+        status = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
+        retargeted_status = (result(status) or {}).get("val")
+        record(summary, "selectorCacheStaleNodeRejected", call, {
+            "staleCachedPathStillResolves": stale_still_resolves,
+            "clickSelfHealed": (retargeted_click or {}).get("selfHealed"),
+            "status": retargeted_status,
+        })
+        require(
+            call["exit"] == 0
+            and stale_still_resolves
+            and retargeted.get("failedSteps") == 0
+            and (retargeted_click or {}).get("selfHealed") is True
+            and retargeted_status == "clicked:retargeted",
+            "replay trusted a cached CSS path that still resolved but pointed at a replacement element",
             call
         )
 

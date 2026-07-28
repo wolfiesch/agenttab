@@ -64,6 +64,12 @@ The default sample policy is intentionally fail-closed and denies loopback URLs.
 
 `verify_capability_matrix.py` binds its HTTP fixture to port `0`, derives the URL at runtime, writes screenshots/HTML/storage to temp files, and prints compact redacted JSON.
 
+`verify_guardrails_contract.py` runs every host-enforced guardrail against **both** native hosts in turn, so a Python-only or Rust-only fix fails the gate. Among the regression cases it pins:
+
+- the full handoff blackout set - one-shot observations including `observe`, the collector reads `consoleMessages`/`networkRequests`/`interceptedRequests`/`screencastFrames`, and the collector starts `startMonitoring`/`startInterception`/`startScreencast` - each denied with `handoff in progress` and never forwarded, plus a `batch` and a `replayWorkflow` that wrap a blacked-out step and are denied as a whole;
+- `replayWorkflow` step-level enforcement before any forward: a denied nested action fails as `workflow step <n>: <reason>` with a `policyDenial.batchStep` index, a reserved action is not dispatchable as a step, a confirmation-gated nested action fails as `workflow step <n> requires confirmation` and mints no token, an all-allowed workflow forwards, and `--tab` retargeting is origin-checked against the live origin of the tab actually targeted;
+- secret masking armed on the **first** request: a policy denial that quotes a `secretMaskFile` value in its target writes `<masked:...>` to the audit log, never the raw value, with no prior reload or successful forward to prime it.
+
 ## Release packaging
 
 Pull requests run `.github/workflows/ci.yml`. Tags that match `v*` run `.github/workflows/release.yml`.
@@ -99,17 +105,17 @@ Before writing anything the script fails closed when:
 - `extension/background.js` or `extension/manifest.json` exists and is not byte-identical to the canonical root file;
 - `manifest_version` is not `3`, the service worker is not `background.js`, or `nativeMessaging` is missing;
 - the packaged manifest drops any permission held by the canonical root `manifest.json`;
-- the manifest carries a `key` field;
+- the manifest carries a `key` field. This is checked against the manifest **as read from disk**, before the packager touches it: a `key` is a hard failure, never silently stripped, so a staging directory that still carries a local unpacked-extension key can never produce a clean-looking upload;
 - `background.js` does not reference the `com.automation.bridge` native messaging host;
 - any forbidden local artifact pattern (tokens, `bridge_policy.json`, `*.pem`, logs, caches, docs, tests) matches a member name.
 
-The archive contains exactly `background.js`, `manifest.json`, `wake.html`, and `wake.js`, written in sorted order with a fixed timestamp, so repeated runs on unchanged inputs produce the same sha256. `verify_install_contract.py` covers this: it packages into a temp directory and asserts the exact member set, the absence of forbidden patterns, `manifest_version` 3, no `key`, root-permission coverage, the fixed timestamp, digest stability across two builds, and rejection of a staged manifest that drops root permissions.
+The archive contains exactly `background.js`, `manifest.json`, `wake.html`, and `wake.js`, written in sorted order with a fixed timestamp, so repeated runs on unchanged inputs produce the same sha256. `verify_install_contract.py` covers this: it packages into a temp directory and asserts the exact member set, the absence of forbidden patterns, `manifest_version` 3, no `key`, root-permission coverage, the fixed timestamp, digest stability across two builds, rejection of a staged manifest that drops root permissions, and rejection of a staged manifest carrying a `key` field with no archive written at all.
 
 `--source <dir>` packages a prepared staging directory instead of the repository root; the canonical root `manifest.json` is still the permission baseline.
 
 ## Cross-platform install verification
 
-`setup-windows.ps1` needs Windows and a live browser, so `verify_install_contract.py` covers it statically instead of running it: the Chrome and Edge `HKCU` registry path strings are present, `HKLM:`/`HKEY_LOCAL_MACHINE` and any elevation request are absent, the `-RepoRoot`/`-HostPort`/`-ExtensionId`/`-UseRustHost` parameters exist, the Rust host path and the `.cmd` launcher are referenced, the launcher is git-ignored, secrets are kept rather than overwritten, the policy is seeded from `bridge_policy.example.json`, no output statement can print the token, and braces and parentheses balance.
+`setup-windows.ps1` needs Windows and a live browser, so `verify_install_contract.py` covers it statically instead of running it: the Chrome and Edge `HKCU` registry path strings are present, the manifest path is written to the key's **unnamed default value** with `Set-Item` and read back for verification (the `Set-ItemProperty -Name "(Default)"` form is rejected outright, because it creates a value literally named `(Default)` and leaves the real default empty, so the browser finds no host), `HKLM:`/`HKEY_LOCAL_MACHINE` and any elevation request are absent, the `-RepoRoot`/`-HostPort`/`-ExtensionId`/`-UseRustHost` parameters exist, the Rust host path and the `.cmd` launcher are referenced, the launcher is git-ignored, secrets are kept rather than overwritten, the policy is seeded from `bridge_policy.example.json`, no output statement can print the token, and braces and parentheses balance.
 
 `setup-edge.sh` is checked the same way: it references the macOS and Linux Edge native-messaging directories, builds its manifest through `scripts/generate_browser_manifests.py`, points Windows users at the PowerShell installer, and never creates or reads a token, key, or policy.
 

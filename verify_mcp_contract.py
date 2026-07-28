@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import tempfile
+import shutil
 import socket
 import subprocess
 import sys
@@ -408,6 +409,85 @@ def main():
            "wait_for_handoff should be present in a normal build")
     expect("browser_wait_for_handoff" not in _tool_names(server.build_server(readonly=True)),
            "wait_for_handoff must be hidden under readonly")
+
+    # 19g. search_tabs is sensitive: its snippets carry content from every open
+    #      tab of the real profile, so it is gated like history and bookmarks.
+    expect("browser_search_tabs" not in _tool_names(server.build_server()),
+           "search_tabs must be hidden by default (sensitive)")
+    expect("browser_search_tabs" in _tool_names(server.build_server(allow_sensitive=True)),
+           "search_tabs should be exposed under allow_sensitive")
+    expect("browser_search_history" not in _tool_names(server.build_server()),
+           "search_history must be hidden by default (sensitive)")
+    os.environ["BRIDGE_MCP_ALLOW_SENSITIVE"] = "1"
+    try:
+        env_names = _tool_names(server.build_server())
+        expect("browser_search_tabs" in env_names,
+               "search_tabs should be exposed with BRIDGE_MCP_ALLOW_SENSITIVE=1")
+        expect("browser_search_history" in env_names and "browser_search_bookmarks" in env_names,
+               "history/bookmarks should be exposed with BRIDGE_MCP_ALLOW_SENSITIVE=1")
+    finally:
+        os.environ.pop("BRIDGE_MCP_ALLOW_SENSITIVE", None)
+
+    # 19h. screencast_save and cache_selectors are NOT read-only: one consumes
+    #      the extension frame buffer and writes/replaces local files, the other
+    #      supports clear/import.
+    for name in ("browser_screencast_save", "browser_cache_selectors"):
+        expect(name in default_names, f"{name} should be present in a normal build")
+        expect(name not in ro_names, f"{name} must be hidden under readonly (mutating)")
+        expect(tools[name].annotations.readOnlyHint is False,
+               f"{name} must not be annotated readOnlyHint=True")
+        expect(tools[name].annotations.destructiveHint is True,
+               f"{name} must be annotated destructiveHint=True")
+
+    # 19i. screencast_save validates/prepares the destination BEFORE draining and
+    #      a second, shorter save never keeps the previous save's frames.
+    drains = []
+    frame_counts = [3, 1]
+
+    def screencast_result(action, payload):
+        if action == "screencastFrames":
+            drains.append(payload)
+            count = frame_counts.pop(0) if frame_counts else 0
+            return {
+                "success": True, "format": "jpeg", "droppedFrames": 0,
+                "frames": [{"base64": "QUJD", "timestamp": index} for index in range(count)],
+            }
+        return default_result(action, payload)
+
+    _result_fn = screencast_result
+    shots = tempfile.mkdtemp()
+    try:
+        first = json.loads(server.browser_screencast_save(shots, tab_id=11))
+        expect(first["frames"] == 3 and first["staleArtifactsRemoved"] == 0,
+               f"first screencast save should write 3 frames into a clean dir: {first}")
+        expect(sorted(os.listdir(shots)) == [
+            "frame-00000.jpg", "frame-00001.jpg", "frame-00002.jpg", "frames.json",
+        ], f"first save layout wrong: {sorted(os.listdir(shots))}")
+        second = json.loads(server.browser_screencast_save(shots, tab_id=11))
+        expect(second["frames"] == 1 and second["staleArtifactsRemoved"] == 4,
+               f"second save should clear 4 stale artifacts and write 1 frame: {second}")
+        expect(sorted(os.listdir(shots)) == ["frame-00000.jpg", "frames.json"],
+               f"second shorter save must not keep stale frames: {sorted(os.listdir(shots))}")
+        with open(os.path.join(shots, "frames.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        expect(manifest["count"] == 1 and len(manifest["timestamps"]) == 1,
+               f"manifest must describe only this save's frames: {manifest}")
+        # An unusable destination must fail while the frames are still buffered.
+        fd, blocker = tempfile.mkstemp()
+        os.close(fd)
+        drained_before = len(drains)
+        try:
+            server.browser_screencast_save(blocker, tab_id=11)
+            expect(False, "screencast_save into a non-directory should raise")
+        except BridgeError as exc:
+            expect("not a directory" in str(exc),
+                   f"non-directory destination error should be actionable: {exc}")
+        expect(len(drains) == drained_before,
+               "a destination that cannot be prepared must not consume the frame buffer")
+        os.unlink(blocker)
+    finally:
+        shutil.rmtree(shots, ignore_errors=True)
+        _result_fn = default_result
 
     # 20. unauthorized maps to an actionable message.
     def unauth(action, payload):

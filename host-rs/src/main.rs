@@ -465,7 +465,14 @@ fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
 // which the host cannot see, so it blacks out ALL tabs (GLOBAL). Symmetrically,
 // an observation request with no tabId could land on the blacked-out tab, so it
 // is denied by any live handoff. Fail-safe in both directions. Mirrors bridge.py.
-const HANDOFF_BLACKOUT_ACTIONS: [&str; 11] = [
+// The set covers three families: one-shot observations, the *retrieval* actions
+// of the long-lived collectors (console, network, interception, screencast), and
+// the collector *start* actions. Denying retrieval keeps a collector that was
+// already running before the handoff from handing the handoff interval back;
+// denying start keeps a client from opening a fresh collector mid-handoff and
+// reading it out afterwards. The extension additionally discards the target
+// tab's buffered collector data before showing the handoff banner.
+const HANDOFF_BLACKOUT_ACTIONS: [&str; 17] = [
     "screenshot",
     "extractText",
     "getHTML",
@@ -477,6 +484,12 @@ const HANDOFF_BLACKOUT_ACTIONS: [&str; 11] = [
     "extractStructured",
     "scanPromptInjection",
     "consoleMessages",
+    "observe",
+    "networkRequests",
+    "interceptedRequests",
+    "startMonitoring",
+    "startScreencast",
+    "startInterception",
 ];
 const HANDOFF_BLACKOUT_ERROR: &str = "handoff in progress";
 
@@ -535,7 +548,20 @@ impl Drop for HandoffGuard<'_> {
 }
 
 /// True when an in-flight handoff must suppress this observation request.
+/// Composite actions are checked step by step as well: runBatch and
+/// replayWorkflow dispatch their steps inside the extension, so a blacked-out
+/// observation nested in one of them would otherwise never reach this gate.
 fn handoff_blackout(handoffs: &Handoffs, action: &str, payload: Option<&Value>) -> bool {
+    if action == "batch" || action == "replayWorkflow" {
+        let steps = if action == "batch" {
+            step_payloads(payload)
+        } else {
+            workflow_step_payloads(payload)
+        };
+        return steps
+            .iter()
+            .any(|(s_action, s_payload)| handoff_blackout(handoffs, s_action, Some(s_payload)));
+    }
     if !HANDOFF_BLACKOUT_ACTIONS.contains(&action) {
         return false;
     }
@@ -718,9 +744,16 @@ struct PolicyRegistry {
 
 type Policy = Arc<RwLock<PolicyRegistry>>;
 
+/// Initial policy load. Secret masks are primed HERE, before the socket server
+/// accepts its first connection: masking must be armed for the very first
+/// request, including a denial whose reason or target quotes a secret. Waiting
+/// for the first mtime reload or the first successful forward would leak the raw
+/// value into that first audit event.
 fn build_policy_registry(host_dir: &Path, logger: &Arc<Logger>) -> PolicyRegistry {
+    let value = load_policy(host_dir, logger);
+    prime_secret_masks(&value, host_dir, logger);
     PolicyRegistry {
-        value: load_policy(host_dir, logger),
+        value,
         policy_file_mtime: file_mtime(&policy_file_path(host_dir)),
     }
 }
@@ -897,6 +930,15 @@ fn targets_from_payload(action: &str, payload: Option<&Value>) -> Vec<String> {
             }
             targets
         }
+        // Replay reproduces its steps through the extension's dispatch table, so
+        // the outer request's policy targets are the union of its steps'.
+        "replayWorkflow" => {
+            let mut targets = Vec::new();
+            for (s_action, s_payload) in workflow_step_payloads(Some(payload)) {
+                targets.extend(targets_from_payload(&s_action, Some(&s_payload)));
+            }
+            targets
+        }
         _ => Vec::new(),
     }
 }
@@ -947,13 +989,60 @@ fn step_payloads(payload: Option<&Value>) -> Vec<(String, Value)> {
     out
 }
 
+/// Selector actions that replayWorkflow retargets at the caller's tabId even
+/// when the recorded step carried none, because they need a tab to resolve
+/// against. Mirrors CACHEABLE_SELECTOR_ACTIONS in background.js.
+const WORKFLOW_SELECTOR_ACTIONS: [&str; 5] = ["click", "type", "fill", "select", "hover"];
+
+/// Yield (action, effective_payload) for a replayWorkflow's steps, applying the
+/// extension's replay retargeting: a top-level tabId REPLACES a step's own tabId
+/// and supplies one for selector steps that carry none, so origin policy cannot
+/// be bypassed either by hoisting tabId to the replay payload or by recording a
+/// step against a different tab. Steps with no action are skipped because the
+/// extension never dispatches them. Mirrors bridge.py::_workflow_step_payloads.
+fn workflow_step_payloads(payload: Option<&Value>) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    let obj = match payload {
+        Some(p) if p.is_object() => p,
+        _ => return out,
+    };
+    let steps = match obj.get("workflow").and_then(|w| w.get("steps")) {
+        Some(Value::Array(steps)) => steps,
+        _ => return out,
+    };
+    let default_tab = obj.get("tabId").filter(|v| v.as_i64().is_some()).cloned();
+    for step in steps {
+        let s_action = step.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+        if s_action.is_empty() {
+            continue;
+        }
+        let mut s_payload = match step.get("payload") {
+            Some(Value::Object(m)) => Value::Object(m.clone()),
+            _ => json!({}),
+        };
+        if let (Some(dt), Value::Object(map)) = (&default_tab, &mut s_payload) {
+            if map.contains_key("tabId") || WORKFLOW_SELECTOR_ACTIONS.contains(&s_action.as_str()) {
+                map.insert("tabId".to_string(), dt.clone());
+            }
+        }
+        out.push((s_action, s_payload));
+    }
+    out
+}
+
 /// The set of tabId keys whose live origin the host must resolve to apply site
 /// policy. "" means the active tab. Empty for origin-exempt actions. Recurses
-/// into batch steps with runBatch tabId defaulting.
+/// into batch steps with runBatch tabId defaulting and into replayWorkflow steps
+/// with replay tabId retargeting.
 fn tab_ids_needed(action: &str, payload: Option<&Value>) -> std::collections::BTreeSet<String> {
     let mut needed = std::collections::BTreeSet::new();
-    if action == "batch" {
-        for (s_action, s_payload) in step_payloads(payload) {
+    if action == "batch" || action == "replayWorkflow" {
+        let steps = if action == "batch" {
+            step_payloads(payload)
+        } else {
+            workflow_step_payloads(payload)
+        };
+        for (s_action, s_payload) in steps {
             needed.extend(tab_ids_needed(&s_action, Some(&s_payload)));
         }
         return needed;
@@ -1135,6 +1224,34 @@ fn evaluate_policy(
         return (true, None, step_confirm, redact_enabled, audit_enabled, targets);
     }
 
+    // replayWorkflow reproduces recorded mutating actions through the extension's
+    // dispatch table, exactly like a batch, so its steps are evaluated here
+    // before anything is forwarded. Two differences from batch:
+    //  - Steps are inspected even when the replay action itself is
+    //    confirmation-gated: an outer replay token approves "replay this
+    //    workflow", never each nested action inside it.
+    //  - There is no aggregate confirmation token for nested steps. A nested step
+    //    that still requires confirmation after its own siteMode is applied fails
+    //    the whole replay, because a single outer token cannot carry per-step
+    //    approval and a half-run workflow has already mutated the page.
+    // Mirrors bridge.py::evaluate_policy.
+    if action == "replayWorkflow" {
+        for (i, (s_action, s_payload)) in workflow_step_payloads(payload).into_iter().enumerate() {
+            let (s_allowed, s_reason, s_confirm, _, _, s_targets) =
+                evaluate_policy(policy, name, &s_action, Some(&s_payload), origins);
+            if !s_allowed {
+                let reason = s_reason.unwrap_or_default();
+                return (false, Some(format!("workflow step {}: {}", i, reason)), false,
+                        redact_enabled, audit_enabled, s_targets);
+            }
+            if s_confirm {
+                return (false, Some(format!("workflow step {} requires confirmation", i)), false,
+                        redact_enabled, audit_enabled, s_targets);
+            }
+        }
+        return (true, None, confirm, redact_enabled, audit_enabled, targets);
+    }
+
     if !targets.is_empty() && target_matches(cp.get("deniedOrigins"), &targets) {
         return (false, Some("target denied".to_string()), false, redact_enabled, audit_enabled, targets);
     }
@@ -1221,16 +1338,27 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
     let mut reason = reason.to_string();
     let mut action = action.to_string();
     let mut batch_step: Option<i64> = None;
-    if let Some(rest) = reason.strip_prefix("batch step ") {
+    let step_prefixed = reason
+        .strip_prefix("batch step ")
+        .or_else(|| reason.strip_prefix("workflow step "))
+        .map(|rest| rest.to_string());
+    if let Some(rest) = step_prefixed {
         if let Some((num, inner)) = rest.split_once(": ") {
             if let Ok(n) = num.parse::<i64>() {
                 batch_step = Some(n);
                 reason = inner.to_string();
             }
+        } else if let Some(num) = rest.strip_suffix(" requires confirmation") {
+            // Carries no nested reason to unwrap, but the step index is still the
+            // actionable part.
+            if let Ok(n) = num.parse::<i64>() {
+                batch_step = Some(n);
+            }
         }
     }
-    // For action-type reasons the real action is embedded in the reason text;
-    // the outer action may be "batch" for a denied step, so trust the reason.
+    // For action-type reasons the real action is embedded in the reason text; the
+    // outer action may be "batch"/"replayWorkflow" for a denied step, so trust
+    // the reason.
     if let Some(inner) = reason.strip_prefix("action ") {
         let act = inner
             .strip_suffix(" not allowed")
@@ -1637,6 +1765,11 @@ fn trace_targets(action: &str, payload: Option<&Value>, response: &Value) -> Vec
     }
     if action == "batch" {
         for (_, step) in step_payloads(payload) {
+            push_trace_tab_ids(&step, &mut out);
+        }
+    }
+    if action == "replayWorkflow" {
+        for (_, step) in workflow_step_payloads(payload) {
             push_trace_tab_ids(&step, &mut out);
         }
     }

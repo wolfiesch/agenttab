@@ -25,10 +25,7 @@ Read-only:
 - `browser_policy_check` - ask the host what its policy would decide for an action/payload without forwarding it. The verdict includes `siteMode`: the per-site permission mode (`manual`/`auto`/`skip`, or null when no origin is known or no `siteModes` pattern matches) that the host folded into `confirmationRequired`
 - `browser_plan_preview` - preflight a list of up to 50 `{action, origin, payload}` steps against host policy in one call; returns a per-step verdict (`step`, `action`, `allowed`, `reason`, `confirmationRequired`, `redact`, `audit`, `originDependent`, `siteMode`) and forwards nothing
 - `browser_wait_for` (`mode`: `load|selector|text|url`)
-- `browser_search_tabs` - search visible text across every open http/https tab; returns tab id, origin host, match count, and bounded snippets (snippets are page content, so treat output as sensitive)
-- `browser_screencast_save` - drain the tab's buffered screencast frames to numbered image files plus a `frames.json` manifest in a caller-supplied directory, returning only directory, frame count, dropped count, byte total, and manifest path (annotated read-only: the page is not mutated, and recorded pixels never enter the transcript)
 - `browser_trace_summary` / `browser_trace_tail` - read a local session trace artifact written by the host when policy sets `traceDir`. Summary returns event counts by action and decision, the time range, and duration totals; tail returns the most recent events (`ts`, `action`, `decision`, `reason`, `requestId`, `durationMs`, `targets`, `traceId`, `responseHash`, `snapshotHash`, `success`). Both are metadata only: a trace stores no payload, no response body, and no page content. `trace_dir` overrides the host's configured directory
-- `browser_cache_selectors` (`op`: `list|export|clear|import`) - inspect or manage the extension's semantic-selector resolution cache. An entry maps a `urlPattern` plus a `text=`/`label=`/`role=`/`aria=` selector to the CSS path that last resolved to that element; CSS selectors are never cached and an imported non-semantic entry is rejected. The CLI `chrome-bridge cache selectors` commands own the file-backed copy
 
 Sensitive:
 
@@ -36,6 +33,7 @@ Sensitive:
 - `browser_session_status` - redacted auth/session probe (cookie names/counts + `loggedIn` per domain, never values)
 - `browser_search_history` - search the real profile's browsing history (url, title, `lastVisitTime`, `visitCount`; `max_results` capped at 100)
 - `browser_search_bookmarks` - search the real profile's bookmarks (id, title, url, parent folder path)
+- `browser_search_tabs` - search visible text across every open http/https tab; returns tab id, origin host, match count, and bounded snippets. Gated as sensitive because the snippets come from **every** tab of the real profile, including mail, docs, and consoles the agent was never pointed at
 
 Mutating:
 
@@ -51,8 +49,10 @@ Mutating:
 - `browser_window_control` (`op`: `list|create|focus|setState|close`) - `list` returns only window id/focus/state/type/tab count, never tab URLs or titles; `create` is unfocused unless `focused=True`; `close` is destructive and refuses to close the last remaining normal window
 - `browser_set_cpu_throttling`, `browser_set_network_conditions`, `browser_clear_network_conditions`, `browser_set_color_scheme`, `browser_set_user_agent`
 - `browser_start_screencast`, `browser_stop_screencast` - record a background tab through CDP `Page.startScreencast` without activating it. Frames buffer only in the extension service worker (a worker restart ends the recording) and the buffer is bounded at 600 frames or ~50MB, dropping and counting the oldest frames past either bound. Continuous capture of a real profile is high-exposure, so the example policy confirmation-gates `startScreencast`; drain with `browser_screencast_save` before stopping, because `browser_stop_screencast` discards whatever is still buffered
+- `browser_screencast_save` - drain the tab's buffered screencast frames to numbered image files plus a `frames.json` manifest in a caller-supplied directory, returning only directory, frame count, dropped count, byte total, manifest path, and `staleArtifactsRemoved`. It does not mutate the page, but it is **not** read-only: it consumes the extension's frame buffer (the frames are gone afterward) and writes local files, so it is annotated mutating and is dropped under `BRIDGE_MCP_READONLY=1`. The destination is created and validated before any frame is drained, and only artifacts a prior save wrote (`frame-*.png`, `frame-*.jpg`, `frames.json`, `screencast.mp4`) are removed first, so a shorter second save cannot present an earlier recording's frames as its own
+- `browser_cache_selectors` (`op`: `list|export|clear|import`) - inspect or manage the extension's semantic-selector resolution cache. An entry maps a `urlPattern` plus a `text=`/`label=`/`role=`/`aria=` selector to the CSS path that last resolved to that element; CSS selectors are never cached and an imported non-semantic entry is rejected. `clear` and `import` mutate that cache, so the tool is annotated mutating and is dropped under `BRIDGE_MCP_READONLY=1`. The CLI `chrome-bridge cache selectors` commands own the file-backed copy
 - `browser_wait_for_handoff` - pause automation, mark the task group as needing review, focus the real tab with a compact bottom card, and wait for a human to finish login/2FA/captcha before resuming
-- `browser_resolve_cached_selector` - resolve a selector to a stable `ref=eN` plus a concrete CSS path, serving a cached resolution when it still holds and re-resolving the semantic selector with `selfHealed: true` when it does not. Returns element identity only, never element text or page content; `refresh=True` skips the cache, and frame/shadow selectors report `cacheable: false`
+- `browser_resolve_cached_selector` - resolve a selector to a stable `ref=eN` plus a concrete CSS path. A cached resolution is served only when the cached CSS path and the original semantic selector resolve to the **same live DOM node** (compared by backend node id); if the page replaced the element the semantic selector names, the cached path is discarded and the semantic selector is re-resolved with `selfHealed: true`, even though the old path still resolves. Imported entries go through the same check. Returns element identity only, never element text or page content; `refresh=True` skips the cache, and frame/shadow selectors report `cacheable: false`
 - `browser_confirm_action` - resend an action with a host-issued confirmation token
 - `browser_confirm` - resume the exact pending action from only its host-issued token
 
@@ -77,8 +77,8 @@ Escape hatch (sensitive):
 
 The server reads two env flags to scope the exposed surface:
 
-- `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, `browser_confirm_action`, and `browser_action`.
-- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, `browser_search_history`, `browser_search_bookmarks`, the cookie/storage write tools, `browser_replay_workflow`, and the raw `browser_action` escape hatch), which are hidden by default. The host policy remains the enforcement boundary even when this escape hatch is exposed.
+- `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, `browser_confirm_action`, `browser_action`, and the two local-side-effect tools `browser_screencast_save` and `browser_cache_selectors`.
+- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, `browser_search_history`, `browser_search_bookmarks`, `browser_search_tabs`, the cookie/storage write tools, `browser_replay_workflow`, and the raw `browser_action` escape hatch), which are hidden by default. The host policy remains the enforcement boundary even when this escape hatch is exposed.
 
 Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately.
 

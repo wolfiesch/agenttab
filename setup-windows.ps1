@@ -185,8 +185,17 @@ foreach ($registryPath in $registryPaths) {
     if (-not (Test-Path -LiteralPath $registryPath)) {
         New-Item -Path $registryPath -Force | Out-Null
     }
-    Set-ItemProperty -LiteralPath $registryPath -Name "(Default)" -Value $manifestPath
-    Write-Output "Registered native host at $registryPath"
+    # Chrome/Edge read the manifest path from the key's UNNAMED (default) value.
+    # Set-ItemProperty cannot write that value: the label PowerShell displays for
+    # the unnamed value is not a usable property name, so naming it there creates
+    # a separate, literally-named value and the browser finds no manifest at all.
+    # Set-Item on the key itself writes the real unnamed value.
+    Set-Item -LiteralPath $registryPath -Value $manifestPath
+    $written = (Get-ItemProperty -LiteralPath $registryPath).'(default)'
+    if ($written -ne $manifestPath) {
+        throw "Registry default value at $registryPath is '$written', expected '$manifestPath'"
+    }
+    Write-Output "Registered native host at $registryPath (default value)"
 }
 
 Write-Output ""

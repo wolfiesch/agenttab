@@ -3801,10 +3801,11 @@ function resolveMappedPosition(map, lineNumber, columnNumber) {
     if (segment.generatedColumn > column) break;
     match = segment;
   }
-  // A frame left of the first mapping on the line still belongs to that line's
-  // first mapped region far more often than to nothing at all.
-  if (!match) match = segments[0];
-  if (!match || match.sourceIndex < 0) return null;
+  // A frame left of the first mapping on the line has no mapping: reporting
+  // the first segment would fabricate an original position the map never
+  // claimed. Leave it unmapped instead.
+  if (!match) return null;
+  if (match.sourceIndex < 0) return null;
   const source = map.sources[match.sourceIndex];
   if (source === undefined) return null;
   return {
@@ -4335,6 +4336,58 @@ async function hideHandoffOverlay(tabId) {
   }
 }
 
+// A handoff turns the tab over to a human, who may type a password or read
+// private mail there. Anything still capturing that tab would buffer it for a
+// later drain, so every capture surface for the target tab is stopped and its
+// buffer discarded before the banner goes up. Stops are best effort: a tab that
+// refuses CDP still ends up with no retained buffer, because the in-memory
+// buffers are dropped regardless of what the browser says.
+async function scrubCapturesForHandoff(tabId) {
+  const scrubbed = { monitor: false, interception: false, screencast: false };
+  const monitor = monitors.get(tabId);
+  if (monitor) {
+    // Drop the buffers before awaiting anything: an event landing mid-stop must
+    // not be able to re-fill them.
+    monitor.console = [];
+    monitor.network = new Map();
+    monitor.dialogs = [];
+    scrubbed.monitor = true;
+  }
+  const interceptor = interceptors.get(tabId);
+  if (interceptor) {
+    interceptor.requests = [];
+    scrubbed.interception = true;
+  }
+  const screencast = screencasts.get(tabId);
+  if (screencast) {
+    screencast.frames = [];
+    screencast.bytes = 0;
+    scrubbed.screencast = true;
+  }
+  if (scrubbed.screencast) {
+    try {
+      await stopScreencast(tabId);
+    } catch (error) {
+      screencasts.delete(tabId);
+    }
+  }
+  if (scrubbed.interception) {
+    try {
+      await stopInterception(tabId);
+    } catch (error) {
+      interceptors.delete(tabId);
+    }
+  }
+  if (scrubbed.monitor) {
+    try {
+      await stopMonitoring(tabId);
+    } catch (error) {
+      monitors.delete(tabId);
+    }
+  }
+  return scrubbed;
+}
+
 async function waitForHandoff(payload) {
   payload = payload || {};
   const until = payload.until || {};
@@ -4354,9 +4407,14 @@ async function waitForHandoff(payload) {
   const previousState = taskSession?.session?.state || "working";
   if (taskSession) await updateTaskSessionState(taskSession.sessionId, "needs_user");
   const startedAt = Date.now();
+  const scrubbed = await scrubCapturesForHandoff(tabId);
   await showHandoffOverlay(tabId, payload.message);
   const timeoutErr = { success: false, err: `handoff timeout after ${timeoutMs}ms (${mode})` };
-  const settle = async (found) => found ? await handoffResult(tabId, mode, startedAt) : timeoutErr;
+  const settle = async (found) => {
+    if (!found) return { ...timeoutErr, scrubbedCaptures: scrubbed };
+    const result = await handoffResult(tabId, mode, startedAt);
+    return { ...result, scrubbedCaptures: scrubbed };
+  };
   try {
     if (mode === "selector") {
       const found = await waitForSelector(tabId, until.selector, timeoutMs);
@@ -5040,7 +5098,9 @@ function stableSelectorExpression(locator) {
 
 // Mints an observe-compatible ref for the resolved element by describing its
 // live CDP node, so a ref handed back here is interchangeable with one from
-// observe and is invalidated by the same navigation/restart rules.
+// observe and is invalidated by the same navigation/restart rules. Returns the
+// backend node id alongside the ref so two selectors can be compared for DOM
+// identity, not just for both resolving.
 async function mintRefForLocator(target, tabId, locator, contextId) {
   const params = {
     expression: elementObjectExpression(locator),
@@ -5052,18 +5112,18 @@ async function mintRefForLocator(target, tabId, locator, contextId) {
   let objectId = null;
   try {
     const evaluated = await debuggerCommand(target, "Runtime.evaluate", params);
-    if (evaluated.exceptionDetails) return null;
+    if (evaluated.exceptionDetails) return { ref: null, backendDOMNodeId: null };
     objectId = evaluated.result?.objectId || null;
-    if (!objectId) return null;
+    if (!objectId) return { ref: null, backendDOMNodeId: null };
     const described = await debuggerCommand(target, "DOM.describeNode", { objectId });
     const backendDOMNodeId = described?.node?.backendNodeId || null;
-    if (!backendDOMNodeId) return null;
+    if (!backendDOMNodeId) return { ref: null, backendDOMNodeId: null };
     const registry = refRegistry(tabId);
     const ref = assignRef(registry, { backendDOMNodeId });
     trimRefRegistry(registry);
-    return ref;
+    return { ref, backendDOMNodeId };
   } catch (error) {
-    return null;
+    return { ref: null, backendDOMNodeId: null };
   } finally {
     if (objectId) {
       try {
@@ -5090,16 +5150,18 @@ async function resolveSelectorTarget(tabId, selector) {
   return withDebugger(tabId, async (target) => {
     const resolved = await resolveActionTarget(tabId, locator, target);
     if (resolved.success === false) return resolved;
-    const ref = await mintRefForLocator(target, tabId, locator, resolved.contextId);
+    const minted = await mintRefForLocator(target, tabId, locator, resolved.contextId);
+    const ref = minted.ref;
+    const backendDOMNodeId = minted.backendDOMNodeId;
     if (scoped) {
-      return { success: true, selector, ref, resolvedSelector: null, cacheable: false, tagName: resolved.tagName || null };
+      return { success: true, selector, ref, backendDOMNodeId, resolvedSelector: null, cacheable: false, tagName: resolved.tagName || null };
     }
     const derived = await evaluateInContext(target, stableSelectorExpression(locator), resolved.contextId);
     const value = derived.val || derived;
     if (!derived.success || value.success === false) {
-      return { success: true, selector, ref, resolvedSelector: null, cacheable: false, tagName: resolved.tagName || null };
+      return { success: true, selector, ref, backendDOMNodeId, resolvedSelector: null, cacheable: false, tagName: resolved.tagName || null };
     }
-    return { success: true, selector, ref, resolvedSelector: value.selector, cacheable: true, tagName: resolved.tagName || null };
+    return { success: true, selector, ref, backendDOMNodeId, resolvedSelector: value.selector, cacheable: true, tagName: resolved.tagName || null };
   });
 }
 
@@ -5113,31 +5175,51 @@ async function resolveCachedSelector(payload) {
   const urlPattern = await selectorUrlPattern(tabId, payload.urlPattern);
   const key = selectorCacheKey(urlPattern, selector);
   const cached = payload.refresh === true ? null : selectorCache.get(key);
+  // A cached CSS path that still resolves is NOT proof the cache is valid: the
+  // page may have replaced the element the semantic selector names, leaving the
+  // old path pointing at a different node. Both are resolved and compared by
+  // live DOM identity (backend node id); anything short of the same node
+  // discards the cache and re-resolves from the semantic selector. Imported
+  // entries go through this same path, so a file-backed cache cannot retarget.
+  let selfHealed = false;
+  const publish = (fresh) => {
+    let entry = null;
+    if (semantic && fresh.cacheable && fresh.resolvedSelector) {
+      entry = { urlPattern, selector, resolvedSelector: fresh.resolvedSelector, lastSuccess: Date.now() };
+      selectorCacheSet(entry);
+    }
+    return {
+      success: true, tabId, urlPattern, selector,
+      resolvedSelector: fresh.resolvedSelector, ref: fresh.ref,
+      cacheable: Boolean(fresh.cacheable), cached: false,
+      selfHealed, entry: entry ? { ...entry } : null
+    };
+  };
   if (cached) {
     const hit = await resolveSelectorTarget(tabId, cached.resolvedSelector);
-    if (hit.success !== false) {
-      cached.lastSuccess = Date.now();
-      return {
-        success: true, tabId, urlPattern, selector,
-        resolvedSelector: cached.resolvedSelector, ref: hit.ref,
-        cached: true, selfHealed: false, entry: { ...cached }
-      };
+    const cachedNode = hit.success === false ? null : (hit.backendDOMNodeId ?? null);
+    if (cachedNode !== null) {
+      const live = await resolveSelectorTarget(tabId, selector);
+      const liveNode = live.success === false ? null : (live.backendDOMNodeId ?? null);
+      if (liveNode !== null && liveNode === cachedNode) {
+        cached.lastSuccess = Date.now();
+        return {
+          success: true, tabId, urlPattern, selector,
+          resolvedSelector: cached.resolvedSelector, ref: hit.ref,
+          cached: true, selfHealed: false, entry: { ...cached }
+        };
+      }
+      selectorCache.delete(key);
+      selfHealed = true;
+      if (liveNode !== null) return publish(live);
+    } else {
+      selectorCache.delete(key);
+      selfHealed = true;
     }
-    selectorCache.delete(key);
   }
   const fresh = await resolveSelectorTarget(tabId, selector);
   if (fresh.success === false) return fresh;
-  let entry = null;
-  if (semantic && fresh.cacheable && fresh.resolvedSelector) {
-    entry = { urlPattern, selector, resolvedSelector: fresh.resolvedSelector, lastSuccess: Date.now() };
-    selectorCacheSet(entry);
-  }
-  return {
-    success: true, tabId, urlPattern, selector,
-    resolvedSelector: fresh.resolvedSelector, ref: fresh.ref,
-    cacheable: Boolean(fresh.cacheable), cached: false,
-    selfHealed: Boolean(cached), entry: entry ? { ...entry } : null
-  };
+  return publish(fresh);
 }
 
 function cacheSelectors(payload) {

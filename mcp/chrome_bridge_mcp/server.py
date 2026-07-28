@@ -9,6 +9,7 @@ takes an optional ``tab_id``; when omitted the active tab is used.
 """
 import base64
 import functools
+import glob
 import json
 import os
 from typing import Any, Optional
@@ -832,6 +833,37 @@ def browser_stop_screencast(tab_id: Optional[int] = None) -> str:
     return _text(call("stopScreencast", {"tabId": tid}))
 
 
+# Kept in sync with the CLI's SCREENCAST_ARTIFACT_PATTERNS: only artifacts a
+# prior save wrote are ever removed from the destination.
+_SCREENCAST_ARTIFACT_PATTERNS = ("frame-*.png", "frame-*.jpg", "frames.json", "frames.json.tmp", "screencast.mp4")
+
+
+def _prepare_screencast_dir(directory: str) -> int:
+    """Create/validate ``directory`` and clear prior save artifacts.
+
+    Runs before the frames are drained, because draining consumes the
+    extension's buffer irrecoverably: an unwritable destination must fail while
+    the frames are still recoverable. Clearing stale ``frame-*`` files keeps a
+    second, shorter save from presenting an earlier recording's tail as its own.
+    """
+    if os.path.exists(directory) and not os.path.isdir(directory):
+        raise BridgeError(f"{directory} exists and is not a directory.")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        if not os.access(directory, os.W_OK):
+            raise PermissionError(f"{directory} is not writable")
+        removed = 0
+        for pattern in _SCREENCAST_ARTIFACT_PATTERNS:
+            for path in glob.glob(os.path.join(glob.escape(directory), pattern)):
+                if not os.path.isfile(path):
+                    continue
+                os.unlink(path)
+                removed += 1
+    except OSError as exc:
+        raise BridgeError(f"Cannot prepare screencast output directory: {exc}") from exc
+    return removed
+
+
 def browser_screencast_save(
     output_dir: str,
     tab_id: Optional[int] = None,
@@ -840,16 +872,19 @@ def browser_screencast_save(
 
     Writes numbered image files plus a ``frames.json`` manifest and returns the
     directory, frame count, dropped-frame count, and byte total, so recorded
-    pixels never land in a transcript. Read-only with respect to the page.
+    pixels never land in a transcript. Read-only with respect to the page, but
+    NOT read-only overall: it consumes the extension's frame buffer and writes
+    local files, replacing any ``frame-*``/``frames.json``/``screencast.mp4``
+    artifacts a previous save left in the destination.
     """
     tid = resolve_tab_id(tab_id)
+    directory = os.path.abspath(os.path.expanduser(output_dir))
+    stale_removed = _prepare_screencast_dir(directory)
     result = call("screencastFrames", {"tabId": tid, "consume": True})
     frames = result.get("frames") if isinstance(result, dict) else None
     if not isinstance(frames, list):
         raise BridgeError("screencastFrames response did not include a frames list.")
     extension = "png" if result.get("format") == "png" else "jpg"
-    directory = os.path.abspath(os.path.expanduser(output_dir))
-    os.makedirs(directory, exist_ok=True)
     total_bytes = 0
     timestamps = []
     written = 0
@@ -865,8 +900,12 @@ def browser_screencast_save(
         written += 1
     manifest_path = os.path.join(directory, "frames.json")
     dropped = result.get("droppedFrames", 0)
-    with open(manifest_path, "w") as handle:
+    # Manifest written last and renamed into place, so a reader never sees a
+    # count that disagrees with the files on disk.
+    manifest_tmp = manifest_path + ".tmp"
+    with open(manifest_tmp, "w") as handle:
         json.dump({"count": written, "dropped": dropped, "timestamps": timestamps}, handle)
+    os.replace(manifest_tmp, manifest_path)
     return _text({
         "success": True,
         "dir": directory,
@@ -874,6 +913,7 @@ def browser_screencast_save(
         "dropped": dropped,
         "bytes": total_bytes,
         "manifest": manifest_path,
+        "staleArtifactsRemoved": stale_removed,
     })
 
 
@@ -1017,10 +1057,12 @@ def browser_search_tabs(
     """Search visible text across every open http/https tab.
 
     Per matching tab returns tabId, origin host (never the full URL), match
-    count, and bounded snippets. Snippets may contain page content, so treat the
-    output as sensitive and keep it out of transcripts. Tabs that cannot be
-    scripted (chrome://, the web store) are skipped and counted in
-    ``skippedTabs``. ``max_matches_per_tab`` is capped at 20 by the extension.
+    count, and bounded snippets. Snippets carry content from EVERY open tab of
+    the real profile, including mail, docs, and admin consoles the agent was
+    never pointed at, so the tool is gated as sensitive
+    (``BRIDGE_MCP_ALLOW_SENSITIVE=1``) alongside history and bookmarks. Tabs
+    that cannot be scripted (chrome://, the web store) are skipped and counted
+    in ``skippedTabs``. ``max_matches_per_tab`` is capped at 20 by the extension.
     """
     return _text(call("searchTabs", {
         "query": query,
@@ -1041,8 +1083,10 @@ def browser_cache_selectors(op: str = "list", entries: Optional[list] = None) ->
     semantic selector (``text=``, ``label=``, ``role=``, ``aria=``) to the CSS
     path that last resolved to that element. CSS selectors are never cached and
     never retargeted, and an imported entry whose selector is not semantic is
-    rejected. The cache lives in extension service-worker memory; the CLI
-    ``chrome-bridge cache selectors`` commands own the file-backed copy.
+    rejected. ``clear`` and ``import`` mutate that cache, so the tool is
+    classified mutating and is dropped in read-only mode. The cache lives in
+    extension service-worker memory; the CLI ``chrome-bridge cache selectors``
+    commands own the file-backed copy.
     """
     payload = {"op": op}
     if entries is not None:
@@ -1058,8 +1102,10 @@ def browser_resolve_cached_selector(
 ) -> str:
     """Resolve a selector to a stable ``ref=eN`` plus a concrete CSS path.
 
-    Serves a cached resolution when one is still valid, otherwise re-resolves
-    the semantic selector and refreshes the cache, reporting ``selfHealed:
+    A cached resolution is served only when the cached CSS path and the original
+    semantic selector resolve to the SAME live DOM node; if the page replaced
+    the element the semantic selector names, the still-resolvable cached path is
+    discarded and the semantic selector is re-resolved, reporting ``selfHealed:
     true``. Returns element identity only (``ref``, ``resolvedSelector``,
     ``urlPattern``), never element text or page content. ``refresh=True`` skips
     the cache. Frame- and shadow-scoped selectors resolve but report
@@ -1109,15 +1155,18 @@ _TOOLS = [
     (browser_console_messages, False, False),
     (browser_screenshot, False, False),
     (browser_save_pdf, False, False),
-    (browser_screencast_save, False, False),
     (browser_get_html, False, False),
     (browser_wait_for, False, False),
     (browser_policy_check, False, False),
     (browser_plan_preview, False, False),
     (browser_trace_summary, False, False),
     (browser_trace_tail, False, False),
-    (browser_search_tabs, False, False),
-    (browser_cache_selectors, False, False),
+    # Consumes the extension frame buffer and writes/replaces local files.
+    (browser_screencast_save, True, False),
+    # clear/import mutate the extension's selector cache.
+    (browser_cache_selectors, True, False),
+    # Snippets span every open tab of the real profile.
+    (browser_search_tabs, False, True),
     (browser_get_cookies, False, True),
     (browser_session_status, False, True),
     (browser_search_history, False, True),

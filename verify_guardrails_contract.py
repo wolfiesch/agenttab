@@ -1042,6 +1042,92 @@ def run_against(label, cmd, env):
         c.close()
     set_tab_origins({None: "https://github.com"})
 
+    # --- replayWorkflow is policed step by step BEFORE it forwards -----------
+    # A recorded workflow reproduces mutating actions inside the extension's
+    # dispatch table, exactly like a batch, so the host must evaluate every
+    # nested step before the outer replay is forwarded at all.
+    def workflow_payload(steps, **extra):
+        payload = {"workflow": {"version": 1, "name": "wf", "steps": steps}}
+        payload.update(extra)
+        return payload
+
+    # (a) a denied nested action blocks the whole replay and forwards nothing.
+    write_policy(permissive_with(deniedActions=["executeScript"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", workflow_payload([
+            {"action": "click", "payload": {"tabId": 7, "selector": "#a"}},
+            {"action": "executeScript", "payload": {"tabId": 7, "code": "1"}},
+        ]))
+        expect(r and r.get("success") is False
+               and "workflow step 1: action executeScript denied" in str(r.get("error", "")),
+               f"{label}: denied nested replay step should name step 1, got {r}")
+        expect(forwarded_actions() == [],
+               f"{label}: denied nested replay step must not forward, got {forwarded_actions()}")
+        pd = (r or {}).get("policyDenial") or {}
+        expect(pd.get("batchStep") == 1 and pd.get("action") == "executeScript",
+               f"{label}: policyDenial should name failing workflow step 1, got {pd}")
+        c.close()
+
+    # (b) a reserved action can never be smuggled in as a workflow step.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", workflow_payload([
+            {"action": "__tabOrigin", "payload": {"tabId": 1}}]))
+        expect(r and r.get("success") is False and "workflow step 0:" in str(r.get("error", "")),
+               f"{label}: reserved replay step must be denied, got {r}")
+        expect("__tabOrigin" not in forwarded_actions(),
+               f"{label}: reserved replay step must not forward")
+        c.close()
+
+    # (c) a confirmation-gated nested action fails the replay outright. There is
+    # no aggregate token: one outer token cannot stand in for per-step approval,
+    # so no token is minted and nothing forwards.
+    write_policy(permissive_with(requireConfirmation=["setCookie"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", workflow_payload([
+            {"action": "click", "payload": {"tabId": 7, "selector": "#a"}},
+            {"action": "setCookie", "payload": {"url": "https://github.com", "name": "s", "value": "1"}},
+        ]))
+        expect(r and r.get("success") is False
+               and "workflow step 1 requires confirmation" in str(r.get("error", "")),
+               f"{label}: confirmation-gated replay step should fail the replay, got {r}")
+        expect(r and r.get("confirmationToken") is None
+               and r.get("confirmationRequired") is not True,
+               f"{label}: a nested confirmation must not mint an outer token, got {r}")
+        expect(forwarded_actions() == [],
+               f"{label}: confirmation-gated replay step must not forward, got {forwarded_actions()}")
+        c.close()
+
+    # (d) nested steps that are all plainly allowed forward as one replay.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", workflow_payload([
+            {"action": "click", "payload": {"tabId": 7, "selector": "#a"}}]))
+        expect(r and r.get("success") is True,
+               f"{label}: an allowed nested click should replay, got {r}")
+        expect("replayWorkflow" in forwarded_actions(),
+               f"{label}: allowed replay should forward, got {forwarded_actions()}")
+        c.close()
+
+    # (e) replay tabId retargeting is origin-checked: the caller's tabId replaces
+    # the recorded one, so the LIVE origin of the target tab governs the step.
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
+    set_tab_origins({7: "https://mail.google.com", 9: "https://github.com"})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", workflow_payload(
+            [{"action": "click", "payload": {"tabId": 9, "selector": "#a"}}], tabId=7))
+        expect(r and r.get("success") is False and str(r.get("error", "")).startswith("policy denied:"),
+               f"{label}: replay retargeted at a denied-origin tab should be denied, got {r}")
+        expect("replayWorkflow" not in forwarded_actions(),
+               f"{label}: denied retargeted replay must not forward, got {forwarded_actions()}")
+        c.close()
+    set_tab_origins({None: "https://github.com"})
+
     # --- policyCheck reports originDependent for tab-scoped actions ---
     write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     with Host(label, cmd, env):
@@ -1210,6 +1296,35 @@ def run_against(label, cmd, env):
     except FileNotFoundError:
         pass
 
+    # --- Secret masking is armed for the VERY FIRST request -------------------
+    # A policy denial quotes the request's target in both the error and the audit
+    # event. If secret masks are only primed on an mtime reload or after the
+    # first successful forward, that first denial writes the raw secret to the
+    # audit log, which is exactly the artifact that must never hold it.
+    with open(SECRETS_FILE, "w") as f:
+        f.write("apiKey=s3cr3t-first-request\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    write_policy(permissive_with(secretMaskFile=SECRETS_FILE,
+                                 allowedOrigins=["https://github.com"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        # First request of this host process, and it is denied.
+        r = c.req("navigate", {"url": "https://s3cr3t-first-request.example.com/x"})
+        expect(r and r.get("success") is False and "target not allowed" in str(r.get("error", "")),
+               f"{label}: navigate to an unlisted origin should be denied, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: denied navigate must not forward, got {forwarded_actions()}")
+        audit_text = json.dumps(audit_events())
+        expect("s3cr3t-first-request" not in audit_text,
+               f"{label}: first-request denial must not write the raw secret to the audit log: {audit_text}")
+        expect("<masked:apiKey>" in audit_text,
+               f"{label}: first-request denial audit should carry the masked secret, got {audit_text}")
+        c.close()
+    try:
+        os.remove(SECRETS_FILE)
+    except FileNotFoundError:
+        pass
+
     # --- Session trace artifacts: one JSONL event per eligible request ---
     # With traceDir configured the host appends exactly one metadata event per
     # trace-eligible request, and never the payload or the response body.
@@ -1280,7 +1395,9 @@ def run_against(label, cmd, env):
     # policy, so nothing needs the (blocked) mock to answer.
     def handoff_result(action, payload):
         if action == "waitForHandoff":
-            time.sleep(2)
+            # Long enough for the whole blacked-out action set to be probed while
+            # the handoff is genuinely in flight.
+            time.sleep(6)
             return {"resolved": True}
         return {"echo": action}
 
@@ -1305,6 +1422,33 @@ def run_against(label, cmd, env):
         r = observer.req("getHTML", {"tabId": 7})
         expect(r and r.get("success") is False and r.get("blackout") is True,
                f"{label}: getHTML during handoff should be blacked out, got {r}")
+        # observe is a full accessibility snapshot of the page the human is
+        # typing into, and the collector actions are the other half of the leak:
+        # retrieval hands back the buffer that spans the handoff, and a start
+        # opened mid-handoff would be read out the moment the blackout lifts.
+        for blacked_out in ("observe", "networkRequests", "interceptedRequests",
+                            "consoleMessages", "screencastFrames",
+                            "startMonitoring", "startInterception", "startScreencast"):
+            r = observer.req(blacked_out, {"tabId": 7})
+            expect(r and r.get("success") is False
+                   and r.get("error") == "handoff in progress"
+                   and r.get("blackout") is True,
+                   f"{label}: {blacked_out} during handoff should be blacked out, got {r}")
+            expect(blacked_out not in forwarded_actions(),
+                   f"{label}: blacked-out {blacked_out} must not forward, got {forwarded_actions()}")
+        # A composite action cannot smuggle an observation past the gate: batch
+        # and replayWorkflow dispatch their steps inside the extension.
+        r = observer.req("batch", {"tabId": 7, "steps": [{"action": "observe"}]})
+        expect(r and r.get("success") is False and r.get("blackout") is True,
+               f"{label}: batch wrapping observe should be blacked out, got {r}")
+        r = observer.req("replayWorkflow", {
+            "tabId": 7,
+            "workflow": {"version": 1, "steps": [{"action": "networkRequests", "payload": {"tabId": 7}}]},
+        })
+        expect(r and r.get("success") is False and r.get("blackout") is True,
+               f"{label}: replayWorkflow wrapping networkRequests should be blacked out, got {r}")
+        expect("batch" not in forwarded_actions() and "replayWorkflow" not in forwarded_actions(),
+               f"{label}: blacked-out composites must not forward, got {forwarded_actions()}")
         r = observer.req("screenshot", {"tabId": 7}, extra={"dryRun": True})
         expect(r and r.get("success") is True and r.get("wouldForward") is False
                and ((r.get("verdict") or {}).get("blackout") is True)
