@@ -484,6 +484,98 @@ def main():
     expect(startup.returncode == 0 and "startup-ok" in startup.stdout,
            f"packaged MCP startup import failed: {startup.stderr.strip()}")
 
+    # 23. HTTP per-request bridge tokens (docs/mcp.md "Per-request bridge
+    # tokens"). ``transport.call(token=...)`` must put the override on the wire
+    # in place of the ambient identity, and must restore the ambient token
+    # afterwards so the stdio path is unaffected.
+    recorder_port = PORT + 1
+    recorded_tokens = []
+    recorder_stop = threading.Event()
+
+    def record_tokens():
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", recorder_port))
+        srv.listen(4)
+        srv.settimeout(0.5)
+        while not recorder_stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if not buf.strip():
+                    continue
+                req = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
+                recorded_tokens.append(req.get("token"))
+                conn.sendall((json.dumps({"success": True, "result": "pong"}) + "\n").encode())
+        srv.close()
+
+    recorder = threading.Thread(target=record_tokens, daemon=True)
+    recorder.start()
+    time.sleep(0.2)
+    saved_port = os.environ["BRIDGE_PORT"]
+    os.environ["BRIDGE_PORT"] = str(recorder_port)
+    try:
+        transport.call("ping", token="per-request-token")
+        expect(recorded_tokens[-1] == "per-request-token",
+               "token override should replace the ambient token in the outbound request")
+        transport.call("ping")
+        expect(recorded_tokens[-1] == "mcp-token",
+               "omitting the token override should restore the ambient bridge token")
+    finally:
+        os.environ["BRIDGE_PORT"] = saved_port
+        recorder_stop.set()
+        recorder.join(timeout=5)
+
+    # 24. Header extraction feeding that override: Bearer wins, X-Bridge-Token
+    # is the fallback, and no HTTP request (the stdio path) means no override.
+    from mcp.server.lowlevel.server import request_ctx  # noqa: E402
+
+    class _Headers(dict):
+        # Mimic Starlette's case-insensitive Headers mapping.
+        def get(self, key, default=None):
+            return dict.get(self, key.lower(), default)
+
+    class _FakeRequest:
+        def __init__(self, headers):
+            self.headers = _Headers(headers)
+
+    class _FakeRequestContext:
+        def __init__(self, request):
+            self.request = request
+
+    header_cases = [
+        ({"authorization": "Bearer bearer-tok", "x-bridge-token": "hdr-tok"}, "bearer-tok",
+         "Authorization: Bearer should win over X-Bridge-Token"),
+        ({"x-bridge-token": "hdr-tok"}, "hdr-tok",
+         "X-Bridge-Token should be used when Authorization is absent"),
+        ({"authorization": "Basic abc"}, None,
+         "a non-Bearer Authorization scheme should not be treated as a bridge token"),
+        ({}, None, "no token header should fall back to the ambient identity"),
+    ]
+    for headers, expected, msg in header_cases:
+        ctx_token = request_ctx.set(_FakeRequestContext(_FakeRequest(headers)))
+        try:
+            expect(server._http_request_token() == expected, msg)
+        finally:
+            request_ctx.reset(ctx_token)
+
+    ctx_token = request_ctx.set(_FakeRequestContext(None))
+    try:
+        expect(server._http_request_token() is None,
+               "stdio requests carry no HTTP request and must use the ambient token")
+    finally:
+        request_ctx.reset(ctx_token)
+
     if failures:
         print(f"\n{len(failures)} contract failure(s).")
         sys.exit(1)

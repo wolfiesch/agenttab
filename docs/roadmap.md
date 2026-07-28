@@ -23,15 +23,15 @@ Progress tracker for the 2026-07 competitive audit. Tiers execute in order: quic
 
 | ID | Feature | Summary | Status |
 |---|---|---|---|
-| HI1 | Handoff telemetry blackout | While `waitForHandoff` is pending on a tab, host denies screenshot/extractText/getHTML/storageState for that tab regardless of policy | todo |
-| HI2 | Stable element refs | `observe` returns `ref=eN` handles usable directly as selectors in click/type/fill | todo |
-| HI3 | Snapshot diffing | Repeat `observe` returns only changes since previous snapshot | todo |
-| HI4 | Per-request HTTP tokens | MCP HTTP transport propagates per-client tokens so leasing arbitrates HTTP clients | todo |
-| HI5 | Parallel lease semantics | Documented intra-token concurrency pattern; per-session queueing guidance | todo |
-| HI6 | Screencast recording | CDP `Page.startScreencast` capture to local video/frames; background-safe | todo |
-| HI7 | Source-mapped console stacks | Resolve original source positions in `consoleMessages` where source maps are available | todo |
-| HI8 | Session trace artifact | Per-task-session JSONL of action/verdict/timing/snapshot-hash pairs | todo |
-| HI9 | Store-ready extension packaging | Packed CRX/zip with stable ID, submission checklist; fixes duplicate-extension port race | todo |
+| HI1 | Handoff telemetry blackout | While `waitForHandoff` is pending on a tab, host denies screenshot/extractText/getHTML/storageState for that tab regardless of policy | done |
+| HI2 | Stable element refs | `observe` returns `ref=eN` handles usable directly as selectors in click/type/fill | done |
+| HI3 | Snapshot diffing | Repeat `observe` returns only changes since previous snapshot | done |
+| HI4 | Per-request HTTP tokens | MCP HTTP transport propagates per-client tokens so leasing arbitrates HTTP clients | done |
+| HI5 | Parallel lease semantics | Documented intra-token concurrency pattern; per-session queueing guidance | done |
+| HI6 | Screencast recording | CDP `Page.startScreencast` capture to local video/frames; background-safe | done |
+| HI7 | Source-mapped console stacks | Resolve original source positions in `consoleMessages` where source maps are available | done |
+| HI8 | Session trace artifact | Policy `traceDir` writes one metadata-only JSONL event per trace-eligible request (`decision`, `durationMs`, tab ids, `responseHash`/`snapshotHash`); CLI `trace summary`/`trace tail`, MCP `browser_trace_summary`/`browser_trace_tail` | done |
+| HI9 | Store-ready extension packaging | Deterministic tracked-files-only upload zip via `scripts/package_extension_store.py`, validated surface, metadata-only output; no publishing and no private key in git | done |
 
 ## Tier 3 - Strategic
 

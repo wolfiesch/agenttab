@@ -79,3 +79,30 @@ Build local release artifacts with:
 ```bash
 python3 scripts/package_release.py --version <version> --dist dist
 ```
+
+## Store package verification
+
+`scripts/package_extension_store.py` builds the zip that is uploaded by hand to the Chrome Web Store developer dashboard. The script writes a local file and prints metadata; it performs no upload and makes no Chrome Web Store API call.
+
+```bash
+python3 scripts/package_extension_store.py --out dist/chrome-bridge-extension-store.zip
+```
+
+Optional JavaScript syntax gate, skipped by default and requiring `node` on `PATH`:
+
+```bash
+python3 scripts/package_extension_store.py --out dist/chrome-bridge-extension-store.zip --check-js
+```
+
+Before writing anything the script fails closed when:
+
+- `extension/background.js` or `extension/manifest.json` exists and is not byte-identical to the canonical root file;
+- `manifest_version` is not `3`, the service worker is not `background.js`, or `nativeMessaging` is missing;
+- the packaged manifest drops any permission held by the canonical root `manifest.json`;
+- the manifest carries a `key` field;
+- `background.js` does not reference the `com.automation.bridge` native messaging host;
+- any forbidden local artifact pattern (tokens, `bridge_policy.json`, `*.pem`, logs, caches, docs, tests) matches a member name.
+
+The archive contains exactly `background.js`, `manifest.json`, `wake.html`, and `wake.js`, written in sorted order with a fixed timestamp, so repeated runs on unchanged inputs produce the same sha256. `verify_install_contract.py` covers this: it packages into a temp directory and asserts the exact member set, the absence of forbidden patterns, `manifest_version` 3, no `key`, root-permission coverage, the fixed timestamp, digest stability across two builds, and rejection of a staged manifest that drops root permissions.
+
+`--source <dir>` packages a prepared staging directory instead of the repository root; the canonical root `manifest.json` is still the permission baseline.

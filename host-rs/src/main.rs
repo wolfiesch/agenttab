@@ -454,6 +454,98 @@ fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
     None
 }
 
+// --- Handoff telemetry blackout --------------------------------------------
+// While a waitForHandoff request is in flight through this host, the human is
+// typing credentials/2FA codes into the real tab. Any observation action would
+// capture that, so the host denies observation for the duration of the handoff
+// -- for every client, including the one that started the handoff.
+//
+// Scope: a handoff whose payload carries a numeric tabId blacks out that tab
+// only; a handoff with no tabId is resolved to the active tab by the extension,
+// which the host cannot see, so it blacks out ALL tabs (GLOBAL). Symmetrically,
+// an observation request with no tabId could land on the blacked-out tab, so it
+// is denied by any live handoff. Fail-safe in both directions. Mirrors bridge.py.
+const HANDOFF_BLACKOUT_ACTIONS: [&str; 8] = [
+    "screenshot",
+    "extractText",
+    "getHTML",
+    "storageState",
+    "printToPDF",
+    "searchTabs",
+    "getCurrentState",
+    "screencastFrames",
+];
+const HANDOFF_BLACKOUT_ERROR: &str = "handoff in progress";
+
+/// One in-flight handoff. `tab_id` None means GLOBAL (extension resolves the
+/// active tab, which the host cannot see).
+struct HandoffRecord {
+    tab_id: Option<i64>,
+    #[allow(dead_code)]
+    started_at: u128,
+    #[allow(dead_code)]
+    client: String,
+}
+
+#[derive(Default)]
+struct HandoffRegistry {
+    next: u64,
+    active: HashMap<u64, HandoffRecord>,
+}
+
+type Handoffs = Arc<Mutex<HandoffRegistry>>;
+
+/// The numeric tabId a request targets, or None for "the active tab", which
+/// only the extension can resolve.
+fn handoff_tab_id(payload: Option<&Value>) -> Option<i64> {
+    payload.and_then(|p| p.get("tabId")).and_then(|v| v.as_i64())
+}
+
+/// Register an in-flight handoff just before forwarding it. The returned handle
+/// must be released on every exit path (see HandoffGuard).
+fn register_handoff(handoffs: &Handoffs, tab_id: Option<i64>, client: &str) -> Option<u64> {
+    let mut reg = handoffs.lock().ok()?;
+    reg.next += 1;
+    let handle = reg.next;
+    reg.active.insert(
+        handle,
+        HandoffRecord { tab_id, started_at: now_ms(), client: client.to_string() },
+    );
+    Some(handle)
+}
+
+/// Drop-scoped release, giving the Python `finally` semantics: the blackout is
+/// cleared whether the forward returns a response, an error, or a timeout.
+struct HandoffGuard<'a> {
+    handoffs: &'a Handoffs,
+    handle: Option<u64>,
+}
+
+impl Drop for HandoffGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle {
+            if let Ok(mut reg) = self.handoffs.lock() {
+                reg.active.remove(&handle);
+            }
+        }
+    }
+}
+
+/// True when an in-flight handoff must suppress this observation request.
+fn handoff_blackout(handoffs: &Handoffs, action: &str, payload: Option<&Value>) -> bool {
+    if !HANDOFF_BLACKOUT_ACTIONS.contains(&action) {
+        return false;
+    }
+    let tab_id = handoff_tab_id(payload);
+    match handoffs.lock() {
+        Ok(reg) => reg
+            .active
+            .values()
+            .any(|record| record.tab_id.is_none() || tab_id.is_none() || record.tab_id == tab_id),
+        Err(_) => false,
+    }
+}
+
 // --- Host-enforced guardrails: policy, audit, redaction --------------------
 // Mirrors bridge.py so the Rust native host governs every local client path
 // (raw TCP/CLI, MCP) with the same policy/audit/redaction behavior.
@@ -465,7 +557,7 @@ fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
 fn sensitive_actions() -> &'static [&'static str] {
     &[
         "getCookies", "storageState", "executeScript", "executeScriptCDP",
-        "startInterception", "downloadUrl",
+        "startInterception", "downloadUrl", "screencastFrames",
     ]
 }
 
@@ -477,7 +569,8 @@ fn mutating_actions() -> &'static [&'static str] {
         "goForward", "setViewport", "setGeolocation", "clearGeolocation",
         "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
         "setColorScheme", "setUserAgent", "startInterception", "stopInterception",
-        "startMonitoring", "stopMonitoring", "handleDialog", "downloadUrl", "batch",
+        "startMonitoring", "stopMonitoring", "startScreencast", "stopScreencast",
+        "handleDialog", "downloadUrl", "batch",
         "createTaskSession", "navigateTaskSession", "updateTaskSessionState", "closeTaskSession",
     ]
 }
@@ -547,6 +640,7 @@ fn default_policy() -> Value {
             "requireConfirmation": [],
             "redactPatterns": [],
             "secretMaskFile": null,
+            "traceDir": null,
             "redact": true,
             "audit": true
         },
@@ -619,7 +713,7 @@ const POLICY_LIST_KEYS: [&str; 6] = [
 ];
 const POLICY_BOOL_KEYS: [&str; 2] = ["redact", "audit"];
 /// String-valued policy keys merged like bools: a later layer replaces the value.
-const POLICY_STR_KEYS: [&str; 1] = ["secretMaskFile"];
+const POLICY_STR_KEYS: [&str; 2] = ["secretMaskFile", "traceDir"];
 
 /// Merge: built-in default -> policy["default"] -> policy["clients"][name].
 fn policy_for_client(policy: &Value, name: &str) -> Value {
@@ -1260,6 +1354,9 @@ fn mask_secrets_value(value: Value, secrets: &[(String, String)]) -> Value {
     }
 }
 
+static AUDIT_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+
 /// Append one JSON line to the audit log. Never writes payload/response bodies,
 /// and never any known secretMaskFile value (a denial reason can quote a
 /// target). A write failure is logged but never blocks browser automation.
@@ -1267,11 +1364,14 @@ fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
     let path = audit_log_path(host_dir);
     let event = mask_secrets_value(event.clone(), &known_secret_masks());
     let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-    let result = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| writeln!(f, "{}", line));
+    let result = match AUDIT_WRITE_LOCK.lock() {
+        Ok(_guard) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| writeln!(f, "{}", line)),
+        Err(e) => Err(io::Error::other(format!("audit write lock poisoned: {}", e))),
+    };
     if let Err(e) = result {
         log_error(logger, &format!("Could not write audit event to {}: {}", path.display(), e));
     }
@@ -1303,6 +1403,215 @@ fn audit(
         "requestId": request_id,
     });
     write_audit_event(host_dir, logger, &event);
+}
+
+// --- Session trace artifacts (policy `traceDir`) ---------------------------
+//
+// Mirrors bridge.py: when a policy layer sets `traceDir`, exactly one JSONL
+// event per trace-eligible request is appended to <traceDir>/<traceId>.jsonl
+// after the request is fully processed (success, host denial, extension error,
+// timeout). The artifact is metadata only -- decision, timing, tab ids, and
+// content hashes -- never a payload body, a response body, or a token.
+
+const TRACE_SESSION_ACTIONS: [&str; 3] =
+    ["createTaskSession", "navigateTaskSession", "closeTaskSession"];
+/// Response keys whose array values are an observe snapshot (or its diff).
+const TRACE_SNAPSHOT_KEYS: [&str; 3] = ["nodes", "snapshot", "diff"];
+const TRACE_ID_MAX: usize = 80;
+
+static TRACE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The trace this request belongs to, or None when it is not trace-eligible.
+/// Priority: explicit traceId, the session the request names, the session a
+/// response just minted, then the session verb itself.
+fn trace_id_for(action: &str, payload: Option<&Value>, response: &Value) -> Option<String> {
+    for key in ["traceId", "sessionId", "taskSessionId"] {
+        if let Some(v) = payload.and_then(|p| p.get(key)).and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    if let Some(v) = response
+        .get("result")
+        .and_then(|r| r.get("sessionId"))
+        .and_then(|v| v.as_str())
+    {
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    if TRACE_SESSION_ACTIONS.contains(&action) {
+        return Some(action.to_string());
+    }
+    None
+}
+
+/// Trace file names come from caller-supplied ids, so everything outside
+/// `[A-Za-z0-9._-]` collapses to `_` and the name is capped: a traceId can
+/// never escape traceDir or grow into an unbounded path component.
+fn sanitize_trace_id(trace_id: &str) -> String {
+    let cleaned: String = trace_id
+        .chars()
+        .take(TRACE_ID_MAX)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "_".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Resolve the client's traceDir. A relative path resolves against the host
+/// install directory, matching the policy and audit paths.
+fn trace_dir_for(policy: &Value, name: &str, host_dir: &Path) -> Option<PathBuf> {
+    let cp = policy_for_client(policy, name);
+    let raw = cp.get("traceDir").and_then(|v| v.as_str())?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let expanded = match raw.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home).join(rest),
+            Err(_) => PathBuf::from(&raw),
+        },
+        None => PathBuf::from(&raw),
+    };
+    if expanded.is_absolute() {
+        Some(expanded)
+    } else {
+        Some(host_dir.join(expanded))
+    }
+}
+
+fn push_trace_tab_ids(source: &Value, out: &mut Vec<i64>) {
+    if let Some(v) = source.get("tabId").and_then(|v| v.as_i64()) {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    if let Some(list) = source.get("tabIds").and_then(|v| v.as_array()) {
+        for item in list {
+            if let Some(v) = item.as_i64() {
+                if !out.contains(&v) {
+                    out.push(v);
+                }
+            }
+        }
+    }
+}
+
+/// Tab ids only: a trace records which tabs an action touched, never their
+/// URLs or titles.
+fn trace_targets(action: &str, payload: Option<&Value>, response: &Value) -> Vec<i64> {
+    let mut out: Vec<i64> = Vec::new();
+    if let Some(p) = payload {
+        push_trace_tab_ids(p, &mut out);
+    }
+    if action == "batch" {
+        for (_, step) in step_payloads(payload) {
+            push_trace_tab_ids(&step, &mut out);
+        }
+    }
+    if let Some(result) = response.get("result") {
+        push_trace_tab_ids(result, &mut out);
+    }
+    out.sort_unstable();
+    out
+}
+
+fn trace_hash(value: &Value) -> String {
+    let encoded = serde_json::to_vec(value).unwrap_or_default();
+    format!("{:x}", Sha256::digest(&encoded))
+}
+
+fn trace_snapshot_subobject(response: &Value) -> Option<Value> {
+    for source in [response.get("result"), Some(response)].into_iter().flatten() {
+        let mut sub = serde_json::Map::new();
+        for key in TRACE_SNAPSHOT_KEYS {
+            if let Some(v) = source.get(key) {
+                if v.is_array() {
+                    sub.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+        if !sub.is_empty() {
+            return Some(Value::Object(sub));
+        }
+    }
+    None
+}
+
+/// Append one JSON line under the same write-lock discipline as the audit log.
+/// A write failure is logged but never blocks browser automation.
+fn write_trace_event(dir: &Path, trace_id: &str, logger: &Arc<Logger>, event: &Value) {
+    let path = dir.join(format!("{}.jsonl", sanitize_trace_id(trace_id)));
+    let line = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    let result = match TRACE_WRITE_LOCK.lock() {
+        Ok(_guard) => std::fs::create_dir_all(dir).and_then(|_| {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| writeln!(f, "{}", line))
+        }),
+        Err(e) => Err(io::Error::other(format!("trace write lock poisoned: {}", e))),
+    };
+    if let Err(e) = result {
+        log_error(logger, &format!("Could not write trace event to {}: {}", path.display(), e));
+    }
+}
+
+/// Exactly one event per fully-processed, trace-eligible request. Secret
+/// masking is applied before hashing and before anything is written, so a known
+/// credential cannot reach the artifact even as a hash preimage.
+#[allow(clippy::too_many_arguments)]
+fn trace_request(
+    host_dir: &Path,
+    logger: &Arc<Logger>,
+    policy: &Value,
+    client: &str,
+    action: &str,
+    payload: Option<&Value>,
+    response: &Value,
+    decision: &str,
+    reason: Option<&str>,
+    request_id: Option<&str>,
+    started_ms: u128,
+) {
+    let dir = match trace_dir_for(policy, client, host_dir) {
+        Some(d) => d,
+        None => return,
+    };
+    let trace_id = match trace_id_for(action, payload, response) {
+        Some(t) => t,
+        None => return,
+    };
+    let secrets = known_secret_masks();
+    let safe_response = mask_secrets_value(response.clone(), &secrets);
+    let snapshot = trace_snapshot_subobject(&safe_response);
+    let event = json!({
+        "ts": now_ms() as u64,
+        "client": client,
+        "action": action,
+        "decision": decision,
+        "reason": reason.map(|r| mask_secret_text(r, &secrets)),
+        "requestId": request_id,
+        "durationMs": now_ms().saturating_sub(started_ms) as u64,
+        "targets": trace_targets(action, payload, &safe_response),
+        "traceId": trace_id,
+        "responseHash": trace_hash(&safe_response),
+        "snapshotHash": snapshot.as_ref().map(trace_hash),
+        "success": safe_response.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+    });
+    write_trace_event(&dir, &trace_id, logger, &event);
 }
 
 const REDACT_KEY_SUBSTRINGS: [&str; 7] =
@@ -1605,6 +1914,7 @@ fn handle_socket_client(
     pending: &Pending,
     lease: &LeaseState,
     confirmations: &Confirmations,
+    handoffs: &Handoffs,
     policy: &Policy,
     stdout: &Arc<Mutex<io::Stdout>>,
     logger: &Arc<Logger>,
@@ -1676,6 +1986,9 @@ fn handle_socket_client(
 
         let mut action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
         let mut payload = cmd.get("payload").cloned();
+        // Start of the traced window: every exit below emits at most one trace
+        // event, measured from here.
+        let trace_started = now_ms();
 
         // Dry run stops before any state change: no confirmation resume, no
         // lease acquisition, no interactive origin approval, no tab-origin
@@ -1689,7 +2002,10 @@ fn handle_socket_client(
                 let cp = policy_for_client(&policy_value, &client_name);
                 let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some("unknown action"), None);
-                let _ = write_line(&mut stream, &json!({"success": false, "error": format!("unknown action: {}", action)}));
+                let resp = json!({"success": false, "error": format!("unknown action: {}", action)});
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                              &resp, "deny", Some("unknown action"), None, trace_started);
+                let _ = write_line(&mut stream, &resp);
                 continue;
             }
             let policy_value = current_policy(policy, host_dir, logger);
@@ -1698,6 +2014,13 @@ fn handle_socket_client(
             if let Some(blocked) = lease_gate(&client_name, lease) {
                 verdict["allowed"] = Value::Bool(false);
                 verdict["reason"] = blocked.get("error").cloned().unwrap_or(Value::Null);
+            }
+            // A live handoff blackout outranks policy and lease: the request
+            // would be denied before policy evaluation, so say so here.
+            if handoff_blackout(handoffs, &action, payload.as_ref()) {
+                verdict["allowed"] = Value::Bool(false);
+                verdict["reason"] = Value::String(HANDOFF_BLACKOUT_ERROR.to_string());
+                verdict["blackout"] = Value::Bool(true);
             }
             // Host-answered actions resolve without Chrome, so they would never
             // forward even when fully allowed.
@@ -1719,6 +2042,8 @@ fn handle_socket_client(
                 "targets": targets,
                 "verdict": verdict,
             });
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &resp, "dry_run", reason.as_deref(), None, trace_started);
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
@@ -1752,10 +2077,14 @@ fn handle_socket_client(
                     let cp = policy_for_client(&policy_value, &client_name);
                     let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
                     audit(host_dir, logger, audit_enabled, &client_name, "confirm", &[], "confirmation_deny", Some("invalid or expired confirmation token"), None);
-                    let _ = write_line(&mut stream, &json!({
+                    let resp = json!({
                         "success": false,
                         "error": "invalid or expired confirmation token"
-                    }));
+                    });
+                    trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                                  &resp, "confirmation_deny", Some("invalid or expired confirmation token"),
+                                  None, trace_started);
+                    let _ = write_line(&mut stream, &resp);
                     continue;
                 }
             }
@@ -1770,7 +2099,10 @@ fn handle_socket_client(
             let cp = policy_for_client(&policy_value, &client_name);
             let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
             audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some("unknown action"), None);
-            let _ = write_line(&mut stream, &json!({"success": false, "error": format!("unknown action: {}", action)}));
+            let resp = json!({"success": false, "error": format!("unknown action: {}", action)});
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &resp, "deny", Some("unknown action"), None, trace_started);
+            let _ = write_line(&mut stream, &resp);
             continue;
         }
 
@@ -1783,6 +2115,8 @@ fn handle_socket_client(
             let decision = if success { "lease_allow" } else { "lease_deny" };
             let reason = resp.get("error").and_then(|v| v.as_str());
             audit(host_dir, logger, audit_enabled, &client_name, &action, &[], decision, reason, None);
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &resp, decision, reason, None, trace_started);
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
@@ -1805,12 +2139,18 @@ fn handle_socket_client(
                 if plan.len() > PLAN_PREVIEW_MAX_STEPS {
                     let reason = format!("plan exceeds {} steps", PLAN_PREVIEW_MAX_STEPS);
                     audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &[], "deny", Some(&reason), None);
-                    let _ = write_line(&mut stream, &json!({"success": false, "error": reason}));
+                    let resp = json!({"success": false, "error": reason});
+                    trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
+                                  &resp, "deny", Some(&reason), None, trace_started);
+                    let _ = write_line(&mut stream, &resp);
                     continue;
                 }
                 let steps = plan_step_verdicts(&policy_value, &client_name, plan);
                 audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &[], "allow", None, None);
-                if write_line(&mut stream, &json!({"success": true, "result": {"plan": steps}})).is_err() {
+                let resp = json!({"success": true, "result": {"plan": steps}});
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
+                              &resp, "allow", None, None, trace_started);
+                if write_line(&mut stream, &resp).is_err() {
                     return;
                 }
                 continue;
@@ -1835,6 +2175,8 @@ fn handle_socket_client(
                 "originDependent": origin_dependent,
             }});
             audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &targets, "allow", None, None);
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
+                          &resp, "allow", None, None, trace_started);
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
@@ -1852,16 +2194,39 @@ fn handle_socket_client(
             let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
             let policy_file = policy_file_path(host_dir);
             let audit_log = audit_log_path(host_dir);
+            let trace_dir = trace_dir_for(&policy_value, &client_name, host_dir)
+                .map(|p| p.to_string_lossy().to_string());
             let resp = json!({"success": true, "result": {
                 "policyFile": policy_file.to_string_lossy(),
                 "policyFileExists": policy_file.exists(),
                 "auditLogFile": audit_log.to_string_lossy(),
+                "traceDir": trace_dir,
                 "client": client_name,
             }});
             audit(host_dir, logger, audit_enabled, &client_name, "policyInfo", &[], "allow", None, None);
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &resp, "allow", None, None, trace_started);
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
+            continue;
+        }
+
+        // Handoff telemetry blackout runs BEFORE policy evaluation: while a
+        // human is completing a login/2FA/captcha step, no client may observe
+        // the tab, no matter what policy would otherwise allow.
+        if handoff_blackout(handoffs, &action, payload.as_ref()) {
+            let cp = policy_for_client(&policy_value, &client_name);
+            let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "handoff_blackout", Some(HANDOFF_BLACKOUT_ERROR), None);
+            let resp = json!({
+                "success": false,
+                "error": HANDOFF_BLACKOUT_ERROR,
+                "blackout": true
+            });
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &resp, "handoff_blackout", Some(HANDOFF_BLACKOUT_ERROR), None, trace_started);
+            let _ = write_line(&mut stream, &resp);
             continue;
         }
 
@@ -1875,7 +2240,10 @@ fn handle_socket_client(
         if !allowed {
             let reason = _reason.unwrap_or_default();
             audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
-            let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)}));
+            let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)});
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &resp, "deny", Some(&reason), None, trace_started);
+            let _ = write_line(&mut stream, &resp);
             continue;
         }
 
@@ -1902,6 +2270,8 @@ fn handle_socket_client(
             if let Some(blocked) = lease_gate(&client_name, lease) {
                 let reason = blocked.get("error").and_then(|v| v.as_str());
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "lease_deny", reason, None);
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                              &blocked, "lease_deny", reason, None, trace_started);
                 if write_line(&mut stream, &blocked).is_err() {
                     return;
                 }
@@ -1915,7 +2285,10 @@ fn handle_socket_client(
                 let mut t = targets.clone();
                 t.push("<unresolved-origin>".to_string());
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &t, "deny", Some("tab origin unresolved"), None);
-                let _ = write_line(&mut stream, &json!({"success": false, "error": "policy denied: tab origin unresolved", "policyDenial": policy_denial("tab origin unresolved", &action, &t, &client_name, host_dir, &policy_value)}));
+                let resp = json!({"success": false, "error": "policy denied: tab origin unresolved", "policyDenial": policy_denial("tab origin unresolved", &action, &t, &client_name, host_dir, &policy_value)});
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                              &resp, "deny", Some("tab origin unresolved"), None, trace_started);
+                let _ = write_line(&mut stream, &resp);
                 continue;
             }
             let (allowed, reason, confirm, _, _, targets) =
@@ -1923,7 +2296,10 @@ fn handle_socket_client(
             if !allowed {
                 let reason = reason.unwrap_or_default();
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
-                let _ = write_line(&mut stream, &json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)}));
+                let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)});
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                              &resp, "deny", Some(&reason), None, trace_started);
+                let _ = write_line(&mut stream, &resp);
                 continue;
             }
             (confirm, targets)
@@ -1951,7 +2327,7 @@ fn handle_socket_client(
                     &targets,
                 );
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "confirmation_required", None, None);
-                let _ = write_line(&mut stream, &json!({
+                let resp = json!({
                     "success": false,
                     "error": "confirmation required",
                     "confirmationRequired": true,
@@ -1960,7 +2336,10 @@ fn handle_socket_client(
                     "confirmationToken": token,
                     "expiresAt": expires_at,
                     "resumeCommand": format!("chrome-bridge confirm {}", token)
-                }));
+                });
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                              &resp, "confirmation_required", None, None, trace_started);
+                let _ = write_line(&mut stream, &resp);
                 continue;
             }
         }
@@ -1969,6 +2348,8 @@ fn handle_socket_client(
         if let Some(blocked) = lease_gate(&client_name, lease) {
             let reason = blocked.get("error").and_then(|v| v.as_str());
             audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "lease_deny", reason, None);
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &blocked, "lease_deny", reason, None, trace_started);
             if write_line(&mut stream, &blocked).is_err() {
                 return;
             }
@@ -1989,6 +2370,17 @@ fn handle_socket_client(
             let ce = client_name.clone();
             let ac = action.clone();
             let tg = targets.clone();
+            // A waitForHandoff forward opens a telemetry blackout for the whole
+            // time the human is interacting with the tab; the guard drops it on
+            // every exit path (response, extension error, or timeout).
+            let _handoff_guard = HandoffGuard {
+                handoffs,
+                handle: if action == "waitForHandoff" {
+                    register_handoff(handoffs, handoff_tab_id(payload.as_ref()), &client_name)
+                } else {
+                    None
+                },
+            };
             forward_to_extension(cmd, pending, stdout, logger, resp_timeout, |rid| {
                 audit(h, l, audit_enabled, &ce, &ac, &tg, "allow", None, Some(rid));
             })
@@ -2000,6 +2392,11 @@ fn handle_socket_client(
                 let reason = response.get("error").and_then(|v| v.as_str());
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, ext_decision, reason, Some(&req_id));
                 let response = redact_response(&action, response, redact_enabled, redact_patterns.as_ref(), payload.as_ref(), &secrets);
+                // Trace the response the client actually receives: already
+                // redacted and secret-masked, so the hash covers no raw content.
+                let reason = response.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                              &response, ext_decision, reason.as_deref(), Some(&req_id), trace_started);
                 if write_line(&mut stream, &response).is_err() {
                     return;
                 }
@@ -2010,10 +2407,10 @@ fn handle_socket_client(
                     &format!("Timed out waiting for extension response to {}.", req_id),
                 );
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "extension_error", Some("extension response timeout"), Some(&req_id));
-                let _ = write_line(
-                    &mut stream,
-                    &json!({"success": false, "error": "extension response timeout"}),
-                );
+                let resp = json!({"success": false, "error": "extension response timeout"});
+                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                              &resp, "extension_error", Some("extension response timeout"), Some(&req_id), trace_started);
+                let _ = write_line(&mut stream, &resp);
                 return;
             }
         }
@@ -2026,6 +2423,7 @@ fn socket_server_loop(
     pending: Pending,
     lease: LeaseState,
     confirmations: Confirmations,
+    handoffs: Handoffs,
     policy: Policy,
     stdout: Arc<Mutex<io::Stdout>>,
     logger: Arc<Logger>,
@@ -2079,11 +2477,12 @@ fn socket_server_loop(
                 let pending = Arc::clone(&pending);
                 let lease = Arc::clone(&lease);
                 let confirmations = Arc::clone(&confirmations);
+                let handoffs = Arc::clone(&handoffs);
                 let policy = Arc::clone(&policy);
                 let stdout = Arc::clone(&stdout);
                 let logger = Arc::clone(&logger);
                 std::thread::spawn(move || {
-                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &confirmations, &policy, &stdout, &logger);
+                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &confirmations, &handoffs, &policy, &stdout, &logger);
                 });
             }
             Err(e) => {
@@ -2112,6 +2511,7 @@ fn main() {
         expires_at: None,
     }));
     let confirmations: Confirmations = Arc::new(Mutex::new(HashMap::new()));
+    let handoffs: Handoffs = Arc::new(Mutex::new(HandoffRegistry::default()));
     let policy: Policy = Arc::new(RwLock::new(build_policy_registry(&host_dir, &logger)));
 
     {
@@ -2120,11 +2520,12 @@ fn main() {
         let pending = Arc::clone(&pending);
         let lease = Arc::clone(&lease);
         let confirmations = Arc::clone(&confirmations);
+        let handoffs = Arc::clone(&handoffs);
         let policy = Arc::clone(&policy);
         let stdout = Arc::clone(&stdout);
         let logger = Arc::clone(&logger);
         std::thread::spawn(move || {
-            socket_server_loop(host_dir, tokens, pending, lease, confirmations, policy, stdout, logger);
+            socket_server_loop(host_dir, tokens, pending, lease, confirmations, handoffs, policy, stdout, logger);
         });
     }
 

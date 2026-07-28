@@ -5,6 +5,7 @@ the MCP surface and the CLI share one wire implementation (connect-retry, token
 load, newline framing, socket timeout). ``test_client`` guards its CLI behind
 ``if __name__ == '__main__'``, so importing it is side-effect-free.
 """
+import contextlib
 import importlib.util
 import os
 import sys
@@ -44,11 +45,34 @@ _client = _load_test_client()
 _call_lock = threading.Lock()
 
 
+@contextlib.contextmanager
+def _token_override(token):
+    """Make the shared wire implementation use ``token`` for one call.
+
+    ``send_command_data`` resolves the bridge token through the module-level
+    ``load_token`` of ``test_client``. Swapping that loader (rather than
+    forking the wire implementation) keeps CLI and MCP on one code path while
+    letting an HTTP request carry its own bridge identity. Safe because every
+    outbound call is serialized by ``_call_lock``, which the caller already
+    holds. Never logs or echoes the token value.
+    """
+    if not token:
+        yield
+        return
+    original = _client.load_token
+    _client.load_token = lambda: token
+    try:
+        yield
+    finally:
+        _client.load_token = original
+
+
 class BridgeError(Exception):
     """Raised when the bridge transport or the extension reports a failure."""
 
 
-def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False):
+def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False,
+         token=None):
     """Send one action to the bridge and return its ``result`` payload.
 
     Raises ``BridgeError`` with an actionable message on transport failures,
@@ -57,8 +81,11 @@ def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dr
     handoff); the wire timeout is kept above it so transport never fires first.
     ``dry_run`` sets the request-level ``dryRun`` flag: the host evaluates the
     request and reports its verdict without forwarding anything to Chrome.
+    ``token`` overrides the ambient bridge token for this request only (used by
+    the HTTP transport to propagate a per-request caller identity); when it is
+    ``None`` the ambient ``bridge_token.txt`` identity is used unchanged.
     """
-    with _call_lock:
+    with _call_lock, _token_override(token):
         exit_code, response, stderr = _client.send_command_data(
             action, payload or {}, read_timeout_ms=read_timeout_ms,
             confirmation_token=confirmation_token, dry_run=dry_run)
@@ -94,14 +121,16 @@ def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dr
     return result
 
 
-def resolve_tab_id(tab_id):
+def resolve_tab_id(tab_id, token=None):
     """Return ``tab_id`` if given, else the active tab's id.
 
-    Falls back to the first tab when no tab is marked active.
+    Falls back to the first tab when no tab is marked active. ``token`` is the
+    same per-request identity override ``call`` takes, so the lookup runs as
+    the requesting client rather than the ambient one.
     """
     if tab_id is not None:
         return tab_id
-    tabs = call("getTabs")
+    tabs = call("getTabs", token=token)
     if not isinstance(tabs, list) or not tabs:
         raise BridgeError("No open tabs to resolve an active tab from.")
     for tab in tabs:

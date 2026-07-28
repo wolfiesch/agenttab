@@ -281,6 +281,68 @@ def handle_lease_action(action, payload, name):
         # leaseStatus: non-mutating snapshot (expired leases already cleared).
         return {"success": True, "result": {"owner": owner, "expiresAt": expires_at, "now": now_ms()}}
 
+# --- Handoff telemetry blackout ---------------------------------------------
+# While a waitForHandoff request is in flight through this host, the human is
+# typing credentials/2FA codes into the real tab. Any observation action would
+# capture that, so the host denies observation for the duration of the handoff
+# -- for every client, including the one that started the handoff.
+#
+# Scope: a handoff whose payload carries a numeric tabId blacks out that tab
+# only; a handoff with no tabId is resolved to the active tab by the extension,
+# which the host cannot see, so it blacks out ALL tabs (GLOBAL). Symmetrically,
+# an observation request with no tabId could land on the blacked-out tab, so it
+# is denied by any live handoff. Fail-safe in both directions.
+HANDOFF_BLACKOUT_ACTIONS = {
+    'screenshot', 'extractText', 'getHTML', 'storageState', 'printToPDF',
+    'searchTabs', 'getCurrentState', 'screencastFrames',
+}
+HANDOFF_BLACKOUT_ERROR = 'handoff in progress'
+
+_handoff_lock = threading.Lock()
+_handoff_seq = 0
+# handle -> {'tabId': int|None (None = GLOBAL), 'startedAt': ms, 'client': name}
+_handoff_active = {}
+
+
+def handoff_tab_id(payload):
+    # The numeric tabId a request targets, or None for "the active tab", which
+    # only the extension can resolve.
+    tab_id = payload.get('tabId') if isinstance(payload, dict) else None
+    if isinstance(tab_id, bool) or not isinstance(tab_id, int):
+        return None
+    return tab_id
+
+
+def register_handoff(tab_id, client):
+    # Called immediately before a waitForHandoff forward; the returned handle
+    # must be released in a finally so no exit path leaves a stale blackout.
+    global _handoff_seq
+    with _handoff_lock:
+        _handoff_seq += 1
+        handle = _handoff_seq
+        _handoff_active[handle] = {
+            'tabId': tab_id, 'startedAt': now_ms(), 'client': client}
+    return handle
+
+
+def clear_handoff(handle):
+    if handle is None:
+        return
+    with _handoff_lock:
+        _handoff_active.pop(handle, None)
+
+
+def handoff_blackout(action, payload):
+    # True when an in-flight handoff must suppress this observation request.
+    if action not in HANDOFF_BLACKOUT_ACTIONS:
+        return False
+    tab_id = handoff_tab_id(payload)
+    with _handoff_lock:
+        for record in _handoff_active.values():
+            if record['tabId'] is None or tab_id is None or record['tabId'] == tab_id:
+                return True
+    return False
+
 # --- Host-enforced guardrails: policy, audit, redaction ---------------------
 # Policy is enforced in the host request path so every local client (Python or
 # Rust host, raw TCP/CLI, MCP) is governed by the same rules before any action
@@ -294,7 +356,7 @@ AUDIT_LOG_FILE = os.environ.get('BRIDGE_AUDIT_LOG_FILE', os.path.join(SCRIPT_DIR
 # file, not these sets.
 SENSITIVE_ACTIONS = {
     'getCookies', 'storageState', 'executeScript', 'executeScriptCDP',
-    'startInterception', 'downloadUrl',
+    'startInterception', 'downloadUrl', 'screencastFrames',
 }
 MUTATING_ACTIONS = {
     'navigate', 'click', 'type', 'fill', 'hover', 'scroll', 'press', 'drag',
@@ -303,6 +365,7 @@ MUTATING_ACTIONS = {
     'setCpuThrottling', 'setNetworkConditions', 'clearNetworkConditions',
     'setColorScheme', 'setUserAgent',
     'startInterception', 'stopInterception', 'startMonitoring', 'stopMonitoring',
+    'startScreencast', 'stopScreencast',
     'handleDialog', 'downloadUrl', 'batch',
     'createTaskSession', 'navigateTaskSession', 'updateTaskSessionState', 'closeTaskSession',
 }
@@ -348,6 +411,7 @@ DEFAULT_POLICY = {
         "requireConfirmation": [],
         "redactPatterns": [],
         "secretMaskFile": None,
+        "traceDir": None,
         "redact": True,
         "audit": True,
     },
@@ -402,7 +466,7 @@ _POLICY_LIST_KEYS = (
 )
 _POLICY_BOOL_KEYS = ('redact', 'audit')
 # String-valued policy keys merged like bools: a later layer replaces the value.
-_POLICY_STR_KEYS = ('secretMaskFile',)
+_POLICY_STR_KEYS = ('secretMaskFile', 'traceDir')
 
 
 def policy_for_client(policy, name):
@@ -963,14 +1027,19 @@ def mask_secrets_value(value, secrets):
     return value
 
 
+_audit_write_lock = threading.Lock()
+
+
 def write_audit_event(event):
     # Append one JSON line. Never writes payload/response bodies, and never any
     # known secretMaskFile value (a denial reason can quote a target). A write
     # failure is logged but never blocks browser automation.
     try:
         event = mask_secrets_value(event, _known_secret_masks())
-        with open(AUDIT_LOG_FILE, 'a') as f:
-            f.write(json.dumps(event) + "\n")
+        line = json.dumps(event) + "\n"
+        with _audit_write_lock:
+            with open(AUDIT_LOG_FILE, 'a') as f:
+                f.write(line)
     except Exception as e:
         logging.error(f"Could not write audit event to {AUDIT_LOG_FILE}: {e}")
 
@@ -986,6 +1055,160 @@ def _audit(audit_enabled, client, action, targets, decision, reason, request_id)
         "decision": decision,
         "reason": reason,
         "requestId": request_id,
+    })
+
+
+# --- Session trace artifacts (policy ``traceDir``) --------------------------
+#
+# When a policy layer sets ``traceDir``, the host appends exactly one JSONL
+# event per trace-eligible request to <traceDir>/<traceId>.jsonl, after the
+# request is fully processed (success, host denial, extension error, timeout).
+# The artifact is metadata only -- decision, timing, tab ids, and content
+# hashes -- so a trace answers "what did this session do, and did the page
+# change" without ever storing what was read, typed, or returned. No payload
+# body, no response body, no tokens.
+
+TRACE_SESSION_ACTIONS = {'createTaskSession', 'navigateTaskSession', 'closeTaskSession'}
+
+# Trace file names are derived from caller-supplied ids, so everything outside
+# this set collapses to "_" and the name is capped: a traceId can never escape
+# traceDir or grow into an unbounded path component.
+_TRACE_SAFE_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+_TRACE_ID_MAX = 80
+
+# Response keys whose array values are an observe snapshot (or its diff). Their
+# hash lets a reader tell "the page changed" from "the page is unchanged"
+# without the snapshot itself ever being written.
+_TRACE_SNAPSHOT_KEYS = ('nodes', 'snapshot', 'diff')
+
+_trace_write_lock = threading.Lock()
+
+
+def trace_id_for(action, payload, response):
+    # The trace this request belongs to, or None when it is not trace-eligible.
+    # Priority: explicit traceId, then the session the request names, then the
+    # session a createTaskSession response just minted, then the session verb.
+    payload = payload if isinstance(payload, dict) else {}
+    for key in ('traceId', 'sessionId', 'taskSessionId'):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    result = response.get('result') if isinstance(response, dict) else None
+    if isinstance(result, dict):
+        value = result.get('sessionId')
+        if isinstance(value, str) and value:
+            return value
+    if action in TRACE_SESSION_ACTIONS:
+        return action
+    return None
+
+
+def sanitize_trace_id(trace_id):
+    cleaned = ''.join(ch if ch in _TRACE_SAFE_CHARS else '_' for ch in str(trace_id))
+    return cleaned[:_TRACE_ID_MAX] or '_'
+
+
+def trace_dir_for(policy, name):
+    # Resolve the client's traceDir. A relative path resolves against the host
+    # install directory, matching how the policy and audit paths behave.
+    value = policy_for_client(policy, name).get('traceDir')
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = os.path.expanduser(value.strip())
+    if not os.path.isabs(path):
+        path = os.path.join(SCRIPT_DIR, path)
+    return path
+
+
+def trace_targets(action, payload, response):
+    # Tab ids only: a trace records which tabs an action touched, never their
+    # URLs or titles.
+    out = []
+
+    def add(value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return
+        if value not in out:
+            out.append(value)
+
+    sources = [payload if isinstance(payload, dict) else {}]
+    if action == 'batch':
+        sources.extend(step_payload for _, step_payload in _step_payloads(payload))
+    result = response.get('result') if isinstance(response, dict) else None
+    if isinstance(result, dict):
+        sources.append(result)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        add(source.get('tabId'))
+        ids = source.get('tabIds')
+        if isinstance(ids, list):
+            for value in ids:
+                add(value)
+    return sorted(out)
+
+
+def trace_hash(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(',', ':'), default=str)
+    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
+def trace_snapshot_subobject(response):
+    if not isinstance(response, dict):
+        return None
+    for source in (response.get('result'), response):
+        if not isinstance(source, dict):
+            continue
+        sub = {k: source[k] for k in _TRACE_SNAPSHOT_KEYS if isinstance(source.get(k), list)}
+        if sub:
+            return sub
+    return None
+
+
+def write_trace_event(trace_dir, trace_id, event):
+    # Append one JSON line under the same write-lock discipline as the audit
+    # log. A write failure is logged but never blocks browser automation.
+    try:
+        os.makedirs(trace_dir, exist_ok=True)
+        path = os.path.join(trace_dir, sanitize_trace_id(trace_id) + '.jsonl')
+        line = json.dumps(event) + "\n"
+        with _trace_write_lock:
+            with open(path, 'a') as f:
+                f.write(line)
+    except Exception as e:
+        logging.error(f"Could not write trace event to {trace_dir}: {e}")
+
+
+def trace_request(policy, client, action, payload, response, decision, reason,
+                  request_id, started_ms):
+    # Exactly one event per fully-processed, trace-eligible request. Secret
+    # masking is applied before hashing and before anything is written, so a
+    # known credential cannot reach the artifact even through a hash preimage.
+    if policy is None or not client:
+        return
+    trace_dir = trace_dir_for(policy, client)
+    if not trace_dir:
+        return
+    trace_id = trace_id_for(action, payload, response)
+    if not trace_id:
+        return
+    secrets = _known_secret_masks()
+    safe_response = mask_secrets_value(response, secrets) if isinstance(response, dict) else {}
+    snapshot = trace_snapshot_subobject(safe_response)
+    write_trace_event(trace_dir, trace_id, {
+        "ts": now_ms(),
+        "client": client,
+        "action": action,
+        "decision": decision,
+        "reason": mask_secret_text(reason, secrets) if isinstance(reason, str) else reason,
+        "requestId": request_id,
+        "durationMs": max(0, now_ms() - started_ms),
+        "targets": trace_targets(action, payload, response),
+        "traceId": trace_id,
+        "responseHash": trace_hash(safe_response),
+        "snapshotHash": trace_hash(snapshot) if snapshot is not None else None,
+        "success": bool(safe_response.get("success")) if isinstance(safe_response, dict) else False,
     })
 
 
@@ -1183,6 +1406,18 @@ def handle_socket_client(client_socket):
     # forwarded to the extension and its response awaited via a per-request
     # queue before the next request is read, preserving request/response order.
     buffer = b""
+    # Per-request trace context, refreshed for every line read on this
+    # connection. ``respond`` is the single terminal exit for a request: it
+    # writes at most one trace event and then sends the response line, so a
+    # traced request can never produce two events or none.
+    trace_ctx = {"client": None, "action": None, "payload": None, "started": now_ms()}
+
+    def respond(resp, decision, reason=None, request_id=None):
+        trace_request(current_policy(), trace_ctx["client"], trace_ctx["action"],
+                      trace_ctx["payload"], resp, decision, reason, request_id,
+                      trace_ctx["started"])
+        client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+
     try:
         client_socket.settimeout(SOCKET_IDLE_TIMEOUT)
         while True:
@@ -1215,6 +1450,8 @@ def handle_socket_client(client_socket):
             dry_run = cmd.pop("dryRun", None) is True
 
             action = cmd.get("action")
+            trace_ctx.update({"client": name, "action": action,
+                              "payload": cmd.get("payload") or {}, "started": now_ms()})
 
             # Dry run stops before any state change: no confirmation resume, no
             # lease acquisition, no interactive origin approval, no tab-origin
@@ -1226,8 +1463,8 @@ def handle_socket_client(client_socket):
                     policy = current_policy()
                     audit_enabled = policy_for_client(policy, name).get('audit', True)
                     _audit(audit_enabled, name, action, [], "deny", "unknown action", None)
-                    client_socket.sendall(
-                        (json.dumps({"success": False, "error": f"unknown action: {action}"}) + "\n").encode('utf-8'))
+                    respond({"success": False, "error": f"unknown action: {action}"},
+                            "deny", "unknown action")
                     continue
                 policy = current_policy()
                 verdict, targets = policy_verdict(policy, name, action, cmd.get("payload") or {})
@@ -1237,20 +1474,26 @@ def handle_socket_client(client_socket):
                 if lease_blocked:
                     verdict["allowed"] = False
                     verdict["reason"] = f"leased by {owner}"
+                # A live handoff blackout outranks policy and lease: the request
+                # would be denied before policy evaluation, so say so here.
+                if handoff_blackout(action, cmd.get("payload") or {}):
+                    verdict["allowed"] = False
+                    verdict["reason"] = HANDOFF_BLACKOUT_ERROR
+                    verdict["blackout"] = True
                 # Host-answered actions resolve without Chrome, so they would
                 # never forward even when fully allowed.
                 host_side = action in ('lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo', 'confirm')
                 would_forward = bool(
                     verdict["allowed"] and not verdict["confirmationRequired"] and not host_side)
                 _audit(verdict["audit"], name, action, targets, "dry_run", verdict["reason"], None)
-                client_socket.sendall((json.dumps({
+                respond({
                     "success": True,
                     "dryRun": True,
                     "wouldForward": would_forward,
                     "action": action,
                     "targets": targets,
                     "verdict": verdict,
-                }) + "\n").encode('utf-8'))
+                }, "dry_run", verdict["reason"])
                 continue
 
             # Token-only confirmation resume. The host keeps the original
@@ -1265,16 +1508,20 @@ def handle_socket_client(client_socket):
                     policy = current_policy()
                     audit_enabled = policy_for_client(policy, name).get('audit', True)
                     _audit(audit_enabled, name, "confirm", [], "confirmation_deny", "invalid or expired confirmation token", None)
-                    client_socket.sendall((json.dumps({
+                    respond({
                         "success": False,
                         "error": "invalid or expired confirmation token",
-                    }) + "\n").encode('utf-8'))
+                    }, "confirmation_deny", "invalid or expired confirmation token")
                     continue
                 confirmation_token = resume_token
                 requester_name = name
                 name = resumed["client"]
                 action = resumed["action"]
                 cmd = {"action": action, "payload": resumed["payload"]}
+                # The resumed action is the one that gets traced, under the
+                # client that originally asked for it.
+                trace_ctx.update({"client": name, "action": action,
+                                  "payload": resumed["payload"]})
                 policy = current_policy()
                 audit_enabled = policy_for_client(policy, requester_name).get('audit', True)
                 _audit(audit_enabled, requester_name, "confirm", [], "confirmation_resume", None, None)
@@ -1287,8 +1534,8 @@ def handle_socket_client(client_socket):
                 policy = current_policy()
                 audit_enabled = policy_for_client(policy, name).get('audit', True)
                 _audit(audit_enabled, name, action, [], "deny", "unknown action", None)
-                client_socket.sendall(
-                    (json.dumps({"success": False, "error": f"unknown action: {action}"}) + "\n").encode('utf-8'))
+                respond({"success": False, "error": f"unknown action: {action}"},
+                        "deny", "unknown action")
                 continue
 
             # Lease control actions are answered host-side, never forwarded.
@@ -1298,7 +1545,7 @@ def handle_socket_client(client_socket):
                 audit_enabled = policy_for_client(policy, name).get('audit', True)
                 decision = "lease_allow" if resp.get("success") else "lease_deny"
                 _audit(audit_enabled, name, action, [], decision, resp.get("error"), None)
-                client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                respond(resp, decision, resp.get("error"))
                 continue
 
             policy = current_policy()
@@ -1317,14 +1564,14 @@ def handle_socket_client(client_socket):
                     if len(plan) > PLAN_PREVIEW_MAX_STEPS:
                         _audit(audit_enabled, name, "policyCheck", [], "deny",
                                f"plan exceeds {PLAN_PREVIEW_MAX_STEPS} steps", None)
-                        client_socket.sendall((json.dumps({
+                        respond({
                             "success": False,
                             "error": f"plan exceeds {PLAN_PREVIEW_MAX_STEPS} steps",
-                        }) + "\n").encode('utf-8'))
+                        }, "deny", f"plan exceeds {PLAN_PREVIEW_MAX_STEPS} steps")
                         continue
                     resp = {"success": True, "result": {"plan": plan_step_verdicts(policy, name, plan)}}
                     _audit(audit_enabled, name, "policyCheck", [], "allow", None, None)
-                    client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                    respond(resp, "allow")
                     continue
                 target_action = pc_payload.get("action") or ""
                 target_payload = pc_payload.get("payload") or {}
@@ -1347,7 +1594,7 @@ def handle_socket_client(client_socket):
                     "originDependent": origin_dependent,
                 }}
                 _audit(audit_enabled, name, "policyCheck", targets, "allow", None, None)
-                client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                respond(resp, "allow")
                 continue
 
             # policyInfo is host-side and always answerable (handled before the
@@ -1364,14 +1611,28 @@ def handle_socket_client(client_socket):
                     "policyFile": POLICY_FILE,
                     "policyFileExists": os.path.exists(POLICY_FILE),
                     "auditLogFile": AUDIT_LOG_FILE,
+                    "traceDir": trace_dir_for(policy, name),
                     "client": name,
                 }}
                 _audit(audit_enabled, name, "policyInfo", [], "allow", None, None)
-                client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                respond(resp, "allow")
                 continue
 
             payload = cmd.get("payload") or {}
             audit_enabled = policy_for_client(policy, name).get('audit', True)
+
+            # Handoff telemetry blackout runs BEFORE policy evaluation: while a
+            # human is completing a login/2FA/captcha step, no client may observe
+            # the tab, no matter what policy would otherwise allow.
+            if handoff_blackout(action, payload):
+                _audit(audit_enabled, name, action, [], "handoff_blackout",
+                       HANDOFF_BLACKOUT_ERROR, None)
+                respond({
+                    "success": False,
+                    "error": HANDOFF_BLACKOUT_ERROR,
+                    "blackout": True,
+                }, "handoff_blackout", HANDOFF_BLACKOUT_ERROR)
+                continue
 
             # Host-enforced policy, phase 1: action-level and payload-target
             # checks that need no extension round-trip. Plain policy denial still
@@ -1385,8 +1646,8 @@ def handle_socket_client(client_socket):
                     owner, _ = _lease_status_locked()
                 if owner is not None and owner != name:
                     _audit(audit_enabled, name, action, targets, "lease_deny", f"leased by {owner}", None)
-                    client_socket.sendall(
-                        (json.dumps({"success": False, "error": f"leased by {owner}"}) + "\n").encode('utf-8'))
+                    respond({"success": False, "error": f"leased by {owner}"},
+                            "lease_deny", f"leased by {owner}")
                     continue
                 approved_policy = maybe_apply_origin_approval(policy, name, action, payload, targets, audit_enabled)
                 if approved_policy is not None:
@@ -1395,9 +1656,9 @@ def handle_socket_client(client_socket):
                         policy, name, action, payload)
             if not allowed:
                 _audit(audit_enabled, name, action, targets, "deny", reason, None)
-                client_socket.sendall(
-                    (json.dumps({"success": False, "error": f"policy denied: {reason}",
-                                 "policyDenial": policy_denial(reason, action, targets, name, policy)}) + "\n").encode('utf-8'))
+                respond({"success": False, "error": f"policy denied: {reason}",
+                         "policyDenial": policy_denial(reason, action, targets, name, policy)},
+                        "deny", reason)
                 continue
 
             resp_timeout = SOCKET_IDLE_TIMEOUT
@@ -1417,8 +1678,8 @@ def handle_socket_client(client_socket):
                     owner, _ = _lease_status_locked()
                 if owner is not None and owner != name:
                     _audit(audit_enabled, name, action, targets, "lease_deny", f"leased by {owner}", None)
-                    client_socket.sendall(
-                        (json.dumps({"success": False, "error": f"leased by {owner}"}) + "\n").encode('utf-8'))
+                    respond({"success": False, "error": f"leased by {owner}"},
+                            "lease_deny", f"leased by {owner}")
                     continue
                 origins = resolve_origins(needed, resp_timeout)
                 # Fail closed when any needed tab resolves to no usable origin
@@ -1429,9 +1690,9 @@ def handle_socket_client(client_socket):
                 if any(not origin_targets(origins.get(t)) for t in needed):
                     targets = targets + ["<unresolved-origin>"]
                     _audit(audit_enabled, name, action, targets, "deny", "tab origin unresolved", None)
-                    client_socket.sendall(
-                        (json.dumps({"success": False, "error": "policy denied: tab origin unresolved",
-                                     "policyDenial": policy_denial("tab origin unresolved", action, targets, name, policy)}) + "\n").encode('utf-8'))
+                    respond({"success": False, "error": "policy denied: tab origin unresolved",
+                             "policyDenial": policy_denial("tab origin unresolved", action, targets, name, policy)},
+                            "deny", "tab origin unresolved")
                     continue
                 allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
                     policy, name, action, payload, origins=origins)
@@ -1443,9 +1704,9 @@ def handle_socket_client(client_socket):
                             policy, name, action, payload, origins=origins)
                 if not allowed:
                     _audit(audit_enabled, name, action, targets, "deny", reason, None)
-                    client_socket.sendall(
-                        (json.dumps({"success": False, "error": f"policy denied: {reason}",
-                                     "policyDenial": policy_denial(reason, action, targets, name, policy)}) + "\n").encode('utf-8'))
+                    respond({"success": False, "error": f"policy denied: {reason}",
+                             "policyDenial": policy_denial(reason, action, targets, name, policy)},
+                            "deny", reason)
                     continue
 
             if confirm:
@@ -1454,7 +1715,7 @@ def handle_socket_client(client_socket):
                 else:
                     token, expires_at = issue_confirmation(name, action, payload, targets)
                     _audit(audit_enabled, name, action, targets, "confirmation_required", None, None)
-                    client_socket.sendall((json.dumps({
+                    respond({
                         "success": False,
                         "error": "confirmation required",
                         "confirmationRequired": True,
@@ -1463,7 +1724,7 @@ def handle_socket_client(client_socket):
                         "confirmationToken": token,
                         "expiresAt": expires_at,
                         "resumeCommand": f"chrome-bridge confirm {token}",
-                    }) + "\n").encode('utf-8'))
+                    }, "confirmation_required")
                     continue
 
             # Enforcement gate: a live lease held by another client blocks others.
@@ -1471,8 +1732,8 @@ def handle_socket_client(client_socket):
                 owner, _ = _lease_status_locked()
             if owner is not None and owner != name:
                 _audit(audit_enabled, name, action, targets, "lease_deny", f"leased by {owner}", None)
-                client_socket.sendall(
-                    (json.dumps({"success": False, "error": f"leased by {owner}"}) + "\n").encode('utf-8'))
+                respond({"success": False, "error": f"leased by {owner}"},
+                        "lease_deny", f"leased by {owner}")
                 continue
 
             # Send to extension, then block this connection until its response.
@@ -1481,14 +1742,23 @@ def handle_socket_client(client_socket):
             # that window (plus headroom) so the host does not time out before
             # the extension legitimately finishes.
             # Audit "allow" with the generated id before the action is forwarded.
-            req_id, response = forward_to_extension(
-                cmd, resp_timeout,
-                on_registered=lambda rid: _audit(audit_enabled, name, action, targets, "allow", None, rid))
+            # A waitForHandoff forward opens a telemetry blackout for the whole
+            # time the human is interacting with the tab; the finally releases it
+            # on every exit path (response, extension error, or timeout).
+            handoff_handle = None
+            if action == 'waitForHandoff':
+                handoff_handle = register_handoff(handoff_tab_id(payload), name)
+            try:
+                req_id, response = forward_to_extension(
+                    cmd, resp_timeout,
+                    on_registered=lambda rid: _audit(audit_enabled, name, action, targets, "allow", None, rid))
+            finally:
+                clear_handoff(handoff_handle)
             if response is None:
                 logging.error(f"Timed out waiting for extension response to {req_id}.")
                 _audit(audit_enabled, name, action, targets, "extension_error", "extension response timeout", req_id)
-                client_socket.sendall(
-                    (json.dumps({"success": False, "error": "extension response timeout"}) + "\n").encode('utf-8'))
+                respond({"success": False, "error": "extension response timeout"},
+                        "extension_error", "extension response timeout", req_id)
                 return
             ext_decision = "extension_success" if response.get("success") else "extension_error"
             _audit(audit_enabled, name, action, targets, ext_decision, response.get("error"), req_id)
@@ -1496,7 +1766,9 @@ def handle_socket_client(client_socket):
             secrets = load_secret_masks(client_policy.get('secretMaskFile'))
             response = redact_response(action, response, redact_enabled,
                                        client_policy.get('redactPatterns'), payload, secrets)
-            client_socket.sendall((json.dumps(response) + "\n").encode('utf-8'))
+            # Trace the response the client actually receives: already redacted
+            # and secret-masked, so the hash covers no raw page content.
+            respond(response, ext_decision, response.get("error"), req_id)
     except Exception as e:
         logging.error(f"Error handling socket client: {e}", exc_info=True)
     finally:

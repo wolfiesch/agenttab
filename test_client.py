@@ -3,7 +3,9 @@ import base64
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -79,6 +81,10 @@ def parse_observe_args(args):
             continue
         if flag == "--compact":
             payload["compact"] = True
+            index += 1
+            continue
+        if flag == "--diff":
+            payload["diff"] = True
             index += 1
             continue
         if flag in {"--role", "--name", "--limit"}:
@@ -217,6 +223,23 @@ def result_payload(response):
     return result if isinstance(result, dict) else response
 
 
+# The extension returns resolved positions only, never script or source-map
+# bodies. This scrub is a defensive backstop for --source-maps output so a
+# future extension build can never dump a private codebase into the terminal.
+SOURCE_TEXT_KEYS = {"sourcesContent", "scriptSource", "sourceText", "mappings", "sourceMap"}
+
+
+def redact_source_text(value):
+    if isinstance(value, dict):
+        return {
+            key: "[redacted]" if key in SOURCE_TEXT_KEYS else redact_source_text(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_source_text(item) for item in value]
+    return value
+
+
 def save_screenshot(tab_id, output_path, quiet=True):
     payload = {"tabId": tab_id, "format": "png", "quiet": quiet}
     exit_code, response, stderr = send_command_data("screenshot", payload)
@@ -290,6 +313,95 @@ def save_html(tab_id, output_path):
         f.write(encoded)
     print(json.dumps({"success": True, "path": path, "bytes": len(encoded)}, indent=2))
     return 0
+
+
+def save_screencast(tab_id, output_dir, fps=8, make_mp4=False):
+    """Drain the extension's buffered screencast frames to local image files.
+
+    Frame bytes are written to disk and never printed: stdout carries only the
+    directory, counts, and byte totals so a recording of the real profile cannot
+    leak into a transcript.
+    """
+    exit_code, response, stderr = send_command_data("screencastFrames", {"tabId": tab_id, "consume": True})
+    if exit_code != 0:
+        if response is not None:
+            print(json.dumps(response, indent=2))
+        if stderr:
+            print(stderr, file=sys.stderr)
+        return exit_code
+    result = result_payload(response) or {}
+    frames = result.get("frames")
+    if not isinstance(frames, list):
+        print("Error: screencastFrames response did not include a frames list", file=sys.stderr)
+        return 1
+    extension = "png" if result.get("format") == "png" else "jpg"
+    directory = expand_output_path(output_dir)
+    os.makedirs(directory, exist_ok=True)
+    total_bytes = 0
+    timestamps = []
+    written = 0
+    for frame in frames:
+        encoded = frame.get("base64") if isinstance(frame, dict) else None
+        if not isinstance(encoded, str) or not encoded:
+            continue
+        try:
+            data = base64.b64decode(encoded)
+        except Exception:
+            continue
+        # Contiguous zero-padded numbering keeps the ffmpeg image sequence valid
+        # even when a malformed frame is skipped.
+        with open(os.path.join(directory, f"frame-{written:05d}.{extension}"), "wb") as f:
+            f.write(data)
+        total_bytes += len(data)
+        timestamps.append(frame.get("timestamp"))
+        written += 1
+    manifest_path = os.path.join(directory, "frames.json")
+    dropped = result.get("droppedFrames", 0)
+    with open(manifest_path, "w") as f:
+        json.dump({"count": written, "dropped": dropped, "timestamps": timestamps}, f)
+    summary = {
+        "success": True,
+        "dir": directory,
+        "frames": written,
+        "dropped": dropped,
+        "bytes": total_bytes,
+        "manifest": manifest_path,
+    }
+    if make_mp4:
+        summary.update(assemble_screencast_mp4(directory, extension, fps, written))
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def assemble_screencast_mp4(directory, extension, fps, frame_count):
+    """Assemble frames into screencast.mp4 with the system ffmpeg, if present.
+
+    ffmpeg is never bundled. When it is missing or fails, the frames stay on
+    disk and the caller reports a note instead of failing the save.
+    """
+    if frame_count == 0:
+        return {"mp4": None, "note": "No frames were buffered, so no mp4 was assembled."}
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return {"mp4": None, "note": "ffmpeg was not found on PATH; frames were kept and no mp4 was assembled."}
+    mp4_path = os.path.join(directory, "screencast.mp4")
+    proc = subprocess.run(
+        [
+            ffmpeg, "-y", "-framerate", str(fps),
+            "-i", os.path.join(directory, f"frame-%05d.{extension}"),
+            "-pix_fmt", "yuv420p", mp4_path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0 or not os.path.exists(mp4_path):
+        # ffmpeg may leave a truncated container behind; do not present it as output.
+        try:
+            os.unlink(mp4_path)
+        except OSError:
+            pass
+        return {"mp4": None, "note": f"ffmpeg exited {proc.returncode}; frames were kept."}
+    return {"mp4": mp4_path, "mp4Bytes": os.path.getsize(mp4_path), "fps": fps}
 
 
 def save_storage_state(tab_id, output_path):
@@ -769,6 +881,176 @@ def cmd_audit(args):
     return 64
 
 
+# --- Session trace artifacts (host policy ``traceDir``) --------------------
+#
+# The host writes one JSONL event per trace-eligible request to
+# <traceDir>/<traceId>.jsonl. Like the audit viewer, these readers print
+# metadata columns and counts only: the artifacts hold no payload or response
+# bodies, and nothing here reconstructs them.
+
+DEFAULT_TRACE_DIRNAME = "bridge_traces"
+
+
+def _resolve_trace_dir(explicit):
+    # Same resolution order as the audit viewer: an explicit --trace-dir wins,
+    # then the running host's configured traceDir, then the repo-local default
+    # so an artifact stays readable when the host is down.
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit)), False
+    exit_code, response, _stderr = send_command_data("policyInfo")
+    if exit_code == 0 and response:
+        info = result_payload(response)
+        if isinstance(info, dict) and info.get("traceDir"):
+            return info["traceDir"], False
+    return os.path.join(SCRIPT_DIR, DEFAULT_TRACE_DIRNAME), True
+
+
+def _sanitize_trace_id(trace_id):
+    # Mirrors the host: file names keep only [A-Za-z0-9._-], capped at 80.
+    safe = "".join(
+        ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_"
+        for ch in str(trace_id))
+    return safe[:80] or "_"
+
+
+def _load_trace(trace_id, trace_dir):
+    # Return (path, events, malformed, exit_code). Malformed lines are counted,
+    # never echoed.
+    path = os.path.join(trace_dir, _sanitize_trace_id(trace_id) + ".jsonl")
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        print(f"No trace at {path} yet; nothing to show.")
+        return path, None, 0, 0
+    except OSError as exc:
+        print(f"Error: could not read trace at {path}: {exc}", file=sys.stderr)
+        return path, None, 0, 1
+    events = []
+    malformed = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            malformed += 1
+            continue
+        if not isinstance(event, dict):
+            malformed += 1
+            continue
+        events.append(event)
+    return path, events, malformed, 0
+
+
+def _trace_tail(trace_id, count, trace_dir_arg):
+    trace_dir, fell_back = _resolve_trace_dir(trace_dir_arg)
+    if fell_back:
+        print(f"Note: host unreachable; falling back to local trace directory {trace_dir}",
+              file=sys.stderr)
+    path, events, malformed, exit_code = _load_trace(trace_id, trace_dir)
+    if events is None:
+        return exit_code
+    if not events:
+        print(f"Trace {path} has no entries yet.")
+        return 0
+    rows = [(
+        _audit_timestamp(event),
+        str(event.get("action") or "-"),
+        str(event.get("decision") or "-"),
+        "yes" if event.get("success") else "no",
+        str(event.get("durationMs") if event.get("durationMs") is not None else "-"),
+        ",".join(str(t) for t in (event.get("targets") or [])) or "-",
+        str(event.get("snapshotHash") or "-")[:12],
+        str(event.get("responseHash") or "-")[:12],
+    ) for event in events[-count:]]
+    _print_audit_table(
+        ("TIMESTAMP", "ACTION", "DECISION", "OK", "MS", "TABS", "SNAPSHOT", "RESPONSE"), rows)
+    if malformed:
+        print(f"Skipped {malformed} malformed line(s).")
+    return 0
+
+
+def _trace_summary(trace_id, trace_dir_arg):
+    trace_dir, fell_back = _resolve_trace_dir(trace_dir_arg)
+    if fell_back:
+        print(f"Note: host unreachable; falling back to local trace directory {trace_dir}",
+              file=sys.stderr)
+    path, events, malformed, exit_code = _load_trace(trace_id, trace_dir)
+    if events is None:
+        return exit_code
+    if not events:
+        print(f"Trace {path} has no entries yet.")
+        return 0
+    actions = Counter()
+    decisions = Counter()
+    stamps = []
+    durations = []
+    successes = 0
+    for event in events:
+        actions[str(event.get("action") or "-")] += 1
+        decisions[str(event.get("decision") or "-")] += 1
+        if event.get("success"):
+            successes += 1
+        ms = _audit_event_ms(event)
+        if ms is not None:
+            stamps.append(ms)
+        duration = event.get("durationMs")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            durations.append(int(duration))
+    print(f"Trace:     {path}")
+    print(f"Trace id:  {trace_id}")
+    if stamps:
+        print(f"Range:     {_audit_local_time(min(stamps))} .. {_audit_local_time(max(stamps))}")
+    else:
+        print("Range:     (no timestamped entries)")
+    print(f"Events:    {len(events)} ({successes} succeeded)")
+    if durations:
+        print(f"Duration:  total {sum(durations)} ms, max {max(durations)} ms, "
+              f"mean {sum(durations) // len(durations)} ms")
+    print("")
+    print("Actions:")
+    _print_audit_table(("ACTION", "COUNT"), [(name, str(n)) for name, n in actions.most_common()])
+    print("")
+    print("Decisions:")
+    _print_audit_table(("DECISION", "COUNT"), [(name, str(n)) for name, n in decisions.most_common()])
+    if malformed:
+        print(f"Skipped {malformed} malformed line(s).")
+    return 0
+
+
+def _trace_dir_flag(args):
+    # Pull an optional trailing --trace-dir <path> out of the argument list.
+    if "--trace-dir" not in args:
+        return args, None
+    index = args.index("--trace-dir")
+    if index + 1 >= len(args):
+        print("Error: --trace-dir expects a directory", file=sys.stderr)
+        sys.exit(2)
+    return args[:index] + args[index + 2:], args[index + 1]
+
+
+TRACE_USAGE = ("Usage: python3 test_client.py trace "
+               "<summary <traceId> | tail <traceId> [count]> [--trace-dir <dir>]")
+
+
+def cmd_trace(args):
+    args, trace_dir_arg = _trace_dir_flag(args)
+    sub = args[2] if len(args) > 2 else ""
+    trace_id = args[3] if len(args) > 3 else ""
+    if sub not in ("summary", "tail") or not trace_id:
+        print(TRACE_USAGE, file=sys.stderr)
+        return 64
+    if sub == "summary":
+        return _trace_summary(trace_id, trace_dir_arg)
+    count = parse_int(args[4], "count") if len(args) > 4 else 20
+    if count <= 0:
+        print("Error: count must be a positive integer", file=sys.stderr)
+        return 2
+    return _trace_tail(trace_id, count, trace_dir_arg)
+
+
 def print_usage():
     print("Usage:")
     print("  chrome-bridge <command> [arguments]")
@@ -779,8 +1061,8 @@ def print_usage():
     print("  ping                              Check bridge health")
     print("  getTabs                           List open tabs")
     print("  navigate <url> [--foreground]     Open a tab in the background by default")
-    print("  observe <tabId> [filters]         Concise accessibility view; use --full for all fields")
-    print("  click <tabId> <selector>          Click by CSS, text, ARIA name, label, or role")
+    print("  observe <tabId> [filters]         Concise accessibility view with ref=eN ids; --full, --diff")
+    print("  click <tabId> <selector>          Click by ref, CSS, text, ARIA name, label, or role")
     print("  fill <tabId> <selector> <text>    Clear and fill a form field")
     print("  screenshot <tabId> <path>         Save a background-safe screenshot")
     print("  github-attach-pr-body <tabId> <files...>")
@@ -789,24 +1071,30 @@ def print_usage():
     print("  taskSession <operation> ...       Manage task-owned background tabs")
     print("  policy <operation> ...            Inspect or update local policy")
     print("  audit <tail|summary> ...          Read the local audit log written by the host")
+    print("  trace <summary|tail> <traceId>    Read a local session trace artifact written by the host")
     print("  searchTabs <query> [--regex]      Search visible text across all http/https tabs")
     print("")
     print("Global flags:")
     print("  --dry-run                         Report the host verdict without touching Chrome")
     print("")
-    print("    selectors: CSS, css=<selector>, label=<text>, text=<text>, role=<role>[name=<text>],")
-    print("               aria=<accessible-name>, <host> >>> <shadow-selector>,")
-    print("               frame=<iframe-selector> >> <target-selector>")
+    print("    selectors: CSS, ref=e<N> (from observe), css=<selector>, label=<text>, text=<text>,")
+    print("               role=<role>[name=<text>], aria=<accessible-name>,")
+    print("               <host> >>> <shadow-selector>, frame=<iframe-selector> >> <target-selector>")
+    print("               refs are invalidated by navigation or an extension restart; stale refs fail with error staleRef")
 
 
 COMMAND_HELP = {
     "observe": (
-        "chrome-bridge observe <tabId> [--compact|--full] [--role <role[,role...]>] [--name <text>] [--limit <count>]",
-        "Print a compact accessibility view by default. Filters are applied before the limit.",
+        "chrome-bridge observe <tabId> [--compact|--full] [--diff] [--role <role[,role...]>] [--name <text>] [--limit <count>]",
+        "Print a compact accessibility view by default. Filters are applied before the limit. "
+        "Every node carries a stable ref such as e12; pass that ref to any selector argument as ref=e12. "
+        "Refs are invalidated by navigation and by an extension service-worker restart, and a stale ref fails with error staleRef. "
+        "--diff returns added/removed/changed against the previous snapshot for this tab, with baseEpoch and epoch; "
+        "the first --diff call after a navigation returns the full snapshot with diffBase true.",
     ),
     "click": (
         "chrome-bridge click <tabId> <selector>",
-        "Click using CSS or a semantic selector such as text=Save, aria=More options, label=Email, or role=button[name=Save].",
+        "Click using CSS or a semantic selector such as ref=e12, text=Save, aria=More options, label=Email, or role=button[name=Save].",
     ),
     "executeScript": (
         "chrome-bridge executeScript <tabId> <code>",
@@ -836,6 +1124,11 @@ COMMAND_HELP = {
         "chrome-bridge audit tail [count] | audit summary [--since <ISO8601|7d|12h|30m>]",
         "Read the local audit log: recent decisions as columns, or aggregate counts. Metadata only, never payloads.",
     ),
+    "trace": (
+        "chrome-bridge trace summary <traceId> | trace tail <traceId> [count] [--trace-dir <dir>]",
+        "Read a session trace artifact the host wrote under policy traceDir: per-action decisions, timings, "
+        "tab ids, and response/snapshot hashes. Metadata only, never payloads or page content.",
+    ),
     "setCookie": (
         "chrome-bridge setCookie <url> <name> <value> [--domain <domain>] [--path <path>] [--secure] [--http-only] [--same-site <policy>] [--expires <epochSeconds>]",
         "Write one cookie into the real profile. The response reports the cookie name and domain only, never the value. Confirmation-gated in the example policy.",
@@ -847,6 +1140,22 @@ COMMAND_HELP = {
     "searchTabs": (
         "chrome-bridge searchTabs <query> [--regex] [--max-per-tab <count>] [--case-sensitive]",
         "Search visible text across all http/https tabs. Reports tab id, domain, and bounded snippets; snippets contain page content, so treat output as sensitive.",
+    ),
+    "startScreencast": (
+        "chrome-bridge startScreencast <tabId> [--quality <1-100>] [--max-width <pixels>]",
+        "Begin buffering CDP screencast frames for the tab without activating it. Continuous capture of a real profile is high-exposure, so the example policy confirmation-gates it. Frames live only in the extension service worker: a worker restart ends the recording.",
+    ),
+    "screencastSave": (
+        "chrome-bridge screencastSave <tabId> <outputDir> [--fps <rate>] [--mp4]",
+        "Drain buffered frames to numbered image files plus frames.json in outputDir. Prints only the directory, frame count, dropped count, and byte totals; frame data is never printed. With --mp4 the system ffmpeg (never bundled) assembles screencast.mp4 and frames are kept either way.",
+    ),
+    "stopScreencast": (
+        "chrome-bridge stopScreencast <tabId>",
+        "Stop the screencast and detach the debugger if nothing else holds it. Any frames still buffered are discarded, so run screencastSave first.",
+    ),
+    "consoleMessages": (
+        "chrome-bridge consoleMessages <tabId> [--source-maps]",
+        "Print buffered console entries as JSON. Each entry carries a stack of raw generated frames (url, 0-based lineNumber/columnNumber, functionName). With --source-maps the extension additionally resolves each frame through the script's own source map, adding originalLocation (source, name, 0-based lineNumber/columnNumber) or sourceMapStatus (notFound, invalid, unmapped, crossOriginRefused). Maps are read only from the script's own origin; source text is never fetched for output and never printed.",
     ),
 }
 
@@ -890,7 +1199,10 @@ COMMAND_USAGES = {
     "setUserAgent": "chrome-bridge setUserAgent <tabId> <userAgent...>",
     "startMonitoring": "chrome-bridge startMonitoring <tabId>",
     "stopMonitoring": "chrome-bridge stopMonitoring <tabId>",
-    "consoleMessages": "chrome-bridge consoleMessages <tabId>",
+    "startScreencast": "chrome-bridge startScreencast <tabId> [--quality <1-100>] [--max-width <pixels>]",
+    "screencastSave": "chrome-bridge screencastSave <tabId> <outputDir> [--fps <rate>] [--mp4]",
+    "stopScreencast": "chrome-bridge stopScreencast <tabId>",
+    "consoleMessages": "chrome-bridge consoleMessages <tabId> [--source-maps]",
     "networkRequests": "chrome-bridge networkRequests <tabId>",
     "handleDialog": "chrome-bridge handleDialog <tabId> accept|dismiss [promptText]",
     "downloadUrl": "chrome-bridge downloadUrl <url> [filename]",
@@ -1022,9 +1334,26 @@ def main():
     elif action == "observe":
         require_args(args, 3, "Usage: python3 test_client.py observe <tabId>")
         sys.exit(send_command("observe", parse_observe_args(args)))
-    elif action in {"activateTab", "closeTab", "reload", "goBack", "goForward", "getCurrentState", "startMonitoring", "stopMonitoring", "consoleMessages", "networkRequests"}:
+    elif action in {"activateTab", "closeTab", "reload", "goBack", "goForward", "getCurrentState", "startMonitoring", "stopMonitoring", "networkRequests"}:
         require_args(args, 3, f"Usage: python3 test_client.py {action} <tabId>")
         sys.exit(send_command(action, {"tabId": parse_int(args[2], "tabId")}))
+    elif action == "consoleMessages":
+        require_args(args, 3, "Usage: chrome-bridge consoleMessages <tabId> [--source-maps]")
+        resolve_source_maps = False
+        for flag in args[3:]:
+            if flag != "--source-maps":
+                print(f"Unknown option for consoleMessages: {flag}", file=sys.stderr)
+                sys.exit(2)
+            resolve_source_maps = True
+        payload = {"tabId": parse_int(args[2], "tabId")}
+        if resolve_source_maps:
+            payload["resolveSourceMaps"] = True
+        exit_code, response, stderr = send_command_data("consoleMessages", payload)
+        if response is not None:
+            print(json.dumps(redact_source_text(response) if resolve_source_maps else response, indent=2))
+        if stderr:
+            print(stderr, file=sys.stderr)
+        sys.exit(exit_code)
     elif action == "waitForLoad":
         require_args(args, 3, "Usage: python3 test_client.py waitForLoad <tabId> [timeoutMs]")
         sys.exit(send_command("waitForLoad", {"tabId": parse_int(args[2], "tabId"), "timeoutMs": parse_timeout(args, 3)}))
@@ -1191,6 +1520,50 @@ def main():
         if rest:
             payload["tabId"] = parse_int(rest[0], "tabId")
         sys.exit(send_command("batch", payload))
+    elif action == "startScreencast":
+        require_args(args, 3, "Usage: chrome-bridge startScreencast <tabId> [--quality <1-100>] [--max-width <pixels>]")
+        payload = {"tabId": parse_int(args[2], "tabId")}
+        index = 3
+        while index < len(args):
+            flag = args[index]
+            if flag in {"--quality", "--max-width"}:
+                if index + 1 >= len(args):
+                    print(f"Missing value for {flag}", file=sys.stderr)
+                    sys.exit(2)
+                key = "quality" if flag == "--quality" else "maxWidth"
+                payload[key] = parse_int(args[index + 1], key)
+                index += 2
+                continue
+            print(f"Unknown startScreencast option: {flag}", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command("startScreencast", payload))
+    elif action == "screencastSave":
+        require_args(args, 4, "Usage: chrome-bridge screencastSave <tabId> <outputDir> [--fps <rate>] [--mp4]")
+        fps = 8
+        make_mp4 = False
+        index = 4
+        while index < len(args):
+            flag = args[index]
+            if flag == "--mp4":
+                make_mp4 = True
+                index += 1
+                continue
+            if flag == "--fps":
+                if index + 1 >= len(args):
+                    print("Missing value for --fps", file=sys.stderr)
+                    sys.exit(2)
+                fps = parse_int(args[index + 1], "fps")
+                index += 2
+                continue
+            print(f"Unknown screencastSave option: {flag}", file=sys.stderr)
+            sys.exit(2)
+        if fps < 1:
+            print("Invalid fps: must be >= 1", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(save_screencast(parse_int(args[2], "tabId"), args[3], fps, make_mp4))
+    elif action == "stopScreencast":
+        require_args(args, 3, "Usage: chrome-bridge stopScreencast <tabId>")
+        sys.exit(send_command("stopScreencast", {"tabId": parse_int(args[2], "tabId")}))
     elif action == "printToPDF":
         require_args(args, 4, "Usage: chrome-bridge printToPDF <tabId> <outputPath> [--landscape] [--scale <factor>]")
         # printBackground defaults on so an exported page matches what the tab renders.
@@ -1340,6 +1713,8 @@ def main():
         }))
     elif action == "audit":
         sys.exit(cmd_audit(args))
+    elif action == "trace":
+        sys.exit(cmd_trace(args))
     elif action == "setCookie":
         require_args(args, 5, "Usage: python3 test_client.py setCookie <url> <name> <value> [--domain <domain>] [--path <path>] [--secure] [--http-only] [--same-site <policy>] [--expires <epochSeconds>]")
         payload = {"url": args[2], "name": args[3], "value": args[4]}

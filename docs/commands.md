@@ -15,10 +15,14 @@ chrome-bridge getTabs
 chrome-bridge getCookies <domain>
 chrome-bridge executeScript <tabId> <code>
 chrome-bridge executeScriptCDP <tabId> <code>
-chrome-bridge observe <tabId> [--compact|--full] [--role <role[,role...]>] [--name <text>] [--limit <count>]
+chrome-bridge observe <tabId> [--compact|--full] [--diff] [--role <role[,role...]>] [--name <text>] [--limit <count>]
 ```
 
 `observe` prints a compact accessibility view by default (role, accessible name, and value). Use `--role button,link`, `--name Save`, and `--limit 20` to narrow it further. Both compact and full snapshots use Chrome's real accessibility tree, so both attach Chrome's debugger. `--full` also includes node IDs, descriptions, and detailed accessibility properties. Text extraction, HTML capture, and text waits use normal extension page access and do not attach the debugger.
+
+Every observed node carries a stable `ref` such as `e12`. Pass it back as `ref=e12` wherever a selector is accepted, which removes the guesswork of turning an accessibility node back into a CSS selector. Refs are minted per tab in extension memory and are invalidated by a navigation or by an extension service-worker restart; the per-tab counter never rewinds, so a ref is never reused for a different element. Using an unknown or invalidated ref fails loudly with `{"success": false, "error": "staleRef", "hint": "re-run observe"}` - it never falls back to matching the literal text as CSS. Re-run `observe` and use the fresh ref.
+
+`--diff` returns only what changed since the previous `observe` of that tab: `added` (nodes), `removed` (refs), and `changed` (nodes whose role, name, or value changed), plus `baseEpoch` (the snapshot the diff is against) and `epoch` (the snapshot just taken). The first `--diff` call with no baseline - a fresh tab, after a navigation, or after an extension restart - returns the full snapshot with `"diffBase": true`. Only the latest snapshot is retained per tab, capped at 5000 nodes, so a diff is always against the immediately preceding `observe`.
 
 ### Navigation and tabs
 
@@ -116,7 +120,7 @@ chrome-bridge githubSubmitComment <tabId> [formSelector] [timeoutMs]
 chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]
 ```
 
-`type` focuses and inserts text. `fill` clears first, then inserts text. `click`, `type`, `hover`, `drag`, `fill`, `select`, and `uploadFile` accept plain CSS plus semantic selector prefixes: `css=<selector>`, `text=<visible-text>`, `aria=<accessible-name>`, `label=<form-label>`, and `role=<role>[name=<accessible-name>]`. For example, `chrome-bridge click 123 'aria=Show options'` or `chrome-bridge click 123 'role=button[name=Save]'` avoids guessing GitHub-specific CSS. Use `<host> >>> <shadow-selector>` for open shadow DOM and `frame=<iframe-selector> >> <target-selector>` for iframe targets; these forms also work for `<select>` elements and file inputs. `uploadFile` expands local paths and fails before contacting Chrome when any file is missing.
+`type` focuses and inserts text. `fill` clears first, then inserts text. `click`, `type`, `hover`, `drag`, `fill`, `select`, `uploadFile`, `scroll`, and `waitForSelector` accept plain CSS plus semantic selector prefixes: `ref=e<N>` (an element ref from `observe`), `css=<selector>`, `text=<visible-text>`, `aria=<accessible-name>`, `label=<form-label>`, and `role=<role>[name=<accessible-name>]`. For example, `chrome-bridge click 123 'ref=e12'`, `chrome-bridge click 123 'aria=Show options'`, or `chrome-bridge click 123 'role=button[name=Save]'` avoids guessing GitHub-specific CSS. A `ref=` target is resolved from the live node recorded by `observe`, not re-matched by text, and a navigation or extension service-worker restart invalidates it: the action then fails with `error: staleRef` rather than silently acting on a different element. Use `<host> >>> <shadow-selector>` to reach into an open shadow root and `frame=<iframe-selector> >> <selector>` to reach into an iframe.
 
 `clickAt` dispatches CDP `Input.dispatchMouseEvent` (`mouseMoved`, `mousePressed`, `mouseReleased`) directly at the given viewport coordinates, in CSS pixels relative to the top-left of the tab's viewport. `x` and `y` must be non-negative numbers. Prefer selector-based `click`: because `clickAt` resolves no element, there is no tag name, accessible name, or selector to record, so the audit log cannot show what was actually clicked and a stale coordinate can hit an unintended control. For that reason `clickAt` is in the sample policy's `requireConfirmation` list - each call returns a one-use token, and you resume it with `chrome-bridge confirm <token>`. Use it only when no selector can reach the target, such as canvas, map, or PDF-viewer surfaces.
 
@@ -144,12 +148,30 @@ chrome-bridge setUserAgent <tabId> <userAgent>
 
 `setCpuThrottling` sets Chrome's CPU throttling rate; use `rate >= 1`, with `1` disabling throttling. `setNetworkConditions` applies CDP `Network.emulateNetworkConditions` and persists until `clearNetworkConditions` resets it. `setColorScheme` overrides `prefers-color-scheme`. `setUserAgent` overrides the tab's user agent string.
 
+### Screencast recording
+
+```bash
+chrome-bridge startScreencast <tabId> [--quality <1-100>] [--max-width <pixels>]
+chrome-bridge screencastSave <tabId> <outputDir> [--fps <rate>] [--mp4]
+chrome-bridge stopScreencast <tabId>
+```
+
+`startScreencast` attaches Chrome's debugger and starts CDP `Page.startScreencast` on the tab, so recording works on a background tab and never activates it. Frames default to JPEG at quality 70 and every frame (`everyNthFrame` 1); `png`, `maxWidth`, `maxHeight`, and `everyNthFrame` are also accepted in the action payload. The debugger stays attached (and Chrome's debugger infobar may persist) until `stopScreencast`.
+
+Frames buffer **only in the extension service worker**: recording does not survive a service-worker restart, and a restart drops whatever was buffered. The buffer is bounded at 600 frames or roughly 50MB of base64; past either bound the **oldest** frames are dropped and counted in `droppedFrames`, so a gapped recording is always distinguishable from a complete one.
+
+`screencastSave` drains the buffer once, writes contiguous zero-padded `frame-00000.jpg`/`.png` files plus a `frames.json` manifest (`count`, `dropped`, `timestamps`) into `outputDir`, and prints only the directory, frame count, dropped count, byte total, and manifest path - never frame data. With `--mp4` it additionally calls the **system** `ffmpeg` (resolved from `PATH`; never bundled) to assemble `screencast.mp4` at `--fps` (default 8). If `ffmpeg` is missing or fails, the frames are kept and the response carries a `note` explaining why no mp4 was written.
+
+`stopScreencast` stops the screencast and detaches the debugger unless monitoring or interception still holds it, reporting `remainingFrames`, `droppedFrames`, and `capturedFrames`. Frames still buffered at stop are discarded, so run `screencastSave` first.
+
+Continuous capture of a real, logged-in profile is high-exposure: every pixel the tab renders while recording is buffered, including anything the human happens to have on screen in that tab. The example policy therefore confirmation-gates `startScreencast` while leaving `screencastFrames` and `stopScreencast` ungated, so a recording cannot begin without an explicit human confirmation.
+
 ### Diagnostics, interception, downloads, storage, geolocation, and metrics
 
 ```bash
 chrome-bridge startMonitoring <tabId>
 chrome-bridge stopMonitoring <tabId>
-chrome-bridge consoleMessages <tabId>
+chrome-bridge consoleMessages <tabId> [--source-maps]
 chrome-bridge networkRequests <tabId>
 chrome-bridge handleDialog <tabId> accept|dismiss [promptText]
 chrome-bridge startInterception <tabId> <urlPattern> continue|abort|fulfill [status] [body]
@@ -169,7 +191,20 @@ chrome-bridge policy allow-action <action> [client]
 chrome-bridge policy allow-origin <pattern> [client]
 chrome-bridge audit tail [count]
 chrome-bridge audit summary [--since <ISO8601|7d|12h|30m>]
+chrome-bridge trace summary <traceId> [--trace-dir <dir>]
+chrome-bridge trace tail <traceId> [count] [--trace-dir <dir>]
 ```
+
+`consoleMessages` returns the buffered console entries for a monitored tab. Every entry now carries a `stack` array of the raw generated frames CDP reported: `url`, 0-based `lineNumber` and `columnNumber`, `functionName`, and the CDP `scriptId`. Entries without a stack (most `Log.entryAdded` records) fall back to a single frame built from the entry's own url and line.
+
+`--source-maps` adds best-effort source-map resolution on top of that, leaving the rest of the response shape unchanged. For each frame the extension reads the script (CDP `Debugger.getScriptSource`, falling back to a plain fetch), looks for a trailing `//# sourceMappingURL=` comment, and decodes a source-map v3 map in the service worker. A resolved frame gains `originalLocation` with `source`, `name`, and 0-based `lineNumber`/`columnNumber`; an unresolved frame gains `sourceMapStatus`:
+
+- `notFound` - no script source, no `sourceMappingURL`, or the map could not be fetched
+- `invalid` - the map is not decodable source-map v3 (index maps with `sections` are not supported)
+- `unmapped` - the map decoded, but the generated position has no mapping
+- `crossOriginRefused` - the `sourceMappingURL` resolved off the script's own origin
+
+Only same-origin (or inline `data:application/json`) maps are read, so resolution never contacts a third-party origin. Parsed maps are cached in service-worker memory per tab and script URL, capped at 100 entries and dropped when the tab closes. Script text and the map's `sourcesContent` are never returned or printed; the CLI additionally scrubs any source-text-shaped field before printing `--source-maps` output.
 
 `startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger notice may persist across the browser while monitoring is active. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
 
@@ -194,6 +229,8 @@ The host stores the exact original client identity, action, and payload only for
 The `policy` subcommands let an agent self-service policy when an action is denied. `policy info` asks the host for the active `bridge_policy.json` / audit-log paths (always answerable, even under a deny-all policy, and it never returns policy contents over the wire). `policy show` prints the local policy file; `policy doctor` reads recent deny events from the audit log and proposes the precise fix for each: a `policy allow-action`/`policy allow-origin` command when an item is missing from an allow-list (`not allowed`), or a manual deny-list edit when a deny-list pattern matched (`denied`, which a grant cannot override). `policy allow-action`/`policy allow-origin` edit the policy file in place (mode `600`); with no client argument they edit the section the host says governs this client, and an explicitly named client always edits its own `clients.<name>` section so a new name never silently broadens the shared `default`. Every deny response also carries a structured `policyDenial` companion (`kind`, `suggestedPatch`, `policyFile`, `batchStep`) alongside the byte-stable `policy denied: <reason>` error string.
 
 The `audit` subcommands read the host's local audit log; they open no socket beyond the `policy info` lookup that resolves the log path, and they add no host action. `audit tail` prints the last `count` entries (default 20) as aligned columns: timestamp, client, action, decision, reason, request ID. `audit summary` aggregates the log into total entries, per-client and per-action counts, allow/deny/confirm/other outcome counts, the top five deny reasons, and the time range covered; `--since` accepts an ISO 8601 stamp or a relative window such as `7d`, `12h`, or `30m`. Both print metadata only - the audit log never stores payload or response bodies, and neither command reconstructs them. When the host cannot be reached, they fall back to the repo-local `bridge_audit.jsonl` and say so; a missing or empty log is reported as such, and malformed JSONL lines are counted and reported rather than printed.
+
+The `trace` subcommands read a session trace artifact. When a policy layer sets `traceDir`, the host appends exactly one JSONL event per trace-eligible request to `<traceDir>/<traceId>.jsonl`: a request is eligible when its payload carries `sessionId`, `taskSessionId`, or an explicit `traceId`, when the action is `createTaskSession`/`navigateTaskSession`/`closeTaskSession`, or when the response result carries a `sessionId`. The trace id is taken in that order (`traceId` first, the response `sessionId` last, the action name as a fallback) and the file name keeps only `[A-Za-z0-9._-]`, capped at 80 characters. Each event records `ts`, `client`, `action`, `decision`, `reason`, `requestId`, `durationMs`, `targets` (tab ids only), `traceId`, `responseHash`, `snapshotHash` when the response carried an observe snapshot or diff, and `success`. `trace tail` prints the last `count` events (default 20) as aligned columns; `trace summary` prints per-action and per-decision counts, the time range, and duration totals. Both are metadata only - a trace stores no payload, no response body, and no page content, so neither command can reconstruct them. `--trace-dir` overrides the directory; otherwise the path comes from `policy info`, falling back to the repo-local `bridge_traces/`.
 
 ### Cookie and storage writes
 
@@ -230,7 +267,7 @@ chrome-bridge waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] 
 
 `sessionStatus` is a **redacted auth probe**: for each domain it reports cookie count, cookie *names* (never values), whether a session/auth cookie is present, and a `loggedIn` boolean - enough to decide "is this profile already signed in to X?" without exposing secrets. Treat its output as sensitive: cookie names plus logged-in status can reveal which accounts and sites the profile uses.
 
-`waitForHandoff` **pauses automation and hands control to you**: it focuses the target tab, changes its task-group label to `↗ Review needed`, shows a compact bottom card with your `message`, and blocks until the page reaches an expected state. It then restores the previous task state and resumes the agent. Use it for interactive steps an agent should not perform - login, 2FA, captcha, payment confirmation. `mode` is `manual` (default; resolves when you change the page), `selector`, `url`, or `text`; the positional argument after `mode` is the selector/URL-substring/text to wait for. `timeoutMs` defaults to 120000. The CLI raises its socket read timeout to cover the wait, so long handoffs do not time out in transport. Under MCP auto-lease, the cooperative lease is extended to span the whole handoff window so another agent cannot mutate the profile while you are acting.
+`waitForHandoff` **pauses automation and hands control to you**: it focuses the target tab, changes its task-group label to `↗ Review needed`, shows a compact bottom card with your `message`, and blocks until the page reaches an expected state. It then restores the previous task state and resumes the agent. Use it for interactive steps an agent should not perform - login, 2FA, captcha, payment confirmation. `mode` is `manual` (default; resolves when you change the page), `selector`, `url`, or `text`; the positional argument after `mode` is the selector/URL-substring/text to wait for. `timeoutMs` defaults to 120000. The CLI raises its socket read timeout to cover the wait, so long handoffs do not time out in transport. Under MCP auto-lease, the cooperative lease is extended to span the whole handoff window so another agent cannot mutate the profile while you are acting. While the handoff is in flight the host also blacks out observation for every client - `screenshot`, `extractText`, `getHTML`, `storageState`, `printToPDF`, `searchTabs`, `getCurrentState`, and `screencastFrames` are denied with `handoff in progress` (scoped to the handoff's `tabId`, or all tabs when it has none), so nothing can watch you type credentials.
 
 ## Raw-output safety
 
@@ -244,6 +281,8 @@ These commands can reveal private browsing context:
 - `printToPDF`
   - The written PDF contains the full rendered page; treat the file like `screenshot` output and do not paste its contents.
 - `consoleMessages`
+  - Console text and stack frames can carry page data and script URLs.
+  - `--source-maps` resolves frames to original build paths, which can expose private source file names and directory layout. Report resolved locations only when the user asked for them.
 - `networkRequests`
 - `interceptedRequests`
 - `storageState`
@@ -255,6 +294,9 @@ These commands can reveal private browsing context:
   - Bookmark titles, URLs, and folder names reveal private context.
 - `searchTabs`
   - Snippets are page content taken from every open tab; report counts and domains, not snippet text.
+- `startScreencast` / `screencastFrames`
+  - A screencast is a continuous stream of rendered page pixels; `screencastFrames` returns base64 image data.
+  - Always drain through `screencastSave`, which writes the frames to disk and prints only counts and byte totals. Never print raw `screencastFrames` output.
 Never paste raw cookies, raw tab URLs/titles, screenshot contents, raw HTML, or network URLs into transcripts unless the user explicitly asks for that output.
 
 Use redacted summaries:

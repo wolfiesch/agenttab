@@ -12,6 +12,7 @@ Usage:
 """
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -117,6 +118,7 @@ LEGACY_FILE = "/tmp/chrome-bridge-guard-legacy.txt"
 POLICY_FILE = "/tmp/chrome-bridge-guard-policy.json"
 AUDIT_FILE = "/tmp/chrome-bridge-guard-audit.jsonl"
 SECRETS_FILE = "/tmp/chrome-bridge-guard-secrets.txt"
+TRACE_DIR = "/tmp/chrome-bridge-guard-traces"
 
 
 def write_policy(policy):
@@ -179,6 +181,19 @@ def audit_events():
             return [json.loads(l) for l in f if l.strip()]
     except FileNotFoundError:
         return []
+
+
+def trace_text(trace_id):
+    # Raw artifact bytes, so a case can assert page content never reaches it.
+    try:
+        with open(os.path.join(TRACE_DIR, trace_id + ".jsonl")) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def trace_events(trace_id):
+    return [json.loads(l) for l in trace_text(trace_id).splitlines() if l.strip()]
 
 
 def forwarded_actions():
@@ -668,7 +683,7 @@ def run_against(label, cmd, env):
         expect(r and r.get("success") is True,
                f"{label}: policyInfo must succeed under deny-all policy, got {r}")
         res = (r or {}).get("result") or {}
-        expect(set(res.keys()) == {"policyFile", "policyFileExists", "auditLogFile", "client"},
+        expect(set(res.keys()) == {"policyFile", "policyFileExists", "auditLogFile", "traceDir", "client"},
                f"{label}: policyInfo must expose only path metadata, got {sorted(res.keys())}")
         expect(res.get("policyFile") == POLICY_FILE and res.get("policyFileExists") is True,
                f"{label}: policyInfo should report the active policy file, got {res}")
@@ -980,6 +995,146 @@ def run_against(label, cmd, env):
         os.remove(SECRETS_FILE)
     except FileNotFoundError:
         pass
+
+    # --- Session trace artifacts: one JSONL event per eligible request ---
+    # With traceDir configured the host appends exactly one metadata event per
+    # trace-eligible request, and never the payload or the response body.
+    shutil.rmtree(TRACE_DIR, ignore_errors=True)
+    write_policy(permissive_with(traceDir=TRACE_DIR))
+    trace_result = lambda a, p: {
+        "sessionId": "sess-alpha",
+        "title": "top-secret-page-title",
+        "nodes": [{"ref": "e1", "role": "button"}],
+    }
+    with Host(label, cmd, env, result_fn=trace_result):
+        c = Client("tok-alpha")
+        r = c.req("createTaskSession", {"name": "demo"})
+        expect(r and r.get("success") is True,
+               f"{label}: traced task session action should succeed, got {r}")
+        events = trace_events("sess-alpha")
+        expect(len(events) == 1,
+               f"{label}: task session action should write exactly one trace event, got {events}")
+        event = events[0] if events else {}
+        expect(event.get("traceId") == "sess-alpha" and event.get("action") == "createTaskSession"
+               and event.get("decision") == "extension_success" and event.get("success") is True,
+               f"{label}: trace event should record the session, action, and decision, got {event}")
+        expect(isinstance(event.get("responseHash"), str) and len(event["responseHash"]) == 64,
+               f"{label}: trace event should carry a response hash, got {event}")
+        expect(isinstance(event.get("snapshotHash"), str) and len(event["snapshotHash"]) == 64,
+               f"{label}: snapshot-bearing response should carry a snapshot hash, got {event}")
+        expect(isinstance(event.get("durationMs"), int) and event["durationMs"] >= 0,
+               f"{label}: trace event should carry a duration, got {event}")
+        raw = trace_text("sess-alpha")
+        expect("top-secret-page-title" not in raw and "demo" not in raw,
+               f"{label}: trace must not store payload or response content, got {raw}")
+
+        # An explicit traceId groups any action into a trace, under a file name
+        # sanitized to [A-Za-z0-9._-].
+        r = c.req("getTabs", {"traceId": "run/../weird id"})
+        expect(r and r.get("success") is True,
+               f"{label}: explicit-traceId action should succeed, got {r}")
+        events = trace_events("run_.._weird_id")
+        expect(len(events) == 1 and events[0].get("traceId") == "run/../weird id"
+               and events[0].get("action") == "getTabs",
+               f"{label}: explicit traceId should write one event to the sanitized file, got {events}")
+        c.close()
+
+    # A host denial is still traced when the request names a trace explicitly:
+    # the artifact must show what was refused, not just what ran.
+    shutil.rmtree(TRACE_DIR, ignore_errors=True)
+    write_policy(permissive_with(traceDir=TRACE_DIR, deniedActions=["screenshot"]))
+    with Host(label, cmd, env, result_fn=trace_result):
+        c = Client("tok-alpha")
+        r = c.req("screenshot", {"tabId": 7, "traceId": "sess-denied"})
+        expect(r and r.get("success") is False and r.get("error") == "policy denied: action screenshot denied",
+               f"{label}: denied action should report the policy denial, got {r}")
+        events = trace_events("sess-denied")
+        expect(len(events) == 1 and events[0].get("decision") == "deny"
+               and events[0].get("success") is False
+               and events[0].get("reason") == "action screenshot denied"
+               and events[0].get("targets") == [7],
+               f"{label}: a denied request with an explicit traceId should still be traced, got {events}")
+        expect(isinstance((events[0] if events else {}).get("responseHash"), str),
+               f"{label}: a denial trace event should still carry a response hash, got {events}")
+        c.close()
+    shutil.rmtree(TRACE_DIR, ignore_errors=True)
+
+    # --- Handoff telemetry blackout: observation denied while a handoff runs ---
+    # The mock delays its waitForHandoff response, which is exactly what the real
+    # extension does while a human types credentials, so the host has a genuine
+    # in-flight handoff for the duration. Blackout is enforced host-side before
+    # policy, so nothing needs the (blocked) mock to answer.
+    def handoff_result(action, payload):
+        if action == "waitForHandoff":
+            time.sleep(2)
+            return {"resolved": True}
+        return {"echo": action}
+
+    # (a) tab-scoped handoff blacks out that tab, (b) it lifts on completion.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env, result_fn=handoff_result):
+        watcher = Client("tok-alpha")
+        observer = Client("tok-alpha")
+        handoff_response = []
+        t = threading.Thread(target=lambda: handoff_response.append(
+            watcher.req("waitForHandoff", {"message": "log in", "tabId": 7})))
+        t.start()
+        time.sleep(0.5)
+        # Same client identity as the initiator: the blackout applies to every
+        # client, including the one that asked for the handoff.
+        r = observer.req("screenshot", {"tabId": 7})
+        expect(r and r.get("success") is False and r.get("error") == "handoff in progress"
+               and r.get("blackout") is True,
+               f"{label}: screenshot during handoff should be blacked out, got {r}")
+        expect("screenshot" not in forwarded_actions(),
+               f"{label}: blacked-out screenshot must not forward, got {forwarded_actions()}")
+        r = observer.req("getHTML", {"tabId": 7})
+        expect(r and r.get("success") is False and r.get("blackout") is True,
+               f"{label}: getHTML during handoff should be blacked out, got {r}")
+        r = observer.req("screenshot", {"tabId": 7}, extra={"dryRun": True})
+        expect(r and r.get("success") is True and r.get("wouldForward") is False
+               and ((r.get("verdict") or {}).get("blackout") is True)
+               and ((r.get("verdict") or {}).get("reason") == "handoff in progress"),
+               f"{label}: dry run during handoff should report the blackout, got {r}")
+        r = observer.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: non-observation actions should pass during handoff, got {r}")
+        blackouts = [e for e in audit_events() if e.get("decision") == "handoff_blackout"]
+        expect(len(blackouts) >= 2 and blackouts[0].get("action") == "screenshot"
+               and blackouts[0].get("reason") == "handoff in progress",
+               f"{label}: blackout should be audited as handoff_blackout, got {blackouts}")
+        t.join(timeout=15)
+        expect(handoff_response and (handoff_response[0] or {}).get("success") is True,
+               f"{label}: handoff should complete, got {handoff_response}")
+        r = observer.req("screenshot", {"tabId": 7})
+        expect(r and r.get("success") is True,
+               f"{label}: screenshot after handoff should pass policy again, got {r}")
+        expect("screenshot" in forwarded_actions(),
+               f"{label}: post-handoff screenshot should forward, got {forwarded_actions()}")
+        observer.close()
+        watcher.close()
+
+    # (c) a handoff with no tabId is GLOBAL: every tab is blacked out.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env, result_fn=handoff_result):
+        watcher = Client("tok-alpha")
+        observer = Client("tok-alpha")
+        t = threading.Thread(target=lambda: watcher.req("waitForHandoff", {"message": "log in"}))
+        t.start()
+        time.sleep(0.5)
+        for payload in ({"tabId": 99}, {"tabId": 7}, {}):
+            r = observer.req("screenshot", payload)
+            expect(r and r.get("success") is False and r.get("error") == "handoff in progress"
+                   and r.get("blackout") is True,
+                   f"{label}: tabless handoff should black out {payload}, got {r}")
+        expect("screenshot" not in forwarded_actions(),
+               f"{label}: globally blacked-out screenshots must not forward, got {forwarded_actions()}")
+        t.join(timeout=15)
+        r = observer.req("screenshot", {"tabId": 99})
+        expect(r and r.get("success") is True,
+               f"{label}: screenshot after a tabless handoff should be allowed again, got {r}")
+        observer.close()
+        watcher.close()
 
 
 

@@ -60,6 +60,12 @@ const expectedDebuggerDetaches = new Map();
 let nextTaskDebuggerGeneration = 1;
 let taskSessionMutationQueue = Promise.resolve();
 const MONITOR_LIMIT = 200;
+// Screencast buffers live only in service-worker memory: a worker restart ends
+// the recording and drops whatever was buffered. Bounded by BOTH a frame count
+// and a total base64 size so a long capture cannot exhaust worker memory.
+const screencasts = new Map();
+const SCREENCAST_FRAME_LIMIT = 600;
+const SCREENCAST_BYTE_LIMIT = 50 * 1024 * 1024;
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source.tabId) return;
@@ -118,6 +124,39 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     return;
   }
 
+  if (method === "Page.screencastFrame" && screencasts.has(source.tabId)) {
+    const session = screencasts.get(source.tabId);
+    const data = typeof params.data === "string" ? params.data : "";
+    if (data) {
+      session.frames.push({
+        base64: data,
+        metadata: params.metadata || null,
+        timestamp: Date.now()
+      });
+      session.bytes += data.length;
+      session.captured += 1;
+      // Drop OLDEST frames past either bound and account for every drop, so a
+      // caller can tell a gapped recording from a complete one.
+      while (session.frames.length > SCREENCAST_FRAME_LIMIT || session.bytes > SCREENCAST_BYTE_LIMIT) {
+        const evicted = session.frames.shift();
+        if (!evicted) break;
+        session.bytes -= evicted.base64.length;
+        session.droppedFrames += 1;
+      }
+    }
+    // Mandatory: Chrome stops emitting frames until each one is acknowledged.
+    if (params.sessionId !== undefined && params.sessionId !== null) {
+      chrome.debugger.sendCommand({ tabId: source.tabId }, "Page.screencastFrameAck", {
+        sessionId: params.sessionId
+      }, () => {
+        if (chrome.runtime.lastError) {
+          console.warn("Page.screencastFrameAck failed:", chrome.runtime.lastError.message);
+        }
+      });
+    }
+    return;
+  }
+
   if (!monitors.has(source.tabId)) return;
   const monitor = monitors.get(source.tabId);
   const ts = Date.now();
@@ -128,19 +167,35 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       type: params.type || "console",
       level: params.type || "log",
       text: (params.args || []).map(stringifyRemoteValue).join(" "),
-      args: (params.args || []).map(stringifyRemoteValue)
+      args: (params.args || []).map(stringifyRemoteValue),
+      stack: captureStackFrames(params.stackTrace)
     });
     return;
   }
 
   if (method === "Log.entryAdded") {
     const entry = params.entry || {};
+    // Log entries carry a stack only for script errors; when they don't, the
+    // entry's own url/line is the single generated location we can report.
+    // LogEntry.lineNumber is 1-based, unlike call-frame lines, so normalize it
+    // to the 0-based convention every frame here uses.
+    const stack = captureStackFrames(entry.stackTrace);
+    if (stack.length === 0 && entry.url) {
+      stack.push({
+        url: entry.url,
+        lineNumber: typeof entry.lineNumber === "number" ? Math.max(0, entry.lineNumber - 1) : null,
+        columnNumber: null,
+        functionName: "",
+        scriptId: null
+      });
+    }
     pushLimited(monitor.console, {
       ts,
       type: "log",
       level: entry.level || "info",
       text: entry.text || "",
-      args: []
+      args: [],
+      stack
     });
     return;
   }
@@ -488,8 +543,17 @@ async function dispatchAction(action, payload) {
       case "stopMonitoring":
         result = await stopMonitoring(payload.tabId);
         break;
+      case "startScreencast":
+        result = await startScreencast(payload.tabId, payload);
+        break;
+      case "screencastFrames":
+        result = screencastFrames(payload.tabId, payload.consume !== false);
+        break;
+      case "stopScreencast":
+        result = await stopScreencast(payload.tabId);
+        break;
       case "consoleMessages":
-        result = consoleMessages(payload.tabId);
+        result = await consoleMessages(payload.tabId, payload);
         break;
       case "networkRequests":
         result = networkRequests(payload.tabId);
@@ -1019,6 +1083,8 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   const state = taskDebuggerStates.get(tabId);
   if (state?.timer) clearTimeout(state.timer);
   taskDebuggerStates.delete(tabId);
+  // A closed tab can never be drained; free its frame buffer immediately.
+  screencasts.delete(tabId);
   monitors.delete(tabId);
   interceptors.delete(tabId);
   await mutateTaskSessions(async (sessions) => {
@@ -1226,7 +1292,7 @@ async function withDebugger(tabId, fn) {
   }
   const taskSession = await findTaskSessionForTab(tabId);
   if (taskSession) return withTaskDebugger(tabId, taskSession.sessionId, fn);
-  if (monitors.has(tabId) || interceptors.has(tabId)) return fn(target);
+  if (monitors.has(tabId) || interceptors.has(tabId) || screencasts.has(tabId)) return fn(target);
   await debuggerAttach(target);
   try {
     return await fn(target);
@@ -1311,6 +1377,11 @@ function parseLocatorToken(rawToken, rawLocator) {
     if (!match) throw new Error(`Invalid role locator in ${rawLocator}`);
     return { kind: "role", role: match[1].toLowerCase(), name: match[2] };
   }
+  if (token.startsWith("ref=")) {
+    const ref = token.slice("ref=".length).trim();
+    if (!/^e[0-9]+$/.test(ref)) throw new Error(`Invalid element ref in ${rawLocator}`);
+    return { kind: "ref", ref };
+  }
   return { kind: "css", selector: token };
 }
 
@@ -1369,7 +1440,32 @@ function hasUnsupportedLocatorToken(raw) {
   return scanLocatorSeparators(raw, ">>>>").length > 1 || scanLocatorSeparators(raw, "<<<").length > 1;
 }
 
-function parseActionLocator(selector) {
+// A ref that is not in the tab's live registry MUST fail loudly: falling back
+// to CSS parsing would silently click whatever "e12" happens to match.
+class StaleRefError extends Error {
+  constructor(ref) {
+    super(`Unknown or stale element ref ${ref}; re-run observe`);
+    this.name = "StaleRefError";
+    this.ref = ref;
+  }
+}
+
+function staleRefResponse(ref) {
+  return {
+    success: false,
+    error: "staleRef",
+    err: `Unknown or stale element ref ${ref}; re-run observe`,
+    ref,
+    hint: "re-run observe"
+  };
+}
+
+function locatorError(error) {
+  if (error instanceof StaleRefError) return staleRefResponse(error.ref);
+  return { success: false, err: error.message };
+}
+
+function parseActionLocator(selector, tabId) {
   const raw = String(selector ?? "");
   if (hasUnsupportedLocatorToken(raw)) {
     throw new Error(`Unsupported selector token in ${raw}`);
@@ -1406,6 +1502,7 @@ function parseActionLocator(selector) {
     throw new Error(`Missing final selector in ${raw}`);
   }
   const shadowSegments = shadowParts.slice(1).map((part) => parseLocatorToken(part, raw));
+  bindLocatorRefs([target, ...shadowSegments], tabId);
   return {
     frames,
     target,
@@ -1481,6 +1578,14 @@ function locatorResolverSource() {
         const selector = token?.selector || '';
         const el = root.querySelector(selector);
         return el ? { success: true, el } : { success: false, err: 'No element found for selector ' + selector };
+      }
+      if (token.kind === 'ref') {
+        const store = self.__chromeBridgeRefs;
+        const el = store && typeof store.get === 'function' ? store.get(token.ref) : null;
+        if (!el || !el.isConnected) {
+          return { success: false, error: 'staleRef', err: 'Stale element ref ' + token.ref + '; re-run observe', hint: 're-run observe' };
+        }
+        return { success: true, el };
       }
       if (token.kind === 'text') {
         const el = deepestTextMatch(root, token.text);
@@ -1768,6 +1873,11 @@ async function resolveActionTarget(tabId, locator, attachedTarget) {
       currentRootNodeId = null;
     }
 
+    // Element refs resolve from the live CDP node rather than a re-query, so
+    // stage them into the execution context the action will actually run in.
+    const staged = await stageLocatorRefs(target, [locator], currentContextId);
+    if (staged.success === false) return staged;
+
     const lookup = await evaluateInContext(target, actionTargetExpression(locator, 'center'), currentContextId);
     const value = lookup.val || lookup;
     if (!lookup.success || value.success === false) return value;
@@ -1794,9 +1904,9 @@ async function focusActionTarget(target, resolved, clear) {
 async function waitForSelector(tabId, selector, timeoutMs) {
   let locator;
   try {
-    locator = parseActionLocator(selector);
+    locator = parseActionLocator(selector, tabId);
   } catch (error) {
-    return { success: false, err: error.message };
+    return locatorError(error);
   }
   const deadline = deadlineFrom(timeoutMs);
   while (Date.now() <= deadline) {
@@ -1925,9 +2035,9 @@ async function getHTML(tabId) {
 async function getElementCenter(target, selector) {
   let locator;
   try {
-    locator = parseActionLocator(selector);
+    locator = parseActionLocator(selector, target.tabId);
   } catch (error) {
-    return { success: false, err: error.message };
+    return locatorError(error);
   }
   return resolveActionTarget(target.tabId, locator, target);
 }
@@ -2054,9 +2164,9 @@ async function scrollTarget(tabId, deltaX, deltaY, selector) {
     let locator = null;
     if (selector) {
       try {
-        locator = parseActionLocator(selector);
+        locator = parseActionLocator(selector, tabId);
       } catch (error) {
-        return { success: false, err: error.message };
+        return locatorError(error);
       }
       point = await resolveActionTarget(tabId, locator, target);
       if (point.success === false) return point;
@@ -2129,8 +2239,14 @@ async function pressKey(tabId, keySpec) {
 
 async function dragSelector(tabId, fromSelector, toSelector) {
   return withDebugger(tabId, async (target) => {
-    const fromLocator = parseActionLocator(fromSelector);
-    const toLocator = parseActionLocator(toSelector);
+    let fromLocator;
+    let toLocator;
+    try {
+      fromLocator = parseActionLocator(fromSelector, tabId);
+      toLocator = parseActionLocator(toSelector, tabId);
+    } catch (error) {
+      return locatorError(error);
+    }
     const from = await resolveActionTarget(tabId, fromLocator, target);
     if (from.success === false) return from;
     const to = await resolveActionTarget(tabId, toLocator, target);
@@ -2162,9 +2278,9 @@ async function selectOption(tabId, selector, value) {
   return withDebugger(tabId, async (target) => {
     let locator;
     try {
-      locator = parseActionLocator(selector);
+      locator = parseActionLocator(selector, tabId);
     } catch (error) {
-      return { success: false, err: error.message };
+      return locatorError(error);
     }
     const resolved = await resolveActionTarget(tabId, locator, target);
     if (resolved.success === false) return resolved;
@@ -2290,9 +2406,9 @@ async function githubAttachUploadedFiles(tabId, inputSelector, formSelector, tim
   return withDebugger(tabId, async (target) => {
     let locator;
     try {
-      locator = parseActionLocator(inputSelector);
+      locator = parseActionLocator(inputSelector, tabId);
     } catch (error) {
-      return { success: false, err: error.message };
+      return locatorError(error);
     }
     const resolved = await resolveActionTarget(tabId, locator, target);
     if (resolved.success === false) return resolved;
@@ -2491,9 +2607,9 @@ async function uploadFile(tabId, selector, files) {
   return withDebugger(tabId, async (target) => {
     let locator;
     try {
-      locator = parseActionLocator(selector);
+      locator = parseActionLocator(selector, tabId);
     } catch (error) {
-      return { success: false, err: error.message };
+      return locatorError(error);
     }
     const resolved = await resolveActionTarget(tabId, locator, target);
     if (resolved.success === false) return resolved;
@@ -2580,6 +2696,148 @@ async function setUserAgent(tabId, userAgent) {
   });
 }
 
+// HI2/HI3: stable per-tab element refs plus the previous observe snapshot used
+// for diffing. This lives only in service-worker memory: a worker restart or a
+// navigation invalidates every ref for that tab. The counter never rewinds, so
+// a ref minted before a navigation can never silently point at a new element.
+const REF_SNAPSHOT_CAP = 5000;
+const REF_PAGE_STORE_LIMIT = 8;
+const refRegistries = new Map();
+
+function refRegistry(tabId) {
+  let registry = refRegistries.get(tabId);
+  if (!registry) {
+    registry = { counter: 0, epoch: 0, byRef: new Map(), byKey: new Map(), snapshot: null, snapshotEpoch: null };
+    refRegistries.set(tabId, registry);
+  }
+  return registry;
+}
+
+function invalidateRefs(tabId) {
+  const registry = refRegistries.get(tabId);
+  if (!registry) return;
+  registry.byRef.clear();
+  registry.byKey.clear();
+  registry.snapshot = null;
+  registry.snapshotEpoch = null;
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  refRegistries.delete(tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading" || typeof changeInfo.url === "string") invalidateRefs(tabId);
+});
+
+function observeNodeKey(node) {
+  return node.backendDOMNodeId ? `dom:${node.backendDOMNodeId}` : `ax:${node.nodeId}`;
+}
+
+function assignRef(registry, node) {
+  const key = observeNodeKey(node);
+  let ref = registry.byKey.get(key);
+  if (!ref) {
+    registry.counter += 1;
+    ref = `e${registry.counter}`;
+    registry.byKey.set(key, ref);
+  }
+  registry.byRef.set(ref, { key, backendDOMNodeId: node.backendDOMNodeId || null });
+  return ref;
+}
+
+function trimRefRegistry(registry) {
+  while (registry.byRef.size > REF_SNAPSHOT_CAP) {
+    const oldest = registry.byRef.keys().next().value;
+    const entry = registry.byRef.get(oldest);
+    registry.byRef.delete(oldest);
+    if (entry) registry.byKey.delete(entry.key);
+  }
+}
+
+function diffSnapshots(previous, current) {
+  const added = [];
+  const changed = [];
+  const removed = [];
+  for (const [ref, node] of current) {
+    const before = previous.get(ref);
+    if (!before) {
+      added.push(node);
+      continue;
+    }
+    if (before.role !== node.role || before.name !== node.name || (before.value ?? null) !== (node.value ?? null)) {
+      changed.push(node);
+    }
+  }
+  for (const ref of previous.keys()) {
+    if (!current.has(ref)) removed.push(ref);
+  }
+  return { added, removed, changed };
+}
+
+function bindLocatorRefs(tokens, tabId) {
+  const registry = tabId === undefined || tabId === null ? null : refRegistries.get(tabId);
+  for (const token of tokens) {
+    if (!token || token.kind !== "ref") continue;
+    const entry = registry ? registry.byRef.get(token.ref) : null;
+    if (!entry || !entry.backendDOMNodeId) throw new StaleRefError(token.ref);
+    token.backendDOMNodeId = entry.backendDOMNodeId;
+  }
+}
+
+const REF_STAGE_FUNCTION = `function (ref) {
+  const view = (this.ownerDocument && this.ownerDocument.defaultView) || self;
+  const store = view.__chromeBridgeRefs instanceof Map ? view.__chromeBridgeRefs : new Map();
+  view.__chromeBridgeRefs = store;
+  store.delete(ref);
+  store.set(ref, this);
+  while (store.size > ${REF_PAGE_STORE_LIMIT}) store.delete(store.keys().next().value);
+  return true;
+}`;
+
+// Resolve each ref token against its live CDP node and stash the element in the
+// page so the injected resolver can pick it up by ref. A node that no longer
+// resolves is a stale ref, never a fallback to selector matching.
+async function stageLocatorRefs(target, locators, contextId) {
+  const tokens = [];
+  for (const locator of locators) {
+    if (!locator) continue;
+    for (const token of [locator.target, ...(locator.shadowSegments || [])]) {
+      if (token && token.kind === "ref") tokens.push(token);
+    }
+  }
+  if (!tokens.length) return { success: true, staged: 0 };
+  for (const token of tokens) {
+    if (!token.backendDOMNodeId) return staleRefResponse(token.ref);
+    let objectId = null;
+    const resolveParams = { backendNodeId: token.backendDOMNodeId };
+    if (contextId !== null && contextId !== undefined) resolveParams.executionContextId = contextId;
+    try {
+      const resolved = await debuggerCommand(target, 'DOM.resolveNode', resolveParams);
+      objectId = resolved?.object?.objectId || null;
+    } catch (error) {
+      objectId = null;
+    }
+    if (!objectId) return staleRefResponse(token.ref);
+    try {
+      await debuggerCommand(target, 'Runtime.callFunctionOn', {
+        objectId,
+        functionDeclaration: REF_STAGE_FUNCTION,
+        arguments: [{ value: token.ref }],
+        returnByValue: true
+      });
+    } catch (error) {
+      return staleRefResponse(token.ref);
+    }
+    try {
+      await debuggerCommand(target, 'Runtime.releaseObject', { objectId });
+    } catch (error) {
+      // Releasing the handle is best-effort; the page store owns the element.
+    }
+  }
+  return { success: true, staged: tokens.length };
+}
+
 async function observeTab(tabId, options = {}) {
   return withDebugger(tabId, async (target) => {
     const ax = await debuggerCommand(target, 'Accessibility.getFullAXTree', {});
@@ -2601,21 +2859,36 @@ async function observeTab(tabId, options = {}) {
       const usefulRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'menuitem', 'tab', 'heading', 'img']);
       nodes = nodes.filter((node) => usefulRoles.has(String(node.role?.value || '').toLowerCase()) || node.name?.value || node.value?.value);
     }
-    return nodes.slice(0, limit).map((node) => {
+    const registry = refRegistry(tabId);
+    const current = new Map();
+    const results = nodes.slice(0, limit).map((node) => {
+      const ref = assignRef(registry, node);
       const basic = {
+        ref,
         role: node.role?.value || null,
         name: node.name?.value || '',
       };
       if (node.value?.value != null) basic.value = node.value.value;
-      if (compact) return basic;
-      return {
+      const entry = compact ? basic : {
         nodeId: node.nodeId,
         backendDOMNodeId: node.backendDOMNodeId || null,
         ...basic,
         description: node.description?.value || null,
         properties: Object.fromEntries((node.properties || []).map((prop) => [prop.name, prop.value?.value ?? prop.value?.description ?? null]))
       };
+      if (current.size < REF_SNAPSHOT_CAP) current.set(ref, entry);
+      return entry;
     });
+    trimRefRegistry(registry);
+    const baseSnapshot = registry.snapshot;
+    const baseEpoch = registry.snapshotEpoch;
+    registry.epoch += 1;
+    const epoch = registry.epoch;
+    registry.snapshot = current;
+    registry.snapshotEpoch = epoch;
+    if (options.diff !== true) return results;
+    if (!baseSnapshot) return { success: true, tabId, epoch, diffBase: true, nodes: results };
+    return { success: true, tabId, baseEpoch, epoch, ...diffSnapshots(baseSnapshot, current) };
   });
 }
 
@@ -2626,7 +2899,7 @@ async function startMonitoring(tabId) {
   const taskLease = taskSession
     ? await acquireTaskDebugger(tabId, taskSession.sessionId, "monitor")
     : null;
-  const attachedHere = !interceptors.has(tabId) && !taskLease;
+  const attachedHere = !interceptors.has(tabId) && !screencasts.has(tabId) && !taskLease;
   if (attachedHere) {
     await debuggerAttach(target);
   }
@@ -2640,7 +2913,7 @@ async function startMonitoring(tabId) {
     monitors.delete(tabId);
     if (taskLease) {
       releaseTaskDebugger(taskLease);
-    } else if (attachedHere && !interceptors.has(tabId)) {
+    } else if (attachedHere && !interceptors.has(tabId) && !screencasts.has(tabId)) {
       await debuggerDetach(target);
     }
     throw error;
@@ -2655,16 +2928,449 @@ async function stopMonitoring(tabId) {
   if (state) {
     state.holders.delete("monitor");
     scheduleTaskDebuggerDetach(tabId);
-  } else if (!interceptors.has(tabId)) {
+  } else if (!interceptors.has(tabId) && !screencasts.has(tabId)) {
     await debuggerDetach({ tabId });
   }
   return { success: true, tabId };
 }
 
-function consoleMessages(tabId) {
+async function startScreencast(tabId, options = {}) {
+  if (screencasts.has(tabId)) return { success: true, tabId, recording: true, already: true };
+  const format = options.format === "png" ? "png" : "jpeg";
+  const rawQuality = Number(options.quality);
+  const quality = Number.isFinite(rawQuality) ? Math.min(100, Math.max(1, Math.round(rawQuality))) : 70;
+  const rawEvery = Number(options.everyNthFrame);
+  const everyNthFrame = Number.isFinite(rawEvery) && rawEvery >= 1 ? Math.round(rawEvery) : 1;
+  const params = { format, everyNthFrame };
+  // CDP applies quality to jpeg only; sending it with png is meaningless.
+  if (format === "jpeg") params.quality = quality;
+  const maxWidth = Number(options.maxWidth);
+  if (Number.isFinite(maxWidth) && maxWidth > 0) params.maxWidth = Math.round(maxWidth);
+  const maxHeight = Number(options.maxHeight);
+  if (Number.isFinite(maxHeight) && maxHeight > 0) params.maxHeight = Math.round(maxHeight);
+  const target = { tabId };
+  // Same ownership rule as startMonitoring: attach only if nothing else already
+  // holds the debugger for this tab, so recording never activates the tab.
+  const heldByOther = monitors.has(tabId) || interceptors.has(tabId);
+  if (!heldByOther) await debuggerAttach(target);
+  screencasts.set(tabId, {
+    frames: [],
+    bytes: 0,
+    droppedFrames: 0,
+    captured: 0,
+    format,
+    startedAt: Date.now()
+  });
+  try {
+    await debuggerCommand(target, 'Page.enable', {});
+    await debuggerCommand(target, 'Page.startScreencast', params);
+  } catch (error) {
+    screencasts.delete(tabId);
+    if (!heldByOther) await debuggerDetach(target);
+    throw error;
+  }
+  return {
+    success: true,
+    tabId,
+    recording: true,
+    already: false,
+    format,
+    quality: params.quality ?? null,
+    everyNthFrame,
+    frameLimit: SCREENCAST_FRAME_LIMIT,
+    byteLimit: SCREENCAST_BYTE_LIMIT
+  };
+}
+
+function screencastFrames(tabId, consume = true) {
+  const session = screencasts.get(tabId);
+  if (!session) return { success: false, err: `Screencast is not active for tab ${tabId}; run startScreencast first` };
+  const frames = session.frames;
+  const droppedFrames = session.droppedFrames;
+  if (consume) {
+    session.frames = [];
+    session.bytes = 0;
+    session.droppedFrames = 0;
+  }
+  return {
+    success: true,
+    tabId,
+    recording: true,
+    consumed: consume,
+    format: session.format,
+    frameCount: frames.length,
+    capturedFrames: session.captured,
+    droppedFrames,
+    frames
+  };
+}
+
+async function stopScreencast(tabId) {
+  const session = screencasts.get(tabId);
+  if (!session) return { success: true, tabId, recording: false, alreadyStopped: true, remainingFrames: 0 };
+  const remainingFrames = session.frames.length;
+  const droppedFrames = session.droppedFrames;
+  const capturedFrames = session.captured;
+  // Delete first so the frame listener stops buffering (and stops acking) while
+  // the stop command is in flight.
+  screencasts.delete(tabId);
+  const target = { tabId };
+  try {
+    await debuggerCommand(target, 'Page.stopScreencast', {});
+  } catch (error) {
+    // The tab may already be gone; the session is stopped either way.
+  }
+  if (!monitors.has(tabId) && !interceptors.has(tabId)) {
+    await debuggerDetach(target);
+  }
+  return {
+    success: true,
+    tabId,
+    recording: false,
+    alreadyStopped: false,
+    remainingFrames,
+    droppedFrames,
+    capturedFrames
+  };
+}
+
+// HI7: raw generated locations for every captured console/error stack frame.
+// CDP reports 0-based line/column; we pass them through untouched so a caller
+// can correlate with `Debugger` output, and any resolved original location
+// uses the same 0-based convention.
+const STACK_FRAME_LIMIT = 20;
+
+function captureStackFrames(stackTrace) {
+  const frames = [];
+  let trace = stackTrace;
+  // Walk async parents too: the interesting frame for a console error raised in
+  // a promise chain often lives above the synchronous callFrames.
+  while (trace && frames.length < STACK_FRAME_LIMIT) {
+    for (const frame of trace.callFrames || []) {
+      if (frames.length >= STACK_FRAME_LIMIT) break;
+      frames.push({
+        url: frame.url || "",
+        lineNumber: typeof frame.lineNumber === "number" ? frame.lineNumber : null,
+        columnNumber: typeof frame.columnNumber === "number" ? frame.columnNumber : null,
+        functionName: frame.functionName || "",
+        scriptId: frame.scriptId || null
+      });
+    }
+    trace = trace.parent;
+  }
+  return frames;
+}
+
+// --- HI7: best-effort source-map resolution --------------------------------
+// Parsed maps live in service-worker memory only, keyed per (tab, script URL),
+// and are dropped when the tab closes. Source TEXT is never retained or
+// returned: we read a script solely to find its sourceMappingURL comment, and
+// `sourcesContent` from the map is ignored. A sourceMappingURL that resolves
+// off the script's own origin is refused rather than fetched, so resolution
+// never reaches a third-party origin.
+const SOURCE_MAP_CACHE_LIMIT = 100;
+const SOURCE_MAP_SOURCE_BYTES = 8 * 1024 * 1024;
+const sourceMapCache = new Map();
+
+function sourceMapCacheKey(tabId, scriptUrl) {
+  return `${tabId}\n${scriptUrl}`;
+}
+
+function sourceMapCacheGet(key) {
+  if (!sourceMapCache.has(key)) return undefined;
+  const entry = sourceMapCache.get(key);
+  // Re-insert so the bounded cache evicts genuinely cold scripts, not the hot
+  // bundle that every stack frame points at.
+  sourceMapCache.delete(key);
+  sourceMapCache.set(key, entry);
+  return entry;
+}
+
+function sourceMapCacheSet(key, entry) {
+  sourceMapCache.set(key, entry);
+  while (sourceMapCache.size > SOURCE_MAP_CACHE_LIMIT) {
+    const oldest = sourceMapCache.keys().next();
+    if (oldest.done) break;
+    sourceMapCache.delete(oldest.value);
+  }
+  return entry;
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  const prefix = `${tabId}\n`;
+  for (const key of [...sourceMapCache.keys()]) {
+    if (key.startsWith(prefix)) sourceMapCache.delete(key);
+  }
+});
+
+const VLQ_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const VLQ_DIGITS = new Map([...VLQ_ALPHABET].map((char, index) => [char, index]));
+
+// Minimal source-map v3 base64 VLQ decoder. Returns null for any malformed
+// segment so a corrupt map is reported as `invalid` instead of silently
+// producing bogus original positions.
+function decodeVlq(segment) {
+  const values = [];
+  let value = 0;
+  let shift = 0;
+  for (const char of segment) {
+    const digit = VLQ_DIGITS.get(char);
+    if (digit === undefined) return null;
+    value += (digit & 31) * Math.pow(2, shift);
+    if ((digit & 32) !== 0) {
+      shift += 5;
+      continue;
+    }
+    const negative = (value & 1) === 1;
+    value = Math.floor(value / 2);
+    values.push(negative ? -value : value);
+    value = 0;
+    shift = 0;
+  }
+  if (shift !== 0) return null;
+  return values;
+}
+
+// `mappings` -> one array of segments per generated line, each segment already
+// carrying absolute (not delta) indices.
+function decodeMappings(mappings) {
+  const lines = [];
+  let sourceIndex = 0;
+  let originalLine = 0;
+  let originalColumn = 0;
+  let nameIndex = 0;
+  for (const group of mappings.split(";")) {
+    const segments = [];
+    let generatedColumn = 0;
+    if (group) {
+      for (const raw of group.split(",")) {
+        if (!raw) continue;
+        const fields = decodeVlq(raw);
+        if (!fields || fields.length === 0) return null;
+        generatedColumn += fields[0];
+        if (fields.length === 1) {
+          segments.push({ generatedColumn, sourceIndex: -1, originalLine: -1, originalColumn: -1, nameIndex: -1 });
+          continue;
+        }
+        if (fields.length < 4) return null;
+        sourceIndex += fields[1];
+        originalLine += fields[2];
+        originalColumn += fields[3];
+        const named = fields.length > 4;
+        if (named) nameIndex += fields[4];
+        segments.push({
+          generatedColumn,
+          sourceIndex,
+          originalLine,
+          originalColumn,
+          nameIndex: named ? nameIndex : -1
+        });
+      }
+      segments.sort((a, b) => a.generatedColumn - b.generatedColumn);
+    }
+    lines.push(segments);
+  }
+  return lines;
+}
+
+function resolveSourcePath(source, sourceRoot, mapUrl) {
+  const prefixed = sourceRoot ? `${String(sourceRoot).replace(/\/?$/, "/")}${source}` : source;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(prefixed)) return prefixed;
+  if (!mapUrl || mapUrl.startsWith("data:")) return prefixed;
+  try {
+    return new URL(prefixed, mapUrl).href;
+  } catch (error) {
+    return prefixed;
+  }
+}
+
+function parseSourceMap(text, mapUrl) {
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch (error) {
+    return null;
+  }
+  if (!raw || raw.version !== 3 || typeof raw.mappings !== "string") return null;
+  // Index maps (`sections`) are out of scope for this minimal decoder.
+  if (Array.isArray(raw.sections)) return null;
+  const lines = decodeMappings(raw.mappings);
+  if (!lines) return null;
+  const sources = (Array.isArray(raw.sources) ? raw.sources : [])
+    .map((source) => resolveSourcePath(String(source ?? ""), raw.sourceRoot, mapUrl));
+  const names = (Array.isArray(raw.names) ? raw.names : []).map((name) => String(name ?? ""));
+  // `sourcesContent` is deliberately dropped: we resolve positions, never text.
+  return { lines, sources, names };
+}
+
+function resolveMappedPosition(map, lineNumber, columnNumber) {
+  if (typeof lineNumber !== "number" || lineNumber < 0) return null;
+  const segments = map.lines[lineNumber];
+  if (!segments || segments.length === 0) return null;
+  const column = typeof columnNumber === "number" && columnNumber >= 0 ? columnNumber : 0;
+  let match = null;
+  for (const segment of segments) {
+    if (segment.generatedColumn > column) break;
+    match = segment;
+  }
+  // A frame left of the first mapping on the line still belongs to that line's
+  // first mapped region far more often than to nothing at all.
+  if (!match) match = segments[0];
+  if (!match || match.sourceIndex < 0) return null;
+  const source = map.sources[match.sourceIndex];
+  if (source === undefined) return null;
+  return {
+    source,
+    name: match.nameIndex >= 0 ? (map.names[match.nameIndex] ?? null) : null,
+    lineNumber: match.originalLine,
+    columnNumber: match.originalColumn
+  };
+}
+
+function sourceMappingUrlFrom(scriptSource) {
+  // Only the LAST comment counts, and it must not be inside the code we skim:
+  // bundlers always emit it on its own trailing line.
+  const pattern = /^[#@]\s*sourceMappingURL=(\S+)\s*$/;
+  const tail = scriptSource.slice(-4096).split("\n");
+  for (let index = tail.length - 1; index >= 0; index -= 1) {
+    const line = tail[index].trim();
+    if (!line.startsWith("//") && !line.startsWith("/*")) continue;
+    const body = line.replace(/^\/\*/, "").replace(/\*\/$/, "").replace(/^\/\//, "").trim();
+    const match = pattern.exec(body);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+async function scriptSourceFor(context, scriptUrl, scriptId) {
+  // Prefer CDP: it returns exactly the bytes the page executed, including
+  // sources a plain fetch would re-request (or be denied).
+  if (scriptId && !context.debuggerFailed) {
+    try {
+      if (!context.debuggerEnabled) {
+        await debuggerCommand({ tabId: context.tabId }, "Debugger.enable", {});
+        context.debuggerEnabled = true;
+      }
+      const response = await debuggerCommand({ tabId: context.tabId }, "Debugger.getScriptSource", { scriptId });
+      if (response && typeof response.scriptSource === "string") return response.scriptSource;
+    } catch (error) {
+      // One failure means the domain is unusable for this pass; stop retrying.
+      if (!context.debuggerEnabled) context.debuggerFailed = true;
+    }
+  }
+  try {
+    const response = await fetch(scriptUrl, { credentials: "omit", cache: "force-cache" });
+    if (!response.ok) return null;
+    const text = await response.text();
+    return text.length > SOURCE_MAP_SOURCE_BYTES ? null : text;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function releaseScriptSourceContext(context) {
+  if (!context.debuggerEnabled) return;
+  context.debuggerEnabled = false;
+  try {
+    await debuggerCommand({ tabId: context.tabId }, "Debugger.disable", {});
+  } catch (error) {
+    // The tab may have navigated or closed; nothing to unwind.
+  }
+}
+
+async function loadSourceMapEntry(context, scriptUrl, scriptId) {
+  if (!scriptUrl || !/^https?:/i.test(scriptUrl)) return { status: "notFound" };
+  const key = sourceMapCacheKey(context.tabId, scriptUrl);
+  const cached = sourceMapCacheGet(key);
+  if (cached) return cached;
+  const source = await scriptSourceFor(context, scriptUrl, scriptId);
+  if (source === null) return sourceMapCacheSet(key, { status: "notFound" });
+  const mappingUrl = sourceMappingUrlFrom(source);
+  if (!mappingUrl) return sourceMapCacheSet(key, { status: "notFound" });
+
+  let mapText = null;
+  let mapUrl = null;
+  if (mappingUrl.startsWith("data:")) {
+    const comma = mappingUrl.indexOf(",");
+    const header = comma >= 0 ? mappingUrl.slice(5, comma) : "";
+    if (comma < 0 || !/^application\/json/i.test(header)) {
+      return sourceMapCacheSet(key, { status: "invalid" });
+    }
+    const payload = mappingUrl.slice(comma + 1);
+    try {
+      mapText = /;base64$/i.test(header) ? atob(payload) : decodeURIComponent(payload);
+    } catch (error) {
+      return sourceMapCacheSet(key, { status: "invalid" });
+    }
+  } else {
+    let resolved;
+    try {
+      resolved = new URL(mappingUrl, scriptUrl);
+    } catch (error) {
+      return sourceMapCacheSet(key, { status: "invalid" });
+    }
+    // Hard boundary: only the script's own origin may be contacted for a map.
+    if (resolved.origin !== new URL(scriptUrl).origin) {
+      return sourceMapCacheSet(key, { status: "crossOriginRefused" });
+    }
+    mapUrl = resolved.href;
+    try {
+      const response = await fetch(mapUrl, { credentials: "omit", cache: "force-cache" });
+      if (!response.ok) return sourceMapCacheSet(key, { status: "notFound" });
+      mapText = await response.text();
+    } catch (error) {
+      return sourceMapCacheSet(key, { status: "notFound" });
+    }
+  }
+
+  const map = parseSourceMap(mapText, mapUrl || scriptUrl);
+  if (!map) return sourceMapCacheSet(key, { status: "invalid" });
+  return sourceMapCacheSet(key, { status: "ok", map });
+}
+
+async function resolveConsoleSourceMaps(tabId, messages) {
+  const context = { tabId, debuggerEnabled: false, debuggerFailed: false };
+  const scripts = new Set();
+  let framesConsidered = 0;
+  let framesResolved = 0;
+  try {
+    for (const message of messages) {
+      for (const frame of message.stack) {
+        framesConsidered += 1;
+        const entry = await loadSourceMapEntry(context, frame.url, frame.scriptId);
+        if (entry.status !== "ok") {
+          frame.sourceMapStatus = entry.status;
+          continue;
+        }
+        scripts.add(frame.url);
+        const original = resolveMappedPosition(entry.map, frame.lineNumber, frame.columnNumber);
+        if (!original) {
+          frame.sourceMapStatus = "unmapped";
+          continue;
+        }
+        frame.originalLocation = original;
+        framesResolved += 1;
+      }
+    }
+  } finally {
+    await releaseScriptSourceContext(context);
+  }
+  return { framesConsidered, framesResolved, mappedScripts: scripts.size };
+}
+
+async function consoleMessages(tabId, options = {}) {
   const monitor = monitors.get(tabId);
   if (!monitor) return { success: false, err: `Monitoring is not active for tab ${tabId}; run startMonitoring first` };
-  return { success: true, tabId, messages: [...monitor.console] };
+  // Copy entries (and their frames) so resolution never mutates the buffer a
+  // later plain consoleMessages call will return.
+  const messages = monitor.console.map((entry) => ({
+    ...entry,
+    args: [...(entry.args || [])],
+    stack: (entry.stack || []).map((frame) => ({ ...frame }))
+  }));
+  if (options.resolveSourceMaps !== true) return { success: true, tabId, messages };
+  const stats = await resolveConsoleSourceMaps(tabId, messages);
+  return { success: true, tabId, sourceMapsResolved: true, ...stats, messages };
 }
 
 function networkRequests(tabId) {
@@ -2862,7 +3568,7 @@ async function startInterception(tabId, urlPattern, mode, status, body) {
   const taskLease = taskSession
     ? await acquireTaskDebugger(tabId, taskSession.sessionId, "interceptor")
     : null;
-  const attachedHere = !monitors.has(tabId) && !interceptors.has(tabId) && !taskLease;
+  const attachedHere = !monitors.has(tabId) && !interceptors.has(tabId) && !screencasts.has(tabId) && !taskLease;
   if (attachedHere) {
     await debuggerAttach(target);
   }
@@ -2885,7 +3591,7 @@ async function startInterception(tabId, urlPattern, mode, status, body) {
     interceptors.delete(tabId);
     if (taskLease) {
       releaseTaskDebugger(taskLease);
-    } else if (attachedHere && !monitors.has(tabId)) {
+    } else if (attachedHere && !monitors.has(tabId) && !screencasts.has(tabId)) {
       await debuggerDetach(target);
     }
     throw error;
@@ -2905,7 +3611,7 @@ async function stopInterception(tabId) {
   if (state) {
     state.holders.delete("interceptor");
     scheduleTaskDebuggerDetach(tabId);
-  } else if (!monitors.has(tabId)) {
+  } else if (!monitors.has(tabId) && !screencasts.has(tabId)) {
     await debuggerDetach(target);
   }
   return { success: true, tabId };

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import os
 import sys
 import json
@@ -8,6 +9,7 @@ import http.server
 import threading
 import subprocess
 import contextlib
+import shutil
 from pathlib import Path
 
 # Paths & Settings
@@ -25,6 +27,7 @@ SHOT_PATH = "/tmp/chrome-bridge-live.png"
 PDF_PATH = "/tmp/chrome-bridge-live.pdf"
 HTML_PATH = "/tmp/chrome-bridge-live.html"
 STATE_PATH = "/tmp/chrome-bridge-state.json"
+SCREENCAST_DIR = "/tmp/chrome-bridge-screencast"
 DOWNLOAD_NAME = "chrome-bridge-smoke-download.json"
 LAST_SUMMARY = {}
 PAGE = b"""<!doctype html>
@@ -48,6 +51,8 @@ PAGE = b"""<!doctype html>
   <button id="log">Log</button>
   <button id="fetch">Fetch</button>
   <button id="alert">Alert</button>
+  <button id="mapped">Mapped error</button>
+  <button id="mapped-cross">Cross map</button>
   <select id="kind" name="kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>
   <input id="file" type="file">
   <div id="status">ready</div>
@@ -76,10 +81,41 @@ PAGE = b"""<!doctype html>
     document.querySelector('#to').addEventListener('dragover', event => event.preventDefault());
     document.querySelector('#to').addEventListener('drop', event => { event.preventDefault(); window.__dragDropped = true; document.querySelector('#status').textContent = 'dropped'; });
   </script>
+  <script src="/mapped.js"></script>
+  <script src="/crossmap.js"></script>
 </body>
 </html>"""
 
 DATA = b'{"ok": true}'
+
+# HI7 fixture: a "minified" script with an INLINE source map. `console.error`
+# starts at generated line 0, column 16 (after `function boom(){`), and the map
+# has a single segment there pointing at src/fixture-original.js line 3,
+# column 2 (0-based), name `boom`. VLQ "gBAGEA" == [16, 0, 3, 2, 0].
+MAPPED_SOURCE = "src/fixture-original.js"
+MAPPED_ORIGINAL_LINE = 3
+MAPPED_SOURCE_MAP = json.dumps({
+    "version": 3,
+    "file": "mapped.js",
+    "sources": [MAPPED_SOURCE],
+    "names": ["boom"],
+    "mappings": "gBAGEA;",
+}).encode("utf-8")
+MAPPED_SCRIPT = (
+    'function boom(){console.error("bridge fixture mapped error")}\n'
+    'document.querySelector("#mapped").addEventListener("click",boom);\n'
+    "//# sourceMappingURL=data:application/json;base64,"
+    + base64.b64encode(MAPPED_SOURCE_MAP).decode("ascii")
+    + "\n"
+).encode("utf-8")
+
+# Same shape, but the map lives on a third-party origin: resolution must refuse
+# it outright rather than fetch it.
+CROSS_MAPPED_SCRIPT = (
+    'function crossBoom(){console.error("bridge fixture cross-origin map")}\n'
+    'document.querySelector("#mapped-cross").addEventListener("click",crossBoom);\n'
+    "//# sourceMappingURL=https://example.invalid/crossmap.js.map\n"
+).encode("utf-8")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -88,6 +124,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(DATA)
+            return
+        if self.path.startswith("/mapped.js") or self.path.startswith("/crossmap.js"):
+            body = MAPPED_SCRIPT if self.path.startswith("/mapped.js") else CROSS_MAPPED_SCRIPT
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -227,6 +271,9 @@ def main(quiet=False):
     for path in [SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH]:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
+    # A stale frame directory would make the frame-count assertions meaningless.
+    with contextlib.suppress(Exception):
+        shutil.rmtree(SCREENCAST_DIR)
     policy_backup = None
     backup_mode = None
     policy_path = None
@@ -235,6 +282,7 @@ def main(quiet=False):
     tab_id = None
     monitoring_started = False
     interception_started = False
+    screencast_started = False
     try:
         p_path, resolved_from_host = resolve_policy_path()
         require(resolved_from_host or "BRIDGE_POLICY_FILE" in os.environ, "Expected policy path to be resolved from host via 'policy info'")
@@ -258,7 +306,8 @@ def main(quiet=False):
                     "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab",
                     "printToPDF", "clickAt", "windowControl", "batch", "waitForText",
                     "setCookie", "deleteCookie", "setStorageItem", "removeStorageItem",
-                    "clearStorage", "searchHistory", "searchBookmarks", "searchTabs"
+                    "clearStorage", "searchHistory", "searchBookmarks", "searchTabs",
+                    "startScreencast", "screencastFrames", "stopScreencast"
                 ],
                 "allowedOrigins": ["*"],
                 "deniedActions": [],
@@ -445,6 +494,46 @@ def main(quiet=False):
         messages = (result(call) or {}).get("messages", [])
         record(summary, "consoleMessages", call, {"count": len(messages)})
         require(call["exit"] == 0 and len(messages) >= 1, "consoleMessages failed")
+        # Backward compatibility: the default response must stay stack-only, with
+        # no source-map fields on any frame.
+        default_frames = [frame for message in messages if isinstance(message, dict)
+                          for frame in (message.get("stack") or []) if isinstance(frame, dict)]
+        require(
+            all("originalLocation" not in frame and "sourceMapStatus" not in frame for frame in default_frames),
+            "consoleMessages resolved source maps without --source-maps",
+        )
+
+        # 19b. Source-Mapped Console Stacks (HI7)
+        run_bridge("click", tab_id, "#mapped")
+        run_bridge("click", tab_id, "#mapped-cross")
+        time.sleep(0.5)
+        call = run_bridge("consoleMessages", tab_id, "--source-maps")
+        mapped_result = result(call) or {}
+        mapped_frames = [frame for message in mapped_result.get("messages", []) if isinstance(message, dict)
+                         for frame in (message.get("stack") or []) if isinstance(frame, dict)]
+        resolved = [frame for frame in mapped_frames
+                    if isinstance(frame.get("originalLocation"), dict)
+                    and str(frame["originalLocation"].get("source", "")).endswith(MAPPED_SOURCE)
+                    and frame["originalLocation"].get("lineNumber") == MAPPED_ORIGINAL_LINE]
+        refused = [frame for frame in mapped_frames
+                   if "crossmap.js" in str(frame.get("url", ""))
+                   and frame.get("sourceMapStatus") == "crossOriginRefused"]
+        # The map body must never come back through the response.
+        leaked = "sourcesContent" in json.dumps(mapped_result)
+        record(summary, "consoleMessagesSourceMaps", call, {
+            "resolved": len(resolved),
+            "crossOriginRefused": len(refused),
+            "sourceMapsResolved": mapped_result.get("sourceMapsResolved"),
+        })
+        require(
+            call["exit"] == 0
+            and mapped_result.get("sourceMapsResolved") is True
+            and len(resolved) >= 1
+            and len(refused) >= 1
+            and not leaked,
+            "consoleMessages --source-maps did not resolve the inline map or refuse the cross-origin map",
+            call,
+        )
 
         # 20. Network Requests
         run_bridge("click", tab_id, "#fetch")
@@ -847,6 +936,132 @@ def main(quiet=False):
             "searchTabs did not match the fixture tab with a host-only domain and capped snippets",
             call
         )
+
+        # 40. Screencast recording: background-safe capture, frames to disk, metadata-only stdout
+        call = run_bridge("startScreencast", tab_id, "--quality", 40, "--max-width", 640)
+        started = result(call) or {}
+        record(summary, "startScreencast", call, {"recording": started.get("recording")})
+        require(call["exit"] == 0 and started.get("recording") is True, "startScreencast did not report recording", call)
+        screencast_started = True
+        # Screencast frames are emitted on repaint; scroll the fixture to force some.
+        run_bridge("scroll", tab_id, 0, 400)
+        time.sleep(0.5)
+        run_bridge("scroll", tab_id, 0, -400)
+        time.sleep(0.5)
+        call = run_bridge("screencastSave", tab_id, SCREENCAST_DIR, "--fps", 8)
+        saved = call.get("json") or {}
+        screencast_path = Path(SCREENCAST_DIR)
+        frame_files = sorted(screencast_path.glob("frame-*"))
+        manifest_file = screencast_path / "frames.json"
+        manifest = json.loads(manifest_file.read_text()) if manifest_file.exists() else {}
+        # Metadata only: base64 frame payloads must never reach stdout.
+        leaked = "base64" in call["stdout"] or any(len(line) > 400 for line in call["stdout"].splitlines())
+        record(summary, "screencastSave", call, {
+            "frames": saved.get("frames"),
+            "dropped": saved.get("dropped"),
+            "bytes": saved.get("bytes"),
+            "frameFiles": len(frame_files),
+            "manifestWritten": manifest_file.exists(),
+            "leakedFrameData": leaked,
+        })
+        require(
+            call["exit"] == 0 and len(frame_files) >= 1 and manifest_file.exists()
+            and manifest.get("count") == len(frame_files) and not leaked,
+            "screencastSave did not write frames plus a manifest with metadata-only stdout",
+            call
+        )
+        if QUIET_MODE:
+            state = run_bridge("getCurrentState", tab_id)
+            active = ((result(state) or {}).get("tab") or {}).get("active")
+            record(summary, "screencastQuietInactive", state, {"active": active})
+            require(state["exit"] == 0 and active is False, "screencast activated the fixture tab", state)
+        call = run_bridge("stopScreencast", tab_id)
+        stopped = result(call) or {}
+        record(summary, "stopScreencast", call, {
+            "remainingFrames": stopped.get("remainingFrames"),
+            "droppedFrames": stopped.get("droppedFrames"),
+        })
+        require(call["exit"] == 0 and stopped.get("recording") is False, "stopScreencast failed", call)
+        screencast_started = False
+
+        # 41. Observe element refs: every node is addressable, and ref=eN clicks it
+        run_bridge("fill", tab_id, "#q", "refclick")
+        run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent = 'ready'; 'reset'")
+        call = run_bridge("observe", tab_id, "--role", "button", "--limit", 50)
+        observed = result(call) or []
+        nodes = observed if isinstance(observed, list) else []
+        refs_present = bool(nodes) and all(
+            isinstance(node, dict) and str(node.get("ref", "")).startswith("e") for node in nodes
+        )
+        button = next((node for node in nodes if isinstance(node, dict) and node.get("name") == "Click me"), None)
+        record(summary, "observeRefs", call, {
+            "nodes": len(nodes),
+            "refsPresent": refs_present,
+            "buttonRef": (button or {}).get("ref"),
+        })
+        require(
+            call["exit"] == 0 and refs_present and button is not None,
+            "observe did not return a ref for the fixture button",
+            call
+        )
+        button_ref = button["ref"]
+        call = run_bridge("click", tab_id, f"ref={button_ref}")
+        status = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
+        clicked = (result(status) or {}).get("val")
+        record(summary, "clickByRef", call, {"ref": button_ref, "status": clicked})
+        require(
+            call["exit"] == 0 and clicked == "clicked:refclick",
+            "click by observe ref did not reach the fixture button",
+            call
+        )
+
+        # 42. Observe diff: a DOM mutation shows up as an added node against the prior epoch
+        call = run_bridge("observe", tab_id, "--diff")
+        baseline = result(call) or {}
+        require(call["exit"] == 0, "observe --diff baseline failed", call)
+        run_bridge(
+            "executeScriptCDP",
+            tab_id,
+            "(() => { const b = document.createElement('button'); b.id = 'diff-btn'; b.textContent = 'Diff added'; document.body.appendChild(b); return 'added'; })()"
+        )
+        call = run_bridge("observe", tab_id, "--diff")
+        diff = result(call) or {}
+        added_names = [node.get("name") for node in diff.get("added", []) if isinstance(node, dict)]
+        epochs_chained = (
+            diff.get("baseEpoch") == baseline.get("epoch")
+            and isinstance(diff.get("epoch"), int)
+            and diff.get("epoch") > diff.get("baseEpoch", 0)
+        )
+        record(summary, "observeDiff", call, {
+            "baseEpoch": diff.get("baseEpoch"),
+            "epoch": diff.get("epoch"),
+            "added": len(diff.get("added", [])),
+            "removed": len(diff.get("removed", [])),
+            "changed": len(diff.get("changed", [])),
+        })
+        require(
+            call["exit"] == 0 and "Diff added" in added_names and epochs_chained,
+            "observe --diff did not report the injected button against the previous epoch",
+            call
+        )
+
+        # 43. Stale refs fail loudly: a navigation invalidates every ref for the tab
+        call = run_bridge("reload", tab_id)
+        require(call["exit"] == 0, "reload before stale-ref check failed", call)
+        call = run_bridge("waitForLoad", tab_id, 20000)
+        require(call["exit"] == 0, "waitForLoad after reload failed", call)
+        call = run_bridge("click", tab_id, f"ref={button_ref}")
+        stale = result(call) or {}
+        record(summary, "staleRefRejected", call, {
+            "ref": button_ref,
+            "error": stale.get("error"),
+        })
+        require(
+            call["exit"] != 0 and stale.get("error") == "staleRef",
+            "a ref from before the navigation was not rejected with staleRef",
+            call
+        )
+
         if QUIET_MODE:
             state = run_bridge("getCurrentState", tab_id)
             active = ((result(state) or {}).get("tab") or {}).get("active")
@@ -866,6 +1081,9 @@ def main(quiet=False):
             if interception_started:
                 with contextlib.suppress(Exception):
                     run_bridge("stopInterception", tab_id)
+            if screencast_started:
+                with contextlib.suppress(Exception):
+                    run_bridge("stopScreencast", tab_id)
             with contextlib.suppress(Exception):
                 run_bridge("closeTab", tab_id)
 
@@ -873,6 +1091,9 @@ def main(quiet=False):
             restore_policy(policy_backup, policy_path, backup_mode)
         if server is not None:
             server.shutdown()
+
+        with contextlib.suppress(Exception):
+            shutil.rmtree(SCREENCAST_DIR)
 
         for path in [UPLOAD_FIXTURE, SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH]:
             with contextlib.suppress(FileNotFoundError):

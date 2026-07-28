@@ -4,6 +4,7 @@ import base64
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -24,6 +25,14 @@ if PACKAGE_RELEASE_SPEC is None or PACKAGE_RELEASE_SPEC.loader is None:
     raise RuntimeError("cannot load scripts/package_release.py")
 package_release = importlib.util.module_from_spec(PACKAGE_RELEASE_SPEC)
 PACKAGE_RELEASE_SPEC.loader.exec_module(package_release)
+
+PACKAGE_STORE_SPEC = importlib.util.spec_from_file_location(
+    "package_extension_store", SCRIPT_DIR / "scripts" / "package_extension_store.py"
+)
+if PACKAGE_STORE_SPEC is None or PACKAGE_STORE_SPEC.loader is None:
+    raise RuntimeError("cannot load scripts/package_extension_store.py")
+package_extension_store = importlib.util.module_from_spec(PACKAGE_STORE_SPEC)
+PACKAGE_STORE_SPEC.loader.exec_module(package_extension_store)
 
 def expect(cond, msg):
     if not cond:
@@ -115,6 +124,50 @@ def expect_package_requires_git_checkout():
             expect(exc.code == 2, f"non-git package error should exit 2, got {exc.code}")
         else:
             expect(False, "source packaging should fail clearly outside a git checkout")
+
+
+def expect_store_package_contract(dist):
+    out = dist / "chrome-bridge-extension-store.zip"
+    metadata = package_extension_store.build_store_package(out)
+    expect_zip_names(out, ["background.js", "manifest.json", "wake.html", "wake.js"],
+                     "store package contents")
+    expect(metadata["path"] == out.as_posix(), f"store metadata path mismatch: {metadata['path']}")
+    expect(metadata["bytes"] == out.stat().st_size, "store metadata byte count should match the written zip")
+    expect(len(metadata["sha256"]) == 64, "store metadata should carry a sha256 digest")
+    expect(sorted(entry["name"] for entry in metadata["files"]) ==
+           ["background.js", "manifest.json", "wake.html", "wake.js"],
+           "store metadata file list mismatch")
+
+    with zipfile.ZipFile(out) as archive:
+        names = archive.namelist()
+        manifest = json.loads(archive.read("manifest.json"))
+        stamps = {info.date_time for info in archive.infolist()}
+    expect(not package_extension_store.forbidden_matches(names),
+           f"store package must not contain local artifacts: {names}")
+    expect(manifest.get("manifest_version") == 3, "store manifest must be manifest_version 3")
+    expect("key" not in manifest, "store manifest must not carry a local extension key")
+    root_permissions = set(json.loads((SCRIPT_DIR / "manifest.json").read_text()).get("permissions", []))
+    expect(root_permissions <= set(manifest.get("permissions", [])),
+           "store manifest must keep every canonical root permission")
+    expect(stamps == {package_extension_store.ZIP_TIMESTAMP},
+           "store package entries should use the fixed deterministic timestamp")
+
+    rebuilt = package_extension_store.build_store_package(dist / "store-rebuild.zip")
+    expect(rebuilt["sha256"] == metadata["sha256"], "store package should be byte-deterministic")
+
+    staging = dist / "staging"
+    staging.mkdir()
+    for name in package_extension_store.EXTENSION_FILES:
+        shutil.copy2(SCRIPT_DIR / name, staging / name)
+    bad_manifest = json.loads((staging / "manifest.json").read_text())
+    bad_manifest["permissions"] = ["nativeMessaging"]
+    (staging / "manifest.json").write_text(json.dumps(bad_manifest), encoding="utf-8")
+    try:
+        package_extension_store.build_store_package(dist / "store-bad.zip", source=staging)
+    except package_extension_store.PackagingError:
+        pass
+    else:
+        expect(False, "store packaging should reject a manifest missing root permissions")
 
 
 
@@ -316,6 +369,7 @@ def main():
             expect("bridge_policy.example.json" in source_names,
                    "source package should include example policy")
             expect_source_archive_omits_scratch_files(SCRIPT_DIR, dist, "scratch-contract")
+            expect_store_package_contract(dist)
         finally:
             backup.unlink(missing_ok=True)
     if failures:

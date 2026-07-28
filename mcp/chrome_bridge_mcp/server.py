@@ -17,7 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent, ToolAnnotations
 
 from .identity import LeaseManager, provision_identity
-from .transport import BridgeError, call, resolve_tab_id
+from .transport import BridgeError, call as _bridge_call, resolve_tab_id as _bridge_resolve_tab_id
 
 _PNG_PREFIX = "data:image/png;base64,"
 
@@ -30,6 +30,53 @@ def _text(value: Any) -> str:
 
 def _truthy(v):
     return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _http_request_token():
+    """Bridge token presented by the current HTTP request, if any.
+
+    Under ``BRIDGE_MCP_TRANSPORT=http`` a single endpoint can serve several
+    agents. Each request may carry its own named bridge token as
+    ``Authorization: Bearer <token>``, or ``X-Bridge-Token: <token>`` when the
+    client reserves the Authorization header for something else; Bearer wins.
+    That gives the caller its own host-side client identity for policy, audit,
+    and cooperative leasing instead of everyone sharing one ambient identity.
+    No header (and every stdio call, where there is no HTTP request) yields
+    ``None``, i.e. the ambient ``bridge_token.txt`` identity. The value is
+    handed to the transport only and is never logged or echoed in errors.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        request = request_ctx.get().request
+    except (ImportError, LookupError, AttributeError):
+        return None
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    scheme, _, value = (headers.get("authorization") or "").partition(" ")
+    if scheme.lower() == "bearer" and value.strip():
+        return value.strip()
+    return (headers.get("x-bridge-token") or "").strip() or None
+
+
+def call(action, payload=None, **kwargs):
+    """``transport.call`` with the current request's bridge identity applied.
+
+    Every tool and resource in this module calls the bridge through here, so
+    per-request HTTP tokens cover the whole surface without threading a token
+    argument through each tool signature. Behaviour is unchanged when no
+    per-request token is present.
+    """
+    kwargs.setdefault("token", _http_request_token())
+    return _bridge_call(action, payload, **kwargs)
+
+
+def resolve_tab_id(tab_id):
+    """Active-tab lookup performed as the current request's bridge identity."""
+    if tab_id is not None:
+        return tab_id
+    return _bridge_resolve_tab_id(None, token=_http_request_token())
 
 
 def _truncate(s, limit):
@@ -105,12 +152,25 @@ def browser_snapshot(
     roles: Optional[list] = None,
     name: Optional[str] = None,
     limit: int = 50,
+    diff: bool = False,
 ) -> str:
     """Filtered accessibility snapshot of what is on the page.
 
     Compact output is the default to avoid huge accessibility dumps. Filter by
     one or more ``roles`` and/or a case-insensitive accessible ``name``. Set
     ``compact=False`` for node ids, descriptions, and accessibility properties.
+
+    Every node carries a stable ``ref`` such as ``e12``. Pass it to any tool
+    that takes a selector as ``ref=e12`` (``browser_click``, ``browser_type``,
+    ``browser_fill``, ``browser_hover``, ``browser_drag``, ``browser_select``,
+    ``browser_upload_file``, ``browser_scroll``, ``browser_wait_for``). Refs are
+    invalidated by navigation and by an extension restart; a stale ref fails
+    with ``error: staleRef`` instead of matching something else, so re-snapshot.
+
+    Set ``diff=True`` to get only what changed since the previous snapshot of
+    this tab: ``added``, ``removed`` (refs), and ``changed``, plus ``baseEpoch``
+    and ``epoch``. The first diff call after a navigation has no baseline and
+    returns the full snapshot with ``diffBase: true``.
     """
     tid = resolve_tab_id(tab_id)
     payload = {"tabId": tid, "compact": compact, "limit": limit}
@@ -118,6 +178,8 @@ def browser_snapshot(
         payload["roles"] = roles
     if name:
         payload["name"] = name
+    if diff:
+        payload["diff"] = True
     return _text(call("observe", payload))
 
 
@@ -125,6 +187,29 @@ def browser_extract_text(tab_id: Optional[int] = None, max_chars: int = 20000) -
     """Extract visible text from the page, truncated to ``max_chars``."""
     tid = resolve_tab_id(tab_id)
     return _text(call("extractText", {"tabId": tid, "maxChars": max_chars}))
+
+
+def browser_console_messages(
+    tab_id: Optional[int] = None, resolve_source_maps: bool = False
+) -> str:
+    """Return buffered console entries for a monitored tab (run ``browser_action`` ``startMonitoring`` first).
+
+    Each entry carries a ``stack`` of raw generated frames (``url``, 0-based
+    ``lineNumber``/``columnNumber``, ``functionName``). With
+    ``resolve_source_maps`` the extension additionally resolves each frame
+    through the script's own source map, adding ``originalLocation``
+    (``source``, ``name``, 0-based ``lineNumber``/``columnNumber``) or a
+    ``sourceMapStatus`` of ``notFound``, ``invalid``, ``unmapped``, or
+    ``crossOriginRefused``. Maps are read only from the script's own origin and
+    source text is never returned, but resolved ``source`` values can expose
+    private file paths from the site's build; keep that output out of
+    transcripts.
+    """
+    tid = resolve_tab_id(tab_id)
+    payload = {"tabId": tid}
+    if resolve_source_maps:
+        payload["resolveSourceMaps"] = True
+    return _text(call("consoleMessages", payload))
 
 
 def browser_screenshot(tab_id: Optional[int] = None) -> ImageContent:
@@ -140,25 +225,29 @@ def browser_screenshot(tab_id: Optional[int] = None) -> ImageContent:
 
 
 def browser_click(selector: str, tab_id: Optional[int] = None) -> str:
-    """Click a target by CSS or semantic selector (label=, text=, role=, frame=... >> ..., shadow >>>)."""
+    """Click a target by ref, CSS, or semantic selector (ref=e12, label=, text=, role=, frame=... >> ..., shadow >>>).
+
+    ``ref=e12`` reuses an element id from ``browser_snapshot``; it fails with
+    ``staleRef`` after a navigation instead of matching a different element.
+    """
     tid = resolve_tab_id(tab_id)
     return _text(call("click", {"tabId": tid, "selector": selector}))
 
 
 def browser_type(selector: str, text: str, tab_id: Optional[int] = None) -> str:
-    """Focus a CSS, semantic, frame, or shadow target and insert text without clearing."""
+    """Focus a ref, CSS, semantic, frame, or shadow target and insert text without clearing (ref=e12 from browser_snapshot)."""
     tid = resolve_tab_id(tab_id)
     return _text(call("type", {"tabId": tid, "selector": selector, "text": text}))
 
 
 def browser_fill(selector: str, text: str, tab_id: Optional[int] = None) -> str:
-    """Clear, then insert text into a CSS, semantic, frame, or shadow target."""
+    """Clear, then insert text into a ref, CSS, semantic, frame, or shadow target (ref=e12 from browser_snapshot)."""
     tid = resolve_tab_id(tab_id)
     return _text(call("fill", {"tabId": tid, "selector": selector, "text": text}))
 
 
 def browser_hover(selector: str, tab_id: Optional[int] = None) -> str:
-    """Hover a CSS, semantic, frame, or shadow target."""
+    """Hover a ref, CSS, semantic, frame, or shadow target (ref=e12 from browser_snapshot)."""
     tid = resolve_tab_id(tab_id)
     return _text(call("hover", {"tabId": tid, "selector": selector}))
 
@@ -200,7 +289,7 @@ def browser_drag(
 
 
 def browser_select(selector: str, value: str, tab_id: Optional[int] = None) -> str:
-    """Select an option ``value`` in a ``<select>`` reached by CSS, semantic, frame, or shadow selector."""
+    """Select an option ``value`` in a ``<select>`` reached by ref, CSS, semantic, frame, or shadow selector (ref=e12 from browser_snapshot)."""
     tid = resolve_tab_id(tab_id)
     return _text(call("select", {"tabId": tid, "selector": selector, "value": value}))
 
@@ -389,6 +478,139 @@ def browser_plan_preview(plan: list) -> str:
     return _text(call("policyCheck", {"plan": plan}))
 
 
+# --- Session trace artifacts (host policy ``traceDir``) --------------------
+#
+# Read-only local readers over the JSONL the host writes per trace. The
+# artifacts contain metadata only (decision, timing, tab ids, content hashes),
+# and these tools never reconstruct or return payload/response bodies.
+
+_TRACE_DEFAULT_DIRNAME = "bridge_traces"
+_TRACE_ID_MAX = 80
+
+
+def _resolve_trace_dir(trace_dir=None):
+    """Explicit directory, else the running host's traceDir, else repo-local."""
+    if trace_dir:
+        return os.path.abspath(os.path.expanduser(trace_dir))
+    try:
+        info = call("policyInfo")
+    except BridgeError:
+        info = None
+    if isinstance(info, dict) and info.get("traceDir"):
+        return info["traceDir"]
+    repo_root = os.environ.get(
+        "BRIDGE_REPO_ROOT",
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))),
+    )
+    return os.path.join(repo_root, _TRACE_DEFAULT_DIRNAME)
+
+
+def _sanitize_trace_id(trace_id):
+    """Mirrors the host: keep only ``[A-Za-z0-9._-]``, capped at 80 chars."""
+    safe = "".join(
+        ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_"
+        for ch in str(trace_id))
+    return safe[:_TRACE_ID_MAX] or "_"
+
+
+def _read_trace_events(trace_id, trace_dir):
+    path = os.path.join(_resolve_trace_dir(trace_dir), _sanitize_trace_id(trace_id) + ".jsonl")
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return path, None, 0
+    except OSError as exc:
+        raise BridgeError(f"Could not read trace at {path}: {exc}")
+    events = []
+    malformed = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            malformed += 1
+            continue
+        if not isinstance(event, dict):
+            malformed += 1
+            continue
+        events.append(event)
+    return path, events, malformed
+
+
+_TRACE_EVENT_FIELDS = ("ts", "action", "decision", "reason", "requestId", "durationMs",
+                       "targets", "traceId", "responseHash", "snapshotHash", "success")
+
+
+def browser_trace_summary(trace_id: str, trace_dir: Optional[str] = None) -> str:
+    """Summarize a local session trace artifact written by the native host.
+
+    Reports event counts by action and decision, the time range, and duration
+    totals for ``trace_id``. Traces hold metadata only: no payloads, no
+    response bodies, no page content. ``trace_dir`` overrides the host's
+    configured ``traceDir``.
+    """
+    path, events, malformed = _read_trace_events(trace_id, trace_dir)
+    if events is None:
+        return _text({"traceFile": path, "exists": False, "events": 0})
+    actions = {}
+    decisions = {}
+    stamps = []
+    durations = []
+    succeeded = 0
+    for event in events:
+        actions[str(event.get("action") or "-")] = actions.get(str(event.get("action") or "-"), 0) + 1
+        decisions[str(event.get("decision") or "-")] = decisions.get(str(event.get("decision") or "-"), 0) + 1
+        if event.get("success"):
+            succeeded += 1
+        ts = event.get("ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+            stamps.append(int(ts))
+        duration = event.get("durationMs")
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            durations.append(int(duration))
+    return _text({
+        "traceFile": path,
+        "traceId": trace_id,
+        "exists": True,
+        "events": len(events),
+        "succeeded": succeeded,
+        "firstTs": min(stamps) if stamps else None,
+        "lastTs": max(stamps) if stamps else None,
+        "durationMsTotal": sum(durations),
+        "durationMsMax": max(durations) if durations else 0,
+        "actions": actions,
+        "decisions": decisions,
+        "malformedLines": malformed,
+    })
+
+
+def browser_trace_tail(trace_id: str, limit: int = 20, trace_dir: Optional[str] = None) -> str:
+    """Return the most recent events of a local session trace artifact.
+
+    Each event carries metadata only: timestamp, action, decision, reason,
+    request id, duration, tab ids, and response/snapshot hashes. Payload and
+    response bodies are never stored in a trace and are never returned here.
+    ``trace_dir`` overrides the host's configured ``traceDir``.
+    """
+    path, events, malformed = _read_trace_events(trace_id, trace_dir)
+    if events is None:
+        return _text({"traceFile": path, "exists": False, "events": []})
+    if limit <= 0:
+        limit = 20
+    tail = [{k: event.get(k) for k in _TRACE_EVENT_FIELDS} for event in events[-limit:]]
+    return _text({
+        "traceFile": path,
+        "traceId": trace_id,
+        "exists": True,
+        "total": len(events),
+        "events": tail,
+        "malformedLines": malformed,
+    })
+
+
 def browser_lease(ttl_ms: int = 300000) -> str:
     """Acquire exclusive cooperative control of the shared real-Chrome profile.
 
@@ -496,6 +718,83 @@ def browser_save_pdf(
         "path": path,
         "mimeType": "application/pdf",
         "bytes": len(data),
+    })
+
+
+def browser_start_screencast(
+    tab_id: Optional[int] = None,
+    quality: int = 70,
+    max_width: Optional[int] = None,
+    max_height: Optional[int] = None,
+    every_nth_frame: int = 1,
+) -> str:
+    """Start buffering screencast frames for a tab without activating it.
+
+    Continuous capture of the REAL profile is high-exposure: everything the tab
+    renders while recording is buffered. Frames live only in the extension's
+    service worker, so a worker restart ends the recording, and the buffer is
+    bounded (oldest frames are dropped and counted).
+    """
+    tid = resolve_tab_id(tab_id)
+    payload = {"tabId": tid, "quality": int(quality), "everyNthFrame": int(every_nth_frame)}
+    if max_width is not None:
+        payload["maxWidth"] = int(max_width)
+    if max_height is not None:
+        payload["maxHeight"] = int(max_height)
+    return _text(call("startScreencast", payload))
+
+
+def browser_stop_screencast(tab_id: Optional[int] = None) -> str:
+    """Stop the tab's screencast and discard whatever is still buffered.
+
+    Call ``browser_screencast_save`` first to keep the frames.
+    """
+    tid = resolve_tab_id(tab_id)
+    return _text(call("stopScreencast", {"tabId": tid}))
+
+
+def browser_screencast_save(
+    output_dir: str,
+    tab_id: Optional[int] = None,
+) -> str:
+    """Drain buffered screencast frames into ``output_dir``; returns metadata only.
+
+    Writes numbered image files plus a ``frames.json`` manifest and returns the
+    directory, frame count, dropped-frame count, and byte total, so recorded
+    pixels never land in a transcript. Read-only with respect to the page.
+    """
+    tid = resolve_tab_id(tab_id)
+    result = call("screencastFrames", {"tabId": tid, "consume": True})
+    frames = result.get("frames") if isinstance(result, dict) else None
+    if not isinstance(frames, list):
+        raise BridgeError("screencastFrames response did not include a frames list.")
+    extension = "png" if result.get("format") == "png" else "jpg"
+    directory = os.path.abspath(os.path.expanduser(output_dir))
+    os.makedirs(directory, exist_ok=True)
+    total_bytes = 0
+    timestamps = []
+    written = 0
+    for frame in frames:
+        encoded = frame.get("base64") if isinstance(frame, dict) else None
+        if not isinstance(encoded, str) or not encoded:
+            continue
+        data = base64.b64decode(encoded)
+        with open(os.path.join(directory, f"frame-{written:05d}.{extension}"), "wb") as handle:
+            handle.write(data)
+        total_bytes += len(data)
+        timestamps.append(frame.get("timestamp"))
+        written += 1
+    manifest_path = os.path.join(directory, "frames.json")
+    dropped = result.get("droppedFrames", 0)
+    with open(manifest_path, "w") as handle:
+        json.dump({"count": written, "dropped": dropped, "timestamps": timestamps}, handle)
+    return _text({
+        "success": True,
+        "dir": directory,
+        "frames": written,
+        "dropped": dropped,
+        "bytes": total_bytes,
+        "manifest": manifest_path,
     })
 
 
@@ -658,12 +957,16 @@ _TOOLS = [
     (browser_task_session_list, False, False),
     (browser_snapshot, False, False),
     (browser_extract_text, False, False),
+    (browser_console_messages, False, False),
     (browser_screenshot, False, False),
     (browser_save_pdf, False, False),
+    (browser_screencast_save, False, False),
     (browser_get_html, False, False),
     (browser_wait_for, False, False),
     (browser_policy_check, False, False),
     (browser_plan_preview, False, False),
+    (browser_trace_summary, False, False),
+    (browser_trace_tail, False, False),
     (browser_search_tabs, False, False),
     (browser_get_cookies, False, True),
     (browser_session_status, False, True),
@@ -690,6 +993,8 @@ _TOOLS = [
     (browser_clear_network_conditions, True, False),
     (browser_set_color_scheme, True, False),
     (browser_set_user_agent, True, False),
+    (browser_start_screencast, True, False),
+    (browser_stop_screencast, True, False),
     (browser_tab_control, True, False),
     (browser_window_control, True, False),
     (browser_wait_for_handoff, True, False),
@@ -852,6 +1157,7 @@ def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> FastM
 def main() -> None:
     global _lease_manager
 
+    transport = os.environ.get("BRIDGE_MCP_TRANSPORT", "stdio")
     auto_identity = _truthy(os.environ.get("BRIDGE_MCP_AUTO_IDENTITY", "1"))
     auto_lease = False
     if auto_identity:
@@ -865,9 +1171,15 @@ def main() -> None:
         # signal-driven exits, so the lease is always released before its token
         # disappears. No separate atexit registration (that diverged on signals).
         identity = provision_identity(repo_root, on_shutdown=_lease_manager.release)
-        auto_lease = True
+        # Auto-leasing caches lease state per process, which is only coherent
+        # while the process has one bridge identity. Over HTTP each request may
+        # present its own token, so a process-wide manager would take the lease
+        # as whichever client called first and then - seeing a live lease in its
+        # own cache - let every other client run unleased straight into
+        # "leased by <that client>". HTTP clients drive browser_lease and
+        # browser_release explicitly instead.
+        auto_lease = transport != "http"
 
-    transport = os.environ.get("BRIDGE_MCP_TRANSPORT", "stdio")
     if transport == "http":
         host = os.environ.get("BRIDGE_MCP_HTTP_HOST", "127.0.0.1")
         port = os.environ.get("BRIDGE_MCP_HTTP_PORT", "8723")

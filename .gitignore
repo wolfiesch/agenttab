@@ -25,6 +25,8 @@ bridge_policy*.json.*
 # Logs and caches
 bridge_debug.log
 bridge_audit.jsonl
+# Session trace artifacts written by the host when policy sets traceDir
+bridge_traces/
 *.log
 __pycache__/
 *.pyc
@@ -33,6 +35,9 @@ mcp/uv.lock
 .venv/
 mcp/.venv/
 .wip/
+
+# Build output (release archives, store upload zip)
+dist/
 
 # OS noise
 .DS_Store

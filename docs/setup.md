@@ -113,6 +113,24 @@ cargo build --release --manifest-path host-rs/Cargo.toml
 
 Use this to register the Rust host with the same extension-ID resolution flow.
 
+### Packaged/store extension
+
+Build the upload zip for the Chrome Web Store developer dashboard:
+
+```bash
+python3 scripts/package_extension_store.py --out dist/chrome-bridge-extension-store.zip
+```
+
+The script creates `dist/` when needed, packages only `manifest.json`, `background.js`, `wake.html`, and `wake.js`, validates the surface before writing, and prints metadata only: output path, sha256, byte count, and per-file list. Add `--check-js` to also run `node --check` on the packaged JavaScript; that gate is off by default so the script works without `node`. Nothing is uploaded and no Chrome Web Store API is contacted - upload the zip yourself through the developer dashboard.
+
+Stable extension identity: the script never creates, reads, or packages `extension_key.pem`. A store listing gets a permanent item ID from the Chrome Web Store itself, and that is the ID to register:
+
+```bash
+./setup.sh --extension-id <store-id>
+```
+
+If you need a locally packed CRX with a stable ID instead, keep the private key outside the repository (never commit it) and pass it to Chrome's "Pack extension" flow; the repository stays key-free either way.
+
 ## Launchd broker mode
 
 Broker mode is optional on macOS. launchd keeps a small Python broker listening on public port `9223`; Chrome-launched Python or Rust native hosts bind backend port `19223`. Clients keep using `BRIDGE_PORT=9223`, or no override. On first install, `setup-broker.sh` seeds the state-dir token from the repo token so the existing `chrome-bridge` CLI keeps working; if both token files already exist and differ, the script warns and clients should set `BRIDGE_TOKEN_FILE` to the state token path.
