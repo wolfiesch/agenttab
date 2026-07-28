@@ -90,10 +90,12 @@ class Client:
                     raise
                 time.sleep(0.05)
 
-    def req(self, action, payload=None, confirmation_token=None):
+    def req(self, action, payload=None, confirmation_token=None, extra=None):
         cmd = {"action": action, "payload": payload or {}, "token": self.token}
         if confirmation_token:
             cmd["confirmationToken"] = confirmation_token
+        if extra:
+            cmd.update(extra)
         self.sock.sendall((json.dumps(cmd) + "\n").encode())
         while b"\n" not in self.buf:
             chunk = self.sock.recv(65536)
@@ -114,6 +116,7 @@ TOKENS_FILE = "/tmp/chrome-bridge-guard-tokens.txt"
 LEGACY_FILE = "/tmp/chrome-bridge-guard-legacy.txt"
 POLICY_FILE = "/tmp/chrome-bridge-guard-policy.json"
 AUDIT_FILE = "/tmp/chrome-bridge-guard-audit.jsonl"
+SECRETS_FILE = "/tmp/chrome-bridge-guard-secrets.txt"
 
 
 def write_policy(policy):
@@ -891,6 +894,92 @@ def run_against(label, cmd, env):
         expect(r and "123-45-6789" in json.dumps(r),
                f"{label}: getHTML without redactPatterns should be unchanged, got {r}")
         c.close()
+
+    # --- Plan preflight: one verdict per step, nothing forwarded ---
+    write_policy(permissive_with(deniedActions=["getCookies"],
+                                 requireConfirmation=["executeScript"],
+                                 deniedOrigins=["*://mail.google.com"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("policyCheck", {"plan": [
+            {"action": "getTabs"},
+            {"action": "getCookies", "payload": {"domain": "x.test"}},
+            {"action": "executeScript", "payload": {"tabId": 7, "code": "1"}},
+            {"action": "click", "payload": {"tabId": 7}, "origin": "https://mail.google.com"},
+        ]})
+        steps = ((r or {}).get("result") or {}).get("plan")
+        expect(isinstance(steps, list) and len(steps) == 4,
+               f"{label}: plan preflight should return one verdict per step, got {r}")
+        if isinstance(steps, list) and len(steps) == 4:
+            expect(all(set(s.keys()) == {"step", "action", "allowed", "reason",
+                                         "confirmationRequired", "redact", "audit",
+                                         "originDependent"} for s in steps),
+                   f"{label}: plan step verdict keys = {[sorted(s.keys()) for s in steps]}")
+            expect([s["step"] for s in steps] == [0, 1, 2, 3],
+                   f"{label}: plan steps should be indexed in order, got {steps}")
+            expect(steps[0]["allowed"] is True,
+                   f"{label}: plan step 0 should be allowed, got {steps[0]}")
+            expect(steps[1]["allowed"] is False and "denied" in str(steps[1]["reason"]),
+                   f"{label}: plan step 1 should be denied, got {steps[1]}")
+            expect(steps[2]["allowed"] is True and steps[2]["confirmationRequired"] is True,
+                   f"{label}: plan step 2 should require confirmation, got {steps[2]}")
+            expect(steps[3]["allowed"] is False and steps[3]["originDependent"] is False,
+                   f"{label}: supplied origin should decide plan step 3, got {steps[3]}")
+        expect(forwarded_actions() == [],
+               f"{label}: plan preflight must not forward, got {forwarded_actions()}")
+        r = c.req("policyCheck", {"plan": [{"action": "getTabs"}] * 51})
+        expect(r and r.get("success") is False and "plan exceeds 50 steps" in str(r.get("error", "")),
+               f"{label}: over-long plan should be rejected, got {r}")
+        c.close()
+
+    # --- dryRun: never forwards, and reports wouldForward per verdict ---
+    write_policy(permissive_with(deniedActions=["getCookies"],
+                                 requireConfirmation=["executeScript"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs", extra={"dryRun": True})
+        expect(r and r.get("success") is True and r.get("dryRun") is True
+               and r.get("wouldForward") is True,
+               f"{label}: allowed dry run should report wouldForward, got {r}")
+        expect(set(((r or {}).get("verdict") or {}).keys()) ==
+               {"allowed", "reason", "confirmationRequired", "redact", "audit", "originDependent"},
+               f"{label}: dry run verdict keys = {sorted(((r or {}).get('verdict') or {}).keys())}")
+        r = c.req("getCookies", {"domain": "x.test"}, extra={"dryRun": True})
+        expect(r and r.get("success") is True and r.get("dryRun") is True
+               and r.get("wouldForward") is False
+               and ((r.get("verdict") or {}).get("allowed") is False),
+               f"{label}: denied dry run should report wouldForward false, got {r}")
+        r = c.req("executeScript", {"tabId": 7, "code": "1"}, extra={"dryRun": True})
+        expect(r and r.get("wouldForward") is False
+               and ((r.get("verdict") or {}).get("confirmationRequired") is True)
+               and "confirmationToken" not in r,
+               f"{label}: confirmation-gated dry run should not mint a token, got {r}")
+        expect(forwarded_actions() == [],
+               f"{label}: dry run must never forward, got {forwarded_actions()}")
+        c.close()
+
+    # --- Secret masking: secretMaskFile values are masked in nested fields ---
+    with open(SECRETS_FILE, "w") as f:
+        f.write("# masked values\napiKey=sup3r-secret-value\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    write_policy(permissive_with(secretMaskFile=SECRETS_FILE))
+    secret_result = lambda a, p: {"success": True, "result": {
+        "outer": "prefix sup3r-secret-value suffix",
+        "nested": {"deep": ["carrying sup3r-secret-value"]},
+    }}
+    with Host(label, cmd, env, result_fn=secret_result):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        rendered = json.dumps(r)
+        expect("sup3r-secret-value" not in rendered,
+               f"{label}: secretMaskFile value must never reach the client, got {r}")
+        expect(rendered.count("<masked:apiKey>") == 2,
+               f"{label}: secret masking should replace nested occurrences, got {r}")
+        c.close()
+    try:
+        os.remove(SECRETS_FILE)
+    except FileNotFoundError:
+        pass
 
 
 

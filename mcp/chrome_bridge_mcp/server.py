@@ -7,6 +7,7 @@ which scopes the exposed surface from ``readonly``/``allow_sensitive`` flags
 and applies ``readOnly``/``destructive`` annotations. Every tab-scoped tool
 takes an optional ``tab_id``; when omitted the active tab is used.
 """
+import base64
 import functools
 import json
 import os
@@ -347,9 +348,14 @@ def browser_action(action: str, payload: Optional[dict] = None) -> str:
 
     Covers the full action surface (interception, geolocation, monitoring,
     console/network logs, downloadUrl, storageState, executeScript, setViewport,
-    handleDialog, batch, etc.). Returns the raw result as JSON text.
+    handleDialog, batch, etc.). A ``"dryRun": true`` entry in ``payload`` is
+    lifted to the request level: the host evaluates policy, lease, and
+    confirmation state and returns {dryRun, wouldForward, verdict} without ever
+    forwarding the action to Chrome. Returns the raw result as JSON text.
     """
-    return _text(call(action, payload or {}))
+    payload = dict(payload or {})
+    dry_run = payload.pop("dryRun", False) is True
+    return _text(call(action, payload, dry_run=dry_run))
 
 def browser_confirm_action(action: str, confirmation_token: str, payload: Optional[dict] = None) -> str:
     """Resend a bridge action with a host-issued confirmation token."""
@@ -369,6 +375,18 @@ def browser_policy_check(action: str, payload: Optional[dict] = None) -> str:
     MCP annotations, so this reflects the real security boundary.
     """
     return _text(call("policyCheck", {"action": action, "payload": payload or {}}))
+
+
+def browser_plan_preview(plan: list) -> str:
+    """Preflight a whole plan against host policy before touching the browser.
+
+    ``plan`` is a list of up to 50 ``{"action": ..., "origin": ..., "payload":
+    ...}`` steps. Each step gets its own verdict (allowed/reason/
+    confirmationRequired/redact/audit/originDependent) plus its ``step`` index.
+    ``origin`` is an optional hypothetical tab origin used to resolve site
+    policy for tab-scoped steps. Nothing is forwarded to the extension.
+    """
+    return _text(call("policyCheck", {"plan": plan}))
 
 
 def browser_lease(ttl_ms: int = 300000) -> str:
@@ -438,6 +456,202 @@ def browser_wait_for_handoff(
     return _text(call("waitForHandoff", payload, read_timeout_ms=timeout_ms))
 
 
+def browser_save_pdf(
+    output_path: str,
+    tab_id: Optional[int] = None,
+    landscape: bool = False,
+    print_background: bool = True,
+    scale: Optional[float] = None,
+    page_ranges: Optional[str] = None,
+) -> str:
+    """Print a tab to PDF and write it to ``output_path``; returns metadata only.
+
+    Read-only with respect to the page: nothing is mutated. The PDF bytes go to
+    the caller-supplied local path and only path, MIME type, and byte count come
+    back, so raw document content never lands in a transcript.
+    """
+    tid = resolve_tab_id(tab_id)
+    payload = {
+        "tabId": tid,
+        "landscape": bool(landscape),
+        "printBackground": bool(print_background),
+    }
+    if scale is not None:
+        payload["scale"] = float(scale)
+    if page_ranges:
+        payload["pageRanges"] = page_ranges
+    result = call("printToPDF", payload)
+    encoded = result.get("base64", "") if isinstance(result, dict) else ""
+    if not encoded:
+        raise BridgeError("printToPDF response did not include base64 PDF data.")
+    path = os.path.abspath(os.path.expanduser(output_path))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    data = base64.b64decode(encoded)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return _text({
+        "success": True,
+        "path": path,
+        "mimeType": "application/pdf",
+        "bytes": len(data),
+    })
+
+
+def browser_click_at(x: float, y: float, tab_id: Optional[int] = None) -> str:
+    """Click raw viewport coordinates, bypassing selector resolution.
+
+    Prefer ``browser_click`` with a selector: a coordinate click has no element
+    identity to audit, so the sample policy confirmation-gates ``clickAt``.
+    """
+    tid = resolve_tab_id(tab_id)
+    return _text(call("clickAt", {"tabId": tid, "x": x, "y": y}))
+
+
+def browser_window_control(
+    op: str,
+    window_id: Optional[int] = None,
+    url: Optional[str] = None,
+    state: Optional[str] = None,
+    focused: bool = False,
+) -> str:
+    """Manage browser windows.
+
+    ``op`` is one of: ``list`` (structural facts only - id, focus, state, type,
+    tab count; never tab URLs or titles), ``create`` (optional ``url``/``state``,
+    unfocused unless ``focused=True``), ``focus``, ``setState``
+    (``normal|minimized|maximized``), or ``close``. ``close`` is destructive and
+    refuses to close the last remaining normal browser window.
+    """
+    payload = {"op": op}
+    if window_id is not None:
+        payload["windowId"] = int(window_id)
+    if url:
+        payload["url"] = url
+    if state:
+        payload["state"] = state
+    if focused:
+        payload["focused"] = True
+    return _text(call("windowControl", payload))
+
+
+def browser_set_cookie(
+    url: str,
+    name: str,
+    value: str,
+    domain: Optional[str] = None,
+    path: Optional[str] = None,
+    secure: Optional[bool] = None,
+    http_only: Optional[bool] = None,
+    same_site: Optional[str] = None,
+    expiration_date: Optional[float] = None,
+) -> str:
+    """Write one cookie into the REAL logged-in profile.
+
+    The response reports the stored cookie's name and domain only and never
+    echoes the value. Confirmation-gated in the example host policy.
+    """
+    payload = {"url": url, "name": name, "value": value}
+    if domain is not None:
+        payload["domain"] = domain
+    if path is not None:
+        payload["path"] = path
+    if secure is not None:
+        payload["secure"] = bool(secure)
+    if http_only is not None:
+        payload["httpOnly"] = bool(http_only)
+    if same_site is not None:
+        payload["sameSite"] = same_site
+    if expiration_date is not None:
+        payload["expirationDate"] = float(expiration_date)
+    return _text(call("setCookie", payload))
+
+
+def browser_delete_cookie(url: str, name: str) -> str:
+    """Delete one cookie from the REAL logged-in profile.
+
+    Destructive: this can sign the profile out of a site. Confirmation-gated in
+    the example host policy.
+    """
+    return _text(call("deleteCookie", {"url": url, "name": name}))
+
+
+def browser_set_storage_item(key: str, value: str, scope: str = "local", tab_id: Optional[int] = None) -> str:
+    """Write one web-storage entry for the tab's origin.
+
+    ``scope`` is ``local`` or ``session``. The response echoes scope and key
+    only, never the written value. Confirmation-gated in the example policy.
+    """
+    tid = resolve_tab_id(tab_id)
+    return _text(call("setStorageItem", {"tabId": tid, "scope": scope, "key": key, "value": value}))
+
+
+def browser_remove_storage_item(key: str, scope: str = "local", tab_id: Optional[int] = None) -> str:
+    """Remove one web-storage entry for the tab's origin.
+
+    ``scope`` is ``local`` or ``session``. The response echoes scope and key
+    only, never the removed value.
+    """
+    tid = resolve_tab_id(tab_id)
+    return _text(call("removeStorageItem", {"tabId": tid, "scope": scope, "key": key}))
+
+
+def browser_clear_storage(scope: str = "both", tab_id: Optional[int] = None) -> str:
+    """Clear web storage for the tab's origin.
+
+    ``scope`` is ``local``, ``session``, or ``both``. Destructive: this can
+    discard site state the human depends on. The response reports removed key
+    counts only, never keys or values.
+    """
+    tid = resolve_tab_id(tab_id)
+    return _text(call("clearStorage", {"tabId": tid, "scope": scope}))
+
+
+def browser_search_history(query: str, max_results: int = 20, start_time: Optional[float] = None) -> str:
+    """Search the REAL profile's browsing history.
+
+    Returns url, title, lastVisitTime, and visitCount per hit (``max_results``
+    is capped at 100 by the extension; ``start_time`` is epoch milliseconds).
+    Highly sensitive: history reveals the human's private browsing.
+    """
+    payload = {"query": query, "maxResults": int(max_results)}
+    if start_time is not None:
+        payload["startTime"] = float(start_time)
+    return _text(call("searchHistory", payload))
+
+
+def browser_search_bookmarks(query: str) -> str:
+    """Search the REAL profile's bookmarks.
+
+    Returns id, title, url, and parent folder path per hit. Sensitive: bookmark
+    titles and folders reveal private context.
+    """
+    return _text(call("searchBookmarks", {"query": query}))
+
+
+def browser_search_tabs(
+    query: str,
+    is_regex: bool = False,
+    max_matches_per_tab: int = 5,
+    case_sensitive: bool = False,
+) -> str:
+    """Search visible text across every open http/https tab.
+
+    Per matching tab returns tabId, origin host (never the full URL), match
+    count, and bounded snippets. Snippets may contain page content, so treat the
+    output as sensitive and keep it out of transcripts. Tabs that cannot be
+    scripted (chrome://, the web store) are skipped and counted in
+    ``skippedTabs``. ``max_matches_per_tab`` is capped at 20 by the extension.
+    """
+    return _text(call("searchTabs", {
+        "query": query,
+        "isRegex": bool(is_regex),
+        "maxMatchesPerTab": int(max_matches_per_tab),
+        "caseSensitive": bool(case_sensitive),
+    }))
+
+
 # (func, mutating, sensitive) for every tool in the surface.
 _TOOLS = [
     (browser_list_tabs, False, False),
@@ -445,17 +659,23 @@ _TOOLS = [
     (browser_snapshot, False, False),
     (browser_extract_text, False, False),
     (browser_screenshot, False, False),
+    (browser_save_pdf, False, False),
     (browser_get_html, False, False),
     (browser_wait_for, False, False),
     (browser_policy_check, False, False),
+    (browser_plan_preview, False, False),
+    (browser_search_tabs, False, False),
     (browser_get_cookies, False, True),
     (browser_session_status, False, True),
+    (browser_search_history, False, True),
+    (browser_search_bookmarks, False, True),
     (browser_navigate, True, False),
     (browser_task_session_create, True, False),
     (browser_task_session_navigate, True, False),
     (browser_task_session_state, True, False),
     (browser_task_session_close, True, False),
     (browser_click, True, False),
+    (browser_click_at, True, False),
     (browser_type, True, False),
     (browser_fill, True, False),
     (browser_hover, True, False),
@@ -471,7 +691,13 @@ _TOOLS = [
     (browser_set_color_scheme, True, False),
     (browser_set_user_agent, True, False),
     (browser_tab_control, True, False),
+    (browser_window_control, True, False),
     (browser_wait_for_handoff, True, False),
+    (browser_set_cookie, True, True),
+    (browser_delete_cookie, True, True),
+    (browser_set_storage_item, True, True),
+    (browser_remove_storage_item, True, True),
+    (browser_clear_storage, True, True),
     (browser_action, True, True),
     (browser_confirm_action, True, False),
     (browser_confirm, True, False),

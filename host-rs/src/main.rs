@@ -546,6 +546,7 @@ fn default_policy() -> Value {
             ],
             "requireConfirmation": [],
             "redactPatterns": [],
+            "secretMaskFile": null,
             "redact": true,
             "audit": true
         },
@@ -605,6 +606,7 @@ fn current_policy(policy: &Policy, host_dir: &Path, logger: &Arc<Logger>) -> Val
         if cur != reg.policy_file_mtime {
             reg.value = load_policy(host_dir, logger);
             reg.policy_file_mtime = cur;
+            prime_secret_masks(&reg.value, host_dir, logger);
         }
         return reg.value.clone();
     }
@@ -616,6 +618,8 @@ const POLICY_LIST_KEYS: [&str; 6] = [
     "requireConfirmation", "redactPatterns",
 ];
 const POLICY_BOOL_KEYS: [&str; 2] = ["redact", "audit"];
+/// String-valued policy keys merged like bools: a later layer replaces the value.
+const POLICY_STR_KEYS: [&str; 1] = ["secretMaskFile"];
 
 /// Merge: built-in default -> policy["default"] -> policy["clients"][name].
 fn policy_for_client(policy: &Value, name: &str) -> Value {
@@ -641,6 +645,11 @@ fn policy_for_client(policy: &Value, name: &str) -> Value {
         for key in POLICY_BOOL_KEYS.iter() {
             if let Some(Value::Bool(b)) = layer.get(*key) {
                 merged[*key] = Value::Bool(*b);
+            }
+        }
+        for key in POLICY_STR_KEYS.iter() {
+            if let Some(Value::String(s)) = layer.get(*key) {
+                merged[*key] = Value::String(s.clone());
             }
         }
     }
@@ -924,6 +933,68 @@ fn evaluate_policy(
     (true, None, confirm, redact_enabled, audit_enabled, targets)
 }
 
+/// Upper bound on a policyCheck plan preflight, so one request cannot make the
+/// host evaluate an unbounded step list. Mirrors bridge.py.
+const PLAN_PREVIEW_MAX_STEPS: usize = 50;
+
+/// The verdict object shared by policyCheck (single and plan forms) and by
+/// dry-run responses. `origin` is an optional hypothetical tab origin: when
+/// given, tab-scoped actions are evaluated against it and the verdict is no
+/// longer origin-dependent, since the caller has already supplied the origin the
+/// real request would carry. Mirrors bridge.py::policy_verdict.
+fn policy_verdict(
+    policy: &Value,
+    name: &str,
+    action: &str,
+    payload: Option<&Value>,
+    origin: Option<&str>,
+) -> (Value, Vec<String>) {
+    let needed = tab_ids_needed(action, payload);
+    let mut origins = std::collections::BTreeMap::new();
+    if let Some(o) = origin.filter(|o| !o.is_empty()) {
+        for key in needed.iter() {
+            origins.insert(key.clone(), Some(o.to_string()));
+        }
+    }
+    let supplied = !origins.is_empty();
+    let (allowed, reason, confirm, redact_enabled, audit_enabled, targets) =
+        evaluate_policy(policy, name, action, payload, &origins);
+    let verdict = json!({
+        "allowed": allowed,
+        "reason": reason,
+        "confirmationRequired": confirm,
+        "redact": redact_enabled,
+        "audit": audit_enabled,
+        "originDependent": !needed.is_empty()
+            && policy_constrains_origins(policy, name)
+            && !supplied,
+    });
+    (verdict, targets)
+}
+
+/// Evaluate each preflight step exactly like a single policyCheck, tagged with
+/// its index. A non-object step evaluates as the empty action, which the action
+/// gate denies, so a malformed plan reports per-step instead of failing the
+/// whole request. Mirrors bridge.py::plan_step_verdicts.
+fn plan_step_verdicts(policy: &Value, name: &str, plan: &[Value]) -> Vec<Value> {
+    plan.iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let action = step.get("action").and_then(|a| a.as_str()).unwrap_or("");
+            let origin = step.get("origin").and_then(|o| o.as_str());
+            let (verdict, _targets) =
+                policy_verdict(policy, name, action, step.get("payload"), origin);
+            let mut entry = serde_json::Map::new();
+            entry.insert("step".to_string(), json!(i));
+            entry.insert("action".to_string(), json!(action));
+            if let Value::Object(fields) = verdict {
+                entry.extend(fields);
+            }
+            Value::Object(entry)
+        })
+        .collect()
+}
+
 /// Structured, actionable companion to the opaque "policy denied: <reason>"
 /// error string. The error string itself stays byte-stable for API and
 /// contract compatibility; this object tells a client exactly what to grant, in
@@ -1039,11 +1110,163 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
     })
 }
 
-/// Append one JSON line to the audit log. Never writes payload/response bodies.
-/// A write failure is logged but never blocks browser automation.
+// --- Secret masking (policy `secretMaskFile`) -----------------------------
+//
+// A local file of `name=value` lines (mode 600 expected) whose values are
+// literally masked out of every outbound response string and every audit event,
+// so a credential the agent typed into a page can never be echoed back to the
+// client or persisted to the audit log. Mirrors bridge.py.
+#[derive(Default)]
+struct SecretMaskState {
+    /// secretMaskFile path -> (mtime at load, entries longest value first)
+    cache: HashMap<String, (Option<SystemTime>, Vec<(String, String)>)>,
+    /// Paths already warned about, so a missing file warns exactly once.
+    warned: std::collections::BTreeSet<String>,
+    /// Union of everything ever loaded; audit events have no client context.
+    known: Vec<(String, String)>,
+}
+
+static SECRET_MASKS: Mutex<Option<SecretMaskState>> = Mutex::new(None);
+
+/// Parse `name=value` lines from the policy's secretMaskFile. Blank lines and
+/// `#` comments are ignored; a missing/unreadable file disables masking for that
+/// path after one warning. Cached by mtime like the policy itself, so edits
+/// apply without a host restart. Entries are ordered longest value first so an
+/// overlapping shorter secret cannot pre-empt a longer one.
+fn load_secret_masks(
+    path: Option<&str>,
+    host_dir: &Path,
+    logger: &Arc<Logger>,
+) -> Vec<(String, String)> {
+    let path = match path {
+        Some(p) if !p.is_empty() => p,
+        _ => return Vec::new(),
+    };
+    let mtime = file_mtime(Path::new(path));
+    if let Ok(mut guard) = SECRET_MASKS.lock() {
+        let state = guard.get_or_insert_with(SecretMaskState::default);
+        if let Some((cached_mtime, entries)) = state.cache.get(path) {
+            if *cached_mtime == mtime {
+                return entries.clone();
+            }
+        }
+    }
+    let (entries, failure) = match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let mut entries: Vec<(String, String)> = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((name, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let (name, value) = (name.trim(), value.trim());
+                if name.is_empty() || value.is_empty() {
+                    continue;
+                }
+                entries.push((name.to_string(), value.to_string()));
+            }
+            entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            (entries, None)
+        }
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    let mut warn_once = None;
+    if let Ok(mut guard) = SECRET_MASKS.lock() {
+        let state = guard.get_or_insert_with(SecretMaskState::default);
+        match &failure {
+            Some(reason) => {
+                if state.warned.insert(path.to_string()) {
+                    warn_once = Some(reason.clone());
+                }
+            }
+            None => {
+                state.warned.remove(path);
+                for entry in entries.iter() {
+                    if !state.known.iter().any(|k| k.1 == entry.1) {
+                        state.known.push(entry.clone());
+                    }
+                }
+                state.known.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            }
+        }
+        state.cache.insert(path.to_string(), (mtime, entries.clone()));
+    }
+    // Emit outside the lock: write_audit_event masks with the same state.
+    if let Some(reason) = warn_once {
+        log_warn(logger, &format!("Could not load secretMaskFile {}: {}", path, reason));
+        write_audit_event(host_dir, logger, &json!({
+            "ts": now_ms() as u64,
+            "client": Value::Null,
+            "action": "secretMaskFile",
+            "targets": [path],
+            "decision": "secret_mask_unavailable",
+            "reason": reason,
+            "requestId": Value::Null,
+        }));
+    }
+    entries
+}
+
+/// Every (name, value) pair loaded so far, longest value first.
+fn known_secret_masks() -> Vec<(String, String)> {
+    match SECRET_MASKS.lock() {
+        Ok(guard) => guard.as_ref().map(|s| s.known.clone()).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Load every configured secretMaskFile at policy load time so masking
+/// (including audit masking) is armed before the first response arrives.
+fn prime_secret_masks(policy: &Value, host_dir: &Path, logger: &Arc<Logger>) {
+    let mut names: Vec<String> = vec!["default".to_string()];
+    if let Some(Value::Object(clients)) = policy.get("clients") {
+        names.extend(clients.keys().cloned());
+    }
+    for name in names {
+        let cp = policy_for_client(policy, &name);
+        load_secret_masks(cp.get("secretMaskFile").and_then(|v| v.as_str()), host_dir, logger);
+    }
+}
+
+fn mask_secret_text(text: &str, secrets: &[(String, String)]) -> String {
+    let mut out = text.to_string();
+    for (name, value) in secrets {
+        if !value.is_empty() && out.contains(value.as_str()) {
+            out = out.replace(value.as_str(), &format!("<masked:{}>", name));
+        }
+    }
+    out
+}
+
+/// Recursively replace every exact secret occurrence in string leaves.
+fn mask_secrets_value(value: Value, secrets: &[(String, String)]) -> Value {
+    if secrets.is_empty() {
+        return value;
+    }
+    match value {
+        Value::String(s) => Value::String(mask_secret_text(&s, secrets)),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, mask_secrets_value(v, secrets)))
+                .collect(),
+        ),
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(|v| mask_secrets_value(v, secrets)).collect())
+        }
+        other => other,
+    }
+}
+
+/// Append one JSON line to the audit log. Never writes payload/response bodies,
+/// and never any known secretMaskFile value (a denial reason can quote a
+/// target). A write failure is logged but never blocks browser automation.
 fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
     let path = audit_log_path(host_dir);
-    let line = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    let event = mask_secrets_value(event.clone(), &known_secret_masks());
+    let line = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
     let result = OpenOptions::new()
         .create(true)
         .append(true)
@@ -1179,8 +1402,23 @@ fn redact_content_value(value: Value, compiled: &[regex::Regex]) -> Value {
 /// Response fields carrying page-derived content, subject to redactPatterns.
 const CONTENT_REDACT_FIELDS: [&str; 5] = ["html", "text", "val", "value", "result"];
 
-/// Redact sensitive response values before returning them to socket clients.
+/// Redact sensitive response values before returning them to socket clients,
+/// then mask literal secretMaskFile values in every remaining string. Secret
+/// masking is independent of the policy `redact` toggle: those values are known
+/// credentials and must never leave the host, redaction on or off.
 fn redact_response(
+    action: &str,
+    response: Value,
+    redact_enabled: bool,
+    patterns: Option<&Value>,
+    payload: Option<&Value>,
+    secrets: &[(String, String)],
+) -> Value {
+    let out = redact_response_patterns(action, response, redact_enabled, patterns, payload);
+    mask_secrets_value(out, secrets)
+}
+
+fn redact_response_patterns(
     action: &str,
     response: Value,
     redact_enabled: bool,
@@ -1223,7 +1461,7 @@ fn redact_response(
             let step_payload = steps
                 .get(i)
                 .and_then(|s| s.get("payload"));
-            let wrapped = redact_response(
+            let wrapped = redact_response_patterns(
                 step_action,
                 json!({ "result": item.clone() }),
                 redact_enabled,
@@ -1424,9 +1662,12 @@ fn handle_socket_client(
             }
         };
 
-        // Never forward secrets or host-only confirmation fields to the extension.
+        // Never forward secrets, host-only confirmation fields, or the
+        // request-level dry-run flag to the extension.
+        let mut dry_run = false;
         let mut confirmation_token = if let Value::Object(map) = &mut cmd {
             map.remove("token");
+            dry_run = map.remove("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
             map.remove("confirmationToken")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
         } else {
@@ -1435,6 +1676,54 @@ fn handle_socket_client(
 
         let mut action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
         let mut payload = cmd.get("payload").cloned();
+
+        // Dry run stops before any state change: no confirmation resume, no
+        // lease acquisition, no interactive origin approval, no tab-origin
+        // lookup (that is itself an extension round-trip), and no forward. It
+        // reports the verdict the request would meet right now. Mirrors
+        // bridge.py.
+        if dry_run {
+            if reserved_action(&action) {
+                log_warn(logger, &format!("Rejected reserved action from client: {}", action));
+                let policy_value = current_policy(policy, host_dir, logger);
+                let cp = policy_for_client(&policy_value, &client_name);
+                let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+                audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some("unknown action"), None);
+                let _ = write_line(&mut stream, &json!({"success": false, "error": format!("unknown action: {}", action)}));
+                continue;
+            }
+            let policy_value = current_policy(policy, host_dir, logger);
+            let (mut verdict, targets) =
+                policy_verdict(&policy_value, &client_name, &action, payload.as_ref(), None);
+            if let Some(blocked) = lease_gate(&client_name, lease) {
+                verdict["allowed"] = Value::Bool(false);
+                verdict["reason"] = blocked.get("error").cloned().unwrap_or(Value::Null);
+            }
+            // Host-answered actions resolve without Chrome, so they would never
+            // forward even when fully allowed.
+            let host_side = matches!(
+                action.as_str(),
+                "lease" | "release" | "leaseStatus" | "policyCheck" | "policyInfo" | "confirm"
+            );
+            let would_forward = verdict.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false)
+                && !verdict.get("confirmationRequired").and_then(|v| v.as_bool()).unwrap_or(false)
+                && !host_side;
+            let audit_enabled = verdict.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+            let reason = verdict.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "dry_run", reason.as_deref(), None);
+            let resp = json!({
+                "success": true,
+                "dryRun": true,
+                "wouldForward": would_forward,
+                "action": action,
+                "targets": targets,
+                "verdict": verdict,
+            });
+            if write_line(&mut stream, &resp).is_err() {
+                return;
+            }
+            continue;
+        }
 
         // Token-only confirmation resume. Recover the exact short-lived action
         // and payload, then run the complete policy/origin/lease/confirmation
@@ -1506,6 +1795,26 @@ fn handle_socket_client(
         // target action/payload without forwarding it to the extension.
         if action == "policyCheck" {
             let pc = payload.unwrap_or(json!({}));
+            // Plan preflight: one verdict per proposed step, evaluated
+            // independently against the current policy. Nothing is forwarded and
+            // no state changes, so an agent can price a whole plan before
+            // touching the browser.
+            if let Some(plan) = pc.get("plan").and_then(|p| p.as_array()) {
+                let cp = policy_for_client(&policy_value, &client_name);
+                let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+                if plan.len() > PLAN_PREVIEW_MAX_STEPS {
+                    let reason = format!("plan exceeds {} steps", PLAN_PREVIEW_MAX_STEPS);
+                    audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &[], "deny", Some(&reason), None);
+                    let _ = write_line(&mut stream, &json!({"success": false, "error": reason}));
+                    continue;
+                }
+                let steps = plan_step_verdicts(&policy_value, &client_name, plan);
+                audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &[], "allow", None, None);
+                if write_line(&mut stream, &json!({"success": true, "result": {"plan": steps}})).is_err() {
+                    return;
+                }
+                continue;
+            }
             let target_action = pc.get("action").and_then(|a| a.as_str()).unwrap_or("");
             let target_payload = pc.get("payload");
             let no_origins = std::collections::BTreeMap::new();
@@ -1667,8 +1976,13 @@ fn handle_socket_client(
         }
 
         // Audit "allow" with the generated id before the action is forwarded.
-        let redact_patterns = policy_for_client(&policy_value, &client_name)
-            .get("redactPatterns").cloned();
+        let client_policy = policy_for_client(&policy_value, &client_name);
+        let redact_patterns = client_policy.get("redactPatterns").cloned();
+        let secrets = load_secret_masks(
+            client_policy.get("secretMaskFile").and_then(|v| v.as_str()),
+            host_dir,
+            logger,
+        );
         let (req_id, response) = {
             let h = host_dir;
             let l = logger;
@@ -1685,7 +1999,7 @@ fn handle_socket_client(
                 let ext_decision = if success { "extension_success" } else { "extension_error" };
                 let reason = response.get("error").and_then(|v| v.as_str());
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, ext_decision, reason, Some(&req_id));
-                let response = redact_response(&action, response, redact_enabled, redact_patterns.as_ref(), payload.as_ref());
+                let response = redact_response(&action, response, redact_enabled, redact_patterns.as_ref(), payload.as_ref(), &secrets);
                 if write_line(&mut stream, &response).is_err() {
                     return;
                 }

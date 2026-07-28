@@ -22,6 +22,7 @@ QUIET_MODE = False
 
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-live-upload.txt"
 SHOT_PATH = "/tmp/chrome-bridge-live.png"
+PDF_PATH = "/tmp/chrome-bridge-live.pdf"
 HTML_PATH = "/tmp/chrome-bridge-live.html"
 STATE_PATH = "/tmp/chrome-bridge-state.json"
 DOWNLOAD_NAME = "chrome-bridge-smoke-download.json"
@@ -223,7 +224,7 @@ def main(quiet=False):
     global QUIET_MODE
     QUIET_MODE = quiet
     Path(UPLOAD_FIXTURE).write_text("upload fixture\n", encoding="utf-8")
-    for path in [SHOT_PATH, HTML_PATH, STATE_PATH]:
+    for path in [SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH]:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
     policy_backup = None
@@ -254,7 +255,10 @@ def main(quiet=False):
                     "setCpuThrottling", "setColorScheme", "networkRequests", "executeScriptCDP",
                     "handleDialog", "stopMonitoring", "getCurrentState", "startInterception",
                     "interceptedRequests", "stopInterception", "downloadUrl", "storageState",
-                    "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab"
+                    "setGeolocation", "clearGeolocation", "performanceMetrics", "closeTab",
+                    "printToPDF", "clickAt", "windowControl", "batch", "waitForText",
+                    "setCookie", "deleteCookie", "setStorageItem", "removeStorageItem",
+                    "clearStorage", "searchHistory", "searchBookmarks", "searchTabs"
                 ],
                 "allowedOrigins": ["*"],
                 "deniedActions": [],
@@ -656,6 +660,193 @@ def main(quiet=False):
         metrics = perf.get("metrics", {}) if isinstance(perf, dict) else {}
         record(summary, "performanceMetrics", call, {"metricCount": len(metrics)})
         require(call["exit"] == 0 and len(metrics) > 0, "performanceMetrics failed or returned no metrics")
+
+        # 31. Audit viewer (local read of the host's audit log; no browser action)
+        call = run_bridge("audit", "tail", 5)
+        lines = [line for line in call["stdout"].splitlines() if line.strip()]
+        header_ok = bool(lines) and lines[0].split()[:3] == ["TIMESTAMP", "CLIENT", "ACTION"]
+        record(summary, "auditTail", call, {"lines": len(lines), "header": header_ok})
+        require(call["exit"] == 0, "audit tail failed")
+
+        call = run_bridge("audit", "summary", "--since", "1d")
+        summary_text = call["stdout"]
+        record(summary, "auditSummary", call, {"hasDecisions": "Decisions:" in summary_text})
+        require(call["exit"] == 0, "audit summary failed")
+
+        # 32. PDF export (background-safe debugger path; metadata only)
+        call = run_bridge("printToPDF", tab_id, PDF_PATH)
+        pdf = call.get("json") or {}
+        pdf_file = Path(PDF_PATH)
+        record(summary, "printToPDF", call, {
+            "bytes": pdf.get("bytes"),
+            "mimeType": pdf.get("mimeType"),
+            "path": PDF_PATH
+        })
+        require(
+            call["exit"] == 0
+            and pdf.get("mimeType") == "application/pdf"
+            and pdf.get("bytes", 0) > 1000
+            and pdf_file.is_file()
+            and pdf_file.read_bytes()[:5] == b"%PDF-",
+            "printToPDF failed"
+        )
+
+        # 33. Coordinate click: no selector is resolved, so verify by page effect
+        box = run_bridge("executeScriptCDP", tab_id, "(() => { const r = document.querySelector('#btn').getBoundingClientRect(); return {x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)}; })()")
+        point = (result(box) or {}).get("val") or {}
+        require(box["exit"] == 0 and "x" in point and "y" in point, "could not resolve fixture button coordinates for clickAt", box)
+        run_bridge("fill", tab_id, "#q", "coordinate")
+        call = run_bridge("clickAt", tab_id, point["x"], point["y"])
+        clicked = result(call) or {}
+        status = run_bridge("executeScriptCDP", tab_id, "document.querySelector('#status').textContent")
+        status_text = (result(status) or {}).get("val")
+        record(summary, "clickAt", call, {"x": clicked.get("x"), "y": clicked.get("y"), "status": status_text})
+        # CDP input targets the tab directly, but an inactive tab may not receive
+        # synthesized mouse input, so only require the page effect when the
+        # fixture tab is the active one.
+        if QUIET_MODE:
+            require(call["exit"] == 0 and clicked.get("x") == point["x"], "clickAt failed", call)
+        else:
+            require(call["exit"] == 0 and status_text == "clicked:coordinate", "clickAt did not activate the fixture button", call)
+
+        # 34. Window management: list stays structural, create is unfocused, close works
+        call = run_bridge("windowControl", "list")
+        windows = (result(call) or {}).get("windows") or []
+        leaked = [w for w in windows if not isinstance(w, dict) or {"url", "title", "tabs"} & set(w)]
+        record(summary, "windowControlList", call, {"windowCount": len(windows), "leakedFields": len(leaked)})
+        require(call["exit"] == 0 and len(windows) > 0 and not leaked, "windowControl list failed or leaked tab detail", call)
+
+        call = run_bridge("windowControl", "create", BASE_URL)
+        created = result(call) or {}
+        new_window_id = created.get("windowId")
+        record(summary, "windowControlCreate", call, {"focused": created.get("focused"), "tabCount": created.get("tabCount")})
+        require(
+            call["exit"] == 0 and isinstance(new_window_id, int) and created.get("focused") is False,
+            "windowControl create failed or focused the new window",
+            call
+        )
+
+        call = run_bridge("windowControl", "setState", new_window_id, "minimized")
+        record(summary, "windowControlSetState", call, {"state": (result(call) or {}).get("state")})
+        require(call["exit"] == 0 and (result(call) or {}).get("state") == "minimized", "windowControl setState failed", call)
+
+        call = run_bridge("windowControl", "close", new_window_id)
+        record(summary, "windowControlClose", call, {"closed": (result(call) or {}).get("closed")})
+        require(call["exit"] == 0 and (result(call) or {}).get("closed") is True, "windowControl close failed", call)
+
+        # 35. Batch: waits interleaved with mutations, then continue-on-error
+        batch_steps = json.dumps([
+            {"action": "fill", "payload": {"selector": "#q", "text": "batched"}},
+            {"action": "waitForSelector", "timeoutMs": 5000, "payload": {"selector": "#btn"}},
+            {"action": "click", "payload": {"selector": "#btn"}},
+            {"action": "waitForText", "timeoutMs": 5000, "payload": {"text": "clicked:batched"}}
+        ])
+        call = run_bridge("batch", batch_steps, tab_id, timeout=40)
+        batch_out = result(call)
+        record(summary, "batchWithWaits", call, {"stepCount": len(batch_out) if isinstance(batch_out, list) else None})
+        require(
+            call["exit"] == 0 and isinstance(batch_out, list) and len(batch_out) == 4,
+            "batch with interleaved waits failed",
+            call
+        )
+
+        failing_steps = json.dumps([
+            {"action": "waitForSelector", "timeoutMs": 1000, "payload": {"selector": "#definitely-absent"}},
+            {"action": "fill", "payload": {"selector": "#q", "text": "after-failure"}}
+        ])
+        call = run_bridge("batch", failing_steps, tab_id, "--continue-on-error", timeout=40)
+        batch_out = result(call)
+        continued = (
+            isinstance(batch_out, list)
+            and len(batch_out) == 2
+            and isinstance(batch_out[0], dict)
+            and batch_out[0].get("success") is False
+        )
+        record(summary, "batchContinueOnError", call, {"continued": continued})
+        require(call["exit"] == 0 and continued, "batch --continue-on-error did not record the failed step and continue", call)
+
+        # 36. Cookie writes (identifier-only responses)
+        cookie_name = "chromeBridgeLive"
+        cookie_value = "live-cookie-secret"
+        call = run_bridge("setCookie", BASE_URL, cookie_name, cookie_value)
+        set_cookie = result(call) or {}
+        value_leaked = cookie_value in call["stdout"]
+        record(summary, "setCookie", call, {
+            "name": set_cookie.get("name"),
+            "hasDomain": bool(set_cookie.get("domain")),
+            "valueEchoed": value_leaked,
+        })
+        require(
+            call["exit"] == 0 and set_cookie.get("name") == cookie_name and not value_leaked,
+            "setCookie failed or echoed the cookie value",
+            call
+        )
+
+        call = run_bridge("deleteCookie", BASE_URL, cookie_name)
+        deleted = result(call) or {}
+        record(summary, "deleteCookie", call, {"name": deleted.get("name"), "removed": deleted.get("removed")})
+        require(call["exit"] == 0 and deleted.get("removed") is True, "deleteCookie failed", call)
+
+        # 37. Storage writes (identifier-only responses)
+        storage_value = "live-storage-secret"
+        call = run_bridge("setStorageItem", tab_id, "local", "bridgeLiveKey", storage_value)
+        set_item = result(call) or {}
+        record(summary, "setStorageItem", call, {
+            "scope": set_item.get("scope"),
+            "key": set_item.get("key"),
+            "valueEchoed": storage_value in call["stdout"],
+        })
+        require(
+            call["exit"] == 0 and set_item.get("key") == "bridgeLiveKey" and storage_value not in call["stdout"],
+            "setStorageItem failed or echoed the stored value",
+            call
+        )
+
+        call = run_bridge("executeScriptCDP", tab_id, "localStorage.getItem('bridgeLiveKey')")
+        stored = (result(call) or {}).get("val")
+        record(summary, "storageItemReadBack", call, {"matched": stored == storage_value})
+        require(call["exit"] == 0 and stored == storage_value, "setStorageItem did not write the value into the tab", call)
+
+        call = run_bridge("removeStorageItem", tab_id, "local", "bridgeLiveKey")
+        removed_item = result(call) or {}
+        record(summary, "removeStorageItem", call, {"key": removed_item.get("key"), "existed": removed_item.get("existed")})
+        require(call["exit"] == 0 and removed_item.get("existed") is True, "removeStorageItem failed", call)
+
+        call = run_bridge("clearStorage", tab_id, "both")
+        cleared = result(call) or {}
+        scopes_cleared = [entry.get("scope") for entry in cleared.get("cleared", []) if isinstance(entry, dict)]
+        record(summary, "clearStorage", call, {"scopes": scopes_cleared})
+        require(call["exit"] == 0 and scopes_cleared == ["local", "session"], "clearStorage did not clear both scopes", call)
+
+        # 38. History and bookmarks search (profile-dependent counts)
+        call = run_bridge("searchHistory", "chrome-bridge-live", 5)
+        history = result(call) or {}
+        record(summary, "searchHistory", call, {"count": history.get("count")})
+        require(call["exit"] == 0 and isinstance(history.get("items"), list), "searchHistory failed", call)
+
+        call = run_bridge("searchBookmarks", "chrome-bridge-live")
+        bookmarks = result(call) or {}
+        record(summary, "searchBookmarks", call, {"count": bookmarks.get("count")})
+        require(call["exit"] == 0 and isinstance(bookmarks.get("items"), list), "searchBookmarks failed", call)
+
+        # 39. Cross-tab text search (origin host only, bounded snippets)
+        call = run_bridge("searchTabs", "Chrome Bridge Live Test", "--max-per-tab", 3)
+        tab_search = result(call) or {}
+        hits = tab_search.get("matches", []) if isinstance(tab_search, dict) else []
+        fixture_hit = next((hit for hit in hits if isinstance(hit, dict) and hit.get("tabId") == tab_id), None)
+        domain_only = fixture_hit is not None and "/" not in str(fixture_hit.get("domain", "/"))
+        record(summary, "searchTabs", call, {
+            "matchingTabs": tab_search.get("matchingTabs"),
+            "skippedTabs": tab_search.get("skippedTabs"),
+            "fixtureMatched": fixture_hit is not None,
+            "domainOnly": domain_only,
+        })
+        require(
+            call["exit"] == 0 and fixture_hit is not None and domain_only
+            and len(fixture_hit.get("snippets", [])) <= 3,
+            "searchTabs did not match the fixture tab with a host-only domain and capped snippets",
+            call
+        )
         if QUIET_MODE:
             state = run_bridge("getCurrentState", tab_id)
             active = ((result(state) or {}).get("tab") or {}).get("active")
@@ -683,7 +874,7 @@ def main(quiet=False):
         if server is not None:
             server.shutdown()
 
-        for path in [UPLOAD_FIXTURE, SHOT_PATH, HTML_PATH, STATE_PATH]:
+        for path in [UPLOAD_FIXTURE, SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH]:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
 

@@ -49,12 +49,32 @@ chrome-bridge/
 | `.github/workflows/ci.yml` | Pull-request and `main` push gates for syntax, offline contracts, Rust parity, benchmarks, and packaging checks. |
 | `.github/workflows/release.yml` | Tag-driven release workflow for `v*` tags after the CI command set passes. |
 | `scripts/package_release.py` | Stdlib release packager for source archives, unpacked extension bundles, and Rust host binaries. |
+| `scripts/quick_install.sh` | One-command bootstrap: runs `setup.sh`, probes the bridge, and prints the extension-load and MCP-registration steps. |
 
 ## Requirements
 
 - Google Chrome, Chrome Beta, or Chromium with Developer mode. The macOS installer also registers Chrome Canary.
 - Python 3.9+ for the core bridge and CLI; Python 3.10+ for the MCP server (`mcp/`, matching `mcp/pyproject.toml`).
 - macOS or Linux for the documented `setup.sh` and `setup-rs.sh` native-host installers. Broker mode and `setup-broker.sh` are macOS-only because they use launchd. Other platforms may be possible with manual Chrome native-host registration, but they are not covered by these installers.
+
+## Quickstart
+
+From a fresh checkout, one command runs the installer and prints everything left to do by hand:
+
+```bash
+scripts/quick_install.sh
+```
+
+It detects macOS or Linux, runs `./setup.sh --print-json` from the repository root, probes the bridge with `python3 test_client.py ping` (a failure there is expected and non-fatal until the extension is loaded), and then prints the unpacked-extension directory reported by `setup.sh`, the `chrome://extensions/` steps, and a ready-to-paste MCP registration block with this checkout's absolute path already substituted.
+
+To install on a non-default port, pass it positionally or through `PORT`; either form is forwarded to `./setup.sh --host-port`:
+
+```bash
+scripts/quick_install.sh 9224
+PORT=9224 scripts/quick_install.sh
+```
+
+Only macOS and Linux are supported, matching `setup.sh`'s native-host auto-registration. Everything the script does can be done by hand with the steps below.
 
 ## Setup
 

@@ -16,7 +16,9 @@
     "alarms",
     "storage",
     "downloads",
-    "contentSettings"
+    "contentSettings",
+    "history",
+    "bookmarks"
   ],
   "background": {
     "service_worker": "background.js"

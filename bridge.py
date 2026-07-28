@@ -347,6 +347,7 @@ DEFAULT_POLICY = {
         ],
         "requireConfirmation": [],
         "redactPatterns": [],
+        "secretMaskFile": None,
         "redact": True,
         "audit": True,
     },
@@ -379,12 +380,20 @@ def current_policy():
     # file's mtime changes (including absent -> present) so changes take effect
     # without a host restart.
     global _policy_cache, _policy_mtime
+    reloaded = False
     with _policy_lock:
         mtime = _file_mtime(POLICY_FILE)
         if mtime != _policy_mtime:
             _policy_cache = load_policy()
             _policy_mtime = mtime
-        return _policy_cache
+            reloaded = True
+        policy = _policy_cache
+    if reloaded:
+        # Load every configured secretMaskFile at policy load time so masking
+        # (including audit masking) is armed before the first response arrives.
+        for layer_name in ("default", *(policy.get("clients") or {})):
+            load_secret_masks(policy_for_client(policy, layer_name).get('secretMaskFile'))
+    return policy
 
 
 _POLICY_LIST_KEYS = (
@@ -392,12 +401,14 @@ _POLICY_LIST_KEYS = (
     'requireConfirmation', 'redactPatterns',
 )
 _POLICY_BOOL_KEYS = ('redact', 'audit')
+# String-valued policy keys merged like bools: a later layer replaces the value.
+_POLICY_STR_KEYS = ('secretMaskFile',)
 
 
 def policy_for_client(policy, name):
     # Merge: built-in default -> policy["default"] -> policy["clients"][name].
-    # List overrides replace the inherited list; bool overrides replace the
-    # inherited value; unknown keys are ignored.
+    # List overrides replace the inherited list; bool/string overrides replace
+    # the inherited value; unknown keys are ignored.
     merged = dict(DEFAULT_POLICY["default"])
     for layer in (policy.get("default"), (policy.get("clients") or {}).get(name)):
         if not isinstance(layer, dict):
@@ -407,6 +418,9 @@ def policy_for_client(policy, name):
                 merged[key] = list(layer[key])
         for key in _POLICY_BOOL_KEYS:
             if isinstance(layer.get(key), bool):
+                merged[key] = layer[key]
+        for key in _POLICY_STR_KEYS:
+            if isinstance(layer.get(key), str):
                 merged[key] = layer[key]
     return merged
 
@@ -591,6 +605,50 @@ def evaluate_policy(policy, name, action, payload, origins=None):
     if targets and not target_matches(allowed_origins, targets):
         return (False, "target not allowed", False, redact_enabled, audit_enabled, targets)
     return (True, None, confirm, redact_enabled, audit_enabled, targets)
+
+
+# Upper bound on a policyCheck plan preflight, so one request cannot make the
+# host evaluate an unbounded step list.
+PLAN_PREVIEW_MAX_STEPS = 50
+
+
+def policy_verdict(policy, name, action, payload, origin=None):
+    # The verdict object shared by policyCheck (single and plan forms) and by
+    # dry-run responses. ``origin`` is an optional hypothetical tab origin: when
+    # given, tab-scoped actions are evaluated against it and the verdict is no
+    # longer origin-dependent, since the caller has already supplied the origin
+    # the real request would carry.
+    action = action if isinstance(action, str) else ""
+    payload = payload if isinstance(payload, dict) else {}
+    needed = tab_ids_needed(action, payload)
+    origins = {t: origin for t in needed} if isinstance(origin, str) and origin else None
+    allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
+        policy, name, action, payload, origins=origins)
+    verdict = {
+        "allowed": allowed,
+        "reason": reason,
+        "confirmationRequired": confirm,
+        "redact": redact_enabled,
+        "audit": audit_enabled,
+        "originDependent": bool(needed and policy_constrains_origins(policy, name) and not origins),
+    }
+    return verdict, targets
+
+
+def plan_step_verdicts(policy, name, plan):
+    # Evaluate each preflight step exactly like a single policyCheck, tagged
+    # with its index. Non-object steps evaluate as the empty action, which the
+    # action gate denies, so a malformed plan reports per-step instead of
+    # failing the whole request.
+    out = []
+    for i, step in enumerate(plan):
+        step = step if isinstance(step, dict) else {}
+        verdict, _targets = policy_verdict(
+            policy, name, step.get("action"), step.get("payload"), step.get("origin"))
+        entry = {"step": i, "action": step.get("action") if isinstance(step.get("action"), str) else ""}
+        entry.update(verdict)
+        out.append(entry)
+    return out
 
 
 def policy_denial(reason, action, targets, name, policy=None):
@@ -816,10 +874,101 @@ def maybe_apply_origin_approval(policy, name, action, payload, targets, audit_en
     return None
 
 
+# --- Secret masking (policy ``secretMaskFile``) ---------------------------
+#
+# A local file of ``name=value`` lines (mode 600 expected) whose values are
+# literally masked out of every outbound response string and every audit event,
+# so a credential the agent typed into a page can never be echoed back to the
+# client or persisted to the audit log.
+_secret_mask_lock = threading.RLock()
+_secret_mask_cache = {}    # path -> (mtime, [(name, value), ...])
+_secret_mask_warned = set()  # paths already warned about (warn once)
+_secret_mask_known = {}    # value -> name, union of everything ever loaded
+
+
+def load_secret_masks(path):
+    # Parse ``name=value`` lines from the policy's secretMaskFile. Blank lines
+    # and ``#`` comments are ignored; a missing/unreadable file disables masking
+    # for that path after one warning. Cached by mtime like the policy itself,
+    # so edits apply without a host restart. Entries are ordered longest value
+    # first so an overlapping shorter secret cannot pre-empt a longer one.
+    if not isinstance(path, str) or not path:
+        return []
+    with _secret_mask_lock:
+        mtime = _file_mtime(path)
+        cached = _secret_mask_cache.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        entries = []
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except Exception as e:
+            if path not in _secret_mask_warned:
+                _secret_mask_warned.add(path)
+                logging.warning(f"Could not load secretMaskFile {path}: {e}")
+                write_audit_event({
+                    "ts": now_ms(),
+                    "client": None,
+                    "action": "secretMaskFile",
+                    "targets": [path],
+                    "decision": "secret_mask_unavailable",
+                    "reason": str(e),
+                    "requestId": None,
+                })
+            _secret_mask_cache[path] = (mtime, [])
+            return []
+        _secret_mask_warned.discard(path)
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            name, _, value = line.partition('=')
+            name, value = name.strip(), value.strip()
+            if not name or not value:
+                continue
+            entries.append((name, value))
+            _secret_mask_known[value] = name
+        entries.sort(key=lambda e: len(e[1]), reverse=True)
+        _secret_mask_cache[path] = (mtime, entries)
+        return entries
+
+
+def _known_secret_masks():
+    # Every (name, value) pair loaded so far, longest value first. Used to keep
+    # secrets out of audit events, which have no per-client policy context.
+    with _secret_mask_lock:
+        entries = [(n, v) for v, n in _secret_mask_known.items()]
+    entries.sort(key=lambda e: len(e[1]), reverse=True)
+    return entries
+
+
+def mask_secret_text(text, secrets):
+    for name, value in secrets:
+        if value and value in text:
+            text = text.replace(value, f"<masked:{name}>")
+    return text
+
+
+def mask_secrets_value(value, secrets):
+    # Recursively replace every exact secret occurrence in string leaves.
+    if not secrets:
+        return value
+    if isinstance(value, str):
+        return mask_secret_text(value, secrets)
+    if isinstance(value, dict):
+        return {k: mask_secrets_value(v, secrets) for k, v in value.items()}
+    if isinstance(value, list):
+        return [mask_secrets_value(v, secrets) for v in value]
+    return value
+
+
 def write_audit_event(event):
-    # Append one JSON line. Never writes payload/response bodies. A write
+    # Append one JSON line. Never writes payload/response bodies, and never any
+    # known secretMaskFile value (a denial reason can quote a target). A write
     # failure is logged but never blocks browser automation.
     try:
+        event = mask_secrets_value(event, _known_secret_masks())
         with open(AUDIT_LOG_FILE, 'a') as f:
             f.write(json.dumps(event) + "\n")
     except Exception as e:
@@ -899,8 +1048,16 @@ def _redact_content_value(value, compiled):
     return value
 
 
-def redact_response(action, response, redact_enabled, patterns=None, payload=None):
-    # Redact sensitive response values before returning them to socket clients.
+def redact_response(action, response, redact_enabled, patterns=None, payload=None, secrets=None):
+    # Redact sensitive response values before returning them to socket clients,
+    # then mask literal secretMaskFile values in every remaining string. Secret
+    # masking is independent of the policy ``redact`` toggle: those values are
+    # known credentials and must never leave the host, redaction on or off.
+    out = _redact_response_patterns(action, response, redact_enabled, patterns, payload)
+    return mask_secrets_value(out, secrets)
+
+
+def _redact_response_patterns(action, response, redact_enabled, patterns=None, payload=None):
     # Operates on a returned copy; never mutates audit/queue/routing structures.
     if not redact_enabled or not isinstance(response, dict):
         return response
@@ -927,7 +1084,7 @@ def redact_response(action, response, redact_enabled, patterns=None, payload=Non
                 redacted.append(redact_unknown_batch_item(item))
                 continue
             step_payload = step.get('payload') if isinstance(step.get('payload'), dict) else {}
-            wrapped = redact_response(step_action, {"result": item}, redact_enabled, patterns, step_payload)
+            wrapped = _redact_response_patterns(step_action, {"result": item}, redact_enabled, patterns, step_payload)
             redacted.append(wrapped.get("result", item) if isinstance(wrapped, dict) else item)
         out = dict(response)
         out['result'] = redacted
@@ -1053,8 +1210,48 @@ def handle_socket_client(client_socket):
                 return
             cmd.pop("token", None)  # never forward the secret to the extension
             confirmation_token = cmd.pop("confirmationToken", None)
+            # Request-level dry run: never forwarded to the extension, and never
+            # left in the command even when false.
+            dry_run = cmd.pop("dryRun", None) is True
 
             action = cmd.get("action")
+
+            # Dry run stops before any state change: no confirmation resume, no
+            # lease acquisition, no interactive origin approval, no tab-origin
+            # lookup (that is itself an extension round-trip), and no forward.
+            # It reports the verdict the request would meet right now.
+            if dry_run:
+                if action in RESERVED_ACTIONS:
+                    logging.warning(f"Rejected reserved action from client: {action}")
+                    policy = current_policy()
+                    audit_enabled = policy_for_client(policy, name).get('audit', True)
+                    _audit(audit_enabled, name, action, [], "deny", "unknown action", None)
+                    client_socket.sendall(
+                        (json.dumps({"success": False, "error": f"unknown action: {action}"}) + "\n").encode('utf-8'))
+                    continue
+                policy = current_policy()
+                verdict, targets = policy_verdict(policy, name, action, cmd.get("payload") or {})
+                with lease_lock:
+                    owner, _ = _lease_status_locked()
+                lease_blocked = owner is not None and owner != name
+                if lease_blocked:
+                    verdict["allowed"] = False
+                    verdict["reason"] = f"leased by {owner}"
+                # Host-answered actions resolve without Chrome, so they would
+                # never forward even when fully allowed.
+                host_side = action in ('lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo', 'confirm')
+                would_forward = bool(
+                    verdict["allowed"] and not verdict["confirmationRequired"] and not host_side)
+                _audit(verdict["audit"], name, action, targets, "dry_run", verdict["reason"], None)
+                client_socket.sendall((json.dumps({
+                    "success": True,
+                    "dryRun": True,
+                    "wouldForward": would_forward,
+                    "action": action,
+                    "targets": targets,
+                    "verdict": verdict,
+                }) + "\n").encode('utf-8'))
+                continue
 
             # Token-only confirmation resume. The host keeps the original
             # action/payload for the short token TTL, then sends it through the
@@ -1110,6 +1307,25 @@ def handle_socket_client(client_socket):
             # target action/payload without forwarding it to the extension.
             if action == 'policyCheck':
                 pc_payload = cmd.get("payload") or {}
+                # Plan preflight: one verdict per proposed step, evaluated
+                # independently against the current policy. Nothing is forwarded
+                # and no state changes, so an agent can price a whole plan before
+                # touching the browser.
+                plan = pc_payload.get("plan")
+                if isinstance(plan, list):
+                    audit_enabled = policy_for_client(policy, name).get('audit', True)
+                    if len(plan) > PLAN_PREVIEW_MAX_STEPS:
+                        _audit(audit_enabled, name, "policyCheck", [], "deny",
+                               f"plan exceeds {PLAN_PREVIEW_MAX_STEPS} steps", None)
+                        client_socket.sendall((json.dumps({
+                            "success": False,
+                            "error": f"plan exceeds {PLAN_PREVIEW_MAX_STEPS} steps",
+                        }) + "\n").encode('utf-8'))
+                        continue
+                    resp = {"success": True, "result": {"plan": plan_step_verdicts(policy, name, plan)}}
+                    _audit(audit_enabled, name, "policyCheck", [], "allow", None, None)
+                    client_socket.sendall((json.dumps(resp) + "\n").encode('utf-8'))
+                    continue
                 target_action = pc_payload.get("action") or ""
                 target_payload = pc_payload.get("payload") or {}
                 allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
@@ -1276,8 +1492,10 @@ def handle_socket_client(client_socket):
                 return
             ext_decision = "extension_success" if response.get("success") else "extension_error"
             _audit(audit_enabled, name, action, targets, ext_decision, response.get("error"), req_id)
-            redact_patterns = policy_for_client(policy, name).get('redactPatterns')
-            response = redact_response(action, response, redact_enabled, redact_patterns, payload)
+            client_policy = policy_for_client(policy, name)
+            secrets = load_secret_masks(client_policy.get('secretMaskFile'))
+            response = redact_response(action, response, redact_enabled,
+                                       client_policy.get('redactPatterns'), payload, secrets)
             client_socket.sendall((json.dumps(response) + "\n").encode('utf-8'))
     except Exception as e:
         logging.error(f"Error handling socket client: {e}", exc_info=True)

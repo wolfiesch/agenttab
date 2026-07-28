@@ -7,6 +7,9 @@ bridge_tokens.txt.lock
 bridge_token_*.txt
 extension_key.pem
 *.pem
+# Secret masking values named by policy `secretMaskFile`
+bridge_secrets.txt
+!bridge_secrets.txt.example
 
 # Generated host manifests (contain absolute paths + your extension ID)
 com.automation.bridge.json

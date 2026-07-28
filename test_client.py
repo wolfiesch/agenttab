@@ -6,9 +6,14 @@ import re
 import socket
 import sys
 import time
+from collections import Counter
+from datetime import datetime
 from bridge_wake import token_file_path
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+# Mirrors the extension's accepted chrome.windows states for windowControl.
+WINDOW_STATES = ("normal", "minimized", "maximized")
 
 
 def load_token():
@@ -99,7 +104,13 @@ def parse_observe_args(args):
 
 
 
-def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None):
+# Global ``--dry-run``: the host runs token, policy, lease, and confirmation
+# checks for the request and reports the verdict without forwarding anything to
+# Chrome. Set once in main() and applied to every request this process sends.
+DRY_RUN = False
+
+
+def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False):
     if payload is None:
         payload = {}
 
@@ -147,6 +158,8 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
             "payload": payload,
             "token": token
         }
+        if DRY_RUN or dry_run:
+            cmd["dryRun"] = True
         if isinstance(confirmation_token, str) and confirmation_token:
             cmd["confirmationToken"] = confirmation_token
         sock.sendall((json.dumps(cmd) + "\n").encode('utf-8'))
@@ -225,6 +238,35 @@ def save_screenshot(tab_id, output_path, quiet=True):
     with open(path, "wb") as f:
         f.write(data)
     print(json.dumps({"success": True, "path": path, "mimeType": "image/png", "bytes": len(data)}, indent=2))
+    return 0
+
+
+def save_pdf(tab_id, output_path, options=None):
+    payload = {"tabId": tab_id}
+    if options:
+        payload.update(options)
+    exit_code, response, stderr = send_command_data("printToPDF", payload)
+    if exit_code != 0:
+        if response is not None:
+            print(json.dumps(response, indent=2))
+        if stderr:
+            print(stderr, file=sys.stderr)
+        return exit_code
+    result = result_payload(response)
+    encoded = result.get("base64") if result else None
+    if not isinstance(encoded, str) or not encoded:
+        print("Error: printToPDF response did not include base64 PDF data", file=sys.stderr)
+        return 1
+    try:
+        data = base64.b64decode(encoded)
+    except Exception as exc:
+        print(f"Error: printToPDF response was not valid base64: {exc}", file=sys.stderr)
+        return 1
+    path = expand_output_path(output_path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    print(json.dumps({"success": True, "path": path, "mimeType": "application/pdf", "bytes": len(data)}, indent=2))
     return 0
 
 
@@ -504,6 +546,229 @@ def _policy_doctor(audit_file, policy_file):
     return 0
 
 
+def _resolve_audit_log_path():
+    # Same resolution order as ``policy doctor``: the running host is the only
+    # component that knows BRIDGE_AUDIT_LOG_FILE as it was actually configured.
+    # When the host is unreachable, fall back to the repo-local default so the
+    # log stays readable offline; callers report that fallback.
+    exit_code, response, _stderr = send_command_data("policyInfo")
+    if exit_code == 0 and response:
+        info = result_payload(response)
+        if isinstance(info, dict) and info.get("auditLogFile"):
+            return info["auditLogFile"], False
+    return os.path.join(SCRIPT_DIR, "bridge_audit.jsonl"), True
+
+
+def _read_audit_entries(path):
+    # Return (entries, malformed, error, missing). Malformed lines are counted
+    # but never echoed: a truncated or corrupt line can hold arbitrary bytes.
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return None, 0, f"No audit log at {path} yet; nothing to show.", True
+    except OSError as exc:
+        return None, 0, f"Error: could not read audit log at {path}: {exc}", False
+    entries = []
+    malformed = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            malformed += 1
+            continue
+        if not isinstance(event, dict):
+            malformed += 1
+            continue
+        entries.append(event)
+    return entries, malformed, None, False
+
+
+def _load_audit_log():
+    # Shared front door for the audit subcommands: resolve, read, and report
+    # both the fallback path and a missing/unreadable log exactly once.
+    path, fell_back = _resolve_audit_log_path()
+    if fell_back:
+        print(f"Note: host unreachable; falling back to local audit log {path}", file=sys.stderr)
+    entries, malformed, error, missing = _read_audit_entries(path)
+    if entries is None:
+        if missing:
+            print(error)
+            return path, None, 0, 0
+        print(error, file=sys.stderr)
+        return path, None, 0, 1
+    return path, entries, malformed, 0
+
+
+def _audit_event_ms(event):
+    ts = event.get("ts")
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    return int(ts)
+
+
+def _audit_local_time(ms):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ms / 1000.0))
+
+
+def _audit_timestamp(event):
+    ms = _audit_event_ms(event)
+    return "-" if ms is None else _audit_local_time(ms)
+
+
+def _parse_since(value):
+    # Accept a relative window (30m / 12h / 7d) or an ISO 8601 stamp. Naive ISO
+    # stamps are read as local time, matching how timestamps are rendered.
+    text = (value or "").strip()
+    m = re.match(r"^(\d+)([mhd])$", text)
+    if m:
+        units = {"m": 60, "h": 3600, "d": 86400}
+        return int((time.time() - int(m.group(1)) * units[m.group(2)]) * 1000)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        print(f"Error: --since expects ISO 8601 or a relative window like 7d/12h/30m, got: {value}",
+              file=sys.stderr)
+        sys.exit(2)
+    return int(parsed.timestamp() * 1000)
+
+
+def _audit_decision_bucket(decision):
+    # The host writes a richer decision vocabulary than allow/deny/confirm
+    # (lease_allow, extension_success, confirmation_required, ...). Fold it into
+    # the three outcomes an operator cares about; anything unrecognized stays
+    # "other" so a new host decision is never miscounted as an allow.
+    text = str(decision or "").lower()
+    if "deny" in text or "denied" in text:
+        return "deny"
+    if "confirmation_required" in text:
+        return "confirm"
+    if any(token in text for token in ("allow", "success", "accepted", "resume", "persisted")):
+        return "allow"
+    return "other"
+
+
+def _print_audit_table(header, rows):
+    widths = [max(len(row[i]) for row in [header] + rows) for i in range(len(header))]
+    for row in [header] + rows:
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)).rstrip())
+
+
+def _audit_tail(count):
+    path, entries, malformed, exit_code = _load_audit_log()
+    if entries is None:
+        return exit_code
+    if not entries:
+        print(f"Audit log {path} has no entries yet.")
+        if malformed:
+            print(f"Skipped {malformed} malformed line(s).")
+        return 0
+    # Metadata columns only. The audit log never stores payload or response
+    # bodies, and nothing here reconstructs them.
+    rows = [(
+        _audit_timestamp(event),
+        str(event.get("client") or "-"),
+        str(event.get("action") or "-"),
+        str(event.get("decision") or "-"),
+        str(event.get("reason") or ""),
+        str(event.get("requestId") or "-"),
+    ) for event in entries[-count:]]
+    _print_audit_table(("TIMESTAMP", "CLIENT", "ACTION", "DECISION", "REASON", "REQUEST-ID"), rows)
+    if malformed:
+        print(f"Skipped {malformed} malformed line(s).")
+    return 0
+
+
+def _audit_summary(since_ms):
+    path, entries, malformed, exit_code = _load_audit_log()
+    if entries is None:
+        return exit_code
+    undated = 0
+    if since_ms is not None:
+        kept = []
+        for event in entries:
+            ms = _audit_event_ms(event)
+            if ms is None:
+                undated += 1
+                continue
+            if ms >= since_ms:
+                kept.append(event)
+        entries = kept
+    if not entries:
+        print(f"Audit log {path} has no entries in range.")
+        if malformed:
+            print(f"Skipped {malformed} malformed line(s).")
+        return 0
+    clients = Counter()
+    actions = Counter()
+    buckets = Counter()
+    deny_reasons = Counter()
+    stamps = []
+    for event in entries:
+        clients[str(event.get("client") or "-")] += 1
+        actions[str(event.get("action") or "-")] += 1
+        bucket = _audit_decision_bucket(event.get("decision"))
+        buckets[bucket] += 1
+        if bucket == "deny":
+            deny_reasons[str(event.get("reason") or "(no reason recorded)")] += 1
+        ms = _audit_event_ms(event)
+        if ms is not None:
+            stamps.append(ms)
+    print(f"Audit log: {path}")
+    if stamps:
+        print(f"Range:     {_audit_local_time(min(stamps))} .. {_audit_local_time(max(stamps))}")
+    else:
+        print("Range:     (no timestamped entries)")
+    print(f"Entries:   {len(entries)}")
+    print("")
+    print("Decisions:")
+    _print_audit_table(("OUTCOME", "COUNT"),
+                       [(name, str(buckets.get(name, 0))) for name in ("allow", "deny", "confirm", "other")])
+    print("")
+    print("Clients:")
+    _print_audit_table(("CLIENT", "COUNT"), [(name, str(n)) for name, n in clients.most_common()])
+    print("")
+    print("Actions:")
+    _print_audit_table(("ACTION", "COUNT"), [(name, str(n)) for name, n in actions.most_common()])
+    if deny_reasons:
+        print("")
+        print("Top deny reasons:")
+        _print_audit_table(("REASON", "COUNT"), [(name, str(n)) for name, n in deny_reasons.most_common(5)])
+    if undated:
+        print("")
+        print(f"Excluded {undated} entry/entries without a usable timestamp from the --since window.")
+    if malformed:
+        print(f"Skipped {malformed} malformed line(s).")
+    return 0
+
+
+def cmd_audit(args):
+    sub = args[2] if len(args) > 2 else ""
+    if sub == "tail":
+        count = parse_int(args[3], "count") if len(args) > 3 else 20
+        if count <= 0:
+            print("Error: count must be a positive integer", file=sys.stderr)
+            return 2
+        return _audit_tail(count)
+    if sub == "summary":
+        since_ms = None
+        if len(args) > 3:
+            if args[3] != "--since" or len(args) < 5:
+                print("Usage: python3 test_client.py audit summary [--since <ISO8601|7d|12h|30m>]",
+                      file=sys.stderr)
+                return 64
+            since_ms = _parse_since(args[4])
+        return _audit_summary(since_ms)
+    print("Usage: python3 test_client.py audit <tail [count] | summary [--since <ISO8601|7d|12h|30m>]>",
+          file=sys.stderr)
+    return 64
+
+
 def print_usage():
     print("Usage:")
     print("  chrome-bridge <command> [arguments]")
@@ -523,6 +788,11 @@ def print_usage():
     print("  confirm <token>                   Resume a confirmation-gated action")
     print("  taskSession <operation> ...       Manage task-owned background tabs")
     print("  policy <operation> ...            Inspect or update local policy")
+    print("  audit <tail|summary> ...          Read the local audit log written by the host")
+    print("  searchTabs <query> [--regex]      Search visible text across all http/https tabs")
+    print("")
+    print("Global flags:")
+    print("  --dry-run                         Report the host verdict without touching Chrome")
     print("")
     print("    selectors: CSS, css=<selector>, label=<text>, text=<text>, role=<role>[name=<text>],")
     print("               aria=<accessible-name>, <host> >>> <shadow-selector>,")
@@ -561,6 +831,22 @@ COMMAND_HELP = {
     "policy": (
         "chrome-bridge policy info|show|doctor|allow-action|allow-origin ...",
         "Inspect the active local policy, explain recent denials, or add a narrow action/origin grant.",
+    ),
+    "audit": (
+        "chrome-bridge audit tail [count] | audit summary [--since <ISO8601|7d|12h|30m>]",
+        "Read the local audit log: recent decisions as columns, or aggregate counts. Metadata only, never payloads.",
+    ),
+    "setCookie": (
+        "chrome-bridge setCookie <url> <name> <value> [--domain <domain>] [--path <path>] [--secure] [--http-only] [--same-site <policy>] [--expires <epochSeconds>]",
+        "Write one cookie into the real profile. The response reports the cookie name and domain only, never the value. Confirmation-gated in the example policy.",
+    ),
+    "clearStorage": (
+        "chrome-bridge clearStorage <tabId> local|session|both",
+        "Clear web storage for the tab origin. The response reports removed key counts only, never keys or values. Confirmation-gated in the example policy.",
+    ),
+    "searchTabs": (
+        "chrome-bridge searchTabs <query> [--regex] [--max-per-tab <count>] [--case-sensitive]",
+        "Search visible text across all http/https tabs. Reports tab id, domain, and bounded snippets; snippets contain page content, so treat output as sensitive.",
     ),
 }
 
@@ -609,6 +895,14 @@ COMMAND_USAGES = {
     "handleDialog": "chrome-bridge handleDialog <tabId> accept|dismiss [promptText]",
     "downloadUrl": "chrome-bridge downloadUrl <url> [filename]",
     "storageState": "chrome-bridge storageState <tabId> <outputPath>",
+    "setCookie": "chrome-bridge setCookie <url> <name> <value> [--domain <domain>] [--path <path>] [--secure] [--http-only] [--same-site no_restriction|lax|strict] [--expires <epochSeconds>]",
+    "deleteCookie": "chrome-bridge deleteCookie <url> <name>",
+    "setStorageItem": "chrome-bridge setStorageItem <tabId> local|session <key> <value>",
+    "removeStorageItem": "chrome-bridge removeStorageItem <tabId> local|session <key>",
+    "clearStorage": "chrome-bridge clearStorage <tabId> local|session|both",
+    "searchHistory": "chrome-bridge searchHistory <query> [maxResults] [--since <epochMillis>]",
+    "searchBookmarks": "chrome-bridge searchBookmarks <query>",
+    "searchTabs": "chrome-bridge searchTabs <query> [--regex] [--max-per-tab <count>] [--case-sensitive]",
     "setGeolocation": "chrome-bridge setGeolocation <tabId> <latitude> <longitude> [accuracy]",
     "clearGeolocation": "chrome-bridge clearGeolocation <tabId>",
     "startInterception": "chrome-bridge startInterception <tabId> <urlPattern> continue|abort|fulfill [status] [body]",
@@ -617,8 +911,11 @@ COMMAND_USAGES = {
     "performanceMetrics": "chrome-bridge performanceMetrics <tabId>",
     "sessionStatus": "chrome-bridge sessionStatus <domain> [domain...]",
     "waitForHandoff": "chrome-bridge waitForHandoff <message> [mode] [target] [timeoutMs] [tabId]",
-    "policyCheck": "chrome-bridge policyCheck <action> [payloadJson]",
-    "batch": "chrome-bridge batch <stepsJson> [tabId]",
+    "policyCheck": "chrome-bridge policyCheck <action> [payloadJson] | chrome-bridge policyCheck --plan '<jsonArray>'",
+    "batch": "chrome-bridge batch <stepsJson> [tabId] [--continue-on-error]",
+    "printToPDF": "chrome-bridge printToPDF <tabId> <outputPath> [--landscape] [--scale <factor>]",
+    "clickAt": "chrome-bridge clickAt <tabId> <x> <y>",
+    "windowControl": "chrome-bridge windowControl list|create|focus|setState|close [args...]",
 }
 
 
@@ -638,6 +935,11 @@ def print_command_help(command):
     return 0
 
 def main():
+    global DRY_RUN
+    if "--dry-run" in sys.argv[1:]:
+        DRY_RUN = True
+        sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--dry-run"]
+
     if len(sys.argv) < 2:
         print_usage()
         sys.exit(0)
@@ -707,6 +1009,13 @@ def main():
     elif action == "click":
         require_args(args, 4, "Usage: python3 test_client.py click <tabId> <selector>")
         sys.exit(send_command("click", {"tabId": parse_int(args[2], "tabId"), "selector": args[3]}))
+    elif action == "clickAt":
+        require_args(args, 5, "Usage: chrome-bridge clickAt <tabId> <x> <y>")
+        sys.exit(send_command("clickAt", {
+            "tabId": parse_int(args[2], "tabId"),
+            "x": parse_float(args[3], "x"),
+            "y": parse_float(args[4], "y"),
+        }))
     elif action == "type":
         require_args(args, 5, "Usage: python3 test_client.py type <tabId> <selector> <text>")
         sys.exit(send_command("type", {"tabId": parse_int(args[2], "tabId"), "selector": args[3], "text": args[4]}))
@@ -869,16 +1178,71 @@ def main():
         require_args(args, 3, f"Usage: python3 test_client.py {action} <tabId>")
         sys.exit(send_command(action, {"tabId": parse_int(args[2], "tabId")}))
     elif action == "batch":
-        require_args(args, 3, "Usage: python3 test_client.py batch <stepsJson> [tabId]")
+        require_args(args, 3, "Usage: chrome-bridge batch <stepsJson> [tabId] [--continue-on-error]")
+        rest = list(args[3:])
+        stop_on_error = "--continue-on-error" not in rest
+        rest = [arg for arg in rest if arg != "--continue-on-error"]
         try:
             steps = json.loads(args[2])
         except Exception as exc:
             print(f"Invalid steps JSON: {exc}", file=sys.stderr)
             sys.exit(2)
-        payload = {"steps": steps}
-        if len(args) > 3:
-            payload["tabId"] = parse_int(args[3], "tabId")
+        payload = {"steps": steps, "stopOnError": stop_on_error}
+        if rest:
+            payload["tabId"] = parse_int(rest[0], "tabId")
         sys.exit(send_command("batch", payload))
+    elif action == "printToPDF":
+        require_args(args, 4, "Usage: chrome-bridge printToPDF <tabId> <outputPath> [--landscape] [--scale <factor>]")
+        # printBackground defaults on so an exported page matches what the tab renders.
+        options = {"printBackground": True}
+        index = 4
+        while index < len(args):
+            if args[index] == "--landscape":
+                options["landscape"] = True
+                index += 1
+                continue
+            if args[index] == "--scale":
+                if index + 1 >= len(args):
+                    print("Missing value for --scale", file=sys.stderr)
+                    sys.exit(2)
+                options["scale"] = parse_float(args[index + 1], "scale")
+                index += 2
+                continue
+            print(f"Unknown printToPDF option: {args[index]}", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(save_pdf(parse_int(args[2], "tabId"), args[3], options))
+    elif action == "windowControl":
+        require_args(args, 3, "Usage: chrome-bridge windowControl list|create|focus|setState|close [args...]")
+        op = args[2]
+        payload = {"op": op}
+        if op == "list":
+            pass
+        elif op == "create":
+            rest = list(args[3:])
+            if "--foreground" in rest:
+                payload["focused"] = True
+                rest = [arg for arg in rest if arg != "--foreground"]
+            if rest:
+                payload["url"] = rest[0]
+            if len(rest) > 1:
+                if rest[1] not in WINDOW_STATES:
+                    print(f"Window state must be one of: {', '.join(WINDOW_STATES)}", file=sys.stderr)
+                    sys.exit(2)
+                payload["state"] = rest[1]
+        elif op in {"focus", "close"}:
+            require_args(args, 4, f"Usage: chrome-bridge windowControl {op} <windowId>")
+            payload["windowId"] = parse_int(args[3], "windowId")
+        elif op == "setState":
+            require_args(args, 5, "Usage: chrome-bridge windowControl setState <windowId> normal|minimized|maximized")
+            if args[4] not in WINDOW_STATES:
+                print(f"Window state must be one of: {', '.join(WINDOW_STATES)}", file=sys.stderr)
+                sys.exit(2)
+            payload["windowId"] = parse_int(args[3], "windowId")
+            payload["state"] = args[4]
+        else:
+            print("windowControl op must be list, create, focus, setState, or close", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command("windowControl", payload))
     elif action == "confirm":
         require_args(args, 3, "Usage: chrome-bridge confirm <confirmationToken>")
         if len(args) == 3:
@@ -896,7 +1260,18 @@ def main():
             sys.exit(2)
         sys.exit(send_command(args[2], payload, confirmation_token=args[3]))
     elif action == "policyCheck":
-        require_args(args, 3, "Usage: python3 test_client.py policyCheck <action> [payloadJson]")
+        require_args(args, 3, "Usage: python3 test_client.py policyCheck <action> [payloadJson] | policyCheck --plan '<jsonArray>'")
+        if args[2] == "--plan":
+            require_args(args, 4, "Usage: python3 test_client.py policyCheck --plan '<jsonArray>'")
+            try:
+                plan = json.loads(args[3])
+            except Exception as exc:
+                print(f"Invalid plan JSON: {exc}", file=sys.stderr)
+                sys.exit(2)
+            if not isinstance(plan, list):
+                print("Plan must be a JSON array of {action, origin?, payload?} steps.", file=sys.stderr)
+                sys.exit(2)
+            sys.exit(send_command("policyCheck", {"plan": plan}))
         target_payload = {}
         if len(args) > 3:
             try:
@@ -963,6 +1338,115 @@ def main():
             "tabId": parse_int(args[2], "tabId"),
             "userAgent": ua,
         }))
+    elif action == "audit":
+        sys.exit(cmd_audit(args))
+    elif action == "setCookie":
+        require_args(args, 5, "Usage: python3 test_client.py setCookie <url> <name> <value> [--domain <domain>] [--path <path>] [--secure] [--http-only] [--same-site <policy>] [--expires <epochSeconds>]")
+        payload = {"url": args[2], "name": args[3], "value": args[4]}
+        rest = args[5:]
+        index = 0
+        while index < len(rest):
+            flag = rest[index]
+            if flag == "--secure":
+                payload["secure"] = True
+            elif flag == "--http-only":
+                payload["httpOnly"] = True
+            elif flag in {"--domain", "--path", "--same-site", "--expires"}:
+                if index + 1 >= len(rest):
+                    print(f"Missing value for {flag}", file=sys.stderr)
+                    sys.exit(2)
+                index += 1
+                value = rest[index]
+                if flag == "--domain":
+                    payload["domain"] = value
+                elif flag == "--path":
+                    payload["path"] = value
+                elif flag == "--same-site":
+                    payload["sameSite"] = value
+                else:
+                    payload["expirationDate"] = parse_float(value, "expires")
+            else:
+                print(f"Unknown setCookie option: {flag}", file=sys.stderr)
+                sys.exit(2)
+            index += 1
+        sys.exit(send_command("setCookie", payload))
+    elif action == "deleteCookie":
+        require_args(args, 4, "Usage: python3 test_client.py deleteCookie <url> <name>")
+        sys.exit(send_command("deleteCookie", {"url": args[2], "name": args[3]}))
+    elif action == "setStorageItem":
+        require_args(args, 6, "Usage: python3 test_client.py setStorageItem <tabId> local|session <key> <value>")
+        if args[3] not in {"local", "session"}:
+            print("Storage scope must be local or session", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command("setStorageItem", {
+            "tabId": parse_int(args[2], "tabId"),
+            "scope": args[3],
+            "key": args[4],
+            "value": args[5],
+        }))
+    elif action == "removeStorageItem":
+        require_args(args, 5, "Usage: python3 test_client.py removeStorageItem <tabId> local|session <key>")
+        if args[3] not in {"local", "session"}:
+            print("Storage scope must be local or session", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command("removeStorageItem", {
+            "tabId": parse_int(args[2], "tabId"),
+            "scope": args[3],
+            "key": args[4],
+        }))
+    elif action == "clearStorage":
+        require_args(args, 4, "Usage: python3 test_client.py clearStorage <tabId> local|session|both")
+        if args[3] not in {"local", "session", "both"}:
+            print("Storage scope must be local, session, or both", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(send_command("clearStorage", {
+            "tabId": parse_int(args[2], "tabId"),
+            "scope": args[3],
+        }))
+    elif action == "searchHistory":
+        require_args(args, 3, "Usage: python3 test_client.py searchHistory <query> [maxResults] [--since <epochMillis>]")
+        payload = {"query": args[2]}
+        rest = list(args[3:])
+        if rest and not rest[0].startswith("--"):
+            payload["maxResults"] = parse_int(rest.pop(0), "maxResults")
+        index = 0
+        while index < len(rest):
+            if rest[index] == "--since":
+                if index + 1 >= len(rest):
+                    print("Missing value for --since", file=sys.stderr)
+                    sys.exit(2)
+                index += 1
+                payload["startTime"] = parse_float(rest[index], "since")
+            else:
+                print(f"Unknown searchHistory option: {rest[index]}", file=sys.stderr)
+                sys.exit(2)
+            index += 1
+        sys.exit(send_command("searchHistory", payload))
+    elif action == "searchBookmarks":
+        require_args(args, 3, "Usage: python3 test_client.py searchBookmarks <query>")
+        sys.exit(send_command("searchBookmarks", {"query": args[2]}))
+    elif action == "searchTabs":
+        require_args(args, 3, "Usage: python3 test_client.py searchTabs <query> [--regex] [--max-per-tab <count>] [--case-sensitive]")
+        payload = {"query": args[2]}
+        rest = args[3:]
+        index = 0
+        while index < len(rest):
+            flag = rest[index]
+            if flag == "--regex":
+                payload["isRegex"] = True
+            elif flag == "--case-sensitive":
+                payload["caseSensitive"] = True
+            elif flag == "--max-per-tab":
+                if index + 1 >= len(rest):
+                    print("Missing value for --max-per-tab", file=sys.stderr)
+                    sys.exit(2)
+                index += 1
+                payload["maxMatchesPerTab"] = parse_int(rest[index], "maxMatchesPerTab")
+            else:
+                print(f"Unknown searchTabs option: {flag}", file=sys.stderr)
+                sys.exit(2)
+            index += 1
+        sys.exit(send_command("searchTabs", payload))
     elif action == "policy":
         sys.exit(cmd_policy(args))
     else:

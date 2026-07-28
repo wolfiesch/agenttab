@@ -48,18 +48,20 @@ class BridgeError(Exception):
     """Raised when the bridge transport or the extension reports a failure."""
 
 
-def call(action, payload=None, read_timeout_ms=None, confirmation_token=None):
+def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False):
     """Send one action to the bridge and return its ``result`` payload.
 
     Raises ``BridgeError`` with an actionable message on transport failures,
     auth rejection, or an unsuccessful extension result. ``read_timeout_ms``
     extends the post-connect socket read deadline for long waits (e.g. human
     handoff); the wire timeout is kept above it so transport never fires first.
+    ``dry_run`` sets the request-level ``dryRun`` flag: the host evaluates the
+    request and reports its verdict without forwarding anything to Chrome.
     """
     with _call_lock:
         exit_code, response, stderr = _client.send_command_data(
             action, payload or {}, read_timeout_ms=read_timeout_ms,
-            confirmation_token=confirmation_token)
+            confirmation_token=confirmation_token, dry_run=dry_run)
         # One reconnect attempt is safe only when TCP connection setup failed:
         # exit 111 means the host never received the action. Never replay after
         # an empty response or timeout because a mutating action may have run.
@@ -69,7 +71,7 @@ def call(action, payload=None, read_timeout_ms=None, confirmation_token=None):
                 time.sleep(delay_ms / 1000)
             exit_code, response, stderr = _client.send_command_data(
                 action, payload or {}, read_timeout_ms=read_timeout_ms,
-                confirmation_token=confirmation_token)
+                confirmation_token=confirmation_token, dry_run=dry_run)
 
     if response is None:
         raise BridgeError(stderr or "No response from bridge.")
@@ -81,6 +83,10 @@ def call(action, payload=None, read_timeout_ms=None, confirmation_token=None):
                    "reads the same bridge_token.txt as the running host "
                    "(check BRIDGE_TOKEN_FILE / BRIDGE_REPO_ROOT).")
         raise BridgeError(err)
+
+    # A dry run carries its verdict at the top level, not under ``result``.
+    if response.get("dryRun") is True:
+        return {k: v for k, v in response.items() if k != "success"}
 
     result = response.get("result")
     if isinstance(result, dict) and result.get("success") is False:

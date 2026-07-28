@@ -297,10 +297,14 @@ async function handleMessageFromHost(message) {
   }
 }
 
-async function runBatch(steps, defaultTabId) {
+async function runBatch(steps, defaultTabId, stopOnError) {
   if (!Array.isArray(steps)) {
     throw new Error("batch requires a steps array");
   }
+  // Wait actions (waitForLoad/waitForSelector/waitForText/waitForUrl) are
+  // ordinary dispatch entries, so they interleave with mutating steps for free.
+  // stopOnError defaults to true: the first failing step aborts the batch.
+  const halt = stopOnError !== false;
   const results = [];
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i] || {};
@@ -315,14 +319,19 @@ async function runBatch(steps, defaultTabId) {
     if (stepPayload.tabId === undefined && defaultTabId !== undefined) {
       stepPayload.tabId = defaultTabId;
     }
+    if (stepPayload.timeoutMs === undefined && step.timeoutMs !== undefined) {
+      stepPayload.timeoutMs = step.timeoutMs;
+    }
     try {
       const stepResult = await dispatchAction(step.action, stepPayload);
       if (stepResult && typeof stepResult === "object" && stepResult.success === false) {
-        throw new Error(stepResult.error || "step reported success=false");
+        throw new Error(stepResult.error || stepResult.err || "step reported success=false");
       }
       results.push(stepResult);
     } catch (error) {
-      throw new Error(`batch step ${i} (${step.action}) failed: ${error.message}`);
+      const message = `batch step ${i} (${step.action}) failed: ${error.message}`;
+      if (halt) throw new Error(message);
+      results.push({ success: false, step: i, action: step.action, err: message });
     }
   }
   return results;
@@ -332,7 +341,7 @@ async function dispatchAction(action, payload) {
     let result;
     switch (action) {
       case "batch":
-        result = await runBatch(payload.steps, payload.tabId);
+        result = await runBatch(payload.steps, payload.tabId, payload.stopOnError);
         break;
       case "ping":
         result = "pong";
@@ -367,6 +376,9 @@ async function dispatchAction(action, payload) {
       case "click":
         result = await clickSelector(payload.tabId, payload.selector);
         break;
+      case "clickAt":
+        result = await clickAt(payload.tabId, payload.x, payload.y);
+        break;
       case "type":
         result = await typeSelector(payload.tabId, payload.selector, payload.text);
         break;
@@ -384,6 +396,9 @@ async function dispatchAction(action, payload) {
         break;
       case "reload":
         result = await reloadTab(payload.tabId);
+        break;
+      case "windowControl":
+        result = await windowControl(payload);
         break;
       case "goBack":
         result = await goHistory(payload.tabId, -1);
@@ -408,6 +423,9 @@ async function dispatchAction(action, payload) {
         break;
       case "screenshot":
         result = await captureScreenshot(payload.tabId, payload.format, payload.quiet);
+        break;
+      case "printToPDF":
+        result = await printToPDF(payload.tabId, payload);
         break;
       case "extractText":
         result = await extractText(payload.tabId, payload.maxChars);
@@ -508,6 +526,30 @@ async function dispatchAction(action, payload) {
         break;
       case "waitForHandoff":
         result = await waitForHandoff(payload);
+        break;
+      case "setCookie":
+        result = await setCookie(payload);
+        break;
+      case "deleteCookie":
+        result = await deleteCookie(payload.url, payload.name);
+        break;
+      case "setStorageItem":
+        result = await setStorageItem(payload.tabId, payload.scope, payload.key, payload.value);
+        break;
+      case "removeStorageItem":
+        result = await removeStorageItem(payload.tabId, payload.scope, payload.key);
+        break;
+      case "clearStorage":
+        result = await clearStorage(payload.tabId, payload.scope);
+        break;
+      case "searchHistory":
+        result = await searchHistory(payload.query, payload.maxResults, payload.startTime);
+        break;
+      case "searchBookmarks":
+        result = await searchBookmarks(payload.query);
+        break;
+      case "searchTabs":
+        result = await searchTabs(payload);
         break;
       case "__tabOrigin":
         result = await tabOrigin(payload.tabId);
@@ -1032,6 +1074,92 @@ async function closeTab(tabId) {
 async function reloadTab(tabId) {
   await chrome.tabs.reload(tabId);
   return { success: true, tabId };
+}
+
+const WINDOW_STATES = new Set(["normal", "minimized", "maximized"]);
+
+// Single window-management entry point. `list` deliberately reports only
+// structural window facts (id, focus, state, type, tab count) and never tab
+// URLs or titles, so a raw response cannot leak private browsing context.
+async function windowControl(payload) {
+  const options = payload && typeof payload === "object" ? payload : {};
+  const op = typeof options.op === "string" ? options.op : "";
+  const requireWindowId = () => {
+    const windowId = Number(options.windowId);
+    if (!Number.isInteger(windowId)) return null;
+    return windowId;
+  };
+  switch (op) {
+    case "list": {
+      const windows = await chrome.windows.getAll({ populate: true });
+      return {
+        success: true,
+        windows: windows.map((win) => ({
+          id: win.id,
+          focused: win.focused === true,
+          state: win.state || null,
+          type: win.type || null,
+          tabCount: Array.isArray(win.tabs) ? win.tabs.length : 0
+        }))
+      };
+    }
+    case "create": {
+      const createOptions = { focused: options.focused === true };
+      if (options.url) createOptions.url = options.url;
+      if (options.state !== undefined && options.state !== null) {
+        if (!WINDOW_STATES.has(options.state)) {
+          return { success: false, err: `windowControl state must be one of ${[...WINDOW_STATES].join(", ")}` };
+        }
+        createOptions.state = options.state;
+        // Chrome rejects an explicit focus preference alongside a non-normal
+        // window state; the state itself already decides visibility.
+        if (options.state !== "normal") delete createOptions.focused;
+      }
+      const win = await chrome.windows.create(createOptions);
+      return {
+        success: true,
+        windowId: win.id,
+        focused: win.focused === true,
+        state: win.state || null,
+        type: win.type || null,
+        tabCount: Array.isArray(win.tabs) ? win.tabs.length : 0
+      };
+    }
+    case "focus": {
+      const windowId = requireWindowId();
+      if (windowId === null) return { success: false, err: "windowControl focus requires a numeric windowId" };
+      const win = await chrome.windows.update(windowId, { focused: true });
+      return { success: true, windowId, focused: win.focused === true, state: win.state || null };
+    }
+    case "setState": {
+      const windowId = requireWindowId();
+      if (windowId === null) return { success: false, err: "windowControl setState requires a numeric windowId" };
+      if (!WINDOW_STATES.has(options.state)) {
+        return { success: false, err: `windowControl state must be one of ${[...WINDOW_STATES].join(", ")}` };
+      }
+      const win = await chrome.windows.update(windowId, { state: options.state });
+      return { success: true, windowId, state: win.state || null, focused: win.focused === true };
+    }
+    case "close": {
+      const windowId = requireWindowId();
+      if (windowId === null) return { success: false, err: "windowControl close requires a numeric windowId" };
+      const target = await chrome.windows.get(windowId, { populate: false });
+      const all = await chrome.windows.getAll({ populate: false });
+      const normalWindows = all.filter((win) => win.type === "normal");
+      if (target.type === "normal" && normalWindows.length <= 1) {
+        return {
+          success: false,
+          err: "refusing to close the last remaining normal browser window",
+          reason: "lastNormalWindow",
+          windowId
+        };
+      }
+      await chrome.windows.remove(windowId);
+      return { success: true, windowId, closed: true };
+    }
+    default:
+      return { success: false, err: "windowControl op must be list, create, focus, setState, or close" };
+  }
 }
 
 async function goHistory(tabId, delta) {
@@ -1733,6 +1861,39 @@ async function captureScreenshot(tabId, format, quiet = true) {
   return { success: true, mimeType, dataUrl };
 }
 
+// Background-safe PDF export over the same debugger-attach path as screenshot.
+// Returns base64 only; writing the file is the caller's job so raw PDF bytes
+// never travel through a transcript.
+async function printToPDF(tabId, options) {
+  const opts = options && typeof options === "object" ? options : {};
+  const params = { transferMode: "ReturnAsBase64" };
+  const positive = (value) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return null;
+    return parsed;
+  };
+  if (opts.landscape !== undefined) params.landscape = opts.landscape === true;
+  if (opts.printBackground !== undefined) params.printBackground = opts.printBackground === true;
+  for (const name of ["scale", "paperWidth", "paperHeight"]) {
+    if (opts[name] === undefined || opts[name] === null) continue;
+    const parsed = positive(opts[name]);
+    if (parsed === null) return { success: false, err: `printToPDF ${name} must be a positive number` };
+    params[name] = parsed;
+  }
+  if (opts.pageRanges !== undefined && opts.pageRanges !== null) {
+    if (typeof opts.pageRanges !== "string") {
+      return { success: false, err: 'printToPDF pageRanges must be a string such as "1-3,5"' };
+    }
+    if (opts.pageRanges) params.pageRanges = opts.pageRanges;
+  }
+  return withDebugger(tabId, async (target) => {
+    const result = await debuggerCommand(target, "Page.printToPDF", params);
+    const base64 = result && typeof result.data === "string" ? result.data : "";
+    if (!base64) return { success: false, err: "Page.printToPDF returned no data" };
+    return { success: true, mimeType: "application/pdf", base64 };
+  });
+}
+
 async function extractText(tabId, maxChars) {
   const limit = maxChars || 20000;
   const results = await chrome.scripting.executeScript({
@@ -1844,6 +2005,22 @@ async function clickSelector(tabId, selector) {
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
     return { success: true, tagName: lookup.tagName, text: lookup.text };
+  });
+}
+
+// Coordinate click. This bypasses selector resolution entirely, so there is no
+// element identity to audit; the example policy confirmation-gates it.
+async function clickAt(tabId, x, y) {
+  const px = Number(x);
+  const py = Number(y);
+  if (!Number.isFinite(px) || !Number.isFinite(py) || px < 0 || py < 0) {
+    return { success: false, err: "clickAt requires non-negative numeric x and y viewport coordinates" };
+  }
+  return withDebugger(tabId, async (target) => {
+    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: px, y: py, button: 'none', buttons: 0 });
+    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: px, y: py, button: 'left', buttons: 1, clickCount: 1 });
+    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: px, y: py, button: 'left', buttons: 0, clickCount: 1 });
+    return { success: true, tabId, x: px, y: py };
   });
 }
 
@@ -2924,4 +3101,302 @@ async function waitForHandoff(payload) {
       }
     }
   }
+}
+
+// Cookie and web-storage write ops. Responses echo identifiers only (cookie
+// name/domain, storage scope/key) and never the stored value, so raw output can
+// be pasted without leaking credentials.
+async function setCookie(payload) {
+  payload = payload || {};
+  if (!payload.url) return { success: false, err: "url is required" };
+  if (typeof payload.name !== "string" || payload.name.length === 0) {
+    return { success: false, err: "name is required" };
+  }
+  const details = {
+    url: payload.url,
+    name: payload.name,
+    value: payload.value === undefined || payload.value === null ? "" : String(payload.value),
+  };
+  if (payload.domain) details.domain = payload.domain;
+  if (payload.path) details.path = payload.path;
+  if (payload.secure !== undefined) details.secure = payload.secure === true;
+  if (payload.httpOnly !== undefined) details.httpOnly = payload.httpOnly === true;
+  if (payload.sameSite) details.sameSite = payload.sameSite;
+  if (payload.expirationDate !== undefined && payload.expirationDate !== null) {
+    details.expirationDate = Number(payload.expirationDate);
+  }
+  let cookie;
+  try {
+    cookie = await chrome.cookies.set(details);
+  } catch (error) {
+    return { success: false, err: error.message };
+  }
+  if (!cookie) {
+    return { success: false, err: "chrome.cookies.set stored nothing (check url, secure, and sameSite constraints)" };
+  }
+  // Name and domain only: never echo the value back to the client.
+  return { success: true, name: cookie.name, domain: cookie.domain };
+}
+
+async function deleteCookie(url, name) {
+  if (!url) return { success: false, err: "url is required" };
+  if (typeof name !== "string" || name.length === 0) return { success: false, err: "name is required" };
+  let removed;
+  try {
+    removed = await chrome.cookies.remove({ url, name });
+  } catch (error) {
+    return { success: false, err: error.message };
+  }
+  if (!removed) return { success: false, err: "No cookie matched the given url and name" };
+  return { success: true, name: removed.name, removed: true };
+}
+
+const STORAGE_SCOPES = { local: "localStorage", session: "sessionStorage" };
+
+function storageObjectName(scope) {
+  return STORAGE_SCOPES[scope];
+}
+
+// Runs a storage mutation in the tab through the same debugger evaluation path
+// storageState uses for reads. Returns { success, origin, val } or a failure.
+async function evaluateStorageOp(tabId, expression) {
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (error) {
+    return { success: false, err: error.message };
+  }
+  let origin = "";
+  try {
+    if (tab.url) origin = new URL(tab.url).origin;
+  } catch (e) {
+    // Ignore invalid URL
+  }
+  if (!origin || origin === "null" || !origin.startsWith("http")) {
+    return { success: false, err: "Storage writes require an http/https tab origin" };
+  }
+  const res = await withDebugger(tabId, async (target) => evaluateWithDebugger(target, expression));
+  if (!res.success) return res;
+  const val = res.val || {};
+  if (val.ok !== true) return { success: false, err: val.err || "Storage operation failed" };
+  return { success: true, origin, val };
+}
+
+async function setStorageItem(tabId, scope, key, value) {
+  const objectName = storageObjectName(scope);
+  if (!objectName) return { success: false, err: 'scope must be "local" or "session"' };
+  if (typeof key !== "string" || key.length === 0) return { success: false, err: "key is required" };
+  const stored = value === undefined || value === null ? "" : String(value);
+  const expression = `(() => { try { ${objectName}.setItem(${JSON.stringify(key)}, ${JSON.stringify(stored)}); return { ok: true }; } catch (e) { return { ok: false, err: e.message }; } })()`;
+  const res = await evaluateStorageOp(tabId, expression);
+  if (!res.success) return res;
+  // Scope and key only: the written value is never echoed back.
+  return { success: true, scope, key, origin: res.origin };
+}
+
+async function removeStorageItem(tabId, scope, key) {
+  const objectName = storageObjectName(scope);
+  if (!objectName) return { success: false, err: 'scope must be "local" or "session"' };
+  if (typeof key !== "string" || key.length === 0) return { success: false, err: "key is required" };
+  const expression = `(() => { try { const had = ${objectName}.getItem(${JSON.stringify(key)}) !== null; ${objectName}.removeItem(${JSON.stringify(key)}); return { ok: true, existed: had }; } catch (e) { return { ok: false, err: e.message }; } })()`;
+  const res = await evaluateStorageOp(tabId, expression);
+  if (!res.success) return res;
+  return { success: true, scope, key, existed: res.val.existed === true, origin: res.origin };
+}
+
+async function clearStorage(tabId, scope) {
+  const requested = scope || "both";
+  const scopes = requested === "both" ? ["local", "session"] : [requested];
+  for (const one of scopes) {
+    if (!storageObjectName(one)) {
+      return { success: false, err: 'scope must be "local", "session", or "both"' };
+    }
+  }
+  const cleared = [];
+  let origin = "";
+  for (const one of scopes) {
+    const objectName = storageObjectName(one);
+    const expression = `(() => { try { const n = ${objectName}.length; ${objectName}.clear(); return { ok: true, keysRemoved: n }; } catch (e) { return { ok: false, err: e.message }; } })()`;
+    const res = await evaluateStorageOp(tabId, expression);
+    if (!res.success) return res;
+    origin = res.origin;
+    cleared.push({ scope: one, keysRemoved: res.val.keysRemoved });
+  }
+  // Key counts only: cleared keys and values are never reported.
+  return { success: true, scope: requested, cleared, origin };
+}
+
+async function searchHistory(query, maxResults, startTime) {
+  const requested = parseInt(maxResults, 10);
+  const limit = Math.min(Math.max(Number.isFinite(requested) ? requested : 20, 1), 100);
+  const search = { text: typeof query === "string" ? query : "", maxResults: limit };
+  if (startTime !== undefined && startTime !== null) search.startTime = Number(startTime);
+  const items = await chrome.history.search(search);
+  return {
+    success: true,
+    count: items.length,
+    items: items.map((item) => ({
+      url: item.url,
+      title: item.title,
+      lastVisitTime: item.lastVisitTime,
+      visitCount: item.visitCount,
+    })),
+  };
+}
+
+// Walks parentId links up to the bookmark root so each hit reports the folder
+// path a human would recognize. Paths are cached per parent within one search.
+async function bookmarkFolderPath(parentId, cache) {
+  if (!parentId) return "";
+  if (cache.has(parentId)) return cache.get(parentId);
+  const parts = [];
+  let current = parentId;
+  while (current) {
+    let node;
+    try {
+      const nodes = await chrome.bookmarks.get(current);
+      node = nodes && nodes[0];
+    } catch (error) {
+      break;
+    }
+    if (!node) break;
+    if (node.title) parts.unshift(node.title);
+    current = node.parentId;
+  }
+  const path = parts.join("/");
+  cache.set(parentId, path);
+  return path;
+}
+
+async function searchBookmarks(query) {
+  const nodes = await chrome.bookmarks.search(typeof query === "string" ? query : "");
+  const cache = new Map();
+  const items = [];
+  for (const node of nodes) {
+    items.push({
+      id: node.id,
+      title: node.title,
+      url: node.url,
+      folderPath: await bookmarkFolderPath(node.parentId, cache),
+    });
+  }
+  return { success: true, count: items.length, items };
+}
+
+// Chrome refuses script injection into its own web store; skip those tabs
+// instead of reporting a per-tab failure.
+function isUnscriptableSearchUrl(url) {
+  return /^https?:\/\/chromewebstore\.google\.com/.test(url)
+    || /^https?:\/\/chrome\.google\.com\/webstore/.test(url);
+}
+
+// Injected into each searched tab by searchTabs. Returns bounded snippets
+// (match text plus 80 characters of context each side), never full page text.
+function pageTextMatches(query, isRegex, caseSensitive, maxMatches) {
+  try {
+    const raw = document.body ? document.body.innerText : document.documentElement.innerText;
+    const text = raw || "";
+    const snippets = [];
+    let count = 0;
+    const push = (index, length) => {
+      count++;
+      const start = Math.max(0, index - 80);
+      const end = Math.min(text.length, index + length + 80);
+      snippets.push({
+        index,
+        text: text.slice(start, end).replace(/\s+/g, " ").trim(),
+        truncatedStart: start > 0,
+        truncatedEnd: end < text.length,
+      });
+    };
+    if (isRegex) {
+      const re = new RegExp(query, caseSensitive ? "g" : "gi");
+      let match;
+      while ((match = re.exec(text)) !== null) {
+        const length = match[0].length;
+        push(match.index, length || 1);
+        if (length === 0) re.lastIndex++;
+        if (count >= maxMatches) break;
+      }
+    } else {
+      const haystack = caseSensitive ? text : text.toLowerCase();
+      const needle = caseSensitive ? query : query.toLowerCase();
+      let from = 0;
+      while (needle) {
+        const index = haystack.indexOf(needle, from);
+        if (index === -1) break;
+        push(index, needle.length);
+        from = index + needle.length;
+        if (count >= maxMatches) break;
+      }
+    }
+    return { ok: true, matchCount: count, snippets };
+  } catch (e) {
+    return { ok: false, err: e.message };
+  }
+}
+
+async function searchTabs(payload) {
+  payload = payload || {};
+  const query = typeof payload.query === "string" ? payload.query : "";
+  if (!query) return { success: false, err: "query is required" };
+  const isRegex = payload.isRegex === true;
+  const caseSensitive = payload.caseSensitive === true;
+  const requested = parseInt(payload.maxMatchesPerTab, 10);
+  const maxPerTab = Math.min(Math.max(Number.isFinite(requested) ? requested : 5, 1), 20);
+  if (isRegex) {
+    try {
+      new RegExp(query);
+    } catch (error) {
+      return { success: false, err: `Invalid regex: ${error.message}` };
+    }
+  }
+  const tabs = await chrome.tabs.query({});
+  const matches = [];
+  let searchedTabs = 0;
+  let skippedTabs = 0;
+  for (const tab of tabs) {
+    const url = tab.url || "";
+    if (tab.id === undefined || !/^https?:\/\//.test(url) || isUnscriptableSearchUrl(url)) {
+      skippedTabs++;
+      continue;
+    }
+    let host = "";
+    try {
+      host = new URL(url).host;
+    } catch (e) {
+      skippedTabs++;
+      continue;
+    }
+    let hit;
+    try {
+      const response = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: pageTextMatches,
+        args: [query, isRegex, caseSensitive, maxPerTab],
+      });
+      hit = response && response[0] && response[0].result;
+    } catch (error) {
+      skippedTabs++;
+      continue;
+    }
+    if (!hit || hit.ok !== true) {
+      skippedTabs++;
+      continue;
+    }
+    searchedTabs++;
+    if (hit.matchCount > 0) {
+      // Origin host only, never the full URL with path and query.
+      matches.push({ tabId: tab.id, domain: host, matchCount: hit.matchCount, snippets: hit.snippets });
+    }
+  }
+  return {
+    success: true,
+    searchedTabs,
+    skippedTabs,
+    matchingTabs: matches.length,
+    maxMatchesPerTab: maxPerTab,
+    matches,
+  };
 }
