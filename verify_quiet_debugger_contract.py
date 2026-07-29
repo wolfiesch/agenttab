@@ -66,7 +66,7 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
     expect("chrome.scripting.executeScript" in extract_text, f"{label} extractText must use chrome.scripting")
     expect("withDebugger" not in extract_text, f"{label} extractText must not attach the debugger")
 
-    get_html = function_body(text, "getHTML", "getElementCenter")
+    get_html = function_body(text, "getHTML", "extractScopedText")
     expect("chrome.scripting.executeScript" in get_html, f"{label} getHTML must use chrome.scripting")
     expect("withDebugger" not in get_html, f"{label} getHTML must not attach the debugger")
 
