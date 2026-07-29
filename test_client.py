@@ -117,6 +117,29 @@ def parse_observe_args(args):
 DRY_RUN = False
 
 
+def env_float(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def response_timeout_seconds(read_timeout_ms=None):
+    """Keep the wire read deadline beyond broker and extension deadlines."""
+    broker_timeout = env_float("BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS", 10.0)
+    configured = os.environ.get("BRIDGE_RESPONSE_TIMEOUT_SECONDS")
+    if configured is None:
+        timeout = max(15.0, broker_timeout + 5.0)
+    else:
+        timeout = env_float("BRIDGE_RESPONSE_TIMEOUT_SECONDS", max(15.0, broker_timeout + 5.0))
+    if isinstance(read_timeout_ms, (int, float)) and read_timeout_ms > 0:
+        timeout = max(timeout, read_timeout_ms / 1000 + 10.0)
+    return timeout
+
+
 def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False):
     if payload is None:
         payload = {}
@@ -136,6 +159,7 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
 
     port = int(os.environ.get('BRIDGE_PORT', 9223))
     retry_seconds = float(os.environ.get('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45))
+    response_timeout = response_timeout_seconds(read_timeout_ms)
     deadline = time.monotonic() + retry_seconds
     sock = None
 
@@ -145,11 +169,9 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(15)
                 sock.connect(('127.0.0.1', port))
-                # Connect uses a short timeout; the post-connect read can be much
-                # longer (e.g. human-handoff waits), with headroom over the
-                # extension-side deadline so the wire never times out first.
-                if read_timeout_ms is not None:
-                    sock.settimeout(max(15, read_timeout_ms / 1000 + 10))
+                # Use a post-connect deadline with headroom over both the broker's
+                # backend wait and any extension-side action deadline.
+                sock.settimeout(response_timeout)
                 break
             except ConnectionRefusedError:
                 try:
@@ -189,9 +211,9 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         return 1, None, "Received empty response from bridge."
     except socket.timeout:
         return 124, None, (
-            "Error: timed out waiting for the extension to respond. "
-            "Is the extension's service worker active? Open chrome://extensions, "
-            f"click 'service worker' to wake it, then check {os.path.join(SCRIPT_DIR, 'bridge_debug.log')}."
+            f"Error: timed out after {response_timeout:g}s waiting for a bridge response. "
+            "The broker/native-host connection may be unavailable, or the extension "
+            "may be stalled. Check bridge_debug.log and run chrome-bridge doctor."
         )
     except ConnectionRefusedError:
         return 111, None, (

@@ -909,7 +909,6 @@ def run_broker_diagnostic(args):
         env.update({
             "BRIDGE_BROKER_PORT": str(frontend_port),
             "BRIDGE_BACKEND_PORT": str(backend_port),
-            "BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS": "45",
             "BRIDGE_BROKER_LOG_FILE": str(Path(tmp) / "broker.log"),
             "BRIDGE_PORT": str(frontend_port),
             "BRIDGE_CONNECT_TIMEOUT_SECONDS": "1",
@@ -944,14 +943,14 @@ def run_broker_diagnostic(args):
                 "browser_unavailable"
                 if "browser unavailable" in combined or "backend unavailable" in combined
                 else "client_timeout"
-                if "timed out waiting" in combined
+                if "timed out" in combined
                 else "other"
             )
             return {
                 "durationMs": round(duration_ms, 3),
                 "exitCode": proc.returncode,
                 "classification": classification,
-                "expectedBackendWaitSeconds": 45,
+                "expectedBackendWaitSeconds": 10,
                 "clientTimeoutSeconds": 15,
             }
         finally:

@@ -164,6 +164,23 @@ def check(name, got, expected):
         failed = True
         print(f"FAIL {name}: expected {expected}, got {got}")
 
+_saved_broker_timeout = os.environ.pop("BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS", None)
+_saved_response_timeout = os.environ.pop("BRIDGE_RESPONSE_TIMEOUT_SECONDS", None)
+try:
+    check("default bridge response timeout", test_client.response_timeout_seconds(), 15.0)
+    os.environ["BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS"] = "45"
+    check("broker-aligned response timeout", test_client.response_timeout_seconds(), 50.0)
+    check("action-aligned response timeout", test_client.response_timeout_seconds(60000), 70.0)
+finally:
+    if _saved_broker_timeout is None:
+        os.environ.pop("BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS", None)
+    else:
+        os.environ["BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS"] = _saved_broker_timeout
+    if _saved_response_timeout is None:
+        os.environ.pop("BRIDGE_RESPONSE_TIMEOUT_SECONDS", None)
+    else:
+        os.environ["BRIDGE_RESPONSE_TIMEOUT_SECONDS"] = _saved_response_timeout
+
 result = dispatch(["sessionStatus", "a.com", "b.com"])
 check("sessionStatus action", result.get("action"), "sessionStatus")
 check("sessionStatus payload", result.get("payload"), {"domains": ["a.com", "b.com"]})
