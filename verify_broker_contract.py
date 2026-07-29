@@ -121,8 +121,8 @@ def test_default_timeout_contract():
         spec.loader.exec_module(module)
         module.refresh_config()
         expect(
-            module.BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS == 10.0,
-            "default backend timeout must remain below the 15s client deadline",
+            module.BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS == 3.0,
+            "default backend timeout must fail fast within the 15s client deadline",
         )
     finally:
         if saved is not None:

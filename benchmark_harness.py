@@ -950,7 +950,7 @@ def run_broker_diagnostic(args):
                 "durationMs": round(duration_ms, 3),
                 "exitCode": proc.returncode,
                 "classification": classification,
-                "expectedBackendWaitSeconds": 10,
+                "expectedBackendWaitSeconds": 3,
                 "clientTimeoutSeconds": 15,
             }
         finally:
