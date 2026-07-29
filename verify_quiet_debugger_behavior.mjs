@@ -56,6 +56,9 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reco
       nativeDisconnectListener();
     },
     commandResult(method) {
+      if (method === 'Runtime.evaluate') {
+        return { result: { value: { success: true, x: 10, y: 20, width: 30, height: 40 } } };
+      }
       if (method === 'Accessibility.getFullAXTree') {
         return {
           nodes: [
@@ -230,7 +233,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reco
 
   const context = vm.createContext({
     chrome,
-    console: { log() {}, warn() {}, error() {} },
+    console: { debug() {}, log() {}, warn() {}, error() {} },
     URL,
     TextEncoder,
     btoa: (value) => Buffer.from(value, 'binary').toString('base64'),
@@ -251,6 +254,8 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reco
       withDebugger,
       withTaskDebugger,
       detachTaskDebugger,
+      resolveActionTarget,
+      clickSelector,
       startMonitoring,
       stopMonitoring,
       loadTaskSessions,
@@ -431,6 +436,35 @@ async function testCloseDoesNotRemoveTabMovedToAnotherGroup() {
   assert.deepEqual(Array.from(result.closedTabIds), []);
 }
 
+async function testTopDocumentSelectorSkipsFrameTreeAndDocumentLookups() {
+  const harness = createHarness({
+    tabs: { 30: { groupId: -1, url: 'https://example.com', status: 'complete' } },
+  });
+  const result = await harness.api.resolveActionTarget(30, {
+    frames: [],
+    target: { kind: 'css', selector: '#save' },
+  });
+  assert.equal(result.success, true);
+  assert.equal(harness.controller.commandMethods.includes('Page.getFrameTree'), false);
+  assert.equal(harness.controller.commandMethods.includes('DOM.getDocument'), false);
+}
+
+
+async function testPointerRenderingDoesNotDelayFocusedClick() {
+  const harness = createHarness({
+    tabs: { 31: { active: true, windowId: 1, groupId: -1, url: 'https://example.com', status: 'complete' } },
+  });
+  const result = await harness.api.clickSelector(31, '#save');
+  assert.equal(result.success, true);
+  assert.deepEqual(
+    harness.controller.commandMethods.filter((method) => method === 'Input.dispatchMouseEvent'),
+    ['Input.dispatchMouseEvent', 'Input.dispatchMouseEvent', 'Input.dispatchMouseEvent'],
+  );
+  await flush();
+  assert.equal(harness.controller.scriptCalls.length, 1);
+}
+
+
 async function testReconnectBackoffResetsOnlyAfterHostAcknowledges() {
   const harness = createHarness({
     reconnectState: { attempt: 4, delay: 16000 },
@@ -460,7 +494,9 @@ const tests = [
   testConcurrentCloseCannotResurrectSession,
   testCurrentGroupReassignsOwnership,
   testIdleDebuggerDoesNotHideCurrentGroup,
+  testTopDocumentSelectorSkipsFrameTreeAndDocumentLookups,
   testCloseDoesNotRemoveTabMovedToAnotherGroup,
+  testPointerRenderingDoesNotDelayFocusedClick,
   testReconnectBackoffResetsOnlyAfterHostAcknowledges,
 ];
 

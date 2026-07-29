@@ -4,6 +4,7 @@ import os
 import struct
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import socket
 import threading
 import uuid
@@ -20,11 +21,19 @@ from urllib.parse import urlparse
 # Resolve paths relative to this script so the install is location-independent.
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-# Configure local logging
+# Configure bounded local logging. Routine wire chatter stays at DEBUG so a
+# long automation session does not grow the default log without limit.
+_log_handler = RotatingFileHandler(
+    os.environ.get('BRIDGE_LOG_FILE', os.path.join(SCRIPT_DIR, 'bridge_debug.log')),
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding='utf-8',
+    delay=True,
+)
 logging.basicConfig(
-    filename=os.environ.get('BRIDGE_LOG_FILE', os.path.join(SCRIPT_DIR, 'bridge_debug.log')),
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[_log_handler],
 )
 
 # Maps in-flight request id -> queue.Queue the handler thread blocks on for
@@ -230,14 +239,14 @@ def read_message():
     message_length = struct.unpack('@I', raw_length)[0]
     message_data = sys.stdin.buffer.read(message_length).decode('utf-8')
     # Do not log payload bodies: responses can contain cookies/DOM secrets.
-    logging.info(f"Read message from extension ({message_length} bytes)")
+    logging.debug("Read message from extension (%s bytes)", message_length)
     return json.loads(message_data)
 
 def write_message(message):
     encoded_message = json.dumps(message).encode('utf-8')
-    logging.info(
-        f"Forwarding to extension: id={message.get('id')} "
-        f"action={message.get('action')} ({len(encoded_message)} bytes)")
+    logging.debug(
+        "Forwarding to extension: id=%s action=%s (%s bytes)",
+        message.get('id'), message.get('action'), len(encoded_message))
     with stdout_lock:
         sys.stdout.buffer.write(struct.pack('@I', len(encoded_message)))
         sys.stdout.buffer.write(encoded_message)
@@ -1992,7 +2001,7 @@ def socket_server_loop():
     while True:
         try:
             client_sock, addr = server.accept()
-            logging.info(f"Accepted connection from {addr}")
+            logging.debug("Accepted connection from %s", addr)
             t = threading.Thread(target=handle_socket_client, args=(client_sock,), daemon=True)
             t.start()
         except Exception as e:
@@ -2017,7 +2026,7 @@ def main():
                     "action": "hostAcknowledged",
                     "protocolVersion": 1,
                 })
-                logging.info("Acknowledged extension native-host handshake.")
+                logging.debug("Acknowledged extension native-host handshake.")
                 continue
             # If the extension sent a response to a command we initiated
             msg_id = msg.get("id")
@@ -2031,7 +2040,7 @@ def main():
                 else:
                     logging.info(f"Received message with ID {msg_id} but no pending request was found.")
             else:
-                logging.info(f"Received message from Chrome with no ID: {msg}")
+                logging.debug("Received message from Chrome with no ID: %s", msg)
         except Exception as e:
             logging.error(f"Error in main loop: {e}", exc_info=True)
             break

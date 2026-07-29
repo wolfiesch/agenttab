@@ -1,13 +1,13 @@
-"""Bridge transport for the MCP server.
+"""Persistent bridge transport for the MCP server.
 
-Reuses ``send_command_data`` from the repo-root ``test_client.py`` verbatim so
-the MCP surface and the CLI share one wire implementation (connect-retry, token
-load, newline framing, socket timeout). ``test_client`` guards its CLI behind
-``if __name__ == '__main__'``, so importing it is side-effect-free.
+Keeps one serialized newline-framed TCP connection open across MCP calls.
+Connection establishment may retry because the host has not received an action;
+after any send attempt, failures are returned without replaying the action.
 """
-import contextlib
 import importlib.util
+import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -41,64 +41,152 @@ def _load_test_client():
 
 
 _client = _load_test_client()
-# One bridge consumer at a time: serialize outbound TCP calls.
+# One bridge consumer at a time: serialize access to the persistent socket.
 _call_lock = threading.Lock()
-
-
-@contextlib.contextmanager
-def _token_override(token):
-    """Make the shared wire implementation use ``token`` for one call.
-
-    ``send_command_data`` resolves the bridge token through the module-level
-    ``load_token`` of ``test_client``. Swapping that loader (rather than
-    forking the wire implementation) keeps CLI and MCP on one code path while
-    letting an HTTP request carry its own bridge identity. Safe because every
-    outbound call is serialized by ``_call_lock``, which the caller already
-    holds. Never logs or echoes the token value.
-    """
-    if not token:
-        yield
-        return
-    original = _client.load_token
-    _client.load_token = lambda: token
-    try:
-        yield
-    finally:
-        _client.load_token = original
 
 
 class BridgeError(Exception):
     """Raised when the bridge transport or the extension reports a failure."""
 
 
+class PersistentBridgeConnection:
+    def __init__(self):
+        self._socket = None
+        self._buffer = b""
+        self._endpoint = None
+        self._last_used = 0.0
+
+    def close(self):
+        sock, self._socket = self._socket, None
+        self._buffer = b""
+        self._endpoint = None
+        self._last_used = 0.0
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _connect(self, endpoint, response_timeout):
+        retry_seconds = _client.env_float("BRIDGE_CONNECT_TIMEOUT_SECONDS", 45.0)
+        deadline = time.monotonic() + retry_seconds
+        while True:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            try:
+                sock.connect(endpoint)
+                sock.settimeout(response_timeout)
+                self._socket = sock
+                self._endpoint = endpoint
+                self._buffer = b""
+                return None
+            except ConnectionRefusedError:
+                sock.close()
+                if time.monotonic() >= deadline:
+                    return (
+                        111,
+                        None,
+                        "Error: browser unavailable. Chrome may be closed, the extension may be "
+                        "disabled, or the native connection may be disconnected.",
+                    )
+                time.sleep(0.5)
+            except OSError as exc:
+                sock.close()
+                return 1, None, f"Error connecting to bridge: {exc}"
+
+    def _recv_line(self):
+        while b"\n" not in self._buffer:
+            chunk = self._socket.recv(65536)
+            if not chunk:
+                raise ConnectionError("bridge closed the persistent connection")
+            self._buffer += chunk
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        return line
+
+    def request(
+        self,
+        action,
+        payload=None,
+        read_timeout_ms=None,
+        confirmation_token=None,
+        dry_run=False,
+        token=None,
+    ):
+        payload = dict(payload or {})
+        if read_timeout_ms is None:
+            payload_timeout = payload.get("timeoutMs")
+            if isinstance(payload_timeout, (int, float)) and payload_timeout > 0:
+                read_timeout_ms = payload_timeout
+        resolved_token = token or _client.load_token()
+        if not resolved_token:
+            return 2, None, "Error: could not read bridge token."
+        response_timeout = _client.response_timeout_seconds(read_timeout_ms)
+        endpoint = ("127.0.0.1", int(os.environ.get("BRIDGE_PORT", "9223")))
+        max_idle = _client.env_float("BRIDGE_MCP_CONNECTION_MAX_IDLE_SECONDS", 240.0)
+        if (
+            self._socket is not None
+            and (
+                self._endpoint != endpoint
+                or (max_idle >= 0 and time.monotonic() - self._last_used > max_idle)
+            )
+        ):
+            self.close()
+        if self._socket is None:
+            error = self._connect(endpoint, response_timeout)
+            if error is not None:
+                return error
+        else:
+            self._socket.settimeout(response_timeout)
+
+        command = {"action": action, "payload": payload, "token": resolved_token}
+        if dry_run:
+            command["dryRun"] = True
+        if isinstance(confirmation_token, str) and confirmation_token:
+            command["confirmationToken"] = confirmation_token
+        encoded = (json.dumps(command) + "\n").encode("utf-8")
+        try:
+            self._socket.sendall(encoded)
+            response = json.loads(self._recv_line().decode("utf-8"))
+            self._last_used = time.monotonic()
+        except socket.timeout:
+            self.close()
+            return 124, None, (
+                f"Error: timed out after {response_timeout:g}s waiting for a bridge response. "
+                "The action was not replayed because it may have reached Chrome."
+            )
+        except (ConnectionError, OSError, ValueError) as exc:
+            self.close()
+            return 1, None, (
+                f"Error communicating over the persistent bridge connection: {exc}. "
+                "The action was not replayed because delivery is ambiguous."
+            )
+        exit_code = 0 if response.get("success") is True else 1
+        result = response.get("result")
+        if isinstance(result, dict) and result.get("success") is False:
+            exit_code = 1
+        return exit_code, response, ""
+
+
+_connection = PersistentBridgeConnection()
+
+
 def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False,
          token=None):
-    """Send one action to the bridge and return its ``result`` payload.
+    """Send one action and return its result without ambiguous replays.
 
-    Raises ``BridgeError`` with an actionable message on transport failures,
-    auth rejection, or an unsuccessful extension result. ``read_timeout_ms``
-    extends the post-connect socket read deadline for long waits (e.g. human
-    handoff); the wire timeout is kept above it so transport never fires first.
-    ``dry_run`` sets the request-level ``dryRun`` flag: the host evaluates the
-    request and reports its verdict without forwarding anything to Chrome.
-    ``token`` overrides the ambient bridge token for this request only (used by
-    the HTTP transport to propagate a per-request caller identity); when it is
-    ``None`` the ambient ``bridge_token.txt`` identity is used unchanged.
+    The persistent connection is serialized for newline framing. It reconnects
+    only before a send when no live socket exists; any failure after ``sendall``
+    closes the socket and surfaces an error so mutating actions cannot run twice.
     """
-    with _call_lock, _token_override(token):
-        exit_code, response, stderr = _client.send_command_data(
-            action, payload or {}, read_timeout_ms=read_timeout_ms,
-            confirmation_token=confirmation_token, dry_run=dry_run)
-        # One reconnect attempt is safe only when TCP connection setup failed:
-        # exit 111 means the host never received the action. Never replay after
-        # an empty response or timeout because a mutating action may have run.
-        if exit_code == 111 and response is None:
-            delay_ms = float(os.environ.get("BRIDGE_MCP_RECONNECT_DELAY_MS", "100"))
-            if delay_ms > 0:
-                time.sleep(delay_ms / 1000)
-            exit_code, response, stderr = _client.send_command_data(
-                action, payload or {}, read_timeout_ms=read_timeout_ms,
-                confirmation_token=confirmation_token, dry_run=dry_run)
+    with _call_lock:
+        exit_code, response, stderr = _connection.request(
+            action,
+            payload or {},
+            read_timeout_ms=read_timeout_ms,
+            confirmation_token=confirmation_token,
+            dry_run=dry_run,
+            token=token,
+        )
 
     if response is None:
         raise BridgeError(stderr or "No response from bridge.")

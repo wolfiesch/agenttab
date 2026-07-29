@@ -298,7 +298,7 @@ function connectToHost() {
   port.onMessage.addListener((message) => {
     if (nativePort !== port) return;
     acknowledgeNativeHost();
-    console.log("Received message from native host:", message);
+    console.debug("Received native host message:", message?.action || message?.id || "response");
     if (message?.action !== "hostAcknowledged") handleMessageFromHost(message);
   });
 
@@ -1885,6 +1885,20 @@ async function describeTopFrameElement(target, rootNodeId, selector) {
 
 async function resolveActionTarget(tabId, locator, attachedTarget) {
   const run = async (target) => {
+    if (locator.frames.length === 0) {
+      const staged = await stageLocatorRefs(target, [locator], null);
+      if (staged.success === false) return staged;
+      const lookup = await evaluateInContext(target, actionTargetExpression(locator, 'center'), null);
+      const value = lookup.val || lookup;
+      if (!lookup.success || value.success === false) return value;
+      return {
+        ...value,
+        frameId: null,
+        contextId: null,
+        locator
+      };
+    }
+
     const pageTree = await debuggerCommand(target, 'Page.getFrameTree', {});
     const topFrameId = pageTree.frameTree.frame.id;
     const doc = await debuggerCommand(target, 'DOM.getDocument', { depth: 1, pierce: false });
@@ -2718,8 +2732,7 @@ async function clickSelector(tabId, selector) {
       return { success: true, tagName: value.tagName, text: value.text };
     }
     const { x, y } = lookup;
-    const pointerShown = await showAgentPointer(tabId, x, y, true);
-    if (pointerShown) await sleep(160);
+    void showAgentPointer(tabId, x, y, true);
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
@@ -2760,8 +2773,7 @@ async function hoverSelector(tabId, selector) {
   return withDebugger(tabId, async (target) => {
     const lookup = await getElementCenter(target, selector);
     if (lookup.success === false) return lookup;
-    const pointerShown = await showAgentPointer(tabId, lookup.x, lookup.y, false);
-    if (pointerShown) await sleep(100);
+    void showAgentPointer(tabId, lookup.x, lookup.y, false);
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: lookup.x, y: lookup.y, button: 'none' });
     return { success: true, tagName: lookup.tagName, text: lookup.text };
   });

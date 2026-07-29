@@ -43,6 +43,7 @@ from chrome_bridge_mcp.transport import BridgeError  # noqa: E402
 received = []
 received_raw = []
 received_lock = threading.Lock()
+accepted_connections = 0
 
 
 # The active result function; swap it to change mock behavior without rebinding.
@@ -50,6 +51,7 @@ _result_fn = None
 
 
 def serve():
+    global accepted_connections
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", PORT))
@@ -58,33 +60,38 @@ def serve():
     while not stop_event.is_set():
         try:
             conn, _ = srv.accept()
+            accepted_connections += 1
         except socket.timeout:
             continue
         except OSError:
             break
         with conn:
             buf = b""
-            while b"\n" not in buf:
-                chunk = conn.recv(65536)
-                if not chunk:
+            while not stop_event.is_set():
+                while b"\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if b"\n" not in buf:
                     break
-                buf += chunk
-            if not buf.strip():
-                continue
-            req = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
-            if req.get("token") != "mcp-token":
-                conn.sendall((json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode())
-                continue
-            action, payload = req.get("action"), req.get("payload")
-            with received_lock:
-                received.append((action, payload))
-                received_raw.append(req)
-            try:
-                result = _result_fn(action, payload)
-                resp = {"success": True, "result": result}
-            except Exception as exc:  # noqa: BLE001
-                resp = {"success": False, "error": str(exc)}
-            conn.sendall((json.dumps(resp) + "\n").encode())
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                req = json.loads(line.decode("utf-8"))
+                if req.get("token") != "mcp-token":
+                    conn.sendall((json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode())
+                    continue
+                action, payload = req.get("action"), req.get("payload")
+                with received_lock:
+                    received.append((action, payload))
+                    received_raw.append(req)
+                try:
+                    result = _result_fn(action, payload)
+                    resp = {"success": True, "result": result}
+                except Exception as exc:  # noqa: BLE001
+                    resp = {"success": False, "error": str(exc)}
+                conn.sendall((json.dumps(resp) + "\n").encode())
     srv.close()
 
 
@@ -537,36 +544,25 @@ def main():
         expect(False, "bridge failure should raise BridgeError")
     except BridgeError as exc:
         expect("boom" in str(exc), "BridgeError should carry the bridge error message")
+    expect(accepted_connections == 1, "MCP calls should reuse one serialized TCP connection")
+    transport._connection.close()
     stop_event.set()
     t.join(timeout=5)
 
-    # 21. The MCP transport retries exactly once when connection setup failed
-    # before the host could receive the action. It must not replay ambiguous
-    # timeout/empty-response failures after a possible mutation.
-    saved_send = transport._client.send_command_data
-    os.environ["BRIDGE_MCP_RECONNECT_DELAY_MS"] = "0"
+    # 21. Call dispatch never retries an ambiguous transport result. Connection
+    # setup retries live inside PersistentBridgeConnection before send.
+    saved_connection = transport._connection
     wire_calls = []
 
-    def connect_then_succeed(*args, **kwargs):
-        wire_calls.append((args, kwargs))
-        if len(wire_calls) == 1:
-            return 111, None, "browser unavailable"
-        return 0, {"success": True, "result": "pong"}, ""
+    class FakeConnection:
+        def __init__(self, result):
+            self.result = result
 
-    transport._client.send_command_data = connect_then_succeed
-    try:
-        expect(transport.call("ping") == "pong", "safe MCP reconnect should return second response")
-        expect(len(wire_calls) == 2, "safe MCP reconnect should make exactly two attempts")
-    finally:
-        transport._client.send_command_data = saved_send
+        def request(self, *args, **kwargs):
+            wire_calls.append((args, kwargs))
+            return self.result
 
-    wire_calls.clear()
-
-    def ambiguous_timeout(*args, **kwargs):
-        wire_calls.append((args, kwargs))
-        return 124, None, "timed out"
-
-    transport._client.send_command_data = ambiguous_timeout
+    transport._connection = FakeConnection((124, None, "timed out"))
     try:
         try:
             transport.call("click", {"tabId": 1, "selector": "#save"})
@@ -575,7 +571,7 @@ def main():
             pass
         expect(len(wire_calls) == 1, "ambiguous MCP failure must not replay a mutating action")
     finally:
-        transport._client.send_command_data = saved_send
+        transport._connection = saved_connection
 
     # 22. A packaged-style import with only mcp/ on PYTHONPATH must still load
     # repo sibling helpers. This reproduces the former MCP startup crash.
@@ -615,16 +611,20 @@ def main():
                 break
             with conn:
                 buf = b""
-                while b"\n" not in buf:
-                    chunk = conn.recv(65536)
-                    if not chunk:
+                while not recorder_stop.is_set():
+                    while b"\n" not in buf:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    if b"\n" not in buf:
                         break
-                    buf += chunk
-                if not buf.strip():
-                    continue
-                req = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
-                recorded_tokens.append(req.get("token"))
-                conn.sendall((json.dumps({"success": True, "result": "pong"}) + "\n").encode())
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    req = json.loads(line.decode("utf-8"))
+                    recorded_tokens.append(req.get("token"))
+                    conn.sendall((json.dumps({"success": True, "result": "pong"}) + "\n").encode())
         srv.close()
 
     recorder = threading.Thread(target=record_tokens, daemon=True)
@@ -640,6 +640,7 @@ def main():
         expect(recorded_tokens[-1] == "mcp-token",
                "omitting the token override should restore the ambient bridge token")
     finally:
+        transport._connection.close()
         os.environ["BRIDGE_PORT"] = saved_port
         recorder_stop.set()
         recorder.join(timeout=5)
