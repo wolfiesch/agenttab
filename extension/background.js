@@ -1,4 +1,5 @@
 let nativePort = null;
+let nativePortAcknowledged = false;
 const HEARTBEAT_ALARM = "chromeBridgeHeartbeat";
 const HEARTBEAT_MINUTES = 0.5;
 const RECONNECT_ALARM = "chromeBridgeReconnect";
@@ -267,16 +268,26 @@ function sendHeartbeat() {
   } catch (error) {
     console.warn("Heartbeat failed:", error);
     nativePort = null;
+    nativePortAcknowledged = false;
     // Don't wait for the next heartbeat alarm; schedule a backed-off reconnect now.
     scheduleReconnect();
   }
 }
+function acknowledgeNativeHost() {
+  if (nativePortAcknowledged) return;
+  nativePortAcknowledged = true;
+  resetBackoff();
+}
+
 function connectToHost() {
   if (nativePort) return;
   const hostName = "com.automation.bridge";
   console.log("Connecting to native host:", hostName);
+  let port;
   try {
-    nativePort = chrome.runtime.connectNative(hostName);
+    port = chrome.runtime.connectNative(hostName);
+    nativePort = port;
+    nativePortAcknowledged = false;
   } catch (error) {
     console.error("Failed to connect native host:", error);
     nativePort = null;
@@ -284,19 +295,29 @@ function connectToHost() {
     return;
   }
 
-  nativePort.onMessage.addListener((message) => {
+  port.onMessage.addListener((message) => {
+    if (nativePort !== port) return;
+    acknowledgeNativeHost();
     console.log("Received message from native host:", message);
-    handleMessageFromHost(message);
+    if (message?.action !== "hostAcknowledged") handleMessageFromHost(message);
   });
 
-  nativePort.onDisconnect.addListener(() => {
+  port.onDisconnect.addListener(() => {
+    if (nativePort !== port) return;
     console.warn("Disconnected from native host:", chrome.runtime.lastError);
     nativePort = null;
+    nativePortAcknowledged = false;
     scheduleReconnect();
   });
 
-  // Connection established: reset backoff and clear any pending reconnect alarm.
-  resetBackoff();
+  try {
+    port.postMessage({ action: "hostHandshake", protocolVersion: 1 });
+  } catch (error) {
+    console.warn("Native host handshake failed:", error);
+    nativePort = null;
+    nativePortAcknowledged = false;
+    scheduleReconnect();
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

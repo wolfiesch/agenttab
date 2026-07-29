@@ -2012,6 +2012,13 @@ def main():
     while True:
         try:
             msg = read_message()
+            if msg.get("action") == "hostHandshake" and not msg.get("id"):
+                write_message({
+                    "action": "hostAcknowledged",
+                    "protocolVersion": 1,
+                })
+                logging.info("Acknowledged extension native-host handshake.")
+                continue
             # If the extension sent a response to a command we initiated
             msg_id = msg.get("id")
             if msg_id:
