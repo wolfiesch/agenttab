@@ -449,6 +449,15 @@ def main():
             expect(launcher.exists(), "setup state-dir launcher should exist")
             expect('BRIDGE_PORT="${BRIDGE_PORT:-19223}"' in launcher.read_text(),
                    "setup state-dir launcher should use host port 19223")
+            native_host = Path(setup_info["nativeHost"])
+            expect(native_host == state_dir / "bridge.py",
+                   "setup state-dir should install the Python runtime into durable state")
+            expect(native_host.exists() and os.access(native_host, os.X_OK),
+                   "setup state-dir native host should exist and be executable")
+            expect(native_host.read_bytes() == (SCRIPT_DIR / "bridge.py").read_bytes(),
+                   "installed Python native host should match repository source")
+            expect(str(native_host) in launcher.read_text(),
+                   "setup state-dir launcher should execute the durable native host")
             expect((state_dir / "extension_id.txt").exists(),
                    "setup state-dir should write extension_id.txt")
             expect(setup_info.get("extensionIdFile") == str(state_dir / "extension_id.txt"),
@@ -490,6 +499,13 @@ def main():
             expect(launcher.exists(), "setup-rs state-dir launcher should exist")
             expect('BRIDGE_PORT="${BRIDGE_PORT:-19223}"' in launcher.read_text(),
                    "setup-rs state-dir launcher should use host port 19223")
+            native_host = Path(setup_info["nativeHost"])
+            expect(native_host == rust_state_dir / "bridge-host",
+                   "setup-rs state-dir should install the Rust runtime into durable state")
+            expect(native_host.exists() and os.access(native_host, os.X_OK),
+                   "setup-rs state-dir native host should exist and be executable")
+            expect(str(native_host) in launcher.read_text(),
+                   "setup-rs state-dir launcher should execute the durable native host")
             expect((rust_state_dir / "extension_id.txt").exists(),
                    "setup-rs state-dir should write extension_id.txt")
             expect(setup_info.get("extensionIdFile") == str(rust_state_dir / "extension_id.txt"),

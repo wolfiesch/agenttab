@@ -1809,6 +1809,11 @@ def cmd_cache(args):
     print(CACHE_USAGE, file=sys.stderr)
     return 64
 
+def cmd_doctor():
+    script = os.path.join(SCRIPT_DIR, "scripts", "diagnose_install.py")
+    return subprocess.run([sys.executable, script], check=False).returncode
+
+
 def print_usage():
     print("Usage:")
     print("  chrome-bridge <command> [arguments]")
@@ -1817,6 +1822,7 @@ def print_usage():
     print("")
     print("Common commands:")
     print("  ping                              Check bridge health")
+    print("  doctor                            Diagnose install drift and live bridge state")
     print("  getTabs                           List open tabs")
     print("  navigate <url> [--foreground]     Open a tab in the background by default")
     print("  observe <tabId> [filters]         Concise accessibility view with ref=eN ids; --full, --diff")
@@ -1845,6 +1851,11 @@ def print_usage():
 
 
 COMMAND_HELP = {
+    "doctor": (
+        "chrome-bridge doctor",
+        "Check the registered manifest, durable launcher and runtime, deployed extension, "
+        "last successful response, and broker/native-backend connection state without exposing secrets.",
+    ),
     "observe": (
         "chrome-bridge observe <tabId> [--compact|--full] [--diff] [--role <role[,role...]>] [--name <text>] [--limit <count>]",
         "Print a compact accessibility view by default. Filters are applied before the limit. "
@@ -2067,6 +2078,8 @@ def main():
     if len(args) > 2 and args[2] in {"-h", "--help"}:
         sys.exit(print_command_help(action))
 
+    if action == "doctor":
+        sys.exit(cmd_doctor())
     if action == "ping":
         sys.exit(send_command("ping"))
     elif action == "navigate":

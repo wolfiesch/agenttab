@@ -14,6 +14,7 @@ HOST_MANIFEST="$SCRIPT_DIR/com.automation.bridge.json"
 TEMPLATE="$SCRIPT_DIR/com.automation.bridge.json.template"
 KEY_FILE="$SCRIPT_DIR/extension_key.pem"
 LAUNCHER="$SCRIPT_DIR/bridge.py"
+HOST_RUNTIME="$SCRIPT_DIR/bridge.py"
 EXTENSION_ID=""
 EXTENSION_ID_FILE="$SCRIPT_DIR/extension_id.txt"
 HOST_PORT=9223
@@ -59,6 +60,7 @@ if [[ -n "$STATE_DIR" ]]; then
   POLICY_FILE="$STATE_DIR/bridge_policy.json"
   HOST_MANIFEST="$STATE_DIR/com.automation.bridge.json"
   LAUNCHER="$STATE_DIR/bridge-host-python-launch.sh"
+  HOST_RUNTIME="$STATE_DIR/bridge.py"
   if [[ "$KEY_FILE_PROVIDED" -eq 0 ]]; then
     KEY_FILE="$STATE_DIR/extension_key.pem"
   fi
@@ -102,6 +104,13 @@ chmod 0644 "$EXTENSION_ID_FILE"
 echo "Wrote extension ID $EXTENSION_ID_FILE"
 
 if [[ -n "$STATE_DIR" ]]; then
+  HOST_RUNTIME_TMP="$HOST_RUNTIME.tmp.$$"
+  install -m 0755 "$SCRIPT_DIR/bridge.py" "$HOST_RUNTIME_TMP"
+  mv -f "$HOST_RUNTIME_TMP" "$HOST_RUNTIME"
+  echo "Installed native host runtime $HOST_RUNTIME"
+fi
+
+if [[ -n "$STATE_DIR" ]]; then
   cat > "$LAUNCHER" <<EOF
 #!/usr/bin/env bash
 export BRIDGE_PORT="\${BRIDGE_PORT:-$HOST_PORT}"
@@ -110,7 +119,7 @@ export BRIDGE_TOKENS_FILE="$TOKENS_FILE"
 export BRIDGE_POLICY_FILE="$POLICY_FILE"
 export BRIDGE_LOG_FILE="$STATE_DIR/bridge_debug.log"
 export BRIDGE_AUDIT_LOG_FILE="$STATE_DIR/bridge_audit.jsonl"
-exec "$SCRIPT_DIR/bridge.py" "\$@"
+exec "$HOST_RUNTIME" "\$@"
 EOF
   chmod 0755 "$LAUNCHER"
   echo "Wrote launcher $LAUNCHER"
@@ -157,9 +166,9 @@ case "$(uname -s)" in
     fi
     echo "Then run: python3 test_client.py ping"
     if [[ "$PRINT_JSON" -eq 1 ]]; then
-      python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" "$EXTENSION_ID_FILE" "$HOST_PORT" <<'PY'
+      python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" "$HOST_RUNTIME" "$EXTENSION_ID_FILE" "$HOST_PORT" <<'PY'
 import json, sys
-keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher", "extensionIdFile", "hostPort")
+keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher", "nativeHost", "extensionIdFile", "hostPort")
 print(json.dumps(dict(zip(keys, sys.argv[1:])), separators=(",", ":")))
 PY
     fi
@@ -184,9 +193,9 @@ fi
 echo "Then run: python3 test_client.py ping"
 
 if [[ "$PRINT_JSON" -eq 1 ]]; then
-  python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" "$EXTENSION_ID_FILE" "$HOST_PORT" <<'PY'
+  python3 - "$EXT_DIR" "$EXTENSION_ID" "$HOST_MANIFEST" "$POLICY_FILE" "$TOKEN_FILE" "$TOKENS_FILE" "$LAUNCHER" "$HOST_RUNTIME" "$EXTENSION_ID_FILE" "$HOST_PORT" <<'PY'
 import json, sys
-keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher", "extensionIdFile", "hostPort")
+keys = ("extensionDir", "extensionId", "hostManifest", "policyFile", "tokenFile", "tokensFile", "launcher", "nativeHost", "extensionIdFile", "hostPort")
 print(json.dumps(dict(zip(keys, sys.argv[1:])), separators=(",", ":")))
 PY
 fi

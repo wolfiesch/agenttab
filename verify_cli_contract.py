@@ -181,6 +181,23 @@ finally:
     else:
         os.environ["BRIDGE_RESPONSE_TIMEOUT_SECONDS"] = _saved_response_timeout
 
+_doctor_invocation = {}
+_saved_subprocess_run = test_client.subprocess.run
+def _fake_doctor_run(argv, check=False):
+    _doctor_invocation["argv"] = argv
+    _doctor_invocation["check"] = check
+    return type("Completed", (), {"returncode": 0})()
+test_client.subprocess.run = _fake_doctor_run
+try:
+    check("doctor rc", test_client.cmd_doctor(), 0)
+    check(
+        "doctor script",
+        os.path.basename(_doctor_invocation.get("argv", ["", ""])[1]),
+        "diagnose_install.py",
+    )
+finally:
+    test_client.subprocess.run = _saved_subprocess_run
+
 result = dispatch(["sessionStatus", "a.com", "b.com"])
 check("sessionStatus action", result.get("action"), "sessionStatus")
 check("sessionStatus payload", result.get("payload"), {"domains": ["a.com", "b.com"]})
