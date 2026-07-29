@@ -4714,10 +4714,11 @@ function credentialArmExpression(locator, token) {
     } else {
       self.__chromeBridgeCredentialArmed = null;
     }
-    // The raw value stays inside the page: only its length leaves this frame.
+    // The raw value never leaves the page, and neither does its length: a
+    // character count narrows a brute-force space, so only emptiness crosses
+    // this frame boundary.
     const raw = 'value' in el ? el.value : el.textContent;
-    const length = typeof raw === 'string' ? raw.length : 0;
-    return { success: true, present: true, empty: length === 0, length, hasForm: !!form };
+    return { success: true, present: true, empty: !(typeof raw === 'string' && raw.length > 0), hasForm: !!form };
   })()`;
 }
 
@@ -4737,13 +4738,11 @@ function credentialFieldProbe(attr, token) {
   };
   const submitted = self.__chromeBridgeCredentialSubmitted === true;
   const el = find(document);
-  if (!el) return { present: false, empty: true, length: 0, submitted };
+  if (!el) return { present: false, empty: true, submitted };
   const raw = 'value' in el ? el.value : el.textContent;
-  const length = typeof raw === 'string' ? raw.length : 0;
   return {
     present: true,
-    empty: length === 0,
-    length,
+    empty: !(typeof raw === 'string' && raw.length > 0),
     submitted,
     focused: document.activeElement === el
   };
@@ -4769,7 +4768,7 @@ function credentialFieldDisarm(attr, token) {
 }
 
 async function credentialProbe(tabId, token) {
-  const absent = { present: false, empty: true, length: 0, submitted: false };
+  const absent = { present: false, empty: true, submitted: false };
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
@@ -4849,17 +4848,18 @@ async function credentialHandoff(payload) {
     });
     if (armed.success === false) return { ...armed, scrubbedCaptures: scrubbed };
     const startUrl = (await chrome.tabs.get(tabId)).url || "";
-    let baseline = armed.length;
-    let lastLength = baseline;
-    let lastNonZero = 0;
-    let stable = 0;
+    // Only emptiness is ever observed. `filled` resolves on a run of
+    // consecutive non-empty probes, which debounces a partially typed value
+    // without measuring it. A field a password manager has already filled is
+    // non-empty from the first probe and resolves after the same debounce.
+    let sawFilled = false;
+    let stableFilled = 0;
     const done = () => ({
       success: true,
       tabId,
       selector,
       mode,
       filled: true,
-      valueLength: lastNonZero,
       elapsedMs: Date.now() - startedAt,
       scrubbedCaptures: scrubbed
     });
@@ -4874,19 +4874,21 @@ async function credentialHandoff(payload) {
         // the completion signal; in filled mode a credential already observed as
         // entered still counts.
         if (mode === "submitted" && navigated) return done();
-        if (mode === "filled" && lastNonZero > 0) return done();
+        if (mode === "filled" && sawFilled) return done();
         continue;
       }
-      const length = state.length;
-      if (length === 0) baseline = 0;
-      else lastNonZero = length;
-      stable = length === lastLength ? stable + 1 : 0;
-      lastLength = length;
+      const filled = state.empty === false;
+      if (filled) {
+        sawFilled = true;
+        stableFilled += 1;
+      } else {
+        stableFilled = 0;
+      }
       if (mode === "submitted") {
         if (navigated) return done();
         continue;
       }
-      if (length > 0 && length !== baseline && stable >= CREDENTIAL_STABLE_POLLS) return done();
+      if (filled && stableFilled >= CREDENTIAL_STABLE_POLLS) return done();
     }
     return {
       success: false,

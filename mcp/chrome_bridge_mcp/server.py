@@ -946,13 +946,15 @@ def browser_credential_handoff(
     Use this instead of ``browser_fill`` for passwords, passphrases, recovery
     codes, and one-time codes. The bridge focuses ``selector`` (CSS, semantic, or
     ``ref=eN``), shows ``message``, and waits. The field value is NEVER read,
-    logged, or returned: the only value-derived datum in the response is
-    ``valueLength``, a character count. For the whole window the native host
-    holds a handoff blackout over the tab, so screenshot, getHTML, observe, and
-    every other observation action are denied to every client, including this
-    one. ``mode`` is ``filled`` (resolve once the field goes from empty to
-    non-empty and settles) or ``submitted`` (resolve on form submit or
-    navigation).
+    logged, measured, or returned: the injected probe reports only whether the
+    field is empty, and the response carries ``filled: true`` with no
+    value-derived datum, not even a character count (a secret's length narrows a
+    brute-force search). For the whole window the native host holds a handoff
+    blackout over the tab, so screenshot, getHTML, observe, and every other
+    observation action are denied to every client, including this one. ``mode``
+    is ``filled`` (resolve on a short run of consecutive non-empty probes, which
+    debounces a partially typed value) or ``submitted`` (resolve on form submit
+    or navigation).
     """
     payload = {"selector": selector, "mode": mode, "timeoutMs": timeout_ms}
     if message is not None:

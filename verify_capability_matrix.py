@@ -1637,8 +1637,9 @@ def main(quiet=False):
         # foregrounds the tab and window by contract, which would break the quiet
         # inactivity assertions above. A background thread plays the human by
         # writing the page-owned fake secret into the password field; the check
-        # then proves the response reports only a character count and that the
-        # secret never surfaces in the client's output.
+        # then proves the response carries no value-derived datum at all - not the
+        # value, not a hash, not a character count - and that the secret never
+        # surfaces in the client's output.
         cred_call = {}
 
         def drive_credential_handoff():
@@ -1668,18 +1669,22 @@ def main(quiet=False):
             or CREDENTIAL_FIXTURE_SECRET in (cred_call.get("stderr") or "")
         )
         record(summary, "credentialHandoff", cred_call, {
-            "valueLength": handed.get("valueLength"),
+            "filled": handed.get("filled"),
             "mode": handed.get("mode"),
             "secretLeaked": leaked,
         })
+        # A character count is as forbidden as the value: it narrows a
+        # brute-force search, so no length-shaped field may appear at all.
+        length_leak = [k for k in handed if "length" in k.lower()]
         require(
             cred_call.get("exit") == 0
             and handed.get("filled") is True
             and handed.get("mode") == "filled"
-            and handed.get("valueLength") == len(CREDENTIAL_FIXTURE_SECRET)
             and not leaked
-            and "value" not in handed,
-            "credentialHandoff did not report a value-length-only success",
+            and "value" not in handed
+            and not length_leak
+            and str(len(CREDENTIAL_FIXTURE_SECRET)) not in (cred_call.get("stdout") or ""),
+            "credentialHandoff leaked a value-derived datum",
             cred_call
         )
 

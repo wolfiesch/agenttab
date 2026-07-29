@@ -54,7 +54,7 @@ Opened after the 2026-07 frontier-product recheck. Verified context: Anthropic's
 |---|---|---|---|
 | T4-1 | MCP elicitation for approvals | `elicitation/create` for confirmation gates and missing workflow bindings, so a gated action becomes an in-client prompt instead of a returned token | todo |
 | T4-2 | Chrome Web Store listing | Submit the packaged extension; stable store ID also removes the duplicate-extension port race | todo |
-| T4-3 | Credential handoff (single field) | `credentialHandoff` focuses one field, banners, and waits for a human or password manager to fill it; the value is never read, returned, or logged, and the host blackout covers the whole window | done |
+| T4-3 | Credential handoff (single field) | `credentialHandoff` focuses one field, banners, and waits for a human or password manager to fill it; the value is never read, measured, returned, or logged (no character count either), and the host blackout covers the whole window | done |
 | T4-4 | Deterministic postconditions | Per-step `expect` (selector/text/url/schema) plus bounded `retry` in workflows, and a standalone `expect` action; deterministic evidence instead of model self-assessment | done |
 | T4-5 | Read-only vs state-changing tiering | Effective tier computed from payload flags, not action name alone: a read-only action carrying a state-changing flag escalates, and `batch` is read-only only when every step is | done |
 | T4-6 | OpenTelemetry spans | Opt-in, off-by-default GenAI-convention spans in both hosts (`BRIDGE_OTEL_ENABLED`), OTLP/HTTP JSON with no SDK dependency, metadata-only attributes, plus W3C `traceparent` propagation across the CLI, MCP HTTP/stdio, and the TCP envelope, correlated with session trace artifacts | done |
