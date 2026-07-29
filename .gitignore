@@ -43,6 +43,7 @@ mcp/uv.lock
 .venv/
 mcp/.venv/
 .wip/
+.perf/
 
 # Build output (release archives, store upload zip)
 dist/
