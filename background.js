@@ -304,7 +304,7 @@ function connectToHost() {
 
   port.onDisconnect.addListener(() => {
     if (nativePort !== port) return;
-    console.warn("Disconnected from native host:", chrome.runtime.lastError);
+    console.warn("Disconnected from native host:", chrome.runtime.lastError?.message || "unknown error");
     nativePort = null;
     nativePortAcknowledged = false;
     scheduleReconnect();
