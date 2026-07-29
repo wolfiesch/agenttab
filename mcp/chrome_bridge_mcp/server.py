@@ -505,6 +505,66 @@ def browser_tab_control(op: str, tab_id: Optional[int] = None) -> str:
     return _text(call(action, {"tabId": tid}))
 
 
+_BATCH_PRIMITIVES = {
+    "waitForLoad",
+    "waitForSelector",
+    "waitForText",
+    "waitForUrl",
+    "click",
+    "type",
+    "fill",
+    "select",
+    "scroll",
+    "press",
+    "hover",
+    "drag",
+}
+
+
+def browser_batch(
+    tab_id: int,
+    steps: list,
+    stop_on_error: bool = True,
+) -> str:
+    """Run typed browser primitives in one bridge round trip on an explicit tab.
+
+    Each step is ``{"action": <bridge action>, "payload": {...}}``. The host
+    evaluates the outer batch and every nested action against the normal policy,
+    lease, origin, and confirmation gates. Use refs from ``browser_snapshot`` in
+    selector fields; do not use this tool to bypass a confirmation requirement.
+    """
+    if not isinstance(tab_id, int):
+        raise ValueError("tab_id must be an integer")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("steps must be a non-empty list")
+    normalized = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict) or not isinstance(step.get("action"), str):
+            raise ValueError(f"steps[{index}] must contain a string action")
+        if step["action"] not in _BATCH_PRIMITIVES:
+            raise ValueError(
+                f"steps[{index}].action must be a typed browser primitive, got {step['action']!r}"
+            )
+        payload = step.get("payload", {})
+        if not isinstance(payload, dict):
+            raise ValueError(f"steps[{index}].payload must be an object")
+        payload = dict(payload)
+        nested_tab_id = payload.pop("tabId", tab_id)
+        if nested_tab_id != tab_id:
+            raise ValueError(f"steps[{index}] cannot target a different tab")
+        normalized.append({
+            "action": step["action"],
+            "payload": payload,
+            **({"timeoutMs": step["timeoutMs"]} if "timeoutMs" in step else {}),
+            **({"delayMs": step["delayMs"]} if "delayMs" in step else {}),
+        })
+    return _text(call("batch", {
+        "tabId": tab_id,
+        "steps": normalized,
+        "stopOnError": bool(stop_on_error),
+    }))
+
+
 def browser_action(action: str, payload: Optional[dict] = None) -> str:
     """Escape hatch: send any raw bridge action with its payload.
 
@@ -1204,6 +1264,7 @@ _TOOLS = [
     (browser_remove_storage_item, True, True),
     (browser_clear_storage, True, True),
     (browser_replay_workflow, True, True),
+    (browser_batch, True, False),
     (browser_action, True, True),
     (browser_confirm_action, True, False),
     (browser_confirm, True, False),

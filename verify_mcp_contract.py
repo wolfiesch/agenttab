@@ -242,6 +242,31 @@ def main():
     server.browser_action("performanceMetrics", {"tabId": 11})
     expect(last_request() == ("performanceMetrics", {"tabId": 11}), "browser_action passthrough mismatch")
 
+    # 9a. typed batch keeps every primitive on one explicit tab.
+    batch_steps = [
+        {"action": "fill", "payload": {"selector": "ref=e8", "text": "Draft"}},
+        {
+            "action": "waitForText",
+            "payload": {"text": "Saved"},
+            "timeoutMs": 5000,
+        },
+    ]
+    server.browser_batch(11, batch_steps)
+    expect(last_request() == ("batch", {
+        "tabId": 11,
+        "steps": batch_steps,
+        "stopOnError": True,
+    }), "browser_batch payload mismatch")
+    for unsafe_steps, message in [
+        ([{"action": "executeScript", "payload": {"code": "1"}}], "sensitive action"),
+        ([{"action": "click", "payload": {"tabId": 12, "selector": "#save"}}], "cross-tab action"),
+    ]:
+        try:
+            server.browser_batch(11, unsafe_steps)
+            expect(False, f"browser_batch accepted {message}")
+        except ValueError:
+            pass
+
     # 9a. browser_confirm_action forwards the same action with top-level confirmation token.
     server.browser_confirm_action("executeScript", "confirm-token", {"tabId": 11, "code": "1"})
     expect(last_request() == ("executeScript", {"tabId": 11, "code": "1"}), "browser_confirm_action payload mismatch")
@@ -325,6 +350,7 @@ def main():
     expect("browser_get_cookies" not in default_names, "cookies must be hidden by default")
     expect("browser_action" not in default_names, "browser_action must be hidden by default (sensitive)")
     expect("browser_click" in default_names, "mutating non-sensitive tool should be present by default")
+    expect("browser_batch" in default_names, "typed batch should be present by default")
     expect("browser_policy_check" in default_names, "policy_check must be present by default (read-only, non-sensitive)")
     expect("browser_confirm_action" in default_names, "confirm_action must be present by default (mutating, non-sensitive)")
     expect("browser_confirm" in default_names, "token-only confirm must be present by default")
@@ -338,6 +364,7 @@ def main():
     ro_names = _tool_names(server.build_server(readonly=True, allow_sensitive=True))
     expect("browser_click" not in ro_names and "browser_navigate" not in ro_names, "readonly must hide mutating tools")
     expect("browser_action" not in ro_names, "readonly must hide browser_action (mutating)")
+    expect("browser_batch" not in ro_names, "readonly must hide typed batch")
     expect("browser_confirm_action" not in ro_names, "readonly must hide browser_confirm_action (mutating)")
     expect("browser_confirm" not in ro_names, "readonly must hide token-only confirm (mutating)")
     expect("browser_snapshot" in ro_names and "browser_list_tabs" in ro_names, "readonly must keep read-only tools")
@@ -347,6 +374,7 @@ def main():
     srv = server.build_server(allow_sensitive=True)
     tools = {t.name: t for t in srv._tool_manager.list_tools()}
     expect(tools["browser_click"].annotations.destructiveHint is True, "mutating tool should be destructiveHint=True")
+    expect(tools["browser_batch"].annotations.destructiveHint is True, "typed batch should be destructiveHint=True")
     expect(tools["browser_confirm_action"].annotations.destructiveHint is True, "confirm_action should be destructiveHint=True")
     expect(tools["browser_confirm"].annotations.destructiveHint is True, "token-only confirm should be destructiveHint=True")
     expect(tools["browser_snapshot"].annotations.readOnlyHint is True, "read-only tool should be readOnlyHint=True")
