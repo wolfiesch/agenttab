@@ -807,7 +807,7 @@ def _run_task_batch_workflow(base_url, timeout_ms):
             "tabId": tab_id,
             "compact": True,
             "roles": ["textbox", "combobox", "button"],
-            "limit": 100,
+            "limit": 500,
         }
         snapshot = _timed_request(timings, "observe", snapshot_options)
         title_ref = _find_ref(snapshot, "textbox", "Article title")
