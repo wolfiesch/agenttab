@@ -159,6 +159,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
     },
     tabs: {
       onRemoved: { addListener(listener) { listeners.removed = listener; } },
+      onUpdated: { addListener() {} },
       async get(tabId) {
         const held = heldTabGets.get(tabId);
         if (held) {

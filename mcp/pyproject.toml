@@ -4,7 +4,7 @@ version = "0.1.1"
 description = "MCP server exposing the Chrome native-messaging automation bridge to MCP clients."
 requires-python = ">=3.10"
 # HTTP (streamable-http) transport uses the server bundled with mcp; no extra dep needed.
-dependencies = ["mcp>=1.23.0"]
+dependencies = ["mcp>=1.28.1,<2"]
 
 [project.scripts]
 chrome-bridge-mcp = "chrome_bridge_mcp.server:main"
