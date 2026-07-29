@@ -1,0 +1,65 @@
+name: Nightly compatibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 2 * * 2,4,6"
+      timezone: "America/Los_Angeles"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-compatibility
+  cancel-in-progress: true
+
+jobs:
+  fresh-install:
+    runs-on: ${{ fromJSON(vars.M1_CI_ENABLED == 'true' && '["self-hosted","macOS","ARM64","wolfie-m1","trusted","chrome-bridge"]' || '"macos-latest"') }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        if: ${{ runner.name != 'wolfie-m1-chrome-bridge' }}
+        with:
+          python-version: "3.11"
+
+      - name: Validate the provisioned M1 browser and Python
+        if: ${{ runner.name == 'wolfie-m1-chrome-bridge' }}
+        shell: bash
+        run: |
+          python_root=/opt/homebrew/opt/python@3.11/libexec/bin
+          "$python_root/python3" --version
+          echo "$python_root" >> "$GITHUB_PATH"
+          chrome_binary="$(find "$HOME/Library/Caches/ms-playwright" \
+            -path '*Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing' \
+            -type f -print -quit)"
+          test -n "$chrome_binary"
+          "$chrome_binary" --version
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install the MCP bridge
+        run: python3 -m pip install -e ./mcp
+
+      - name: Repeat fresh-profile install smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            echo "Fresh-profile attempt $attempt of 5"
+            PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
+          done
+
+      - name: Verify a cold locked native-host build
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/chrome-bridge-nightly-cargo"
+          cargo build --release --locked --manifest-path host-rs/Cargo.toml
+          python3 scripts/package_release.py \
+            --version nightly \
+            --dist "$RUNNER_TEMP/chrome-bridge-nightly-dist"
+          PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py
