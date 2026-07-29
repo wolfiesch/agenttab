@@ -803,7 +803,13 @@ def _run_task_batch_workflow(base_url, timeout_ms):
         _timed_request(timings, "waitForSelector", {
             "tabId": tab_id, "selector": "#workflow-title", "timeoutMs": timeout_ms,
         })
-        snapshot = _timed_request(timings, "observe", {"tabId": tab_id, "compact": True})
+        snapshot_options = {
+            "tabId": tab_id,
+            "compact": True,
+            "roles": ["textbox", "combobox", "button"],
+            "limit": 100,
+        }
+        snapshot = _timed_request(timings, "observe", snapshot_options)
         title_ref = _find_ref(snapshot, "textbox", "Article title")
         body_ref = _find_ref(snapshot, "textbox", "Article body")
         category_ref = _find_ref(snapshot, "combobox", "Category")
@@ -829,7 +835,7 @@ def _run_task_batch_workflow(base_url, timeout_ms):
         _timed_request(timings, "batch", {
             "tabId": tab_id, "steps": first_steps, "stopOnError": True,
         })
-        diff = _timed_request(timings, "observe", {"tabId": tab_id, "compact": True, "diff": True})
+        diff = _timed_request(timings, "observe", {**snapshot_options, "diff": True})
         section_ref = _find_ref(diff, "textbox", "Section 1", key="added")
         second_steps = [
             {"action": "fill", "payload": {"selector": section_ref, "text": "Measured section"}},
