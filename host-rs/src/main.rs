@@ -751,6 +751,154 @@ fn origin_exempt_action(action: &str) -> bool {
 
 const TARGET_REQUIRED_ACTIONS: [&str; 4] = ["navigate", "navigateTaskSession", "downloadUrl", "getCookies"];
 
+/// Actions that make the browser issue a NEW outbound request to a host named in
+/// the request payload, so the host can bound the destination before forwarding.
+/// `setCookie` is included because it writes a cookie scoped to its `url`, which
+/// the browser then attaches to its next request to that host, so it stages
+/// egress even though the write itself is local.
+///
+/// Deliberately NOT here, because the host cannot see the destination and must
+/// not imply coverage it does not have (see docs/security.md): in-page navigation
+/// the agent causes by clicking a link or submitting a form; script-driven
+/// requests (`executeScript`/`executeScriptCDP`); resource loads a page makes on
+/// its own; `uploadFile`/`githubAttach*` (which post to the tab's own origin,
+/// already governed by site policy); `startInterception` in `fulfill` mode (the
+/// extension fulfills from the inline `body` and fetches nothing); and
+/// `deleteCookie` (names a url but removes state and sends nothing).
+/// Mirrors bridge.py::EGRESS_URL_ACTIONS.
+const EGRESS_URL_ACTIONS: [&str; 4] = ["navigate", "navigateTaskSession", "downloadUrl", "setCookie"];
+
+// --- Data-loss-prevention channels (policy key `dlp`) -----------------------
+// `dlp` is a map of CHANNEL -> MODE:
+//   allow - default; current behavior, nothing is added.
+//   audit - the action runs and exactly one `dlp_audit` audit event naming the
+//           channel is written. The event carries no file contents, no file
+//           paths, and no frame data -- only the channel name.
+//   block - the action is denied with reason `dlp blocked` BEFORE it is
+//           forwarded, so Chrome never opens the file.
+// Merged as a map key (see POLICY_MAP_KEYS). Mirrors bridge.py DLP_CHANNELS.
+const DLP_CHANNELS: [&str; 4] = ["clipboard", "upload", "download", "screenShare"];
+const DLP_MODES: [&str; 3] = ["allow", "audit", "block"];
+const DLP_BLOCKED_ERROR: &str = "dlp blocked";
+const DLP_AUDIT_DECISION: &str = "dlp_audit";
+
+/// The DLP channel an action belongs to, or None. Only chokepoints the bridge
+/// itself owns appear here: the three actions that hand local file paths to CDP
+/// `DOM.setFileInputFiles`, the one action that starts a browser download, and
+/// the screencast start plus frame read. `clipboard` is DECLARED but has no
+/// entry, because no bridge action reads or writes the clipboard and a
+/// page-driven copy never crosses the bridge. Mirrors
+/// bridge.py::DLP_ACTION_CHANNELS.
+fn dlp_channel_for_action(action: &str) -> Option<&'static str> {
+    match action {
+        "uploadFile" | "githubAttachUploadedFiles" | "githubAttachPrBody" => Some("upload"),
+        "downloadUrl" => Some("download"),
+        "startScreencast" | "screencastFrames" => Some("screenShare"),
+        _ => None,
+    }
+}
+
+/// The mode governing `channel`, or None when `channel` is not a DLP channel.
+/// Fail closed: a channel configured with anything outside DLP_MODES resolves to
+/// `block` rather than being silently ignored, because a typo in a data-loss
+/// control must not widen it. Mirrors bridge.py::resolve_dlp_mode.
+fn resolve_dlp_mode(cp: &Value, channel: Option<&str>) -> Option<&'static str> {
+    let channel = channel.filter(|c| DLP_CHANNELS.contains(c))?;
+    let dlp = match cp.get("dlp") {
+        None | Some(Value::Null) => return Some("allow"),
+        Some(Value::Object(m)) => m,
+        Some(_) => return Some("block"),
+    };
+    match dlp.get(channel) {
+        None => Some("allow"),
+        Some(Value::String(m)) => DLP_MODES
+            .iter()
+            .find(|known| **known == m.as_str())
+            .copied()
+            .or(Some("block")),
+        Some(_) => Some("block"),
+    }
+}
+
+/// The non-`allow` channel modes for this client, stamped onto a forwarded
+/// request so the extension can refuse independently. Mirrors
+/// bridge.py::dlp_modes_for_client.
+fn dlp_modes_for_client(cp: &Value) -> serde_json::Map<String, Value> {
+    let mut modes = serde_json::Map::new();
+    for channel in DLP_CHANNELS.iter() {
+        if let Some(mode) = resolve_dlp_mode(cp, Some(*channel)) {
+            if mode != "allow" {
+                modes.insert((*channel).to_string(), json!(mode));
+            }
+        }
+    }
+    modes
+}
+
+/// Channels resolving to `mode` for this request, recursing into composites so a
+/// batch or replayWorkflow step is seen. Ordered by DLP_CHANNELS and
+/// deduplicated. Mirrors bridge.py::dlp_channels_in_mode.
+fn dlp_channels_in_mode(cp: &Value, action: &str, payload: Option<&Value>, mode: &str) -> Vec<String> {
+    let mut found: Vec<&'static str> = Vec::new();
+    dlp_walk_channels(cp, action, payload, mode, &mut found);
+    DLP_CHANNELS
+        .iter()
+        .filter(|c| found.contains(*c))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+fn dlp_walk_channels(
+    cp: &Value,
+    action: &str,
+    payload: Option<&Value>,
+    mode: &str,
+    found: &mut Vec<&'static str>,
+) {
+    if action == "batch" || action == "replayWorkflow" {
+        let steps = if action == "batch" {
+            step_payloads(payload)
+        } else {
+            workflow_step_payloads(payload)
+        };
+        for (s_action, s_payload) in steps {
+            dlp_walk_channels(cp, &s_action, Some(&s_payload), mode, found);
+        }
+        return;
+    }
+    if let Some(channel) = dlp_channel_for_action(action) {
+        if resolve_dlp_mode(cp, Some(channel)) == Some(mode) && !found.contains(&channel) {
+            found.push(channel);
+        }
+    }
+}
+
+/// (action, channel) of the first blocked chokepoint in this request, walking
+/// composite steps in dispatch order so a denial can name the smuggled step's own
+/// action rather than the enclosing `batch`. Mirrors
+/// bridge.py::dlp_blocked_target.
+fn dlp_blocked_target(cp: &Value, action: &str, payload: Option<&Value>) -> Option<(String, &'static str)> {
+    if action == "batch" || action == "replayWorkflow" {
+        let steps = if action == "batch" {
+            step_payloads(payload)
+        } else {
+            workflow_step_payloads(payload)
+        };
+        for (s_action, s_payload) in steps {
+            if let Some(hit) = dlp_blocked_target(cp, &s_action, Some(&s_payload)) {
+                return Some(hit);
+            }
+        }
+        return None;
+    }
+    let channel = dlp_channel_for_action(action)?;
+    if resolve_dlp_mode(cp, Some(channel)) == Some("block") {
+        Some((action.to_string(), channel))
+    } else {
+        None
+    }
+}
+
 /// Actions reserved for host-internal use (tab-origin lookup). A socket client
 /// may never invoke these; they are rejected as unknown.
 fn reserved_action(action: &str) -> bool {
@@ -790,17 +938,311 @@ fn default_policy() -> Value {
                 "*://[[]::1[]]", "*://[[]::1[]]:*"
             ],
             "requireConfirmation": [],
+            // Where the agent may make the browser SEND traffic. Empty means
+            // unconstrained, preserving behavior for policies that never set it.
+            "egressAllowlist": [],
             "siteModes": {},
+            // Per-channel data-loss-prevention modes (see DLP_CHANNELS). An
+            // absent channel is "allow", preserving behavior for policies that
+            // never set it.
+            "dlp": {},
             "redactPatterns": [],
             "secretMaskFile": null,
             "traceDir": null,
+            // Optional forwarder for audit events that were already written
+            // locally. Null/absent disables export entirely.
+            "auditExport": null,
             "redact": true,
             "audit": true
         },
         "clients": {}
     })
 }
-fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
+
+// --- Content-addressed org policy bundles (policy key `policyBundle`) ------
+// Mirrors bridge.py. An org distributes one policy document out of band and
+// pins it by digest:
+//
+//   "policyBundle": {"path": "/etc/chrome-bridge/org-policy.json",
+//                    "lockfile": "/etc/chrome-bridge/org-policy.lock"}
+//
+// read from the ROOT of the local policy file (its `default` layer is also
+// accepted). The bundle is applied ONLY when its sha256 equals the `sha256`
+// recorded in the lockfile. Every other outcome -- unreadable bundle,
+// unreadable or malformed lockfile, malformed bundle, digest mismatch,
+// malformed policyBundle stanza -- fails closed to the BUILT-IN default policy
+// (never the last verified bundle), is logged, and is audited as
+// `policy_bundle_rejected` carrying both digests. The reload signature covers
+// the bundle and lockfile mtimes, so a swapped bundle is re-verified on the
+// next request and each rejection is audited once per change.
+//
+// Precedence for a VERIFIED bundle:
+//   built-in default -> bundle default/clients -> local bridge_policy.json
+// so a local operator can always tighten. A bundle can never loosen: composed
+// `deniedActions`/`deniedOrigins` are the UNION of bundle and local entries.
+
+const POLICY_BUNDLE_DECISION: &str = "policy_bundle_rejected";
+const POLICY_BUNDLE_MISCONFIGURED: &str = "policy bundle misconfigured";
+const POLICY_BUNDLE_UNREADABLE: &str = "policy bundle unreadable";
+const POLICY_BUNDLE_MALFORMED: &str = "policy bundle malformed";
+const POLICY_BUNDLE_LOCK_UNREADABLE: &str = "policy bundle lockfile unreadable";
+const POLICY_BUNDLE_LOCK_MALFORMED: &str = "policy bundle lockfile malformed";
+const POLICY_BUNDLE_MISMATCH: &str = "policy bundle digest mismatch";
+
+/// Deny lists never shrink when a bundle is composed with the local policy.
+const POLICY_BUNDLE_DENY_KEYS: [&str; 2] = ["deniedActions", "deniedOrigins"];
+
+/// policyInfo and the CLI report a truncated digest: enough to compare two
+/// installs by eye, never enough to reconstruct any bundle content.
+const POLICY_BUNDLE_DIGEST_CHARS: usize = 12;
+
+#[derive(Clone, Default)]
+struct PolicyBundleState {
+    path: Option<String>,
+    lockfile: Option<String>,
+    verified: bool,
+    digest: Option<String>,
+}
+
+static POLICY_BUNDLE_STATE: Mutex<Option<PolicyBundleState>> = Mutex::new(None);
+
+fn policy_bundle_state() -> PolicyBundleState {
+    match POLICY_BUNDLE_STATE.lock() {
+        Ok(guard) => guard.as_ref().cloned().unwrap_or_default(),
+        Err(_) => PolicyBundleState::default(),
+    }
+}
+
+fn set_policy_bundle_state(state: PolicyBundleState) {
+    if let Ok(mut guard) = POLICY_BUNDLE_STATE.lock() {
+        *guard = Some(state);
+    }
+}
+
+fn short_digest(digest: Option<&str>) -> Value {
+    match digest {
+        Some(d) if !d.is_empty() => {
+            Value::String(d.chars().take(POLICY_BUNDLE_DIGEST_CHARS).collect())
+        }
+        _ => Value::Null,
+    }
+}
+
+/// Expand a leading `~` like Python's os.path.expanduser, which the Python host
+/// applies to both bundle paths.
+fn expand_home(raw: &str) -> String {
+    if raw == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| raw.to_string());
+    }
+    match raw.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{}/{}", home.trim_end_matches('/'), rest),
+            Err(_) => raw.to_string(),
+        },
+        None => raw.to_string(),
+    }
+}
+
+/// (path, lockfile) from the local policy document; ("", "") when the stanza is
+/// present but unusable (fail closed); None when no bundle is configured.
+fn policy_bundle_config(doc: &Value) -> Option<(String, String)> {
+    let mut holders: Vec<&Value> = vec![doc];
+    if let Some(layer) = doc.get("default") {
+        if layer.is_object() {
+            holders.push(layer);
+        }
+    }
+    for holder in holders {
+        let cfg = match holder.get("policyBundle") {
+            None | Some(Value::Null) => continue,
+            Some(v) => v,
+        };
+        if !cfg.is_object() {
+            return Some((String::new(), String::new()));
+        }
+        let path = cfg.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let lockfile = cfg.get("lockfile").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if path.is_empty() || lockfile.is_empty() {
+            return Some((String::new(), String::new()));
+        }
+        return Some((expand_home(path), expand_home(lockfile)));
+    }
+    None
+}
+
+/// (digest, reason). The lockfile is JSON: {"sha256": "<64 lowercase hex>"}.
+/// Any other shape is malformed and therefore fails closed.
+fn read_lock_digest(path: &str) -> (Option<String>, Option<&'static str>) {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return (None, Some(POLICY_BUNDLE_LOCK_UNREADABLE)),
+    };
+    let data: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return (None, Some(POLICY_BUNDLE_LOCK_MALFORMED)),
+    };
+    if !data.is_object() {
+        return (None, Some(POLICY_BUNDLE_LOCK_MALFORMED));
+    }
+    let digest = match data.get("sha256").and_then(|v| v.as_str()) {
+        Some(s) => s.trim().to_lowercase(),
+        None => return (None, Some(POLICY_BUNDLE_LOCK_MALFORMED)),
+    };
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+        return (None, Some(POLICY_BUNDLE_LOCK_MALFORMED));
+    }
+    (Some(digest), None)
+}
+
+/// (document, actualDigest, expectedDigest, reason). `reason` is None only when
+/// the digest matched AND the bundle parsed as a JSON object. The digest is
+/// compared BEFORE parsing so an unpinned document is never interpreted.
+fn verify_policy_bundle(
+    path: &str,
+    lockfile: &str,
+) -> (Option<Value>, Option<String>, Option<String>, Option<&'static str>) {
+    if path.is_empty() || lockfile.is_empty() {
+        return (None, None, None, Some(POLICY_BUNDLE_MISCONFIGURED));
+    }
+    let raw = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return (None, None, None, Some(POLICY_BUNDLE_UNREADABLE)),
+    };
+    let actual = format!("{:x}", Sha256::digest(&raw));
+    let (expected, reason) = read_lock_digest(lockfile);
+    if let Some(reason) = reason {
+        return (None, Some(actual), expected, Some(reason));
+    }
+    if Some(&actual) != expected.as_ref() {
+        return (None, Some(actual), expected, Some(POLICY_BUNDLE_MISMATCH));
+    }
+    let text = match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(_) => return (None, Some(actual), expected, Some(POLICY_BUNDLE_MALFORMED)),
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) if v.is_object() => (Some(v), Some(actual), expected, None),
+        _ => (None, Some(actual), expected, Some(POLICY_BUNDLE_MALFORMED)),
+    }
+}
+
+/// Local layer keys override the bundle's, EXCEPT deny lists, which become the
+/// union of the bundle's entries and the local floor (this layer's own list
+/// when it defines one, else the local default layer's list). That is the
+/// no-loosening rule: an org baseline can add denials, never drop them.
+fn merge_bundle_layer(
+    bundle_layer: Option<&Value>,
+    local_layer: Option<&Value>,
+    local_default: &Value,
+) -> Value {
+    let empty = serde_json::Map::new();
+    let bundle_map = bundle_layer.and_then(|v| v.as_object()).unwrap_or(&empty);
+    let local_map = local_layer.and_then(|v| v.as_object()).unwrap_or(&empty);
+    let mut merged = bundle_map.clone();
+    for (k, v) in local_map.iter() {
+        merged.insert(k.clone(), v.clone());
+    }
+    for key in POLICY_BUNDLE_DENY_KEYS.iter() {
+        let floor = match local_map.get(*key) {
+            Some(v) if v.is_array() => Some(v.clone()),
+            _ => local_default.get(*key).filter(|v| v.is_array()).cloned(),
+        };
+        let mut union: Vec<Value> = Vec::new();
+        for values in [bundle_map.get(*key).cloned(), floor].iter().flatten() {
+            if let Some(arr) = values.as_array() {
+                for value in arr {
+                    if !union.contains(value) {
+                        union.push(value.clone());
+                    }
+                }
+            }
+        }
+        if !union.is_empty() {
+            merged.insert((*key).to_string(), Value::Array(union));
+        }
+    }
+    Value::Object(merged)
+}
+
+/// A verified bundle supplies the baseline "default"/"clients" layers; the
+/// local policy document is layered on top. Local root keys (including the
+/// policyBundle stanza itself) are preserved.
+fn compose_bundle_policy(bundle: &Value, local: &Value) -> Value {
+    let empty = serde_json::Map::new();
+    let local_map = local.as_object().unwrap_or(&empty);
+    let local_default = local
+        .get("default")
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let mut composed = serde_json::Map::new();
+    for (k, v) in local_map.iter() {
+        if k != "default" && k != "clients" {
+            composed.insert(k.clone(), v.clone());
+        }
+    }
+    composed.insert(
+        "default".to_string(),
+        merge_bundle_layer(bundle.get("default"), local.get("default"), &local_default),
+    );
+    let bundle_clients = bundle.get("clients").and_then(|v| v.as_object()).unwrap_or(&empty);
+    let local_clients = local.get("clients").and_then(|v| v.as_object()).unwrap_or(&empty);
+    let mut names: Vec<String> = bundle_clients.keys().cloned().collect();
+    for name in local_clients.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    let mut clients = serde_json::Map::new();
+    for name in names {
+        clients.insert(
+            name.clone(),
+            merge_bundle_layer(bundle_clients.get(&name), local_clients.get(&name), &local_default),
+        );
+    }
+    composed.insert("clients".to_string(), Value::Object(clients));
+    Value::Object(composed)
+}
+
+/// policyInfo view: path, verification result, truncated digest. Metadata only
+/// -- bundle CONTENTS are never returned, matching the existing rule that
+/// policyInfo discloses paths, not policy bodies.
+fn policy_bundle_info() -> Value {
+    let state = policy_bundle_state();
+    match state.path {
+        None => Value::Null,
+        Some(path) => json!({
+            "path": path,
+            "verified": state.verified,
+            "digest": short_digest(state.digest.as_deref()),
+        }),
+    }
+}
+
+fn audit_policy_bundle_rejected(
+    host_dir: &Path,
+    logger: &Arc<Logger>,
+    path: &str,
+    reason: &str,
+    expected: Option<&str>,
+    actual: Option<&str>,
+) {
+    let targets: Vec<String> = if path.is_empty() { Vec::new() } else { vec![path.to_string()] };
+    write_audit_event(host_dir, logger, &json!({
+        "ts": now_ms() as u64,
+        "client": "host",
+        "action": "policyBundle",
+        "targets": targets,
+        "decision": POLICY_BUNDLE_DECISION,
+        "reason": reason,
+        "requestId": Value::Null,
+        "expectedDigest": expected,
+        "actualDigest": actual,
+    }));
+}
+
+/// The local policy file only: fail-closed default and logs load errors.
+fn load_local_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
     let path = policy_file_path(host_dir);
     match std::fs::read_to_string(&path) {
         Ok(s) => match serde_json::from_str::<Value>(&s) {
@@ -814,10 +1256,6 @@ fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
                 default_policy()
             }
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
-            default_policy()
-        },
         Err(e) => {
             log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
             default_policy()
@@ -825,10 +1263,77 @@ fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
     }
 }
 
-/// Shared policy value plus the recorded policy-file mtime, reloadable under a lock.
+/// The effective policy document: the local policy file, or -- when it names a
+/// policyBundle -- the VERIFIED bundle with the local file layered on top.
+fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
+    let local = load_local_policy(host_dir, logger);
+    let config = match policy_bundle_config(&local) {
+        None => {
+            set_policy_bundle_state(PolicyBundleState::default());
+            return local;
+        }
+        Some(cfg) => cfg,
+    };
+    let (path, lockfile) = config;
+    let (doc, actual, expected, reason) = verify_policy_bundle(&path, &lockfile);
+    if let Some(reason) = reason {
+        set_policy_bundle_state(PolicyBundleState {
+            path: Some(path.clone()),
+            lockfile: Some(lockfile.clone()),
+            verified: false,
+            digest: actual.clone(),
+        });
+        log_error(logger, &format!(
+            "Rejected policy bundle {}: {} (expected {}, actual {}); serving built-in fail-closed default policy",
+            if path.is_empty() { "<unset>" } else { path.as_str() },
+            reason,
+            expected.clone().unwrap_or_else(|| "none".to_string()),
+            actual.clone().unwrap_or_else(|| "none".to_string()),
+        ));
+        audit_policy_bundle_rejected(
+            host_dir, logger, &path, reason, expected.as_deref(), actual.as_deref());
+        return default_policy();
+    }
+    set_policy_bundle_state(PolicyBundleState {
+        path: Some(path),
+        lockfile: Some(lockfile),
+        verified: true,
+        digest: actual,
+    });
+    match doc {
+        Some(bundle) => compose_bundle_policy(&bundle, &local),
+        None => default_policy(),
+    }
+}
+
+/// Every file the effective policy derives from, using the bundle paths the
+/// last load resolved. A swapped bundle or lockfile changes the signature, so
+/// its digest is re-verified instead of being trusted for the process's life.
+#[derive(Clone, PartialEq, Eq)]
+struct PolicySourceSig {
+    policy_mtime: Option<SystemTime>,
+    bundle_path: Option<String>,
+    bundle_mtime: Option<SystemTime>,
+    lock_path: Option<String>,
+    lock_mtime: Option<SystemTime>,
+}
+
+fn policy_source_signature(host_dir: &Path) -> PolicySourceSig {
+    let state = policy_bundle_state();
+    PolicySourceSig {
+        policy_mtime: file_mtime(&policy_file_path(host_dir)),
+        bundle_mtime: state.path.as_ref().and_then(|p| file_mtime(Path::new(p))),
+        bundle_path: state.path,
+        lock_mtime: state.lockfile.as_ref().and_then(|p| file_mtime(Path::new(p))),
+        lock_path: state.lockfile,
+    }
+}
+
+/// Shared policy value plus the signature of every file it derives from,
+/// reloadable under a lock.
 struct PolicyRegistry {
     value: Value,
-    policy_file_mtime: Option<SystemTime>,
+    sources: PolicySourceSig,
 }
 
 type Policy = Arc<RwLock<PolicyRegistry>>;
@@ -841,42 +1346,46 @@ type Policy = Arc<RwLock<PolicyRegistry>>;
 fn build_policy_registry(host_dir: &Path, logger: &Arc<Logger>) -> PolicyRegistry {
     let value = load_policy(host_dir, logger);
     prime_secret_masks(&value, host_dir, logger);
+    prime_audit_export(&value, host_dir, logger);
     PolicyRegistry {
         value,
-        policy_file_mtime: file_mtime(&policy_file_path(host_dir)),
+        // Computed AFTER the load: the load is what resolves the bundle paths
+        // this signature has to cover.
+        sources: policy_source_signature(host_dir),
     }
 }
 
-/// Cached-with-mtime read: reload when the policy file's mtime changes
+/// Cached-with-mtime read: reload when any policy source's mtime changes
 /// (including absent -> present) so changes take effect without a restart.
 fn current_policy(policy: &Policy, host_dir: &Path, logger: &Arc<Logger>) -> Value {
-    let cur = file_mtime(&policy_file_path(host_dir));
+    let cur = policy_source_signature(host_dir);
     if let Ok(reg) = policy.read() {
-        if cur == reg.policy_file_mtime {
+        if cur == reg.sources {
             return reg.value.clone();
         }
     }
     if let Ok(mut reg) = policy.write() {
-        if cur != reg.policy_file_mtime {
+        if cur != reg.sources {
             reg.value = load_policy(host_dir, logger);
-            reg.policy_file_mtime = cur;
+            reg.sources = policy_source_signature(host_dir);
             prime_secret_masks(&reg.value, host_dir, logger);
+            prime_audit_export(&reg.value, host_dir, logger);
         }
         return reg.value.clone();
     }
     default_policy()
 }
 
-const POLICY_LIST_KEYS: [&str; 6] = [
+const POLICY_LIST_KEYS: [&str; 7] = [
     "allowedActions", "deniedActions", "allowedOrigins", "deniedOrigins",
-    "requireConfirmation", "redactPatterns",
+    "requireConfirmation", "redactPatterns", "egressAllowlist",
 ];
 const POLICY_BOOL_KEYS: [&str; 2] = ["redact", "audit"];
 /// String-valued policy keys merged like bools: a later layer replaces the value.
 const POLICY_STR_KEYS: [&str; 2] = ["secretMaskFile", "traceDir"];
 /// Map-valued policy keys merged PER KEY: a later layer overrides only the
 /// origin patterns it names and inherits the rest. Mirrors bridge.py.
-const POLICY_MAP_KEYS: [&str; 1] = ["siteModes"];
+const POLICY_MAP_KEYS: [&str; 3] = ["siteModes", "dlp", "auditExport"];
 
 /// Merge: built-in default -> policy["default"] -> policy["clients"][name].
 fn policy_for_client(policy: &Value, name: &str) -> Value {
@@ -1037,6 +1546,26 @@ fn targets_from_payload(action: &str, payload: Option<&Value>) -> Vec<String> {
 fn origin_targets(origin: Option<&str>) -> Vec<String> {
     match origin {
         Some(o) if !o.is_empty() => normalize_url_targets(o),
+        _ => Vec::new(),
+    }
+}
+
+/// Normalized policy targets for the outbound destination an action would cause,
+/// or [] when the action names no destination the host can see. batch and
+/// replayWorkflow deliberately resolve to [] here: their steps are each evaluated
+/// by evaluate_policy, so a smuggled step is reported with its own index instead
+/// of being flattened into the composite's verdict.
+/// Mirrors bridge.py::egress_targets.
+fn egress_targets(action: &str, payload: Option<&Value>) -> Vec<String> {
+    if !EGRESS_URL_ACTIONS.contains(&action) {
+        return Vec::new();
+    }
+    match payload {
+        Some(p) if p.is_object() => p
+            .get("url")
+            .and_then(|u| u.as_str())
+            .map(normalize_url_targets)
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -1320,6 +1849,15 @@ fn evaluate_policy(
     if !action_matches(cp.get("allowedActions"), action) {
         return (false, Some(format!("action {} not allowed", action)), false, redact_enabled, audit_enabled, targets);
     }
+    // Data-loss-prevention channel gate. Placed after the action gates and before
+    // anything that could forward, so a blocked channel is refused while the
+    // request is still just JSON: no file is opened, no frame is read. batch and
+    // replayWorkflow belong to no channel themselves; their steps are evaluated
+    // recursively below and produce "<batch|workflow> step N: dlp blocked".
+    // Mirrors bridge.py::evaluate_policy.
+    if resolve_dlp_mode(&cp, dlp_channel_for_action(action)) == Some("block") {
+        return (false, Some(DLP_BLOCKED_ERROR.to_string()), false, redact_enabled, audit_enabled, targets);
+    }
     // Per-site permission mode. Applied to the confirmation requirement only,
     // and only after the action gates: every deny path below returns
     // confirm=false explicitly, so a deny still outranks any mode.
@@ -1400,6 +1938,24 @@ fn evaluate_policy(
     if !targets.is_empty() && !target_matches(cp.get("allowedOrigins"), &targets) {
         return (false, Some("target not allowed".to_string()), false, redact_enabled, audit_enabled, targets);
     }
+
+    // Egress allowlist (`egressAllowlist`): where the agent may make the browser
+    // SEND traffic, as opposed to which page it may act upon. Evaluated AFTER the
+    // action and site-target gates, so a denied action or a denied / non-allowed
+    // origin still wins and an egress grant can never widen site policy. Empty or
+    // absent means unconstrained. Mirrors bridge.py::evaluate_policy.
+    let egress_allow = cp.get("egressAllowlist");
+    let egress_active = matches!(egress_allow, Some(Value::Array(a)) if !a.is_empty());
+    if egress_active && EGRESS_URL_ACTIONS.contains(&action) {
+        let e_targets = egress_targets(action, payload);
+        // Fail closed: an egress-bearing action whose destination the host cannot
+        // resolve is denied rather than forwarded unchecked.
+        if e_targets.is_empty() || !target_matches(egress_allow, &e_targets) {
+            let reported = if e_targets.is_empty() { targets } else { e_targets };
+            return (false, Some("egress not allowed".to_string()), false,
+                    redact_enabled, audit_enabled, reported);
+        }
+    }
     (true, None, confirm, redact_enabled, audit_enabled, targets)
 }
 
@@ -1445,6 +2001,9 @@ fn policy_verdict(
         // "read_only" or "mutating". Computed from the payload, so a batch of
         // reads is read_only and a read whose flag changes state is mutating.
         "effectiveTier": effective_action_tier(action, payload),
+        // The resolved DLP mode for this action's channel, or null when the
+        // action belongs to no DLP channel.
+        "dlp": resolve_dlp_mode(&policy_for_client(policy, name), dlp_channel_for_action(action)),
     });
     (verdict, targets)
 }
@@ -1476,7 +2035,7 @@ fn plan_step_verdicts(policy: &Value, name: &str, plan: &[Value]) -> Vec<Value> 
 /// error string. The error string itself stays byte-stable for API and
 /// contract compatibility; this object tells a client exactly what to grant, in
 /// which list, and in which file. Mirrors bridge.py::policy_denial.
-fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, host_dir: &Path, policy: &Value) -> Value {
+fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, host_dir: &Path, policy: &Value, payload: Option<&Value>) -> Value {
     let policy_file = policy_file_path(host_dir).to_string_lossy().to_string();
     let sample = targets.first().cloned();
     // Strip a "batch step N: <inner>" wrapper so a denied batch step yields the
@@ -1513,6 +2072,15 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
             if !a.contains(' ') {
                 action = a.to_string();
             }
+        }
+    }
+    // DLP: resolve the blocked chokepoint before `action` is frozen, so a
+    // composite denial names the smuggled step's own action rather than "batch".
+    let mut dlp_channel: Option<&'static str> = None;
+    if reason == DLP_BLOCKED_ERROR {
+        if let Some((hit_action, channel)) = dlp_blocked_target(&policy_for_client(policy, name), &action, payload) {
+            action = hit_action;
+            dlp_channel = Some(channel);
         }
     }
     let reason = reason.as_str();
@@ -1564,6 +2132,17 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
              },
              if matched.is_empty() { Value::Null }
              else { json!({"op": "removePattern", "section": section, "list": "deniedOrigins", "value": sample, "patterns": matched}) })
+        } else if reason == "egress not allowed" {
+            let section = section_for("egressAllowlist");
+            ("egress",
+             match &sample {
+                 Some(s) => format!("Add a host pattern covering '{}' to {}.egressAllowlist in {}", s, section, policy_file),
+                 None => format!("Add the destination host to {}.egressAllowlist in {}", section, policy_file),
+             },
+             match &sample {
+                 Some(_) => json!({"op": "add", "section": section, "list": "egressAllowlist", "value": sample}),
+                 None => Value::Null,
+             })
         } else if reason.starts_with("action ") && reason.ends_with("denied") {
             let section = section_for("deniedActions");
             let cp = policy_for_client(policy, name);
@@ -1582,6 +2161,27 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
             ("target",
              "The request carried no resolvable target origin; supply a valid url/domain/tabId so site policy can be evaluated".to_string(),
              Value::Null)
+        } else if reason == DLP_BLOCKED_ERROR {
+            // `dlp` is a MAP key, so section_for (which tests for a list) cannot
+            // resolve it. It is also merged per channel, so a client layer only
+            // governs the channel it names.
+            let client_owns = dlp_channel
+                .and_then(|channel| policy
+                    .get("clients")
+                    .and_then(|c| c.get(name))
+                    .and_then(|l| l.get("dlp"))
+                    .and_then(|d| d.get(channel)))
+                .is_some();
+            let section = if client_owns { format!("clients.{}", name) } else { "default".to_string() };
+            let channel_name = dlp_channel.unwrap_or("the requested");
+            ("dlp",
+             format!("Set {}.dlp.{} to 'audit' or 'allow' in {} to permit '{}'",
+                     section, channel_name, policy_file, action),
+             match dlp_channel {
+                 Some(channel) => json!({"op": "setChannelMode", "section": section, "map": "dlp",
+                                         "channel": channel, "value": "audit"}),
+                 None => Value::Null,
+             })
         } else {
             ("other", format!("Review default policy in {}", policy_file), Value::Null)
         };
@@ -1594,6 +2194,8 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
         "remediation": remediation,
         "suggestedPatch": suggested,
         "batchStep": batch_step,
+        // The DLP channel that refused the request, or null for every other kind.
+        "dlpChannel": dlp_channel,
         "cli": "chrome-bridge policy doctor",
     })
 }
@@ -1754,6 +2356,11 @@ static AUDIT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// Append one JSON line to the audit log. Never writes payload/response bodies,
 /// and never any known secretMaskFile value (a denial reason can quote a
 /// target). A write failure is logged but never blocks browser automation.
+///
+/// The local log is the source of truth. The optional `auditExport` sink is a
+/// MIRROR of the line just committed here: it runs after the local append has
+/// returned, on the already-masked event, behind its own lock, so export can
+/// never precede, replace, or delay the local write.
 fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
     let path = audit_log_path(host_dir);
     let event = mask_secrets_value(event.clone(), &known_secret_masks());
@@ -1768,7 +2375,9 @@ fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
     };
     if let Err(e) = result {
         log_error(logger, &format!("Could not write audit event to {}: {}", path.display(), e));
+        return;
     }
+    forward_audit_export(host_dir, logger, &event);
 }
 
 /// Emit an audit event when audit is enabled for the client.
@@ -1797,6 +2406,494 @@ fn audit(
         "requestId": request_id,
     });
     write_audit_event(host_dir, logger, &event);
+}
+
+// --- Audit export forwarder (policy `auditExport`) -------------------------
+//
+// Mirrors bridge.py. An ADDITIONAL sink for audit events the local log already
+// holds. Export never computes a new event and never adds a field: it
+// re-encodes the exact masked object `write_audit_event` just committed, so no
+// payload body, no response body, and no unmasked secret can reach a SIEM that
+// the local log does not already carry.
+//
+// Configuration is the `auditExport` policy map, merged per key across the
+// `default` and `clients.<name>` layers. `format` is jsonl, syslog, or cef;
+// `destination` is a local file path (jsonl/cef) or udp://host:port,
+// tcp://host:port, or a unix datagram socket path (syslog). Null or absent
+// disables export entirely.
+//
+// Fail closed and loud: a malformed control block, or a sink that refuses a
+// write, disables that sink for the life of the process after exactly one log
+// line and exactly one `audit_export_unavailable` audit event.
+
+const AUDIT_EXPORT_FORMATS: [&str; 3] = ["jsonl", "syslog", "cef"];
+
+/// Bound on any network sink so a wedged collector cannot hold the export lock.
+const AUDIT_EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// RFC 5424 framing constants. Facility local0 (16); severity 4 (warning) for
+/// the deny/blackout class, 6 (informational) for everything else.
+const SYSLOG_FACILITY: u16 = 16;
+const SYSLOG_SEVERITY_ALERT: u16 = 4;
+const SYSLOG_SEVERITY_INFO: u16 = 6;
+const SYSLOG_APP_NAME: &str = "chrome-bridge";
+const SYSLOG_SD_ID: &str = "chromeBridge@0";
+
+/// ArcSight CEF header constants. The version field is the audit-export SCHEMA
+/// version, not the product version.
+const CEF_VENDOR: &str = "ChromeBridge";
+const CEF_PRODUCT: &str = "NativeHost";
+const CEF_VERSION: &str = "1.0";
+const CEF_SEVERITY_ALERT: u16 = 7;
+const CEF_SEVERITY_INFO: u16 = 3;
+
+/// Fixed field order for syslog structured data, so a Rust line and a Python
+/// line for the same event are byte-identical.
+const AUDIT_EXPORT_FIELDS: [&str; 6] =
+    ["client", "action", "decision", "reason", "requestId", "targets"];
+
+/// Key for the base (built-in + `default`) export layer. Client names are
+/// parsed from `name:token` lines, so a NUL can never collide with a real one.
+const POLICY_BASE_LAYER: &str = "\u{0}";
+
+#[derive(Clone)]
+struct AuditExportConfig {
+    format: String,
+    destination: String,
+    rotate_bytes: Option<u64>,
+    retain_days: Option<f64>,
+    key: String,
+}
+
+#[derive(Default)]
+struct AuditExportState {
+    layers: HashMap<String, Option<AuditExportConfig>>,
+    disabled: std::collections::HashSet<String>,
+}
+
+/// Serializes every export write (and therefore every rotation) under the
+/// thread-per-connection model, exactly like AUDIT_WRITE_LOCK does locally.
+/// Separate from it on purpose: a slow sink must never delay the local append.
+static AUDIT_EXPORT_LOCK: Mutex<()> = Mutex::new(());
+static AUDIT_EXPORT_STATE: Mutex<Option<AuditExportState>> = Mutex::new(None);
+
+/// Deny and blackout outcomes ride at the higher severity in both formats.
+fn audit_export_alerting(decision: Option<&Value>) -> bool {
+    let text = decision.and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    text.contains("deny") || text.contains("blackout") || text.contains("unavailable")
+}
+
+/// Render one audit field. Absent/null/empty is "-"; a non-string leaf is
+/// rendered as compact JSON so both hosts agree byte for byte.
+fn audit_export_scalar(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "-".to_string(),
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                "-".to_string()
+            } else {
+                s.clone()
+            }
+        }
+        Some(v) => serde_json::to_string(v).unwrap_or_else(|_| "-".to_string()),
+    }
+}
+
+fn audit_export_field(event: &Value, key: &str) -> String {
+    let value = event.get(key);
+    if key == "targets" {
+        return match value {
+            Some(Value::Array(items)) if !items.is_empty() => items
+                .iter()
+                .map(|v| audit_export_scalar(Some(v)))
+                .collect::<Vec<String>>()
+                .join(","),
+            _ => "-".to_string(),
+        };
+    }
+    audit_export_scalar(value)
+}
+
+fn audit_export_epoch_ms(event: &Value) -> Option<i64> {
+    let ts = event.get("ts")?;
+    ts.as_i64().or_else(|| ts.as_f64().map(|f| f as i64))
+}
+
+fn syslog_timestamp(event: &Value) -> String {
+    let ms = match audit_export_epoch_ms(event) {
+        Some(ms) => ms,
+        None => return "-".to_string(),
+    };
+    match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms) {
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// RFC 5424 6.3.3: only these three characters are escaped in PARAM-VALUE.
+fn syslog_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"").replace(']', "\\]")
+}
+
+/// MSGID is PRINTUSASCII, capped so a long action cannot unbalance the line.
+fn syslog_msgid(event: &Value) -> String {
+    let action = event.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let safe: String = action.chars().filter(|c| c.is_ascii_graphic()).take(32).collect();
+    if safe.is_empty() {
+        "-".to_string()
+    } else {
+        safe
+    }
+}
+
+fn cef_header_escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\n', " ")
+        .replace('\r', " ")
+}
+
+fn cef_value_escape(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('=', "\\=")
+        .replace('\n', "\\n")
+        .replace('\r', "\\n")
+}
+
+/// One export line for one audit event, without a trailing newline. Reads only
+/// fields the audit log already carries.
+fn format_audit_export_line(format: &str, event: &Value) -> Result<String, String> {
+    if format == "jsonl" {
+        return serde_json::to_string(event).map_err(|e| e.to_string());
+    }
+    let field = |key: &str| audit_export_field(event, key);
+    let alerting = audit_export_alerting(event.get("decision"));
+    if format == "syslog" {
+        let pri = SYSLOG_FACILITY * 8
+            + if alerting { SYSLOG_SEVERITY_ALERT } else { SYSLOG_SEVERITY_INFO };
+        let data = AUDIT_EXPORT_FIELDS
+            .iter()
+            .copied()
+            .map(|key| format!("{}=\"{}\"", key, syslog_escape(&field(key))))
+            .collect::<Vec<String>>()
+            .join(" ");
+        return Ok(format!(
+            "<{}>1 {} - {} - {} [{} {}]",
+            pri,
+            syslog_timestamp(event),
+            SYSLOG_APP_NAME,
+            syslog_msgid(event),
+            SYSLOG_SD_ID,
+            data
+        ));
+    }
+    if format == "cef" {
+        let rt = match audit_export_epoch_ms(event) {
+            Some(ms) => ms.to_string(),
+            None => "-".to_string(),
+        };
+        let header = format!(
+            "CEF:0|{}|{}|{}|{}|{}|{}",
+            CEF_VENDOR,
+            CEF_PRODUCT,
+            CEF_VERSION,
+            cef_header_escape(&field("decision")),
+            cef_header_escape(&field("action")),
+            if alerting { CEF_SEVERITY_ALERT } else { CEF_SEVERITY_INFO }
+        );
+        let extension = format!(
+            "rt={} suser={} act={} outcome={} externalId={} reason={} cs1Label=targets cs1={}",
+            cef_value_escape(&rt),
+            cef_value_escape(&field("client")),
+            cef_value_escape(&field("action")),
+            cef_value_escape(&field("decision")),
+            cef_value_escape(&field("requestId")),
+            cef_value_escape(&field("reason")),
+            cef_value_escape(&field("targets"))
+        );
+        return Ok(format!("{}|{}", header, extension));
+    }
+    Err(format!("unknown auditExport format {}", format))
+}
+
+/// Ok(config) or Err(reason). Fail closed: anything present but malformed
+/// returns an error and disables export rather than falling back to a looser
+/// sink.
+fn normalize_audit_export(config: Option<&Value>) -> Result<Option<AuditExportConfig>, String> {
+    let config = match config {
+        None | Some(Value::Null) => return Ok(None),
+        Some(v) => v,
+    };
+    if !config.is_object() {
+        return Err("auditExport must be an object".to_string());
+    }
+    let format = config.get("format");
+    let destination = config.get("destination");
+    let absent = |v: Option<&Value>| matches!(v, None | Some(Value::Null));
+    if absent(format) && absent(destination) {
+        return Ok(None);
+    }
+    let format = match format.and_then(|v| v.as_str()) {
+        Some(f) if AUDIT_EXPORT_FORMATS.contains(&f) => f.to_string(),
+        _ => {
+            return Err(format!(
+                "auditExport.format must be one of {}",
+                AUDIT_EXPORT_FORMATS.join(", ")
+            ))
+        }
+    };
+    let destination = match destination.and_then(|v| v.as_str()).map(|s| s.trim()) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => return Err("auditExport.destination must be a non-empty string".to_string()),
+    };
+    let rotate_bytes = match config.get("rotateBytes") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) if n.as_u64().is_some_and(|v| v > 0) => n.as_u64(),
+        _ => return Err("auditExport.rotateBytes must be a positive integer".to_string()),
+    };
+    let retain_days = match config.get("retainDays") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) if n.as_f64().is_some_and(|v| v > 0.0) => n.as_f64(),
+        _ => return Err("auditExport.retainDays must be a positive number".to_string()),
+    };
+    let key = format!("{}|{}", format, destination);
+    Ok(Some(AuditExportConfig { format, destination, rotate_bytes, retain_days, key }))
+}
+
+/// Resolve the merged auditExport for the base layer and every named client at
+/// policy load time. Sinks already disabled stay disabled: a reload must not
+/// silently re-arm a destination that already failed this process.
+fn prime_audit_export(policy: &Value, host_dir: &Path, logger: &Arc<Logger>) {
+    let mut names: Vec<String> = vec![POLICY_BASE_LAYER.to_string()];
+    if let Some(Value::Object(clients)) = policy.get("clients") {
+        names.extend(clients.keys().cloned());
+    }
+    let mut layers: HashMap<String, Option<AuditExportConfig>> = HashMap::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    for name in names {
+        let cp = policy_for_client(policy, &name);
+        match normalize_audit_export(cp.get("auditExport")) {
+            Ok(config) => {
+                layers.insert(name, config);
+            }
+            Err(reason) => {
+                layers.insert(name.clone(), None);
+                errors.push((name, reason));
+            }
+        }
+    }
+    if let Ok(mut guard) = AUDIT_EXPORT_STATE.lock() {
+        let state = guard.get_or_insert_with(AuditExportState::default);
+        state.layers = layers;
+    }
+    for (name, reason) in errors {
+        let label = if name == POLICY_BASE_LAYER { "default" } else { name.as_str() };
+        let key = format!("config|{}", label);
+        match AUDIT_EXPORT_STATE.lock() {
+            Ok(mut guard) => {
+                let state = guard.get_or_insert_with(AuditExportState::default);
+                if !state.disabled.insert(key) {
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        }
+        log_error(
+            logger,
+            &format!("Disabling auditExport for policy layer {}: {}", label, reason),
+        );
+        let client = if name == POLICY_BASE_LAYER { Value::Null } else { json!(label) };
+        write_audit_event(host_dir, logger, &json!({
+            "ts": now_ms() as u64,
+            "client": client,
+            "action": "auditExport",
+            "targets": [label],
+            "decision": "audit_export_unavailable",
+            "reason": reason,
+            "requestId": Value::Null,
+        }));
+    }
+}
+
+/// The sink for the client this event is attributed to, falling back to the
+/// base layer for host-level events that name no client.
+fn audit_export_sink(client: Option<&str>) -> Option<AuditExportConfig> {
+    let guard = AUDIT_EXPORT_STATE.lock().ok()?;
+    let state = guard.as_ref()?;
+    if let Some(name) = client {
+        if let Some(entry) = state.layers.get(name) {
+            return entry.clone();
+        }
+    }
+    state.layers.get(POLICY_BASE_LAYER).cloned().flatten()
+}
+
+fn audit_export_disabled(key: &str) -> bool {
+    match AUDIT_EXPORT_STATE.lock() {
+        Ok(guard) => guard.as_ref().is_some_and(|s| s.disabled.contains(key)),
+        Err(_) => true,
+    }
+}
+
+/// Single-generation rotation, no compression. retainDays prunes an existing
+/// <destination>.1 older than the window before the new one replaces it, so a
+/// rotated generation never outlives the retention window.
+fn audit_export_rotate(config: &AuditExportConfig, pending: u64) -> io::Result<()> {
+    let rotate = match config.rotate_bytes {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let path = PathBuf::from(&config.destination);
+    let size = match std::fs::metadata(&path) {
+        Ok(m) => m.len(),
+        Err(_) => return Ok(()),
+    };
+    if size + pending <= rotate {
+        return Ok(());
+    }
+    let rotated = PathBuf::from(format!("{}.1", config.destination));
+    if let Some(days) = config.retain_days {
+        if let Some(mtime) = file_mtime(&rotated) {
+            if let Ok(age) = SystemTime::now().duration_since(mtime) {
+                if age.as_secs_f64() > days * 86400.0 {
+                    let _ = std::fs::remove_file(&rotated);
+                }
+            }
+        }
+    }
+    std::fs::rename(&path, &rotated)
+}
+
+fn audit_export_syslog(destination: &str, line: &str) -> io::Result<()> {
+    let data = line.as_bytes();
+    for scheme in ["udp", "tcp"] {
+        let prefix = format!("{}://", scheme);
+        let rest = match destination.strip_prefix(&prefix) {
+            Some(r) => r,
+            None => continue,
+        };
+        let (host, port) = rest.rsplit_once(':').ok_or_else(|| {
+            io::Error::other(format!("syslog destination must be {}host:port", prefix))
+        })?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        if host.is_empty() {
+            return Err(io::Error::other(format!(
+                "syslog destination must be {}host:port",
+                prefix
+            )));
+        }
+        let port: u16 = port
+            .parse()
+            .map_err(|_| io::Error::other("syslog destination port must be a number"))?;
+        let target = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?
+            .next()
+            .ok_or_else(|| io::Error::other("syslog destination did not resolve"))?;
+        if scheme == "udp" {
+            let bind: std::net::SocketAddr = if target.is_ipv4() {
+                ([0u8, 0, 0, 0], 0).into()
+            } else {
+                (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+            };
+            let sock = std::net::UdpSocket::bind(bind)?;
+            sock.set_write_timeout(Some(AUDIT_EXPORT_TIMEOUT))?;
+            sock.send_to(data, target)?;
+        } else {
+            // RFC 6587 non-transparent framing: one LF-delimited message.
+            let mut stream = TcpStream::connect_timeout(&target, AUDIT_EXPORT_TIMEOUT)?;
+            stream.set_write_timeout(Some(AUDIT_EXPORT_TIMEOUT))?;
+            stream.write_all(data)?;
+            stream.write_all(b"\n")?;
+        }
+        return Ok(());
+    }
+    audit_export_unix_syslog(destination, data)
+}
+
+#[cfg(unix)]
+fn audit_export_unix_syslog(destination: &str, data: &[u8]) -> io::Result<()> {
+    let sock = std::os::unix::net::UnixDatagram::unbound()?;
+    sock.set_write_timeout(Some(AUDIT_EXPORT_TIMEOUT))?;
+    sock.send_to(data, destination)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn audit_export_unix_syslog(_destination: &str, _data: &[u8]) -> io::Result<()> {
+    Err(io::Error::other(
+        "unix socket syslog destinations are unsupported on this platform",
+    ))
+}
+
+fn audit_export_emit(config: &AuditExportConfig, line: &str) -> io::Result<()> {
+    if config.format == "syslog" {
+        return audit_export_syslog(&config.destination, line);
+    }
+    let mut data = line.as_bytes().to_vec();
+    data.push(b'\n');
+    audit_export_rotate(config, data.len() as u64)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.destination)?;
+    file.write_all(&data)
+}
+
+/// Mirror one already-written, already-masked audit event to the configured
+/// sink. Called only AFTER the local append succeeded.
+fn forward_audit_export(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
+    let config = match audit_export_sink(event.get("client").and_then(|v| v.as_str())) {
+        Some(c) => c,
+        None => return,
+    };
+    if audit_export_disabled(&config.key) {
+        return;
+    }
+    let mut failure: Option<String> = None;
+    match format_audit_export_line(&config.format, event) {
+        Err(reason) => failure = Some(reason),
+        Ok(line) => match AUDIT_EXPORT_LOCK.lock() {
+            Ok(_guard) => {
+                if audit_export_disabled(&config.key) {
+                    return;
+                }
+                if let Err(e) = audit_export_emit(&config, &line) {
+                    failure = Some(e.to_string());
+                }
+            }
+            Err(e) => failure = Some(format!("audit export lock poisoned: {}", e)),
+        },
+    }
+    let reason = match failure {
+        Some(r) => r,
+        None => return,
+    };
+    match AUDIT_EXPORT_STATE.lock() {
+        Ok(mut guard) => {
+            let state = guard.get_or_insert_with(AuditExportState::default);
+            if !state.disabled.insert(config.key.clone()) {
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+    log_error(
+        logger,
+        &format!(
+            "Disabling auditExport sink {} -> {}: {}",
+            config.format, config.destination, reason
+        ),
+    );
+    // The sink is already marked dead, so this event's own forward is a no-op:
+    // exactly one audit_export_unavailable per sink, never a recursion.
+    write_audit_event(host_dir, logger, &json!({
+        "ts": now_ms() as u64,
+        "client": event.get("client").cloned().unwrap_or(Value::Null),
+        "action": "auditExport",
+        "targets": [config.destination.clone()],
+        "decision": "audit_export_unavailable",
+        "reason": reason,
+        "requestId": Value::Null,
+    }));
 }
 
 // --- Session trace artifacts (policy `traceDir`) ---------------------------
@@ -2976,6 +4073,9 @@ fn handle_socket_client(
                 "siteMode": resolve_site_mode(
                     &policy_for_client(&policy_value, &client_name), &targets),
                 "effectiveTier": effective_action_tier(target_action, target_payload),
+                "dlp": resolve_dlp_mode(
+                    &policy_for_client(&policy_value, &client_name),
+                    dlp_channel_for_action(target_action)),
             }});
             audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &targets, "allow", None, None);
             trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
@@ -3003,6 +4103,7 @@ fn handle_socket_client(
                 "policyFile": policy_file.to_string_lossy(),
                 "policyFileExists": policy_file.exists(),
                 "auditLogFile": audit_log.to_string_lossy(),
+                "policyBundle": policy_bundle_info(),
                 "traceDir": trace_dir,
                 "client": client_name,
             }});
@@ -3045,7 +4146,7 @@ fn handle_socket_client(
         if !allowed {
             let reason = _reason.unwrap_or_default();
             audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
-            let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)});
+            let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value, payload.as_ref())});
             trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
                           &resp, "deny", Some(&reason), None, trace_started);
             let _ = write_line(&mut stream, &resp);
@@ -3090,7 +4191,7 @@ fn handle_socket_client(
                 let mut t = targets.clone();
                 t.push("<unresolved-origin>".to_string());
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &t, "deny", Some("tab origin unresolved"), None);
-                let resp = json!({"success": false, "error": "policy denied: tab origin unresolved", "policyDenial": policy_denial("tab origin unresolved", &action, &t, &client_name, host_dir, &policy_value)});
+                let resp = json!({"success": false, "error": "policy denied: tab origin unresolved", "policyDenial": policy_denial("tab origin unresolved", &action, &t, &client_name, host_dir, &policy_value, payload.as_ref())});
                 trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
                               &resp, "deny", Some("tab origin unresolved"), None, trace_started);
                 let _ = write_line(&mut stream, &resp);
@@ -3101,7 +4202,7 @@ fn handle_socket_client(
             if !allowed {
                 let reason = reason.unwrap_or_default();
                 audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
-                let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value)});
+                let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value, payload.as_ref())});
                 trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
                               &resp, "deny", Some(&reason), None, trace_started);
                 let _ = write_line(&mut stream, &resp);
@@ -3182,6 +4283,29 @@ fn handle_socket_client(
             host_dir,
             logger,
         );
+
+        // DLP: record the permitted channels and stamp the enforcing modes on the
+        // envelope. Runs once, here, after every gate and before the forward, so a
+        // request that never reaches Chrome never claims an audited transfer and
+        // one request writes at most one dlp_audit event. Mirrors bridge.py.
+        let dlp_audited = dlp_channels_in_mode(&client_policy, &action, payload.as_ref(), "audit");
+        if !dlp_audited.is_empty() {
+            // Channel names only: never a file name, a path, or frame data.
+            let dlp_channels = dlp_audited.join(",");
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets,
+                  DLP_AUDIT_DECISION, Some(dlp_channels.as_str()), None);
+        }
+        // The extension refuses a blocked channel independently (see background.js
+        // dlpRefusal), so the host always overwrites this field: a client cannot
+        // loosen it by supplying its own.
+        let dlp_modes = dlp_modes_for_client(&client_policy);
+        if let Value::Object(envelope) = &mut cmd {
+            if dlp_modes.is_empty() {
+                envelope.remove("dlp");
+            } else {
+                envelope.insert("dlp".to_string(), Value::Object(dlp_modes));
+            }
+        }
         let (req_id, response) = {
             let h = host_dir;
             let l = logger;

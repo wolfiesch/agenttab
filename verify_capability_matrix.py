@@ -23,6 +23,10 @@ QUIET_MODE = False
 
 
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-live-upload.txt"
+# A DLP-blocked upload must never read this file, so its content is a sentinel
+# the check greps for in the client's output.
+DLP_FIXTURE = "/tmp/chrome-bridge-live-dlp-upload.txt"
+DLP_FIXTURE_SENTINEL = "dlp-fixture-content-must-not-be-read"
 SHOT_PATH = "/tmp/chrome-bridge-live.png"
 PDF_PATH = "/tmp/chrome-bridge-live.pdf"
 HTML_PATH = "/tmp/chrome-bridge-live.html"
@@ -1679,6 +1683,41 @@ def main(quiet=False):
             cred_call
         )
 
+        # 49. T4-10 DLP. Runs after everything else because it rewrites the live
+        # policy: a `block` on the `upload` channel must refuse uploadFile
+        # host-side, before any file byte is read on the request's behalf. The
+        # fixture holds a sentinel string, and the proof is that the sentinel
+        # appears NOWHERE in the client's output.
+        Path(DLP_FIXTURE).write_text(DLP_FIXTURE_SENTINEL + "\n", encoding="utf-8")
+        dlp_policy = json.loads(json.dumps(policy))
+        dlp_policy["default"]["dlp"] = {"upload": "block"}
+        policy_path.write_text(json.dumps(dlp_policy, separators=(",", ":")), encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(policy_path, 0o600)
+        time.sleep(1.1)  # let the host pick up the new policy mtime
+        call = run_bridge("uploadFile", tab_id, "#file", DLP_FIXTURE)
+        blocked_output = (call.get("stdout") or "") + (call.get("stderr") or "")
+        sentinel_leaked = DLP_FIXTURE_SENTINEL in blocked_output
+        record(summary, "dlpBlockedUpload", call, {
+            "sentinelLeaked": sentinel_leaked,
+            "dlpBlocked": "dlp blocked" in blocked_output,
+        })
+        require(
+            call["exit"] != 0
+            and "dlp blocked" in blocked_output
+            and not sentinel_leaked,
+            "a dlp-blocked upload was not refused with 'dlp blocked' and no fixture content",
+            call
+        )
+        # An unconfigured channel is untouched by the same policy.
+        call = run_bridge("getCurrentState", tab_id)
+        record(summary, "dlpUnrelatedActionUnaffected", call)
+        require(call["exit"] == 0, "dlp block on upload must not affect other channels", call)
+        # Back to the matrix policy so the teardown restore is not the only path.
+        policy_path.write_text(json.dumps(policy, separators=(",", ":")), encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(policy_path, 0o600)
+
 
         # Compact JSON output on success
         print(json.dumps(summary, separators=(",", ":")))
@@ -1706,7 +1745,7 @@ def main(quiet=False):
         with contextlib.suppress(Exception):
             shutil.rmtree(SCREENCAST_DIR)
 
-        for path in [UPLOAD_FIXTURE, SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, STRUCTURED_SCHEMA_PATH,
+        for path in [UPLOAD_FIXTURE, DLP_FIXTURE, SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, STRUCTURED_SCHEMA_PATH,
                      STRUCTURED_DATA_PATH, WORKFLOW_PATH, ACTION_CACHE_PATH, WORKFLOW_STASH_PATH,
                      EXPECT_SCHEMA_PATH, EXPECT_WORKFLOW_PATH, EXPECT_FAIL_WORKFLOW_PATH, LEGACY_WORKFLOW_PATH]:
             with contextlib.suppress(FileNotFoundError):

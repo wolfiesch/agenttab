@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import glob
+import hashlib
 import json
 import os
 import re
@@ -653,6 +654,9 @@ _BUILTIN_DEFAULT_LISTS = {
         "*://*.local", "*://*.local:*",
         "*://[[]::1[]]", "*://[[]::1[]]:*",
     ],
+    # Where the agent may make the browser SEND traffic. Empty (the built-in
+    # default) means unconstrained.
+    "egressAllowlist": [],
 }
 
 
@@ -683,10 +687,47 @@ def _policy_add_to_list(policy, client, list_key, value, explicit):
     return True
 
 
+def _policy_remove_from_list(policy, client, list_key, value, explicit):
+    # Mirror of _policy_add_to_list. A missing list is seeded from the inherited
+    # effective list first, so clearing a pattern the default layer supplied
+    # actually takes effect for a client layer instead of silently doing nothing.
+    container, key = _policy_section(policy, client, explicit)
+    section = container.setdefault(key, {})
+    if list_key not in section:
+        section[list_key] = _effective_inherited_list(policy, container, key, list_key)
+    lst = section[list_key]
+    if value not in lst:
+        return False
+    while value in lst:
+        lst.remove(value)
+    return True
+
+
 # The host's accepted values for a siteModes entry, mirrored from bridge.py
 # SITE_MODES / host-rs SITE_MODES. Validated locally so a typo is rejected here
 # instead of being silently ignored by the host at evaluation time.
 _SITE_MODES = ("manual", "auto", "skip")
+
+# The host's DLP channels and modes, mirrored from bridge.py DLP_CHANNELS /
+# DLP_MODES and host-rs DLP_CHANNELS / DLP_MODES. Validated locally so a typo is
+# rejected here rather than resolving to the host's fail-closed ``block``.
+_DLP_CHANNELS = ("clipboard", "upload", "download", "screenShare")
+_DLP_MODES = ("allow", "audit", "block")
+
+
+def _policy_set_dlp_mode(policy, client, channel, mode, explicit):
+    # dlp is merged per channel by both hosts, so a client-layer entry never drops
+    # the default layer's other channels and needs no inherited seeding.
+    container, key = _policy_section(policy, client, explicit)
+    section = container.setdefault(key, {})
+    modes = section.get("dlp")
+    if not isinstance(modes, dict):
+        modes = {}
+        section["dlp"] = modes
+    if modes.get(channel) == mode:
+        return False
+    modes[channel] = mode
+    return True
 
 
 def _policy_set_site_mode(policy, client, pattern, mode, explicit):
@@ -714,10 +755,163 @@ def _policy_clear_site_mode(policy, client, pattern, explicit):
     return True
 
 
+# --- Content-addressed org policy bundles (host key ``policyBundle``) -------
+# These subcommands hash a bundle and manage its lockfile. They print METADATA
+# only -- path, digest, match -- never bundle contents, matching what the
+# host's policyInfo discloses.
+
+# Truncated digest length, mirroring bridge.py POLICY_BUNDLE_DIGEST_CHARS and
+# host-rs POLICY_BUNDLE_DIGEST_CHARS.
+POLICY_BUNDLE_DIGEST_CHARS = 12
+
+POLICY_BUNDLE_USAGE = (
+    "Usage: python3 test_client.py policy bundle "
+    "<verify|lock|show> [<bundlePath> --lockfile <lockPath>] [--force]")
+
+
+def _flag_value(args, flag):
+    # (value, remaining). Returns (None, args) when the flag is absent.
+    if flag not in args:
+        return None, args
+    index = args.index(flag)
+    if index + 1 >= len(args):
+        return None, args
+    return args[index + 1], args[:index] + args[index + 2:]
+
+
+def _bundle_digest(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        print(f"Error: cannot read policy bundle {path}: {exc}", file=sys.stderr)
+        return None
+    return digest.hexdigest()
+
+
+def _read_bundle_lock(path):
+    # (digest, status). status is "ok", "missing", or "malformed"; the host
+    # treats anything but a 64-hex ``sha256`` string as malformed and fails
+    # closed, so this mirrors that check instead of guessing.
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "malformed"
+    except Exception:
+        return None, "malformed"
+    if not isinstance(data, dict):
+        return None, "malformed"
+    digest = data.get("sha256")
+    if not isinstance(digest, str):
+        return None, "malformed"
+    digest = digest.strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return None, "malformed"
+    return digest, "ok"
+
+
+def _write_bundle_lock(path, bundle_path, digest):
+    # Mode 600 like the policy file: the lockfile is what authorizes an org
+    # baseline to take effect on this machine.
+    encoded = json.dumps({
+        "sha256": digest,
+        "bundle": os.path.basename(bundle_path),
+        "updated": datetime.now().astimezone().replace(microsecond=0).isoformat(),
+    }, indent=2) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+        os.write(fd, encoded.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _cmd_policy_bundle(args):
+    # verify/lock are local file operations and deliberately do NOT require a
+    # running host: an admin locks a bundle before the host ever loads it.
+    verb = args[3] if len(args) > 3 else ""
+    rest = list(args[4:])
+    force = "--force" in rest
+    rest = [a for a in rest if a != "--force"]
+    lockfile, rest = _flag_value(rest, "--lockfile")
+    bundle_path = rest[0] if rest else ""
+    if verb == "show":
+        info = _policy_paths()
+        if info is None:
+            return 1
+        bundle = info.get("policyBundle")
+        if not bundle:
+            print(json.dumps({
+                "policyFile": info.get("policyFile"),
+                "policyBundle": None,
+                "note": "No policyBundle configured; the local policy file is the only source.",
+            }, indent=2))
+            return 0
+        print(json.dumps({"policyFile": info.get("policyFile"),
+                          "policyBundle": bundle}, indent=2))
+        return 0 if bundle.get("verified") else 1
+    if verb not in ("verify", "lock") or not bundle_path or not lockfile:
+        print(POLICY_BUNDLE_USAGE, file=sys.stderr)
+        return 2
+    digest = _bundle_digest(bundle_path)
+    if digest is None:
+        return 1
+    expected, status = _read_bundle_lock(lockfile)
+    if verb == "verify":
+        matched = status == "ok" and expected == digest
+        exit_code = 0 if matched else 1
+        print(json.dumps({
+            "bundle": bundle_path,
+            "lockfile": lockfile,
+            "lockfileStatus": status,
+            "digest": digest,
+            "shortDigest": digest[:POLICY_BUNDLE_DIGEST_CHARS],
+            "expected": expected,
+            "match": matched,
+            "exitCode": exit_code,
+        }, indent=2))
+        if not matched:
+            print("Policy bundle does not match its lockfile; the host will "
+                  "fail closed to the built-in default policy.", file=sys.stderr)
+        return exit_code
+    if status == "malformed" and not force:
+        print(f"Error: lockfile {lockfile} is malformed; re-run with --force to "
+              "overwrite it.", file=sys.stderr)
+        return 1
+    if status == "ok" and expected != digest and not force:
+        print(f"Error: lockfile {lockfile} pins {expected[:POLICY_BUNDLE_DIGEST_CHARS]} "
+              f"but {bundle_path} hashes to {digest[:POLICY_BUNDLE_DIGEST_CHARS]}; "
+              "re-run with --force to repin.", file=sys.stderr)
+        return 1
+    _write_bundle_lock(lockfile, bundle_path, digest)
+    print(json.dumps({
+        "bundle": bundle_path,
+        "lockfile": lockfile,
+        "digest": digest,
+        "shortDigest": digest[:POLICY_BUNDLE_DIGEST_CHARS],
+        "changed": expected != digest,
+        "forced": bool(force and status == "ok" and expected != digest),
+    }, indent=2))
+    return 0
+
+
 def cmd_policy(args):
     sub = args[2] if len(args) > 2 else ""
     if sub == "info":
         return send_command("policyInfo")
+    if sub == "bundle":
+        # Handled before _policy_paths: verify/lock are offline file operations
+        # an admin runs before (or without) a running host.
+        return _cmd_policy_bundle(args)
     info = _policy_paths()
     if info is None:
         return 1
@@ -760,6 +954,33 @@ def cmd_policy(args):
         print(json.dumps({"success": True, "changed": changed, "origin": args[3],
                           "policyFile": policy_file}, indent=2))
         return 0
+    if sub == "allow-egress":
+        # Egress is CLI-managed only: MCP exposes no policy mutation.
+        require_args(args, 4, "Usage: python3 test_client.py policy allow-egress <pattern> [client]")
+        explicit = len(args) > 4
+        target_client = args[4] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_add_to_list(policy, target_client, "egressAllowlist", args[3], explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        print(json.dumps({"success": True, "changed": changed, "egress": args[3],
+                          "policyFile": policy_file}, indent=2))
+        return 0
+    if sub == "clear-egress":
+        require_args(args, 4, "Usage: python3 test_client.py policy clear-egress <pattern> [client]")
+        explicit = len(args) > 4
+        target_client = args[4] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_remove_from_list(policy, target_client, "egressAllowlist", args[3], explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        print(json.dumps({"success": True, "changed": changed, "egress": args[3],
+                          "policyFile": policy_file}, indent=2))
+        return 0
     if sub == "site-mode":
         require_args(args, 5, "Usage: python3 test_client.py policy site-mode <originPattern> manual|auto|skip [client]")
         mode = args[4]
@@ -790,8 +1011,37 @@ def cmd_policy(args):
         print(json.dumps({"success": True, "changed": changed, "origin": args[3],
                           "policyFile": policy_file}, indent=2))
         return 0
+    if sub == "dlp":
+        require_args(args, 5, "Usage: python3 test_client.py policy dlp <clipboard|upload|download|screenShare> allow|audit|block [client]")
+        channel = args[3]
+        mode = args[4]
+        if channel not in _DLP_CHANNELS:
+            print(f"DLP channel must be one of {', '.join(_DLP_CHANNELS)}", file=sys.stderr)
+            return 2
+        if mode not in _DLP_MODES:
+            print(f"DLP mode must be one of {', '.join(_DLP_MODES)}", file=sys.stderr)
+            return 2
+        explicit = len(args) > 5
+        target_client = args[5] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_set_dlp_mode(policy, target_client, channel, mode, explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        out = {"success": True, "changed": changed, "channel": channel,
+               "dlp": mode, "policyFile": policy_file}
+        if channel == "clipboard":
+            # Never let a policy edit imply coverage the bridge does not have.
+            out["note"] = ("clipboard is a declared channel with no bridge chokepoint: no "
+                           "bridge action reads or writes the clipboard and a page-driven copy "
+                           "never crosses the bridge, so this mode records intent and "
+                           "enforces nothing.")
+        print(json.dumps(out, indent=2))
+        return 0
     print("Usage: python3 test_client.py policy "
-          "<info|show|doctor|allow-action|allow-origin|site-mode|clear-site-mode> ...", file=sys.stderr)
+          "<info|show|doctor|bundle|allow-action|allow-origin|allow-egress|clear-egress|"
+          "site-mode|clear-site-mode|dlp> ...", file=sys.stderr)
     return 64
 
 
@@ -847,6 +1097,8 @@ def _policy_doctor(audit_file, policy_file):
             suggestion = {"cli": f"policy allow-origin '{targets[0]}'"}
         elif reason == "target denied" and targets:
             suggestion = {"manual": f"Remove or narrow the deniedOrigins pattern matching '{targets[0]}' in {policy_file}"}
+        elif reason == "egress not allowed" and targets:
+            suggestion = {"cli": f"policy allow-egress '{targets[0]}'"}
         denials.append({"action": action, "reason": reason, "targets": targets,
                         "batchStep": batch_step, "suggestion": suggestion})
     print(json.dumps({"policyFile": policy_file, "auditLogFile": audit_file,
@@ -1253,6 +1505,118 @@ def _audit_summary(since_ms):
     return 0
 
 
+# --- One-shot audit export (chrome-bridge audit export) --------------------
+#
+# Backfill, or a way to prove a destination works before enabling ``auditExport``
+# in policy. Independent of policy: it re-encodes lines the LOCAL audit log
+# already holds, using the host's own encoders so a CLI line and a live
+# forwarded line are the same bytes. Prints metadata only, never an exported
+# line: the audit log holds no payloads, and nothing here reconstructs one.
+
+AUDIT_EXPORT_USAGE = (
+    "Usage: chrome-bridge audit export --format <jsonl|syslog|cef> "
+    "--destination <path|udp://host:port|tcp://host:port|unix-socket-path> "
+    "[--since <ISO8601|7d|12h>] [--limit N] [--dry-run]")
+
+
+def _import_bridge():
+    # The host owns the export encoders. The CLI must not carry a second copy
+    # that could drift from what a SIEM actually receives.
+    if SCRIPT_DIR not in sys.path:
+        sys.path.insert(0, SCRIPT_DIR)
+    import bridge
+    return bridge
+
+
+def _parse_audit_export_args(rest):
+    # Returns (format, destination, since_ms, limit) or None on a usage error.
+    fmt = destination = None
+    since_ms = limit = None
+    index = 0
+    while index < len(rest):
+        flag = rest[index]
+        value = rest[index + 1] if index + 1 < len(rest) else None
+        if flag not in ("--format", "--destination", "--since", "--limit"):
+            print(f"Unknown option for audit export: {flag}", file=sys.stderr)
+            return None
+        if value is None:
+            print(f"Error: {flag} expects a value", file=sys.stderr)
+            return None
+        if flag == "--format":
+            fmt = value
+        elif flag == "--destination":
+            destination = value
+        elif flag == "--since":
+            since_ms = _parse_since(value)
+        else:
+            limit = parse_int(value, "limit")
+            if limit <= 0:
+                print("Error: --limit must be a positive integer", file=sys.stderr)
+                return None
+        index += 2
+    return fmt, destination, since_ms, limit
+
+
+def _audit_export(fmt, destination, since_ms, limit, dry_run):
+    bridge = _import_bridge()
+    if fmt not in bridge.AUDIT_EXPORT_FORMATS:
+        print(f"Error: --format must be one of {', '.join(bridge.AUDIT_EXPORT_FORMATS)}",
+              file=sys.stderr)
+        return 64
+    if not dry_run and not destination:
+        print("Error: --destination is required unless --dry-run is set", file=sys.stderr)
+        return 64
+    path, entries, malformed, exit_code = _load_audit_log()
+    if entries is None:
+        return exit_code
+    selected = []
+    undated = 0
+    for event in entries:
+        if since_ms is not None:
+            ms = _audit_event_ms(event)
+            if ms is None:
+                undated += 1
+                continue
+            if ms < since_ms:
+                continue
+        selected.append(event)
+    if limit is not None and limit < len(selected):
+        selected = selected[-limit:]
+    lines = []
+    unformattable = 0
+    for event in selected:
+        try:
+            lines.append(bridge.format_audit_export_line(fmt, event))
+        except Exception:
+            unformattable += 1
+    total_bytes = sum(len(line.encode("utf-8")) + 1 for line in lines)
+    if not dry_run:
+        # No rotation or retention on a backfill: the operator named this exact
+        # destination, and silently renaming their file would be a surprise.
+        config = {"format": fmt, "destination": destination,
+                  "rotateBytes": None, "retainDays": None}
+        try:
+            for line in lines:
+                bridge.audit_export_emit(config, line)
+        except Exception as exc:
+            print(f"Error: could not export to {destination}: {exc}", file=sys.stderr)
+            return 1
+    print(json.dumps({
+        "auditLog": path,
+        "format": fmt,
+        "destination": destination or "-",
+        "dryRun": dry_run,
+        "eventsRead": len(entries),
+        "eventsSelected": len(selected),
+        "eventsExported": 0 if dry_run else len(lines),
+        "bytes": total_bytes,
+        "skippedMalformed": malformed,
+        "skippedUnformattable": unformattable,
+        "skippedUndated": undated,
+    }, indent=2))
+    return 0
+
+
 def cmd_audit(args):
     sub = args[2] if len(args) > 2 else ""
     if sub == "tail":
@@ -1270,7 +1634,20 @@ def cmd_audit(args):
                 return 64
             since_ms = _parse_since(args[4])
         return _audit_summary(since_ms)
-    print("Usage: python3 test_client.py audit <tail [count] | summary [--since <ISO8601|7d|12h|30m>]>",
+    if sub == "export":
+        parsed = _parse_audit_export_args(args[3:])
+        if parsed is None:
+            print(AUDIT_EXPORT_USAGE, file=sys.stderr)
+            return 64
+        fmt, destination, since_ms, limit = parsed
+        # --dry-run is the process-wide flag, already stripped from argv.
+        if fmt is None:
+            print(AUDIT_EXPORT_USAGE, file=sys.stderr)
+            return 64
+        return _audit_export(fmt, destination, since_ms, limit, DRY_RUN)
+    print("Usage: python3 test_client.py audit <tail [count] "
+          "| summary [--since <ISO8601|7d|12h|30m>] "
+          "| export --format <jsonl|syslog|cef> --destination <dest>>",
           file=sys.stderr)
     return 64
 
@@ -1963,16 +2340,20 @@ COMMAND_HELP = {
         "Create and manage tabs owned by one task. Set state to working, needs_user, or completed.",
     ),
     "policy": (
-        "chrome-bridge policy info|show|doctor|allow-action|allow-origin|site-mode|clear-site-mode ...",
-        "Inspect the active local policy, explain recent denials, add a narrow action/origin grant, or set an origin's permission mode (manual gates every mutation, skip pre-approves confirmations that are not on the non-skippable list).",
+        "chrome-bridge policy info|show|doctor|bundle|allow-action|allow-origin|allow-egress|clear-egress|site-mode|clear-site-mode|dlp ...",
+        "Inspect the active local policy, explain recent denials, verify or lock a content-addressed org policy bundle, add a narrow action/origin grant, bound where automation may send traffic (egressAllowlist), set an origin's permission mode (manual gates every mutation, skip pre-approves confirmations that are not on the non-skippable list), or set a DLP channel mode (dlp <clipboard|upload|download|screenShare> allow|audit|block).",
     ),
     "schedule": (
         "chrome-bridge schedule workflow <workflowPath> --at <ISO8601>|--interval <seconds> [--name <name>] | schedule list | schedule remove <name>",
         "Register local metadata for a replayable workflow file. This starts nothing: Chrome Bridge runs no daemon and no timer, so an OS scheduler (cron, launchd, systemd) or a human must invoke the printed runCommand, and host policy still authorizes every step at run time.",
     ),
     "audit": (
-        "chrome-bridge audit tail [count] | audit summary [--since <ISO8601|7d|12h|30m>]",
-        "Read the local audit log: recent decisions as columns, or aggregate counts. Metadata only, never payloads.",
+        "chrome-bridge audit tail [count] | audit summary [--since <ISO8601|7d|12h|30m>] | "
+        "audit export --format <jsonl|syslog|cef> --destination <dest> "
+        "[--since <ISO8601|7d|12h>] [--limit N] [--dry-run]",
+        "Read the local audit log: recent decisions as columns, or aggregate counts. Metadata only, never payloads. "
+        "export re-encodes the existing local log to a file or syslog collector for backfill, or to prove a "
+        "destination before enabling the auditExport policy key; --dry-run formats and counts without writing.",
     ),
     "trace": (
         "chrome-bridge trace summary <traceId> | trace tail <traceId> [count] [--trace-dir <dir>]",

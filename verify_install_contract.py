@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline contract test for extension identity and install/deploy scripts."""
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -111,6 +112,8 @@ def expect_source_archive_omits_scratch_files(repo_root, dist, version):
 
         expected_tracked_public_files = [
             "bridge_policy.example.json",
+            "bridge_policy_bundle.example.json",
+            "bridge_policy_bundle.lock.example",
             "bridge_tokens.txt.example",
             "com.automation.bridge.json.template",
         ]
@@ -363,6 +366,40 @@ def expect_browser_manifest_contract(tmp):
 
 
 
+def expect_policy_bundle_examples():
+    # The tracked org-bundle examples must parse and must be obviously inert:
+    # a placeholder digest can never verify, so copying the pair verbatim fails
+    # closed instead of silently pinning something real.
+    bundle_path = SCRIPT_DIR / "bridge_policy_bundle.example.json"
+    lock_path = SCRIPT_DIR / "bridge_policy_bundle.lock.example"
+    try:
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        expect(False, f"example policy bundle should parse as JSON: {exc}")
+        return
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        expect(False, f"example bundle lockfile should parse as JSON: {exc}")
+        return
+    expect(isinstance(bundle.get("default"), dict) and isinstance(bundle.get("clients"), dict),
+           "example policy bundle should carry the default and clients layers a host merges")
+    expect("policyBundle" not in bundle,
+           "a bundle must not name another bundle; policyBundle belongs in the local policy file")
+    digest = lock.get("sha256")
+    expect(isinstance(digest, str) and len(digest) == 64 and set(digest) <= set("0123456789abcdef"),
+           f"example lockfile digest should be 64 lowercase hex characters, got {digest!r}")
+    expect(isinstance(digest, str) and set(digest) == {"0"},
+           f"example lockfile digest must be an obvious placeholder, got {digest!r}")
+    actual = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+    expect(digest != actual,
+           "example lockfile must not pin the example bundle; a real digest comes from "
+           "'chrome-bridge policy bundle lock'")
+    note = " ".join(str(v) for v in (lock.get("_comment"), bundle.get("_comment")) if v)
+    expect("policy bundle lock" in note,
+           "the examples should say a real digest must come from the lock command")
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -584,6 +621,7 @@ def main():
         expect_windows_installer_contract()
         expect_edge_setup_contract()
         expect_browser_manifest_contract(tmp)
+        expect_policy_bundle_examples()
     if failures:
         print(f"\n{len(failures)} install contract failure(s).")
         return 1

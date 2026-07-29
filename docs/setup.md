@@ -206,6 +206,43 @@ Stable extension identity: the script never creates, reads, or packages `extensi
 
 If you need a locally packed CRX with a stable ID instead, keep the private key outside the repository (never commit it) and pass it to Chrome's "Pack extension" flow; the repository stays key-free either way.
 
+## Managed distribution: shipping one policy to a fleet
+
+Chrome Bridge has no server, so an org baseline travels as a file plus a digest. The host applies the file only when the digest matches, which makes distribution channel-agnostic: MDM, config management, a signed package, or a shared read-only mount all work, because the lockfile - not the transport - is what authorizes the bundle.
+
+On the admin's machine, author the baseline and pin it:
+
+```bash
+cp bridge_policy_bundle.example.json org-policy.json
+# edit org-policy.json: default + clients layers, exactly like bridge_policy.json
+chrome-bridge policy bundle lock org-policy.json --lockfile org-policy.lock
+```
+
+`policy bundle lock` writes the bundle's SHA-256 into the lockfile (mode `600`). Editing the bundle later changes its digest, so re-run the same command; it refuses to repin a lockfile that holds a different digest unless you pass `--force`, which keeps an accidental edit from silently becoming the new baseline. `bridge_policy_bundle.lock.example` ships a placeholder digest of all zeros that can never verify - a real digest must come from this command.
+
+Ship both files to each machine (same directory, any path the host user can read), then point the machine's local policy at them:
+
+```json
+{
+  "policyBundle": {
+    "path": "/etc/chrome-bridge/org-policy.json",
+    "lockfile": "/etc/chrome-bridge/org-policy.lock"
+  }
+}
+```
+
+Confirm on the machine:
+
+```bash
+chrome-bridge policy bundle verify /etc/chrome-bridge/org-policy.json \
+  --lockfile /etc/chrome-bridge/org-policy.lock
+chrome-bridge policy bundle show
+```
+
+`verify` exits `0` only on a match; `show` reports what the running host resolved (`path`, `verified`, and a 12-character digest) and exits `1` when the active bundle is unverified. If a machine reports `verified: false`, the host is serving the built-in fail-closed default policy - only `ping`, `policyCheck`, `policyInfo`, and lease actions - and `chrome-bridge audit tail` shows one `policy_bundle_rejected` entry with the expected and actual digests.
+
+Two properties matter operationally. A machine's local `bridge_policy.json` still layers on top of the bundle, so a stricter machine can tighten the baseline without a separate bundle. And a bundle can never loosen a local deny list: composed `deniedActions`/`deniedOrigins` are the union of the bundle's and the machine's. To roll out a change, update the bundle, re-run `policy bundle lock`, and ship both files together - shipping a new bundle without its lockfile fails every machine closed rather than leaving the old policy in force. See docs/security.md for the full precedence and verification rules.
+
 ## Launchd broker mode
 
 Broker mode is optional on macOS. launchd keeps a small Python broker listening on public port `9223`; Chrome-launched Python or Rust native hosts bind backend port `19223`. Clients keep using `BRIDGE_PORT=9223`, or no override. On first install, `setup-broker.sh` seeds the state-dir token from the repo token so the existing `chrome-bridge` CLI keeps working; if both token files already exist and differ, the script warns and clients should set `BRIDGE_TOKEN_FILE` to the state token path.

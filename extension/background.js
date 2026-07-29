@@ -363,17 +363,49 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 scheduleHeartbeat();
 connectToHost();
 
+// --- DLP channel refusal (host policy key `dlp`) ----------------------------
+// The host stamps the resolved non-`allow` channel modes onto every forwarded
+// request as `dlp` and refuses a blocked channel before forwarding, so this is a
+// SECOND, independent gate rather than the only one. It matters because it sits
+// ahead of every handler: `uploadFile`, `githubAttachUploadedFiles`, and
+// `githubAttachPrBody` hand local paths to CDP `DOM.setFileInputFiles`, which is
+// where the browser process opens the file, and `downloadUrl` calls
+// `chrome.downloads.download`. Refusing here means a blocked upload never
+// reaches that call, so no file byte is ever read on behalf of the request. The
+// map is threaded explicitly (never stored in worker state) so a concurrent
+// request cannot be judged against another request's modes.
+//
+// `clipboard` is a declared channel with no action here: no bridge action reads
+// or writes the clipboard, and a page-driven copy never crosses the bridge.
+// Mirrors bridge.py DLP_ACTION_CHANNELS / host-rs dlp_channel_for_action.
+const DLP_ACTION_CHANNELS = {
+  uploadFile: "upload",
+  githubAttachUploadedFiles: "upload",
+  githubAttachPrBody: "upload",
+  downloadUrl: "download",
+  startScreencast: "screenShare",
+  screencastFrames: "screenShare"
+};
+
+function dlpRefusal(action, dlp) {
+  if (!dlp || typeof dlp !== "object") return null;
+  const channel = DLP_ACTION_CHANNELS[action];
+  if (!channel) return null;
+  if (dlp[channel] !== "block") return null;
+  return `dlp blocked: ${channel}`;
+}
+
 async function handleMessageFromHost(message) {
-  const { id, action, payload } = message;
+  const { id, action, payload, dlp } = message;
   try {
-    const result = await dispatchAction(action, payload);
+    const result = await dispatchAction(action, payload, dlp);
     sendResponseToHost({ id, success: true, result });
   } catch (error) {
     sendResponseToHost({ id, success: false, error: error.message });
   }
 }
 
-async function runBatch(steps, defaultTabId, stopOnError) {
+async function runBatch(steps, defaultTabId, stopOnError, dlp) {
   if (!Array.isArray(steps)) {
     throw new Error("batch requires a steps array");
   }
@@ -399,7 +431,7 @@ async function runBatch(steps, defaultTabId, stopOnError) {
       stepPayload.timeoutMs = step.timeoutMs;
     }
     try {
-      const stepResult = await dispatchAction(step.action, stepPayload);
+      const stepResult = await dispatchAction(step.action, stepPayload, dlp);
       if (stepResult && typeof stepResult === "object" && stepResult.success === false) {
         throw new Error(stepResult.error || stepResult.err || "step reported success=false");
       }
@@ -413,11 +445,15 @@ async function runBatch(steps, defaultTabId, stopOnError) {
   return results;
 }
 
-async function dispatchAction(action, payload) {
+async function dispatchAction(action, payload, dlp) {
+    // DLP channel refusal, ahead of every handler and inside every composite:
+    // a blocked upload is rejected before any code path can open a file.
+    const dlpBlocked = dlpRefusal(action, dlp);
+    if (dlpBlocked) throw new Error(dlpBlocked);
     let result;
     switch (action) {
       case "batch":
-        result = await runBatch(payload.steps, payload.tabId, payload.stopOnError);
+        result = await runBatch(payload.steps, payload.tabId, payload.stopOnError, dlp);
         break;
       case "ping":
         result = "pong";
@@ -652,7 +688,7 @@ async function dispatchAction(action, payload) {
         result = stopWorkflowRecording(payload);
         break;
       case "replayWorkflow":
-        result = await replayWorkflow(payload);
+        result = await replayWorkflow(payload, dlp);
         break;
       case "resolveCachedSelector":
         result = await resolveCachedSelector(payload);
@@ -5713,7 +5749,7 @@ async function selectorForReplay(action, stepPayload) {
   };
 }
 
-async function replayWorkflow(payload) {
+async function replayWorkflow(payload, dlp) {
   const workflow = payload?.workflow;
   if (!workflow || typeof workflow !== "object") {
     return { success: false, err: "replayWorkflow requires a workflow object" };
@@ -5809,7 +5845,7 @@ async function replayWorkflow(payload) {
         const originalSelector = stepPayload.selector;
         if (healing.selector !== undefined) stepPayload.selector = healing.selector;
         try {
-          let result = await dispatchAction(step.action, stepPayload);
+          let result = await dispatchAction(step.action, stepPayload, dlp);
           let selfHealed = healing.selfHealed === true;
           const cachedMiss = result && typeof result === "object" && !Array.isArray(result) && result.success === false;
           // A cached CSS path that resolves but no longer behaves gets one
@@ -5818,7 +5854,7 @@ async function replayWorkflow(payload) {
             const refreshed = await resolveCachedSelector({ tabId: stepPayload.tabId, selector: originalSelector, refresh: true });
             if (refreshed.success !== false) {
               stepPayload.selector = refreshed.resolvedSelector || originalSelector;
-              result = await dispatchAction(step.action, stepPayload);
+              result = await dispatchAction(step.action, stepPayload, dlp);
               selfHealed = true;
             }
           }

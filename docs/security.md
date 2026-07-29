@@ -15,8 +15,11 @@ The example policy is conservative: built-in defaults allow only `ping`, policy 
 - Host policy in `bridge_policy.json` (`BRIDGE_POLICY_FILE`) is the enforcement layer for every raw TCP/CLI/MCP client: the TCP API is localhost-only and token-gated, but token holders bypass MCP scoping, so deny/allow/confirmation rules are enforced in the native host before any action reaches the extension.
 - MCP `readonly`/`allow_sensitive` controls are usability scoping, not the security boundary, because a client with the token can call the raw TCP API directly. Use `bridge_policy.json` for real restrictions; use `browser_policy_check` (or `test_client.py policyCheck`) to see what the host would decide.
 - Built-in host defaults are fail-closed when no valid `bridge_policy.json` exists: only `ping`, `policyCheck`, `policyInfo`, and lease actions are allowed. `setup.sh` copies `bridge_policy.example.json` to make normal local automation an explicit opt-in. `policyInfo` is additionally answered host-side before the action gate (like `policyCheck`), so a client can always discover the active policy/audit file paths even under a deny-all policy; it returns only those paths, never policy contents.
+- An org can distribute the policy itself as a **content-addressed bundle** (`policyBundle`): the host applies the bundle only when its SHA-256 matches the digest pinned in a lockfile, fails closed to the built-in default on any mismatch or read/parse error, re-verifies on reload, and never lets a bundle drop a locally denied action or origin. See "Org policy bundles: verified, content-addressed baselines" below.
 - Actions listed in `requireConfirmation` return an opaque `confirmationToken` plus `resumeCommand`. `chrome-bridge confirm <token>` / MCP `browser_confirm` asks the host to recover the exact short-lived client identity, action, and payload; this intentionally allows an authenticated CLI client to approve a token produced by MCP. The older `browser_confirm_action` resend form remains available. Both paths re-run the original client's policy, live-origin, lease, and fingerprint checks before the host forwards anything, and tokens are one-use. Treat the opaque token as a short-lived local capability: this confirmation is friction against accidental use by a trusted token holder, not protection from a compromised bridge client or leaked token.
 - Site policy (`allowedOrigins`/`deniedOrigins`) applies to tab-scoped actions too, not just URL-carrying ones. For an action whose payload has no URL/domain (e.g. `click`, `type`, `executeScript`, `getHTML` on a `tabId`), the host resolves that tab's live origin through a reserved internal lookup and evaluates policy against it before forwarding. When policy constrains origins and the origin cannot be resolved, the action is denied (fail-closed). `policyCheck` cannot see the live origin without forwarding, so its result includes `originDependent: true` for such actions to flag that the real request is additionally origin-checked.
+- Egress policy (`egressAllowlist`) is a separate, narrower control: `allowedOrigins`/`deniedOrigins` govern **which page an action may act upon**, while `egressAllowlist` bounds **where the agent may make the browser send a new outbound request**. It is a list of host patterns using the same syntax and the same layered list merge as the origin lists, empty or absent means unconstrained, and it is enforced host-side before anything is forwarded. See "Egress allowlist: where the agent may send traffic" below for the covered actions, the precedence rules, and the traffic it deliberately cannot see.
+- Audit export (`auditExport`) forwards audit events to a SIEM. It is a **mirror, not a new source**: the host writes the local audit log first, then re-encodes that exact already-masked event for the sink, so nothing can reach a collector that `bridge_audit.jsonl` does not already hold - no payload body, no response body, no cookie, no storage value, and no `secretMaskFile` value. Formats are `jsonl`, RFC 5424 `syslog`, and ArcSight `cef`. A malformed control block or a sink that refuses a write disables that sink for the life of the process after exactly one `audit_export_unavailable` event, and never blocks automation. See "Audit export: what leaves the machine" below for the field mapping tables.
 - Python host only: set `BRIDGE_POLICY_APPROVAL_MODE=gui` (default on macOS) to show a native prompt when an otherwise-allowed action is blocked only because the target origin is not in `allowedOrigins`. The prompt offers `Deny`, `Allow This Time`, and `Always Allow`. `Allow This Time` creates a TTL-bound one-shot in-memory origin grant for the exact client/action/payload/target; `Always Allow` adds that origin to the local `bridge_policy.json`. Origin approval only authorizes the site, then the host re-runs normal policy evaluation, so actions in `requireConfirmation` still require a confirmation token. Set `BRIDGE_POLICY_APPROVAL_MODE=off` to disable prompts, or `BRIDGE_POLICY_APPROVAL_MODE=command` with `BRIDGE_POLICY_APPROVAL_COMMAND` for tests/custom frontends. Rust host users currently get the conservative deny/doctor flow without this GUI approval UX.
 - Per-site permission modes (`siteModes`) attach a mode to an origin pattern instead of an action: `manual`, `auto` (the default when no pattern matches), or `skip`. They are merged **per pattern** across the `default` and `clients.<name>` layers, so a client layer overriding one origin inherits every other origin's mode. A mode only moves the confirmation gate, never the action or origin gates: a `deniedActions` or `deniedOrigins` match still denies, and `skip` only relaxes actions the policy already allows. `manual` requires a confirmation token for every mutating or high-risk action on a matching origin even when nothing is listed in `requireConfirmation`. `skip` pre-approves the confirmation gate for a matching origin, so no token is minted at all - and the waiver is written to the audit log as decision `confirmation_waived` with reason `siteMode skip`, because under an unattended pre-approval that log entry is the only trace a human later sees. When two patterns match, the longest pattern wins (a length tie is broken by the lexicographically smaller pattern) in both hosts, and a value outside `manual|auto|skip` is ignored rather than guessed at. `policyCheck`, `policyCheck --plan`, and every `dryRun` verdict report the resolved `siteMode` (null when no origin is known yet or no pattern matches). Edit modes with `chrome-bridge policy site-mode <originPattern> manual|auto|skip [client]` and `chrome-bridge policy clear-site-mode <originPattern> [client]`; MCP deliberately exposes no policy-mutation tool.
 - `skip` can **never** waive these non-skippable confirmations, in either host: `executeScript`, `executeScriptCDP`, `getCookies`, `storageState`, `setCookie`, `deleteCookie`, `setStorageItem`, `removeStorageItem`, `clearStorage`, `startScreencast`, `clickAt`. They execute arbitrary script, read or rewrite real profile credentials and storage, start continuous capture of a logged-in profile, or click with no auditable element identity. An origin-level pre-approval is a statement about a *site*, not about those capabilities, so they keep requiring a per-call token no matter what `siteModes` says.
@@ -54,6 +57,86 @@ The example policy is conservative: built-in defaults allow only `ping`, policy 
 - Typed and stored values are redacted out of recordings by default. `type`/`fill` text, `setCookie`/`setStorageItem` values, `handleDialog` prompt text, and any credential-shaped payload key (`token`, `password`, `secret`, `credential`, `authorization`, `api_key`) are recorded as `<redacted>` with `requiresValue: true` and a `bindingKeys` entry, so a macro of a login never carries the password. Replay refuses the **entire** workflow - before running any step - until every redacted field is supplied through `bindings`/`--binding step<N>.<field>=<value>`, which keeps the secret in the caller's hands rather than on disk and prevents a partially-applied macro that stops at the credential field. `recordSensitive: true` (CLI `--record-sensitive`) opts one recording or one call out of that redaction and writes the literal value into the workflow file; use it only when you accept that file as a secret.
 - **A postcondition is an assertion, not a read.** A version-2 workflow step may carry an `expect` clause, and `expect` is also a standalone action. It returns only `mode`, `negate`, `passed`, `attempts`, `elapsedMs`, and a short `reason` when it failed; the matched element, the matched text, the tab URL, and the extracted values never come back, so a failing assertion cannot be used to read a page an observation action is not allowed to read. `expect` changes nothing, so it appears in none of the mutating, sensitive, or destructive sets and stays on the read-only side of the classification. It is not exempt from the origin gate: both hosts enumerate a step's `expect` clause as a nested `expect` step during the same `replayWorkflow` recursion that polices the steps themselves, so a postcondition aimed at a tab the policy does not grant is denied with the rest of the replay rather than riding in unexamined. Retry is bounded by construction - `retry.max` clamps to `0..5` and `retry.delayMs` to `0..10000` - so an authored workflow cannot turn into an unbounded poll of a page that is never going to settle.
 - The semantic-selector cache only self-heals **semantic** selectors (`text=`, `label=`, `role=`, `aria=`). A CSS selector is a literal address and is never cached or retargeted, so a stale CSS step fails instead of silently acting on a different element. A cached entry maps `(origin+pathname, semantic selector)` to a CSS path that resolved once, and a hit is trusted only when that path and the original semantic selector resolve to the **same live DOM node**: a path that still resolves but now addresses a replacement element is discarded just like one that stopped resolving, the semantic selector is re-resolved, and the step reports `selfHealed: true`. That closes the case where a page swaps a control and the old path keeps matching something - "still resolves" is not "still the right element". Entries imported from a cache file are rejected unless their selector is semantic and go through the same identity check at resolution time, so an edited `bridge_action_cache.json` cannot redirect a step onto a substituted element. The file is git-ignored and mode `600`: it holds no page content, but it does map a site's DOM structure.
+
+## Egress allowlist: where the agent may send traffic
+
+`egressAllowlist` answers a different question from the origin lists. `allowedOrigins`/`deniedOrigins` decide which page an action may operate on; `egressAllowlist` decides which hosts the agent may cause the browser to contact. Both are enforced in the native host before a request reaches the extension, and both use the same pattern syntax (`https://github.com`, `*://*.github.com`, ...) and the same list merge across the `default` and `clients.<name>` layers. Empty or absent means no egress constraint, so a policy that never sets it behaves exactly as before.
+
+A violation is denied with the error `policy denied: egress not allowed` and a `policyDenial` companion whose `kind` is `egress`, whose `targets` name the destination that was refused, and whose `suggestedPatch` adds the pattern to the governing section's `egressAllowlist`. Grant one with `chrome-bridge policy allow-egress <pattern>` and remove one with `chrome-bridge policy clear-egress <pattern>`; MCP exposes no policy mutation, so egress is CLI-managed and `browser_policy_check` is how an MCP client sees the resulting denial.
+
+**What it covers.** Exactly the actions whose payload names the destination, so the host can see it:
+
+| Action | Destination the host reads | Why it is egress |
+| --- | --- | --- |
+| `navigate` | `payload.url` | drives the tab to that host |
+| `navigateTaskSession` | `payload.url` | same, inside a task session's own tab |
+| `downloadUrl` | `payload.url` | fetches that URL through the real profile |
+| `setCookie` | `payload.url` | writes a cookie scoped to that host, which the browser then attaches to its next request there |
+
+`batch` and `replayWorkflow` are not exempt: both hosts already walk their steps before forwarding the composite, so a nested `navigate` outside the allowlist denies the whole request as `batch step <n>: egress not allowed` / `workflow step <n>: egress not allowed`, with the index in `policyDenial.batchStep`. An egress-bearing action whose destination the host cannot resolve (missing or unparseable `url`) is denied rather than forwarded unchecked.
+
+**Precedence.** Egress is evaluated alongside the target checks and never widens anything:
+
+1. `deniedActions` wins. A denied action stays denied no matter what the egress allowlist says.
+2. `allowedActions` wins. An action that is not allowed stays not allowed.
+3. `deniedOrigins` then `allowedOrigins` win. A denied or non-allowed origin is still reported as `target denied` / `target not allowed`, even when the same host is on the egress allowlist. **Being on the egress allowlist never grants an origin that site policy denies.**
+4. Only then is `egressAllowlist` applied.
+
+`siteModes` and `requireConfirmation` are untouched: egress is a deny gate, so it never mints, waives, or consumes a confirmation token. `policyCheck` and `dryRun` gain no new fields; the denial simply surfaces as `verdict.reason: "egress not allowed"`, and a plan preview evaluates egress per step.
+
+**What it cannot see, and therefore does not cover.** This is a real limitation, not an omission - do not read an egress allowlist as a claim that the browser can only talk to the listed hosts:
+
+- **In-page navigation the agent triggers indirectly.** `click`, `press`, `type`, `fill`, and `drag` can follow a link or submit a form to any host. The destination lives in page markup the host never parses, so the host cannot know it. Such actions remain governed by site policy against the tab's live origin only.
+- **Script-issued requests.** `executeScript` and `executeScriptCDP` can `fetch()` anywhere; the URL is inside the script body. These actions are confirmation-gated in the example policy precisely because they are unbounded.
+- **Resource loads a page makes on its own.** Subresources, XHR, `fetch`, WebSockets, and beacons issued by a page the agent merely opened are the browser's normal behavior and are invisible to the host.
+- **Uploads.** `uploadFile` and the `githubAttach*` helpers post to the tab's own origin, which site policy already governs, so they are not separately egress-checked.
+- **`startInterception` in `fulfill` mode** fetches nothing: the extension answers from the inline `body`, so no new outbound request exists to bound. `continue` and `abort` likewise create no destination the host chooses.
+- **`deleteCookie`** names a `url` but removes state and sends nothing.
+
+The honest summary: `egressAllowlist` bounds the destinations an agent can name in a request, which is where an exfiltration attempt most often has to name a host. It does not and cannot bound every byte a real Chrome profile emits. Pair it with a narrow `allowedOrigins`, keep `executeScript*` confirmation-gated, and use the network layer (a proxy, DNS policy, or firewall) when you need an actual traffic boundary.
+
+## DLP channels: what a mode actually enforces
+
+`dlp` attaches a data-loss-prevention mode to a *channel* rather than to an action or an origin. It is enforced in the native host, before anything is forwarded to Chrome, and it is merged **per channel** across the `default` and `clients.<name>` layers, so a client layer can tighten one channel and inherit the rest.
+
+```json
+"dlp": {"upload": "audit", "download": "block", "screenShare": "audit"}
+```
+
+Three modes, identical in both hosts:
+
+| Mode | Effect |
+| --- | --- |
+| `allow` | Default, and what an absent channel resolves to. Nothing is added; behavior is exactly as before. |
+| `audit` | The action runs, and exactly one audit event with decision `dlp_audit` is written, naming the channel and nothing else. No file name, no file path, no frame data, no payload body. |
+| `block` | The action is denied with reason `dlp blocked` and error `policy denied: dlp blocked`, carrying a `policyDenial` whose `kind` is `dlp` and whose `dlpChannel` names the channel. Nothing is forwarded. |
+
+A mode outside those three (a typo) resolves to **`block`**, not to `allow`. A data-loss control that fails open because someone wrote `"blocked"` would be worse than no control, so the fail-closed direction is deliberate and differs from `siteModes`, where an unknown value is ignored.
+
+The channels, and the exact chokepoints each one gates:
+
+| Channel | Gated actions | Where enforcement lands |
+| --- | --- | --- |
+| `upload` | `uploadFile`, `githubAttachUploadedFiles`, `githubAttachPrBody` | The host refuses before forwarding, so CDP `DOM.setFileInputFiles` is never dispatched and the browser process never opens the file. The extension additionally refuses in `dispatchAction`, ahead of every handler, using the modes the host stamps on the forwarded envelope. |
+| `download` | `downloadUrl` | The host refuses before forwarding, so `chrome.downloads.download` is never called. |
+| `screenShare` | `startScreencast`, `screencastFrames` | The host refuses both the capture start and the frame read, so no frame is buffered and no buffered frame is drained. |
+| `clipboard` | *(none)* | **Declared but not enforceable here.** See below. |
+
+A gated action cannot be smuggled through a composite: `batch` and `replayWorkflow` steps are evaluated recursively, and a blocked step denies the whole request with `batch step <n>: dlp blocked` / `workflow step <n>: dlp blocked`. The `policyDenial` reports that step index in `batchStep` and names the smuggled step's own action, not the enclosing `batch`.
+
+`policyCheck`, `browser_policy_check`, plan preflight steps, and dry-run verdicts all carry `dlp`: the resolved mode for that action's channel, or `null` when the action belongs to no channel.
+
+### What DLP here cannot see
+
+State this plainly rather than implying coverage:
+
+- **`clipboard` has no bridge chokepoint.** No bridge action reads or writes the clipboard, and a copy or paste the *page* performs - `document.execCommand('copy')`, a `copy` event handler, the async Clipboard API, or a human pressing Cmd-C - never crosses the bridge at all. The channel is declared so that a policy can record the intent and so that a future clipboard action cannot be added without a mode already governing it, but setting `"clipboard": "block"` today **enforces nothing**. It is deliberately omitted from `bridge_policy.example.json` rather than listed as if it were covered.
+- **Content, not just the channel, is out of scope.** A mode decides whether the channel may be used; it never inspects file contents, page text, or frame pixels. There is no classifier, no regex scan of an uploaded file, and no partial redaction of a transfer. `redactPatterns` and `secretMaskFile` govern what leaves the host in a *response*; they do not read an upload.
+- **The `audit` event is metadata only.** It records the channel name so that a later review can see that a transfer happened on that channel. It deliberately does not record the file name, the path, the byte count, or the destination, because an audit log that quotes a path is itself a disclosure surface.
+- **An upload's destination is still site policy's job.** An upload posts to the tab's own origin; `allowedOrigins`/`deniedOrigins` decide which origin that may be. DLP decides only whether the upload channel may be used at all.
+- **Anything a page does on its own.** A page that exfiltrates by `fetch()` after the agent merely opened it is invisible to this control, as it is to `egressAllowlist`.
+
+Modes are CLI-managed only, never through MCP: `chrome-bridge policy dlp <clipboard|upload|download|screenShare> allow|audit|block [client]`.
 
 ## Untrusted page content and prompt-injection posture
 
@@ -110,3 +193,125 @@ While a `waitForHandoff` or `credentialHandoff` request is in flight through a n
 - **The same blackout applies.** `credentialHandoff` registers the identical in-flight handoff record as `waitForHandoff` in both hosts, with the same scoping (numeric `tabId` scopes to that tab; no `tabId` is global) and the same `handoff in progress` denial and `handoff_blackout` audit decision. The record is released in a `finally` on success, error, and timeout.
 - **Captures are scrubbed first.** Buffers for the target tab are dropped and monitoring, interception, and screencast are stopped **before** the tab or the field is focused, so no collector window can span the credential entry.
 - **Scope is one field.** `mode: "filled"` (default) resolves when the field goes from empty to non-empty and the length settles; `mode: "submitted"` resolves when the owning form submits or the page navigates. Frame-scoped selectors are rejected rather than silently widened. On every exit path the banner is hidden, the transient marker attribute the extension used to track the field is removed, and the prior task-session state is restored.
+
+## Org policy bundles: verified, content-addressed baselines
+
+A fleet needs one policy that an admin authors centrally and a machine cannot quietly edit into something weaker. `policyBundle` is that mechanism, and it is enforced in the native host, not in the extension or the CLI.
+
+```json
+{
+  "policyBundle": {
+    "path": "/etc/chrome-bridge/org-policy.json",
+    "lockfile": "/etc/chrome-bridge/org-policy.lock"
+  },
+  "default": { "deniedOrigins": ["*://intranet.example"] }
+}
+```
+
+The stanza lives at the root of the local `bridge_policy.json` (its `default` layer is also accepted). See `bridge_policy_bundle.example.json` and `bridge_policy_bundle.lock.example` for the shape of a bundle and its lockfile.
+
+**Verification.** On every policy load the host reads the bundle, computes its SHA-256, and compares it against the `sha256` recorded in the lockfile. The bundle is parsed **after** the digest matches, so a document that is not pinned is never interpreted. Only a matching digest applies the bundle. The lockfile is the authorization: distributing a bundle is not enough, an admin must also pin its digest on the machine.
+
+**Fail closed, always.** A digest mismatch, an unreadable bundle, an unreadable or malformed lockfile, a malformed bundle, or a malformed `policyBundle` stanza all produce the same outcome in both hosts: the host serves the **built-in fail-closed default policy** (`ping`, `policyCheck`, `policyInfo`, and the lease actions only). It does not fall back to the local file, and it never falls back to the last bundle that verified - a previously good bundle that is swapped or corrupted loses its authority immediately. The rejection is logged and written to the audit log once as decision `policy_bundle_rejected` with the reason (`policy bundle digest mismatch`, `policy bundle unreadable`, `policy bundle malformed`, `policy bundle lockfile unreadable`, `policy bundle lockfile malformed`, `policy bundle misconfigured`) plus `expectedDigest` and `actualDigest`.
+
+**Precedence.** A verified bundle supplies the `default` and `clients` layers that the existing merge already consumes, so the full order is:
+
+```
+built-in fail-closed default -> bundle default -> local bridge_policy.json default
+                             -> bundle clients.<name> -> local clients.<name>
+```
+
+The local file wins on top because a local operator must be able to **tighten** the org baseline (a stricter machine, a narrower client). It is deliberately not the other way around: an org that wants a floor gets one through the next rule.
+
+**A bundle can never loosen a local deny list.** When the bundle and the local file are composed, `deniedActions` and `deniedOrigins` are the **union**, not an override. The local floor for a layer is that layer's own list when it defines one, else the local `default` layer's list. So a bundle whose `clients.<name>` layer sets `"deniedOrigins": []` cannot drop `*://intranet.example` that the local `default` denied - the composed client layer keeps it. A bundle can only add denials.
+
+**Re-verified on reload.** The digest is not trusted for the life of the process. The host's mtime-based policy reload covers the local policy file, the bundle, and the lockfile, so swapping the bundle on disk is caught on the next request and reverts to the fail-closed default. Because the check is keyed to those mtimes, each rejection is audited once per change, not once per request.
+
+**No contents leak.** `policyInfo` gains `policyBundle: {path, verified, digest}` with the digest truncated to 12 hex characters. That is metadata only, consistent with the existing rule that `policyInfo` returns paths and never policy bodies. `chrome-bridge policy bundle verify|lock|show` is likewise metadata only: it prints paths, digests, and match/mismatch, never bundle contents.
+
+A bundle governs the same surface as any other policy: it cannot grant an action the built-in classification treats as non-skippable, and every other host control (confirmation, leases, redaction, audit, egress) continues to apply on top of whatever the bundle allows.
+
+## Audit export: what leaves the machine
+
+`auditExport` forwards the host's audit events to a SIEM. It exists because an enterprise cannot deploy an agentic browser whose only record lives on the endpoint, and it is deliberately the *narrowest* thing that satisfies that: an additional sink for events the local log already holds.
+
+**Export never precedes or replaces the local write.** `write_audit_event` appends to `bridge_audit.jsonl` first, under the audit write lock. Only after that append returns does the host re-encode the same already-masked event object and hand it to the sink, under a *separate* export lock so a slow collector can never delay the local append. If the local write fails, nothing is exported: there is no event to mirror.
+
+**Export invents no fields.** Both hosts read only `ts`, `client`, `action`, `targets`, `decision`, `reason`, and `requestId` - the fields the audit log already carries. There is no payload body, no response body, no page content, no cookie, no storage value, and no token in an audit event, so there is none in an export line. A `secretMaskFile` value is masked before the local write, and the export re-encodes that same masked object, so a secret cannot reach a collector even when a denial's own target quoted it.
+
+### Configuration
+
+`auditExport` is a map-valued policy key, merged **per key** across the `default` and `clients.<name>` layers, so a client layer can point one client at a different destination without restating the format. Null or absent disables export entirely.
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `format` | yes | `jsonl`, `syslog`, or `cef` |
+| `destination` | yes | A local file path for `jsonl`/`cef`; `udp://host:port`, `tcp://host:port`, or a unix datagram socket path for `syslog` |
+| `rotateBytes` | no | Positive integer. File destinations only: rotate to `<destination>.1` when the next line would exceed it |
+| `retainDays` | no | Positive number. File destinations only: at rotation time, delete an existing `<destination>.1` older than this window before the new one replaces it |
+
+Rotation is a single generation with no compression, performed under the export lock, so it is safe under the host's thread-per-connection model. Absent `rotateBytes` means the sink grows without bound; absent `retainDays` means a rotated generation is never pruned by age.
+
+A rotating file sink is therefore a **bounded buffer, not a durable record**. Once the sink has rotated more than once, each new rotation replaces `<destination>.1` and the older generation is gone. That is deliberate: it keeps a local sink from filling the disk. The complete record is always `bridge_audit.jsonl`, which is never rotated by this mechanism, so treat the file sink as a tail for local inspection and use a streaming `syslog` destination (or ship `bridge_audit.jsonl` itself) when an off-host copy has to be complete.
+
+### Fail closed, loudly, once
+
+A malformed `auditExport` block (`format` outside the three names, an empty `destination`, a non-positive `rotateBytes`/`retainDays`, or a non-object stanza) **disables export for that policy layer**. It does not fall back to a looser sink or to a default destination. A sink that then refuses a write - unwritable path, missing directory, unreachable collector, unresolvable host - disables that sink for the life of the process.
+
+Either way the host writes exactly one line to the debug log and exactly one audit event, with `action: "auditExport"`, `decision: "audit_export_unavailable"`, `targets: [<destination or layer>]`, and the failure as `reason`. It is once per sink, not once per request: a dead collector must not turn into an audit-log flood. Automation is never blocked and never retried against a dead sink, and re-arming a sink requires a host restart, so a collector that failed cannot silently resume mid-session.
+
+### Format: `jsonl`
+
+The audit event verbatim: compact JSON, keys sorted, one line per event, appended to the destination file. This is the same object the local log holds, so a `jsonl` sink and `bridge_audit.jsonl` are field-for-field identical.
+
+### Format: `syslog` (RFC 5424)
+
+```
+<PRI>1 TIMESTAMP - chrome-bridge - MSGID [chromeBridge@0 ...]
+```
+
+| Element | Value |
+| --- | --- |
+| `PRI` | facility `local0` (16) * 8 + severity. `132` for the deny class, `134` otherwise |
+| VERSION | `1` |
+| TIMESTAMP | `ts` as RFC 3339 UTC with milliseconds (`2025-01-01T00:00:00.123Z`), or `-` when absent |
+| HOSTNAME | always `-`. The machine name is not the agent's to publish |
+| APP-NAME | `chrome-bridge` |
+| PROCID | always `-` |
+| MSGID | `action`, filtered to printable ASCII and capped at 32 characters, or `-` |
+| SD-ID | `chromeBridge@0` |
+| SD params | `client`, `action`, `decision`, `reason`, `requestId`, `targets`, always in that order |
+| MSG | omitted. There is no free-text message to leak into |
+
+`targets` is the target list joined with `,`. Any absent, null, or empty field renders as `-`. Param values are escaped per RFC 5424 6.3.3 (`\`, `"`, `]`). A `tcp://` destination uses RFC 6587 non-transparent framing: one LF-delimited message per event.
+
+The severity split is by decision text: a decision containing `deny`, `blackout`, or `unavailable` is a **warning** (4); everything else is **informational** (6). That keeps denials, handoff blackouts, and a dead export sink above routine allows in a collector's default view.
+
+### Format: `cef` (ArcSight)
+
+```
+CEF:0|ChromeBridge|NativeHost|1.0|<decision>|<action>|<severity>|<extension>
+```
+
+`1.0` is the audit-export **schema** version, not the product version: a receiver keys its field mapping off it. Severity is `7` for the deny class described above and `3` otherwise. Header fields escape `\` and `|`; extension values escape `\` and `=`, and newlines become `\n`.
+
+| CEF key | Audit field |
+| --- | --- |
+| `rt` | `ts` (epoch milliseconds), or `-` |
+| `suser` | `client` |
+| `act` | `action` |
+| `outcome` | `decision` |
+| `externalId` | `requestId` |
+| `reason` | `reason` |
+| `cs1Label` | the literal `targets` |
+| `cs1` | `targets` joined with `,` |
+
+Keys are always emitted in that order, and an absent value renders as `-`, so a line's shape does not change with the event.
+
+Both hosts are byte-compatible for all three formats: the Python and Rust encoders produce the same line for the same event. `bridge_audit_export.example` holds one fabricated sample line per format.
+
+**Session traces are not forwarded.** `auditExport` covers the audit log only. Session trace artifacts stay local JSONL files under `traceDir`, and an exported OpenTelemetry span (`BRIDGE_OTEL_*`) remains a separate, independently configured sink. A trace event correlates with an exported audit event through `requestId`; nothing about a trace leaves the machine because `auditExport` is on.
+
+### Backfill and testing a destination
+
+`chrome-bridge audit export --format <fmt> --destination <dest> [--since ...] [--limit N]` re-encodes the **existing local audit log** to a destination, independent of policy. Use it to backfill a collector that was added late, or to prove a destination works before enabling `auditExport` in policy. `--dry-run` formats and counts without writing or connecting. It prints metadata only - counts, byte totals, destination, and the number of malformed lines skipped - never an exported line. The one-shot path deliberately performs no rotation and no pruning: the operator named that exact destination, and silently renaming their file would be a surprise.

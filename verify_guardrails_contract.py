@@ -10,6 +10,7 @@ which actions reach the extension and what responses are redacted.
 Usage:
     PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
 """
+import hashlib
 import json
 import os
 import shutil
@@ -36,6 +37,9 @@ def expect(cond, msg):
 # Forwarded actions seen by the mock extension, shared per running host.
 forwarded = []
 forwarded_lock = threading.Lock()
+# Full forwarded envelopes, so a case can assert host-stamped fields that live
+# OUTSIDE payload (e.g. the DLP channel modes stamped as `dlp`).
+forwarded_messages = []
 
 # Configurable origins the mock returns for the reserved __tabOrigin lookup.
 # Keyed by the request's payload tabId (int) or None for the active tab.
@@ -61,6 +65,7 @@ def mock_extension(proc, result_fn):
         payload = msg.get("payload") or {}
         with forwarded_lock:
             forwarded.append((action, payload))
+            forwarded_messages.append(msg)
         if action == "__tabOrigin":
             origin = tab_origins.get(payload.get("tabId"))
             url = None if origin is None else origin + "/some/path"
@@ -123,11 +128,49 @@ OTEL_FILE = "/tmp/chrome-bridge-guard-otel.jsonl"
 SCHEDULE_FILE = "/tmp/chrome-bridge-guard-schedules.json"
 WORKFLOW_FILE = "/tmp/chrome-bridge-guard-workflow.json"
 BAD_WORKFLOW_FILE = "/tmp/chrome-bridge-guard-workflow-invalid.json"
+BUNDLE_FILE = "/tmp/chrome-bridge-guard-bundle.json"
+BUNDLE_LOCK_FILE = "/tmp/chrome-bridge-guard-bundle.lock"
+EXPORT_FILE = "/tmp/chrome-bridge-guard-export.jsonl"
+EXPORT_CEF_FILE = "/tmp/chrome-bridge-guard-export.cef"
+EXPORT_DEAD_DIR = "/tmp/chrome-bridge-guard-export-missing"
 
 
 def write_policy(policy):
     with open(POLICY_FILE, "w") as f:
         json.dump(policy, f)
+
+
+def write_bundle(document, bump=0):
+    # ``bump`` advances the file's mtime so a rewrite is unambiguously a change
+    # for the host's mtime-based reload check, with no sleep involved.
+    with open(BUNDLE_FILE, "w") as f:
+        json.dump(document, f)
+    if bump:
+        stamp = time.time() + bump
+        os.utime(BUNDLE_FILE, (stamp, stamp))
+
+
+def bundle_digest():
+    with open(BUNDLE_FILE, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def write_bundle_lock(digest):
+    with open(BUNDLE_LOCK_FILE, "w") as f:
+        json.dump({"sha256": digest}, f)
+
+
+def bundle_local_policy(**layers):
+    # A local policy whose only job is to name the bundle, plus any local layer
+    # the case wants to layer on top of it.
+    policy = {"policyBundle": {"path": BUNDLE_FILE, "lockfile": BUNDLE_LOCK_FILE}}
+    policy.update(layers)
+    return policy
+
+
+def bundle_rejections():
+    return [e for e in audit_events() if e.get("decision") == "policy_bundle_rejected"]
+
 
 
 def make_env():
@@ -154,6 +197,7 @@ class Host:
         self.result_fn = result_fn or (lambda a, p: {"echo": a})
         with forwarded_lock:
             forwarded.clear()
+            forwarded_messages.clear()
         # Truncate the audit log for this scenario.
         open(AUDIT_FILE, "w").close()
         self.proc = subprocess.Popen(
@@ -201,6 +245,49 @@ def wait_until_forwarded(action, timeout=10.0):
     return False
 
 
+def export_text(path=EXPORT_FILE):
+    # Raw sink bytes, so a case can assert a secret never reaches the SIEM.
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def export_lines(path=EXPORT_FILE):
+    return [line for line in export_text(path).splitlines() if line.strip()]
+
+
+def wait_until_exported(count, path=EXPORT_FILE, timeout=10.0):
+    # Same discipline as wait_until_forwarded: the export sink is written after
+    # the local audit append returns, so any fixed sleep is a race against host
+    # startup. Block until the sink actually holds ``count`` lines.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if len(export_lines(path)) >= count:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def wait_until_datagrams(received, count, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with forwarded_lock:
+            if len(received) >= count:
+                return True
+        time.sleep(0.02)
+    return False
+
+
+def remove_paths(*paths):
+    for path in paths:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
 def trace_text(trace_id):
     # Raw artifact bytes, so a case can assert page content never reaches it.
     try:
@@ -226,6 +313,12 @@ def otel_spans(documents):
 def forwarded_actions():
     with forwarded_lock:
         return [a for a, _ in forwarded]
+
+
+def forwarded_envelopes():
+    # (action, whole envelope) per forward, for fields outside payload.
+    with forwarded_lock:
+        return [(m.get("action"), m) for m in forwarded_messages]
 
 
 def make_approval_command():
@@ -649,7 +742,7 @@ def run_against(label, cmd, env):
         r = c.req("policyCheck", {"action": "getCookies", "payload": {"domain": "mail.google.com"}})
         res = (r or {}).get("result", {})
         expect(set(res.keys()) == {"allowed", "reason", "confirmationRequired", "redact", "audit",
-                                   "originDependent", "siteMode", "effectiveTier"},
+                                   "originDependent", "siteMode", "effectiveTier", "dlp"},
                f"{label}: policyCheck result keys = {sorted(res.keys())}")
         expect(res.get("effectiveTier") == "mutating",
                f"{label}: policyCheck getCookies should report a mutating effectiveTier, got {res}")
@@ -775,6 +868,172 @@ def run_against(label, cmd, env):
         r = c.req("navigate", {"url": "https://docs.google.com/d"})
         expect(r and r.get("success") is True,
                f"{label}: client layer should override the same siteModes pattern, got {r}")
+        c.close()
+
+    # --- DLP: block on `upload` denies uploadFile with `dlp blocked` and does
+    #     not forward, so no file is ever opened on the request's behalf ---
+    write_policy(permissive_with(dlp={"upload": "block"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("uploadFile", {"tabId": 7, "selector": "#f", "files": ["/tmp/dlp-fixture.txt"]})
+        expect(r and r.get("success") is False and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: dlp block on upload should deny uploadFile, got {r}")
+        denial = (r or {}).get("policyDenial") or {}
+        expect(denial.get("kind") == "dlp" and denial.get("dlpChannel") == "upload"
+               and denial.get("action") == "uploadFile",
+               f"{label}: dlp denial should name the channel and action, got {denial}")
+        expect("uploadFile" not in forwarded_actions(),
+               f"{label}: a dlp-blocked upload must not forward, got {forwarded_actions()}")
+        # The other upload chokepoints share the channel.
+        r = c.req("githubAttachPrBody", {"tabId": 7, "files": ["/tmp/dlp-fixture.txt"]})
+        expect(r and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: dlp block on upload should cover githubAttachPrBody, got {r}")
+        # A channel with no configured mode stays exactly as before.
+        r = c.req("downloadUrl", {"url": "https://github.com/x.zip"})
+        expect(r and r.get("success") is True,
+               f"{label}: an unconfigured dlp channel must not be gated, got {r}")
+        c.close()
+
+    # --- DLP: audit permits the action and writes exactly one dlp_audit event
+    #     naming the channel, with no file name or path anywhere in it ---
+    write_policy(permissive_with(dlp={"upload": "audit"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("uploadFile", {"tabId": 7, "selector": "#f", "files": ["/tmp/dlp-secret-name.txt"]})
+        expect(r and r.get("success") is True,
+               f"{label}: dlp audit should permit uploadFile, got {r}")
+        expect(wait_until_forwarded("uploadFile"),
+               f"{label}: dlp audit should forward uploadFile, got {forwarded_actions()}")
+        c.close()
+        events = [e for e in audit_events() if e["decision"] == "dlp_audit"]
+        expect(len(events) == 1 and events[0]["action"] == "uploadFile"
+               and events[0]["reason"] == "upload",
+               f"{label}: dlp audit should write exactly one channel-named event, got {events}")
+        expect(all(set(e.keys()) == AUDIT_KEYS for e in events),
+               f"{label}: dlp_audit event keys = {[sorted(e.keys()) for e in events]}")
+        expect("dlp-secret-name" not in json.dumps(events),
+               f"{label}: a dlp_audit event must record no file name, got {events}")
+
+    # --- DLP: block on `download` denies downloadUrl ---
+    write_policy(permissive_with(dlp={"download": "block"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("downloadUrl", {"url": "https://github.com/x.zip"})
+        expect(r and r.get("success") is False and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: dlp block on download should deny downloadUrl, got {r}")
+        expect("downloadUrl" not in forwarded_actions(),
+               f"{label}: a dlp-blocked download must not forward, got {forwarded_actions()}")
+        c.close()
+
+    # --- DLP: block on `screenShare` denies startScreencast (and the frame read) ---
+    write_policy(permissive_with(dlp={"screenShare": "block"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("startScreencast", {"tabId": 7})
+        expect(r and r.get("success") is False and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: dlp block on screenShare should deny startScreencast, got {r}")
+        r = c.req("screencastFrames", {"tabId": 7})
+        expect(r and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: dlp block on screenShare should deny screencastFrames, got {r}")
+        expect("startScreencast" not in forwarded_actions()
+               and "screencastFrames" not in forwarded_actions(),
+               f"{label}: a dlp-blocked screen share must not forward, got {forwarded_actions()}")
+        c.close()
+
+    # --- DLP: a composite cannot smuggle a gated action; the denial carries the
+    #     step index and names the smuggled step's own action ---
+    write_policy(permissive_with(dlp={"upload": "block"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("batch", {"tabId": 7, "steps": [
+            {"action": "getHTML", "payload": {}},
+            {"action": "uploadFile", "payload": {"selector": "#f", "files": ["/tmp/dlp-fixture.txt"]}},
+        ]})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: batch step 1: dlp blocked",
+               f"{label}: a batch hiding a blocked upload should be denied with its step, got {r}")
+        denial = (r or {}).get("policyDenial") or {}
+        expect(denial.get("kind") == "dlp" and denial.get("batchStep") == 1
+               and denial.get("dlpChannel") == "upload"
+               and denial.get("action") == "uploadFile",
+               f"{label}: batch dlp denial should name step, channel, and action, got {denial}")
+        expect("uploadFile" not in forwarded_actions() and "batch" not in forwarded_actions(),
+               f"{label}: a dlp-blocked batch must not forward, got {forwarded_actions()}")
+        c.close()
+
+    # --- DLP: policyCheck reports the resolved mode per channel, null off-channel,
+    #     and a malformed mode fails CLOSED to block rather than being ignored ---
+    write_policy(permissive_with(dlp={"upload": "audit", "download": "block",
+                                      "screenShare": "sometimes"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("policyCheck", {"action": "uploadFile", "payload": {"tabId": 7}})
+        expect(((r or {}).get("result") or {}).get("dlp") == "audit",
+               f"{label}: policyCheck should report the resolved dlp mode, got {r}")
+        r = c.req("policyCheck", {"action": "downloadUrl",
+                                  "payload": {"url": "https://github.com/x.zip"}})
+        res = (r or {}).get("result") or {}
+        expect(res.get("dlp") == "block" and res.get("allowed") is False
+               and res.get("reason") == "dlp blocked",
+               f"{label}: policyCheck should report a blocked channel, got {res}")
+        r = c.req("policyCheck", {"action": "getTabs"})
+        expect(((r or {}).get("result") or {}).get("dlp") is None,
+               f"{label}: policyCheck should report null dlp off-channel, got {r}")
+        r = c.req("startScreencast", {"tabId": 7})
+        expect(r and r.get("success") is False and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: a malformed dlp mode must fail closed to block, got {r}")
+        c.close()
+
+    # --- DLP merges per channel: a client layer tightens one channel and inherits
+    #     the default layer's other channels ---
+    write_policy({"default": {"allowedActions": ["*"], "deniedActions": [],
+                              "allowedOrigins": ["*"], "deniedOrigins": [],
+                              "requireConfirmation": [], "redact": True, "audit": True,
+                              "dlp": {"upload": "block", "download": "audit"}},
+                  "clients": {"alpha": {"dlp": {"upload": "allow"}}}})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("uploadFile", {"tabId": 7, "selector": "#f", "files": ["/tmp/dlp-fixture.txt"]})
+        expect(r and r.get("success") is True,
+               f"{label}: a client layer should be able to relax one dlp channel, got {r}")
+        r = c.req("policyCheck", {"action": "downloadUrl",
+                                  "payload": {"url": "https://github.com/x.zip"}})
+        expect(((r or {}).get("result") or {}).get("dlp") == "audit",
+               f"{label}: an unnamed dlp channel must survive a client override, got {r}")
+        c.close()
+
+    # --- Absent dlp preserves current behavior exactly: no gate, no dlp_audit
+    #     event, and no `dlp` field stamped on the forwarded envelope ---
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for action, payload in (("uploadFile", {"tabId": 7, "selector": "#f", "files": ["/tmp/f.txt"]}),
+                                ("downloadUrl", {"url": "https://github.com/x.zip"}),
+                                ("startScreencast", {"tabId": 7})):
+            r = c.req(action, payload)
+            expect(r and r.get("success") is True,
+                   f"{label}: absent dlp should leave {action} untouched, got {r}")
+        c.close()
+        time.sleep(0.3)
+        expect(not [e for e in audit_events() if e["decision"] == "dlp_audit"],
+               f"{label}: absent dlp must write no dlp_audit event")
+        expect(not [p for a, p in forwarded_envelopes() if "dlp" in p],
+               f"{label}: absent dlp must not stamp a dlp field on the envelope")
+
+    # --- DLP stamps the enforcing modes on the forwarded envelope, always
+    #     overwriting a client-supplied value so a caller cannot loosen it ---
+    write_policy(permissive_with(dlp={"upload": "audit", "download": "block"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("uploadFile", {"tabId": 7, "selector": "#f", "files": ["/tmp/f.txt"]},
+                  extra={"dlp": {"upload": "allow", "download": "allow"}})
+        expect(r and r.get("success") is True,
+               f"{label}: audit-mode upload should still forward, got {r}")
+        expect(wait_until_forwarded("uploadFile"),
+               f"{label}: audit-mode upload should reach the extension, got {forwarded_actions()}")
+        stamped = [p.get("dlp") for a, p in forwarded_envelopes() if a == "uploadFile"]
+        expect(stamped == [{"upload": "audit", "download": "block"}],
+               f"{label}: host must overwrite the envelope dlp field, got {stamped}")
         c.close()
 
     # --- Effective tier: a read-only action whose payload sets a state-changing
@@ -910,7 +1169,8 @@ def run_against(label, cmd, env):
         expect(r and r.get("success") is True,
                f"{label}: policyInfo must succeed under deny-all policy, got {r}")
         res = (r or {}).get("result") or {}
-        expect(set(res.keys()) == {"policyFile", "policyFileExists", "auditLogFile", "traceDir", "client"},
+        expect(set(res.keys()) == {"policyFile", "policyFileExists", "auditLogFile", "traceDir",
+                                   "policyBundle", "client"},
                f"{label}: policyInfo must expose only path metadata, got {sorted(res.keys())}")
         expect(res.get("policyFile") == POLICY_FILE and res.get("policyFileExists") is True,
                f"{label}: policyInfo should report the active policy file, got {res}")
@@ -1309,6 +1569,172 @@ def run_against(label, cmd, env):
         c.close()
     set_tab_origins({None: "https://github.com"})
 
+    # --- egressAllowlist: host-side bound on where the agent may make the
+    #     browser SEND traffic (T4-9) ------------------------------------------
+    # (a) baseline: an absent/empty allowlist changes nothing.
+    write_policy(permissive_with())
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://anywhere.test/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: no egressAllowlist must leave navigate unconstrained, got {r}")
+        c.close()
+    write_policy(permissive_with(egressAllowlist=[]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://anywhere.test/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: an empty egressAllowlist must preserve current behavior, got {r}")
+        c.close()
+
+    # (b) a configured allowlist denies an outside destination before forwarding
+    #     and admits one inside it, for every action whose payload names the
+    #     destination the host can see.
+    write_policy(permissive_with(egressAllowlist=["*://github.com", "*://*.github.com"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for action, payload in (
+                ("navigate", {"url": "https://evil.test/x"}),
+                ("navigateTaskSession", {"sessionId": "s1", "url": "https://evil.test/x"}),
+                ("downloadUrl", {"url": "https://evil.test/f.zip"}),
+                ("setCookie", {"url": "https://evil.test", "name": "s", "value": "1"})):
+            r = c.req(action, payload)
+            expect(r and r.get("success") is False
+                   and r.get("error") == "policy denied: egress not allowed",
+                   f"{label}: {action} outside egressAllowlist should be denied, got {r}")
+            pd = (r or {}).get("policyDenial") or {}
+            expect(pd.get("kind") == "egress"
+                   and pd.get("targets") == ["https://evil.test", "*://evil.test"],
+                   f"{label}: {action} egress denial should be kind=egress on the destination, got {pd}")
+            expect(action not in forwarded_actions(),
+                   f"{label}: {action} must not forward outside the egressAllowlist, got {forwarded_actions()}")
+        for action, payload in (
+                ("navigate", {"url": "https://github.com/x"}),
+                ("downloadUrl", {"url": "https://raw.github.com/f.zip"}),
+                ("setCookie", {"url": "https://github.com", "name": "s", "value": "1"})):
+            r = c.req(action, payload)
+            expect(r and r.get("success") is True,
+                   f"{label}: {action} inside the egressAllowlist should proceed, got {r}")
+        # Fail closed: an egress-bearing action whose destination the host cannot
+        # resolve is denied, never forwarded unchecked.
+        r = c.req("setCookie", {"name": "s", "value": "1"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: egress not allowed",
+               f"{label}: setCookie with no resolvable destination should fail closed, got {r}")
+        # The reason surfaces through policyCheck and dry run without any new field.
+        r = c.req("policyCheck", {"action": "navigate",
+                                  "payload": {"url": "https://evil.test/x"}})
+        res = (r or {}).get("result") or {}
+        expect(res.get("allowed") is False and res.get("reason") == "egress not allowed",
+               f"{label}: policyCheck should surface the egress reason, got {res}")
+        r = c.req("navigate", {"url": "https://evil.test/x"}, extra={"dryRun": True})
+        expect(r and r.get("wouldForward") is False
+               and ((r.get("verdict") or {}).get("reason")) == "egress not allowed",
+               f"{label}: dry run should surface the egress reason, got {r}")
+        c.close()
+
+    # (c) composites cannot smuggle egress: the offending step is named by index.
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("batch", {"steps": [
+            {"action": "getTabs", "payload": {}},
+            {"action": "navigate", "payload": {"url": "https://evil.test/x"}}]})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: batch step 1: egress not allowed",
+               f"{label}: a batch hiding an outside navigate should be denied by step, got {r}")
+        pd = (r or {}).get("policyDenial") or {}
+        expect(pd.get("kind") == "egress" and pd.get("batchStep") == 1,
+               f"{label}: batch egress denial should report the step index, got {pd}")
+        expect("batch" not in forwarded_actions(),
+               f"{label}: a denied batch must not forward, got {forwarded_actions()}")
+        r = c.req("replayWorkflow", {"workflow": {"version": 1, "name": "wf", "steps": [
+            {"action": "downloadUrl", "payload": {"url": "https://evil.test/f.zip"}}]}})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: workflow step 0: egress not allowed",
+               f"{label}: a workflow hiding an outside download should be denied by step, got {r}")
+        expect("replayWorkflow" not in forwarded_actions(),
+               f"{label}: a denied replay must not forward, got {forwarded_actions()}")
+        r = c.req("batch", {"steps": [
+            {"action": "navigate", "payload": {"url": "https://github.com/x"}}]})
+        expect(r and r.get("success") is True,
+               f"{label}: an all-inside batch should proceed, got {r}")
+        c.close()
+
+    # (d) egress never loosens site policy: a denied origin still wins even when
+    #     the same host is on the egress allowlist.
+    write_policy(permissive_with(deniedOrigins=["*://evil.test"],
+                                 egressAllowlist=["*://evil.test"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://evil.test/x"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: target denied",
+               f"{label}: a denied origin must outrank an egress grant, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: a denied origin must not forward under an egress grant, got {forwarded_actions()}")
+        c.close()
+    write_policy(permissive_with(deniedActions=["navigate"],
+                                 egressAllowlist=["*://github.com"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action navigate denied",
+               f"{label}: a denied action must outrank an egress grant, got {r}")
+        c.close()
+
+    # (e) the documented out-of-scope paths are genuinely out of scope, not
+    #     silently denied. The host cannot see where a click-driven in-page
+    #     navigation, a script-issued request, or a cookie DELETE sends traffic,
+    #     so those actions stay governed by site policy alone.
+    write_policy(permissive_with(egressAllowlist=["*://github.com"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for action, payload in (
+                ("click", {"tabId": 7, "selector": "a[href='https://evil.test']"}),
+                ("executeScript", {"tabId": 7, "code": "fetch('https://evil.test')"}),
+                ("deleteCookie", {"url": "https://evil.test", "name": "s"}),
+                ("startInterception", {"tabId": 7, "urlPattern": "https://evil.test/*",
+                                       "mode": "fulfill", "status": 200, "body": "x"})):
+            r = c.req(action, payload)
+            expect(r and r.get("success") is True,
+                   f"{label}: {action} is out of egress scope and must not be egress-denied, got {r}")
+        c.close()
+
+    # (f) CLI `policy allow-egress` / `clear-egress` write an egressAllowlist the
+    #     host honors, and leave the rest of the policy intact.
+    write_policy({"default": {"allowedActions": ["*"], "deniedActions": [],
+                              "allowedOrigins": ["*"], "deniedOrigins": [],
+                              "requireConfirmation": [], "redact": True, "audit": True}})
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_policy(["test_client.py", "policy", "allow-egress", "*://github.com"])
+    expect(_rc == 0, f"{label}: CLI policy allow-egress should succeed, got rc={_rc}")
+    time.sleep(1.1)  # let the policy file mtime advance for hot-reload
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: host should honor a CLI-written egress grant, got {r}")
+        r = c.req("navigate", {"url": "https://evil.test/x"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: egress not allowed",
+               f"{label}: a CLI-written egressAllowlist should bound other hosts, got {r}")
+        # Inherited grants must survive the edit (the replace-merge footgun).
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: inherited getTabs must survive CLI allow-egress, got {r}")
+        c.close()
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _rc = _tc.cmd_policy(["test_client.py", "policy", "clear-egress", "*://github.com"])
+    expect(_rc == 0, f"{label}: CLI policy clear-egress should succeed, got rc={_rc}")
+    time.sleep(1.1)
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://evil.test/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: clearing the last egress pattern should restore unconstrained egress, got {r}")
+        c.close()
+
     # --- policyCheck reports originDependent for tab-scoped actions ---
     write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
     with Host(label, cmd, env):
@@ -1409,7 +1835,7 @@ def run_against(label, cmd, env):
             expect(all(set(s.keys()) == {"step", "action", "allowed", "reason",
                                          "confirmationRequired", "redact", "audit",
                                          "originDependent", "siteMode",
-                                         "effectiveTier"} for s in steps),
+                                         "effectiveTier", "dlp"} for s in steps),
                    f"{label}: plan step verdict keys = {[sorted(s.keys()) for s in steps]}")
             expect([s["effectiveTier"] for s in steps]
                    == ["read_only", "mutating", "mutating", "mutating"],
@@ -1442,7 +1868,7 @@ def run_against(label, cmd, env):
                f"{label}: allowed dry run should report wouldForward, got {r}")
         expect(set(((r or {}).get("verdict") or {}).keys()) ==
                {"allowed", "reason", "confirmationRequired", "redact", "audit",
-                "originDependent", "siteMode", "effectiveTier"},
+                "originDependent", "siteMode", "effectiveTier", "dlp"},
                f"{label}: dry run verdict keys = {sorted(((r or {}).get('verdict') or {}).keys())}")
         expect(((r or {}).get("verdict") or {}).get("effectiveTier") == "read_only",
                f"{label}: dry run getTabs should report a read_only effectiveTier, got {r}")
@@ -1855,6 +2281,339 @@ def run_against(label, cmd, env):
         pass
     shutil.rmtree(TRACE_DIR, ignore_errors=True)
 
+    # --- Content-addressed org policy bundles (policy key policyBundle) -----
+    # A bundle is a verified SOURCE for the policy the host already merges, so
+    # these cases assert what a bundle may do (supply the baseline layers) and
+    # what it may never do (take effect unverified, or drop a local denial).
+
+    # (a) A matching digest applies the bundle and its allow list governs.
+    marker_origin = "https://bundle-only-marker.test"
+    write_bundle({"default": {
+        "allowedActions": ["ping", "policyInfo", "getTabs"],
+        "deniedActions": [], "allowedOrigins": ["*", marker_origin],
+        "deniedOrigins": [], "requireConfirmation": [],
+        "redact": True, "audit": True}})
+    digest = bundle_digest()
+    write_bundle_lock(digest)
+    write_policy(bundle_local_policy())
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: a verified bundle's allow list should govern, got {r}")
+        r = c.req("getCookies", {"domain": "x.test"})
+        expect(r and r.get("success") is False and str(r.get("error", "")).startswith("policy denied:"),
+               f"{label}: an action the bundle does not allow should still deny, got {r}")
+        expect(not bundle_rejections(),
+               f"{label}: a verified bundle must not audit a rejection, got {bundle_rejections()}")
+
+        # (e) policyInfo reports the truncated digest and never bundle contents.
+        r = c.req("policyInfo")
+        info = (r or {}).get("result") or {}
+        reported = info.get("policyBundle") or {}
+        expect(reported.get("path") == BUNDLE_FILE and reported.get("verified") is True,
+               f"{label}: policyInfo should report the verified bundle, got {reported}")
+        expect(reported.get("digest") == digest[:12] and len(reported.get("digest") or "") == 12,
+               f"{label}: policyInfo should report a 12-char digest, got {reported}")
+        expect(marker_origin not in json.dumps(r),
+               f"{label}: policyInfo must never return bundle contents, got {r}")
+        c.close()
+
+    # (b) A mismatched digest falls back to the built-in fail-closed default and
+    # audits policy_bundle_rejected exactly once, carrying both digests.
+    wrong = "f" * 64
+    write_bundle_lock(wrong)
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action getTabs not allowed",
+               f"{label}: an unverified bundle must never take effect, got {r}")
+        r = c.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: the built-in fail-closed default should still allow ping, got {r}")
+        r = c.req("policyInfo")
+        reported = ((r or {}).get("result") or {}).get("policyBundle") or {}
+        expect(reported.get("verified") is False,
+               f"{label}: policyInfo should report the bundle as unverified, got {reported}")
+        rejections = bundle_rejections()
+        expect(len(rejections) == 1,
+               f"{label}: a rejected bundle should audit exactly once, got {rejections}")
+        event = rejections[0] if rejections else {}
+        expect(event.get("reason") == "policy bundle digest mismatch"
+               and event.get("expectedDigest") == wrong
+               and event.get("actualDigest") == digest,
+               f"{label}: the rejection should carry both digests, got {event}")
+        c.close()
+
+    # (c) A bundle cannot loosen a local deny list: the bundle's client layer
+    # clears deniedOrigins, and the local default's denial still wins.
+    write_bundle({
+        "default": {"allowedActions": ["*"], "allowedOrigins": ["*"]},
+        "clients": {"alpha": {"allowedActions": ["*"], "allowedOrigins": ["*"],
+                              "deniedOrigins": []}}})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(
+        default={"deniedOrigins": ["*://mail.google.com"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: the bundle's client layer should govern allowed actions, got {r}")
+        r = c.req("getCookies", {"domain": "mail.google.com"})
+        expect(r and r.get("success") is False and str(r.get("error", "")).startswith("policy denied:"),
+               f"{label}: a bundle must not drop a locally denied origin, got {r}")
+        expect("getCookies" not in forwarded_actions(),
+               f"{label}: a locally denied origin must not forward under a bundle")
+        c.close()
+
+    # (d) Swapping the bundle on disk is caught on the existing reload path: the
+    # digest is re-verified, not trusted for the process's lifetime.
+    write_bundle({"default": {
+        "allowedActions": ["ping", "policyInfo", "getTabs"],
+        "deniedActions": [], "allowedOrigins": ["*"], "deniedOrigins": [],
+        "requireConfirmation": [], "redact": True, "audit": True}})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy())
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: the verified bundle should allow getTabs before the swap, got {r}")
+        write_bundle({"default": {
+            "allowedActions": ["*"], "deniedActions": [], "allowedOrigins": ["*"],
+            "deniedOrigins": [], "requireConfirmation": [],
+            "redact": True, "audit": True}}, bump=5)
+        r = c.req("getTabs")
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action getTabs not allowed",
+               f"{label}: a swapped bundle must revert to fail-closed default, got {r}")
+        rejections = bundle_rejections()
+        expect(len(rejections) == 1
+               and rejections[0].get("reason") == "policy bundle digest mismatch",
+               f"{label}: the swap should audit one rejection, got {rejections}")
+        r = c.req("policyInfo")
+        reported = ((r or {}).get("result") or {}).get("policyBundle") or {}
+        expect(reported.get("verified") is False,
+               f"{label}: policyInfo should report the swapped bundle as unverified, got {reported}")
+        expect(len(bundle_rejections()) == 1,
+               f"{label}: the rejection must be audited once per change, not per request, "
+               f"got {bundle_rejections()}")
+        c.close()
+    for path in (BUNDLE_FILE, BUNDLE_LOCK_FILE):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+    # --- Audit export forwarder (policy auditExport) ------------------------
+    # Export is an ADDITIONAL sink for events the local audit log already holds,
+    # so every case compares the sink against AUDIT_FILE rather than against an
+    # expectation invented here: the contract is "mirror", not "recompute".
+
+    # (a) A jsonl file destination mirrors every audit event verbatim, and a
+    # denied action arrives with decision exactly "deny".
+    remove_paths(EXPORT_FILE, EXPORT_FILE + ".1", EXPORT_CEF_FILE)
+    write_policy(permissive_with(
+        deniedActions=["screenshot"],
+        auditExport={"format": "jsonl", "destination": EXPORT_FILE}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: an allowed action should still succeed with export on, got {r}")
+        r = c.req("screenshot", {"tabId": 7})
+        expect(r and r.get("success") is False,
+               f"{label}: the denied action should still be denied with export on, got {r}")
+        expect(wait_until_exported(len(audit_events())),
+               f"{label}: the export sink never mirrored the audit log, got {export_lines()}")
+        exported = [json.loads(line) for line in export_lines()]
+        expect(exported == audit_events(),
+               f"{label}: exported events must equal the local audit events field for field, "
+               f"got {exported} vs {audit_events()}")
+        denials = [e for e in exported if e.get("decision") == "deny"]
+        expect(any(e.get("action") == "screenshot" for e in denials),
+               f"{label}: the denial must reach the export with decision deny, got {denials}")
+        c.close()
+
+    # (b) A known secretMaskFile value can never reach the sink, even when the
+    # denial's own targets quote it.
+    remove_paths(EXPORT_FILE)
+    with open(SECRETS_FILE, "w") as f:
+        f.write("siteKey=s3cr3t-host\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    write_policy(permissive_with(
+        allowedOrigins=["https://github.com"],
+        secretMaskFile=SECRETS_FILE,
+        auditExport={"format": "jsonl", "destination": EXPORT_FILE}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://s3cr3t-host.invalid/login"})
+        expect(r and r.get("success") is False,
+               f"{label}: a navigate to a denied origin should fail, got {r}")
+        expect(wait_until_exported(len(audit_events())),
+               f"{label}: the export sink never mirrored the masked denial, got {export_lines()}")
+        raw = export_text()
+        expect("s3cr3t-host" not in raw,
+               f"{label}: a known secret must never reach the export sink, got {raw}")
+        expect("<masked:siteKey>" in raw,
+               f"{label}: the export should carry the masked placeholder, got {raw}")
+        c.close()
+    remove_paths(SECRETS_FILE)
+
+    # (c) An unwritable destination disables the sink loudly and exactly once,
+    # and never breaks the request that triggered it.
+    remove_paths(EXPORT_FILE)
+    shutil.rmtree(EXPORT_DEAD_DIR, ignore_errors=True)
+    dead_sink = os.path.join(EXPORT_DEAD_DIR, "sink.jsonl")
+    write_policy(permissive_with(
+        auditExport={"format": "jsonl", "destination": dead_sink}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for _ in range(3):
+            r = c.req("getTabs")
+            expect(r and r.get("success") is True,
+                   f"{label}: a dead export sink must not block automation, got {r}")
+        unavailable = [e for e in audit_events()
+                       if e.get("decision") == "audit_export_unavailable"]
+        expect(len(unavailable) == 1
+               and unavailable[0].get("action") == "auditExport"
+               and unavailable[0].get("targets") == [dead_sink],
+               f"{label}: a dead sink should audit exactly one audit_export_unavailable, "
+               f"got {unavailable}")
+        expect(not os.path.exists(dead_sink),
+               f"{label}: the host must not create a sink under a missing directory")
+        c.close()
+    shutil.rmtree(EXPORT_DEAD_DIR, ignore_errors=True)
+
+    # (d) CEF formatting, asserted against the captured line.
+    remove_paths(EXPORT_CEF_FILE)
+    write_policy(permissive_with(
+        deniedActions=["screenshot"],
+        auditExport={"format": "cef", "destination": EXPORT_CEF_FILE}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        c.req("screenshot", {"tabId": 7})
+        expect(wait_until_exported(1, EXPORT_CEF_FILE),
+               f"{label}: no CEF line reached the sink")
+        cef_lines = export_lines(EXPORT_CEF_FILE)
+        denials = [line for line in cef_lines if "|deny|screenshot|" in line]
+        expect(denials, f"{label}: the CEF sink should carry the denial, got {cef_lines}")
+        if denials:
+            line = denials[0]
+            expect(line.startswith("CEF:0|ChromeBridge|NativeHost|1.0|deny|screenshot|7|"),
+                   f"{label}: unexpected CEF header, got {line}")
+            extension = line.split("|", 7)[7]
+            stamp = extension.split(" ", 1)[0]
+            expect(stamp.startswith("rt=") and stamp[3:].isdigit(),
+                   f"{label}: CEF rt should be epoch milliseconds, got {stamp}")
+            for fragment in (" suser=alpha ", " act=screenshot ", " outcome=deny ",
+                             " cs1Label=targets ", "cs1=-"):
+                expect(fragment in extension,
+                       f"{label}: CEF extension missing {fragment!r}, got {extension}")
+        c.close()
+    remove_paths(EXPORT_CEF_FILE)
+
+    # (e) RFC 5424 syslog over UDP, asserted against the captured datagram,
+    # including the severity split between the deny class and everything else.
+    datagrams = []
+    collector = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    collector.bind(("127.0.0.1", 0))
+    collector.settimeout(0.2)
+    syslog_port = collector.getsockname()[1]
+    stop_collector = threading.Event()
+
+    def collect_syslog():
+        while not stop_collector.is_set():
+            try:
+                data, _addr = collector.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with forwarded_lock:
+                datagrams.append(data.decode("utf-8", "replace"))
+
+    collector_thread = threading.Thread(target=collect_syslog, daemon=True)
+    collector_thread.start()
+    write_policy(permissive_with(
+        deniedActions=["screenshot"],
+        auditExport={"format": "syslog",
+                     "destination": f"udp://127.0.0.1:{syslog_port}"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        c.req("getTabs")
+        c.req("screenshot", {"tabId": 7})
+        expect(wait_until_datagrams(datagrams, 2),
+               f"{label}: the syslog collector never received both events, got {datagrams}")
+        with forwarded_lock:
+            lines = list(datagrams)
+        denials = [line for line in lines if 'decision="deny"' in line]
+        others = [line for line in lines if 'decision="deny"' not in line]
+        expect(denials, f"{label}: the syslog sink should carry the denial, got {lines}")
+        if denials:
+            line = denials[0]
+            expect(line.startswith("<132>1 "),
+                   f"{label}: a denial must ride at local0.warning (PRI 132), got {line}")
+            expect(" - chrome-bridge - screenshot [chromeBridge@0 " in line,
+                   f"{label}: unexpected syslog header, got {line}")
+            expect(line.endswith('targets="-"]'),
+                   f"{label}: syslog structured data should end with targets, got {line}")
+        expect(others and all(line.startswith("<134>1 ") for line in others),
+               f"{label}: non-deny events must ride at local0.info (PRI 134), got {others}")
+        c.close()
+    stop_collector.set()
+    collector_thread.join(timeout=2)
+    collector.close()
+
+    # (f) Rotation is single-generation, so a file sink is a BOUNDED buffer, not
+    # a durable record: with rotateBytes far below the event stream the sink
+    # rotates repeatedly and each pass replaces the previous `.1`, discarding the
+    # older generation by design. What must hold is that the bound is respected,
+    # that no line is torn across a rotation, and that it is the OLDEST data that
+    # is dropped while the newest is retained. The complete record stays in
+    # bridge_audit.jsonl; a durable off-host copy needs a streaming destination.
+    remove_paths(EXPORT_FILE, EXPORT_FILE + ".1")
+    write_policy(permissive_with(
+        auditExport={"format": "jsonl", "destination": EXPORT_FILE,
+                     "rotateBytes": 400, "retainDays": 30}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for _ in range(8):
+            c.req("getTabs")
+        expect(wait_until_exported(1),
+               f"{label}: the rotating sink never received a line")
+        expect(os.path.exists(EXPORT_FILE + ".1"),
+               f"{label}: exceeding rotateBytes should produce exactly one rotated generation")
+        expect(not os.path.exists(EXPORT_FILE + ".2"),
+               f"{label}: rotation must stay single-generation, found a .2")
+        expect(os.path.getsize(EXPORT_FILE) <= 400,
+               f"{label}: the live sink must stay within rotateBytes, got {os.path.getsize(EXPORT_FILE)}")
+        live = export_lines()
+        rotated = export_lines(EXPORT_FILE + ".1")
+        expect(live and rotated,
+               f"{label}: both generations should hold lines, got {len(live)} and {len(rotated)}")
+        # No torn write: every surviving line in either generation is a complete
+        # JSON event, not a fragment split by the rotation boundary.
+        parsed = []
+        for raw in live + rotated:
+            try:
+                parsed.append(json.loads(raw))
+            except ValueError:
+                parsed.append(None)
+        expect(all(isinstance(e, dict) and e.get("action") for e in parsed),
+               f"{label}: rotation must not tear a line, got {parsed}")
+        # Oldest is discarded, newest is kept: the most recent audit event is the
+        # last line of the live generation.
+        audit_tail = audit_events()[-1]
+        expect(parsed and live and json.loads(live[-1]).get("action") == audit_tail.get("action")
+               and json.loads(live[-1]).get("decision") == audit_tail.get("decision"),
+               f"{label}: the live generation should end with the newest event, got {live[-1] if live else None}")
+        expect(len(live) + len(rotated) <= len(audit_events()),
+               f"{label}: a bounded sink can hold at most the full audit stream")
+        c.close()
+    remove_paths(EXPORT_FILE, EXPORT_FILE + ".1")
+
 
 
 def check_example_policy_is_conservative():
@@ -1926,6 +2685,65 @@ def check_classification_parity():
            "python: effective_action_tier is missing")
     expect("fn effective_action_tier(" in rs,
            "rust: effective_action_tier is missing")
+
+    # The egress action set decides which requests the egressAllowlist can bound
+    # at all, so drift would silently exempt an action in one host only.
+    em = re.search(r"const EGRESS_URL_ACTIONS[^=]*=\s*\[(.*?)\];", rs, re.S)
+    expect(em is not None, "rust: could not locate EGRESS_URL_ACTIONS")
+    if em:
+        rust_egress = set(re.findall(r'"([^"]+)"', em.group(1)))
+        expect(bridge.EGRESS_URL_ACTIONS == rust_egress,
+               "python/rust EGRESS_URL_ACTIONS drift: "
+               f"py-only={sorted(bridge.EGRESS_URL_ACTIONS - rust_egress)} "
+               f"rust-only={sorted(rust_egress - bridge.EGRESS_URL_ACTIONS)}")
+    expect("egressAllowlist" in bridge._POLICY_LIST_KEYS,
+           "python: egressAllowlist must merge as a list policy key")
+    lm = re.search(r"const POLICY_LIST_KEYS[^=]*=\s*\[(.*?)\];", rs, re.S)
+    expect(lm is not None and "egressAllowlist" in lm.group(1),
+           "rust: egressAllowlist must merge as a list policy key")
+
+    # The DLP channel map decides which chokepoints a `block`/`audit` mode can
+    # reach, so drift would leave one host enforcing a channel the other ignores.
+    expect("dlp" in bridge._POLICY_MAP_KEYS,
+           "python: dlp must merge as a map policy key")
+    mm = re.search(r"const POLICY_MAP_KEYS[^=]*=\s*\[(.*?)\];", rs, re.S)
+    expect(mm is not None and '"dlp"' in mm.group(1),
+           "rust: dlp must merge as a map policy key")
+    cm2 = re.search(r"const DLP_CHANNELS[^=]*=\s*\[(.*?)\];", rs, re.S)
+    expect(cm2 is not None, "rust: could not locate DLP_CHANNELS")
+    if cm2:
+        expect(tuple(re.findall(r'"([^"]+)"', cm2.group(1))) == bridge.DLP_CHANNELS,
+               f"python/rust DLP_CHANNELS drift: rust={cm2.group(1)} py={bridge.DLP_CHANNELS}")
+    mo = re.search(r"const DLP_MODES[^=]*=\s*\[(.*?)\];", rs, re.S)
+    expect(mo is not None and tuple(re.findall(r'"([^"]+)"', mo.group(1))) == bridge.DLP_MODES,
+           f"python/rust DLP_MODES drift: py={bridge.DLP_MODES}")
+    # Rust encodes the action->channel map as a match arm rather than a table, so
+    # compare the action names Python maps against the arms Rust lists.
+    fm = re.search(r"fn dlp_channel_for_action\(action: &str\)[^{]*\{(.*?)\n\}", rs, re.S)
+    expect(fm is not None, "rust: could not locate dlp_channel_for_action")
+    if fm:
+        # Only the left side of each `=>` names actions; the right side names
+        # channels, which would otherwise pollute the comparison.
+        rust_actions = set()
+        for arm in re.findall(r'^\s*((?:"[A-Za-z]+"\s*\|\s*)*"[A-Za-z]+")\s*=>',
+                              fm.group(1), re.M):
+            rust_actions.update(re.findall(r'"([A-Za-z]+)"', arm))
+        py_actions = set(bridge.DLP_ACTION_CHANNELS)
+        expect(py_actions == rust_actions,
+               "python/rust DLP action map drift: "
+               f"py-only={sorted(py_actions - rust_actions)} "
+               f"rust-only={sorted(rust_actions - py_actions)}")
+    # And the extension's own refusal table must cover the same actions, since it
+    # is the gate that sits ahead of DOM.setFileInputFiles.
+    bg = open(os.path.join(SCRIPT_DIR, "background.js")).read()
+    bm = re.search(r"const DLP_ACTION_CHANNELS = \{(.*?)\};", bg, re.S)
+    expect(bm is not None, "background.js: could not locate DLP_ACTION_CHANNELS")
+    if bm:
+        ext_actions = set(re.findall(r'^\s*([A-Za-z]+):', bm.group(1), re.M))
+        expect(ext_actions == set(bridge.DLP_ACTION_CHANNELS),
+               "extension/host DLP action map drift: "
+               f"ext-only={sorted(ext_actions - set(bridge.DLP_ACTION_CHANNELS))} "
+               f"host-only={sorted(set(bridge.DLP_ACTION_CHANNELS) - ext_actions)}")
 
 
 def main():

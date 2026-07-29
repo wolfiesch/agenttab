@@ -686,6 +686,31 @@ def browser_policy_check(action: str, payload: Optional[dict] = None) -> str:
     boundary. MCP deliberately exposes no policy-mutation tool: change
     ``siteModes`` with
     ``chrome-bridge policy site-mode <originPattern> manual|auto|skip``.
+
+    An egress denial surfaces here as ``allowed: false`` with ``reason:
+    "egress not allowed"``. The ``egressAllowlist`` policy key bounds where an
+    agent may make the browser send a NEW outbound request (``navigate``,
+    ``navigateTaskSession``, ``downloadUrl``, ``setCookie``, and those actions
+    nested in a ``batch``/``replayWorkflow`` step) and is CLI-managed only:
+    ``chrome-bridge policy allow-egress <pattern>`` /
+    ``chrome-bridge policy clear-egress <pattern>``. It never loosens site
+    policy, and it cannot see click-driven in-page navigation, script-issued
+    requests, or a page's own resource loads.
+
+    Every verdict also carries ``dlp``: the resolved data-loss-prevention mode
+    for this action's channel (``allow``/``audit``/``block``), or null when the
+    action belongs to no channel. A ``block`` surfaces as ``allowed: false`` with
+    ``reason: "dlp blocked"`` and is refused host-side before anything is
+    forwarded, so no file is opened and no frame is read. The channels the host
+    actually enforces are ``upload`` (``uploadFile``,
+    ``githubAttachUploadedFiles``, ``githubAttachPrBody``), ``download``
+    (``downloadUrl``), and ``screenShare`` (``startScreencast``,
+    ``screencastFrames``); a gated action nested in a
+    ``batch``/``replayWorkflow`` step is denied with its step index. The declared
+    ``clipboard`` channel has NO chokepoint: no bridge action reads or writes the
+    clipboard and a page-driven copy never crosses the bridge, so a clipboard
+    mode records intent and enforces nothing. DLP modes are CLI-managed only:
+    ``chrome-bridge policy dlp <channel> allow|audit|block``.
     """
     return _text(call("policyCheck", {"action": action, "payload": payload or {}}))
 
@@ -695,7 +720,7 @@ def browser_plan_preview(plan: list) -> str:
 
     ``plan`` is a list of up to 50 ``{"action": ..., "origin": ..., "payload":
     ...}`` steps. Each step gets its own verdict (allowed/reason/
-    confirmationRequired/redact/audit/originDependent/siteMode/effectiveTier)
+    confirmationRequired/redact/audit/originDependent/siteMode/effectiveTier/dlp)
     plus its ``step`` index.
 
     ``origin`` is an optional hypothetical tab origin used to resolve site

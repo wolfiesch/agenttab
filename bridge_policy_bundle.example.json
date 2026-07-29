@@ -1,0 +1,24 @@
+{
+  "_comment": "Example ORG POLICY BUNDLE. An admin distributes this document out of band (MDM, config management, a signed package) and pins it by digest with 'chrome-bridge policy bundle lock <path> --lockfile <path>'. A host applies it only when its sha256 matches the lockfile; anything else fails closed to the built-in default policy. Point a machine at it from bridge_policy.json: {\"policyBundle\": {\"path\": \"...\", \"lockfile\": \"...\"}, \"default\": {...}}. The local file layers on top and can only tighten: composed deniedActions/deniedOrigins are the union of this bundle's entries and the local ones.",
+  "default": {
+    "allowedActions": ["ping", "policyCheck", "policyInfo", "lease", "release", "leaseStatus"],
+    "deniedActions": ["executeScript", "executeScriptCDP", "startInterception", "downloadUrl"],
+    "allowedOrigins": [],
+    "deniedOrigins": ["file://*", "chrome://*", "chrome-extension://*", "*://localhost", "*://localhost:*", "*://127.0.0.1", "*://127.0.0.1:*", "*://0.0.0.0", "*://0.0.0.0:*", "*://*.local", "*://*.local:*", "*://[[]::1[]]", "*://[[]::1[]]:*"],
+    "requireConfirmation": [],
+    "siteModes": {},
+    "redactPatterns": ["(?i)bearer\\s+[a-z0-9\\-._~+/]+=*"],
+    "redact": true,
+    "audit": true
+  },
+  "clients": {
+    "default": {
+      "allowedActions": ["ping", "getTabs", "getCurrentState", "observe", "extractText", "extractStructured", "screenshot", "navigate", "click", "type", "fill", "waitForLoad", "waitForSelector"],
+      "allowedOrigins": ["https://github.com"],
+      "deniedOrigins": ["file://*", "chrome://*", "chrome-extension://*", "*://localhost", "*://localhost:*", "*://127.0.0.1", "*://127.0.0.1:*", "*://0.0.0.0", "*://0.0.0.0:*", "*://*.local", "*://*.local:*", "*://[[]::1[]]", "*://[[]::1[]]:*"],
+      "requireConfirmation": ["navigate", "click", "type", "fill"],
+      "redact": true,
+      "audit": true
+    }
+  }
+}

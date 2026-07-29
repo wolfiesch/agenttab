@@ -535,6 +535,136 @@ RESERVED_ACTIONS = {'__tabOrigin'}
 
 TARGET_REQUIRED_ACTIONS = {'navigate', 'navigateTaskSession', 'downloadUrl', 'getCookies'}
 
+# Actions that make the browser issue a NEW outbound request to a host named in
+# the request payload, so the host can bound the destination before forwarding.
+# ``setCookie`` is included because it writes a cookie scoped to its ``url``,
+# which the browser then attaches to its next request to that host, so it stages
+# egress even though the write itself is local.
+#
+# Deliberately NOT here, because the host cannot see the destination and must not
+# imply coverage it does not have (see docs/security.md):
+#   - in-page navigation the agent causes by clicking a link or submitting a form
+#     (``click``, ``press``, ``type``, ``fill``, ``drag``): the destination is
+#     decided by page markup the host never parses.
+#   - script-driven requests (``executeScript``, ``executeScriptCDP``): the URL
+#     lives inside the script body.
+#   - resource loads a page makes on its own (subresources, XHR, beacons).
+#   - ``uploadFile``/``githubAttach*``: the upload goes to the tab's own origin,
+#     which site policy already governs.
+#   - ``startInterception`` in ``fulfill`` mode: the extension fulfills from the
+#     inline ``body``, so it fetches nothing and creates no new egress.
+#   - ``deleteCookie``: names a url but removes state and sends nothing.
+EGRESS_URL_ACTIONS = {'navigate', 'navigateTaskSession', 'downloadUrl', 'setCookie'}
+
+# --- Data-loss-prevention channels (policy key ``dlp``) ---------------------
+# ``dlp`` is a map of CHANNEL -> MODE:
+#   allow - default; current behavior, nothing is added.
+#   audit - the action runs, and exactly one ``dlp_audit`` audit event naming
+#           the channel is written. The event carries no file contents, no file
+#           paths, and no frame data -- only the channel name.
+#   block - the action is denied with reason ``dlp blocked`` BEFORE it is
+#           forwarded, so Chrome never opens the file and the extension never
+#           dispatches the handler.
+# Merged as a map key (see _POLICY_MAP_KEYS), so a client layer can tighten one
+# channel without restating the rest.
+DLP_CHANNELS = ('clipboard', 'upload', 'download', 'screenShare')
+DLP_MODES = ('allow', 'audit', 'block')
+DLP_BLOCKED_ERROR = 'dlp blocked'
+DLP_AUDIT_DECISION = 'dlp_audit'
+
+# Which action belongs to which channel. Only chokepoints the BRIDGE ITSELF owns
+# appear here, because a mode must mean enforcement rather than aspiration:
+#   upload      - the three actions that hand local file paths to CDP
+#                 ``DOM.setFileInputFiles``.
+#   download    - ``downloadUrl``, the only action that starts a browser download.
+#   screenShare - the screencast capture start and the frame read.
+# ``clipboard`` is DECLARED but has no entry: no bridge action reads or writes the
+# clipboard, and a page-driven copy/paste never crosses the bridge, so there is
+# nothing here to gate. See docs/security.md; do not add aspirational entries.
+DLP_ACTION_CHANNELS = {
+    'uploadFile': 'upload',
+    'githubAttachUploadedFiles': 'upload',
+    'githubAttachPrBody': 'upload',
+    'downloadUrl': 'download',
+    'startScreencast': 'screenShare',
+    'screencastFrames': 'screenShare',
+}
+
+
+def dlp_channel_for_action(action):
+    # The DLP channel this action belongs to, or None when it belongs to none.
+    return DLP_ACTION_CHANNELS.get(action if isinstance(action, str) else '')
+
+
+def resolve_dlp_mode(cp, channel):
+    # The mode governing ``channel`` for this client, or None when ``channel`` is
+    # not a DLP channel. Fail closed: a channel configured with anything outside
+    # DLP_MODES resolves to ``block`` rather than being silently ignored, because
+    # a typo in a data-loss control must not widen it.
+    if channel not in DLP_CHANNELS:
+        return None
+    dlp = cp.get('dlp')
+    if dlp is None:
+        return 'allow'
+    if not isinstance(dlp, dict):
+        return 'block'
+    if channel not in dlp:
+        return 'allow'
+    mode = dlp.get(channel)
+    return mode if isinstance(mode, str) and mode in DLP_MODES else 'block'
+
+
+def dlp_modes_for_client(cp):
+    # The non-default channel modes for this client, for stamping onto a
+    # forwarded request so the extension can refuse independently. Channels in
+    # ``allow`` are omitted, so an unconfigured policy changes no envelope.
+    modes = {}
+    for channel in DLP_CHANNELS:
+        mode = resolve_dlp_mode(cp, channel)
+        if mode and mode != 'allow':
+            modes[channel] = mode
+    return modes
+
+
+def dlp_channels_in_mode(cp, action, payload, mode):
+    # Channels resolving to ``mode`` for this request, recursing into composites
+    # so a batch or replayWorkflow step is seen. Ordered by DLP_CHANNELS and
+    # deduplicated, so both hosts report the same string for the same request.
+    found = set()
+
+    def walk(w_action, w_payload):
+        if w_action in ('batch', 'replayWorkflow'):
+            steps = (_step_payloads(w_payload) if w_action == 'batch'
+                     else _workflow_step_payloads(w_payload))
+            for s_action, s_payload in steps:
+                walk(s_action, s_payload)
+            return
+        channel = dlp_channel_for_action(w_action)
+        if channel and resolve_dlp_mode(cp, channel) == mode:
+            found.add(channel)
+
+    walk(action if isinstance(action, str) else '', payload)
+    return [c for c in DLP_CHANNELS if c in found]
+
+
+def dlp_blocked_target(cp, action, payload):
+    # (action, channel) of the first blocked chokepoint in this request, walking
+    # composite steps in dispatch order so a denial can name the smuggled step's
+    # own action rather than the enclosing ``batch``.
+    if action in ('batch', 'replayWorkflow'):
+        steps = (_step_payloads(payload) if action == 'batch'
+                 else _workflow_step_payloads(payload))
+        for s_action, s_payload in steps:
+            hit = dlp_blocked_target(cp, s_action, s_payload)
+            if hit:
+                return hit
+        return None
+    channel = dlp_channel_for_action(action)
+    if channel and resolve_dlp_mode(cp, channel) == 'block':
+        return (action, channel)
+    return None
+
+
 # Built-in fail-closed default. A policy file must explicitly opt into browser
 # automation beyond host-side liveness/policy/lease operations.
 DEFAULT_POLICY = {
@@ -551,10 +681,19 @@ DEFAULT_POLICY = {
             "*://[[]::1[]]", "*://[[]::1[]]:*",
         ],
         "requireConfirmation": [],
+        # Where the agent may make the browser SEND traffic. Empty means
+        # unconstrained, preserving behavior for policies that never set it.
+        "egressAllowlist": [],
         "siteModes": {},
+        # Per-channel data-loss-prevention modes (see DLP_CHANNELS). An absent
+        # channel is "allow", preserving behavior for policies that never set it.
+        "dlp": {},
         "redactPatterns": [],
         "secretMaskFile": None,
         "traceDir": None,
+        # Optional forwarder for audit events that were already written locally
+        # (see the audit export section). Null/absent disables export entirely.
+        "auditExport": None,
         "redact": True,
         "audit": True,
     },
@@ -563,36 +702,267 @@ DEFAULT_POLICY = {
 
 _policy_lock = threading.Lock()
 _policy_cache = DEFAULT_POLICY
-_policy_mtime = object()
+# Signature of every file the effective policy derives from. A fresh sentinel
+# object never equals a real signature, so the first read always loads.
+_policy_sig = object()
+
+# --- Content-addressed org policy bundles (policy key ``policyBundle``) -----
+# An org distributes one policy document out of band and pins it by digest:
+#
+#   "policyBundle": {"path": "/etc/chrome-bridge/org-policy.json",
+#                    "lockfile": "/etc/chrome-bridge/org-policy.lock"}
+#
+# read from the ROOT of the local policy file (its ``default`` layer is also
+# accepted). The host applies the bundle ONLY when the bundle's sha256 equals
+# the ``sha256`` recorded in the lockfile. Every other outcome -- unreadable
+# bundle, unreadable or malformed lockfile, malformed bundle, digest mismatch,
+# malformed policyBundle stanza -- fails closed to the BUILT-IN default policy
+# (never the last verified bundle), is logged, and is audited as
+# ``policy_bundle_rejected`` carrying both digests. The reload signature covers
+# the bundle and lockfile mtimes, so a swapped bundle is re-verified on the
+# next request and each rejection is audited once per change, not per request.
+#
+# Precedence for a VERIFIED bundle:
+#   built-in default -> bundle default/clients -> local bridge_policy.json
+# so a local operator can always tighten on top of the org baseline. The one
+# thing a bundle can never do is loosen: composed ``deniedActions`` and
+# ``deniedOrigins`` are the UNION of the bundle's entries and the local ones.
+
+POLICY_BUNDLE_DECISION = 'policy_bundle_rejected'
+POLICY_BUNDLE_MISCONFIGURED = 'policy bundle misconfigured'
+POLICY_BUNDLE_UNREADABLE = 'policy bundle unreadable'
+POLICY_BUNDLE_MALFORMED = 'policy bundle malformed'
+POLICY_BUNDLE_LOCK_UNREADABLE = 'policy bundle lockfile unreadable'
+POLICY_BUNDLE_LOCK_MALFORMED = 'policy bundle lockfile malformed'
+POLICY_BUNDLE_MISMATCH = 'policy bundle digest mismatch'
+
+# Deny lists never shrink when a bundle is composed with the local policy.
+POLICY_BUNDLE_DENY_KEYS = ('deniedActions', 'deniedOrigins')
+
+# policyInfo and the CLI report a truncated digest: enough to compare two
+# installs by eye, never enough to reconstruct any bundle content.
+POLICY_BUNDLE_DIGEST_CHARS = 12
+
+_policy_bundle_state = {"path": None, "lockfile": None, "verified": False, "digest": None}
 
 
-def load_policy():
-    # fail-closed default and logs parse/load errors.
+def short_digest(digest):
+    if not isinstance(digest, str) or not digest:
+        return None
+    return digest[:POLICY_BUNDLE_DIGEST_CHARS]
+
+
+def policy_bundle_config(doc):
+    # (path, lockfile) from the local policy document; ("", "") when the stanza
+    # is present but unusable (fail closed); None when no bundle is configured.
+    if not isinstance(doc, dict):
+        return None
+    holders = [doc]
+    if isinstance(doc.get("default"), dict):
+        holders.append(doc["default"])
+    for holder in holders:
+        cfg = holder.get("policyBundle")
+        if cfg is None:
+            continue
+        if not isinstance(cfg, dict):
+            return ("", "")
+        path = cfg.get("path")
+        lockfile = cfg.get("lockfile")
+        if not isinstance(path, str) or not path.strip():
+            return ("", "")
+        if not isinstance(lockfile, str) or not lockfile.strip():
+            return ("", "")
+        return (os.path.expanduser(path.strip()), os.path.expanduser(lockfile.strip()))
+    return None
+
+
+def read_lock_digest(path):
+    # (digest, reason). The lockfile is JSON: {"sha256": "<64 lowercase hex>"}.
+    # Any other shape is malformed and therefore fails closed.
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except OSError:
+        return None, POLICY_BUNDLE_LOCK_UNREADABLE
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    if not isinstance(data, dict):
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    digest = data.get("sha256")
+    if not isinstance(digest, str):
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    digest = digest.strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    return digest, None
+
+
+def verify_policy_bundle(path, lockfile):
+    # (document, actualDigest, expectedDigest, reason). ``reason`` is None only
+    # when the digest matched AND the bundle parsed as a JSON object. The digest
+    # is compared BEFORE parsing so an unpinned document is never interpreted.
+    if not path or not lockfile:
+        return None, None, None, POLICY_BUNDLE_MISCONFIGURED
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return None, None, None, POLICY_BUNDLE_UNREADABLE
+    actual = hashlib.sha256(raw).hexdigest()
+    expected, reason = read_lock_digest(lockfile)
+    if reason is not None:
+        return None, actual, expected, reason
+    if actual != expected:
+        return None, actual, expected, POLICY_BUNDLE_MISMATCH
+    try:
+        doc = json.loads(raw.decode('utf-8'))
+    except Exception:
+        return None, actual, expected, POLICY_BUNDLE_MALFORMED
+    if not isinstance(doc, dict):
+        return None, actual, expected, POLICY_BUNDLE_MALFORMED
+    return doc, actual, expected, None
+
+
+def _merge_bundle_layer(bundle_layer, local_layer, local_default):
+    # Local layer keys override the bundle's, EXCEPT deny lists, which become
+    # the union of the bundle's entries and the local floor (this layer's own
+    # list when it defines one, else the local default layer's list). That is
+    # the no-loosening rule: an org baseline can add denials, never drop them.
+    bundle_layer = bundle_layer if isinstance(bundle_layer, dict) else {}
+    local_layer = local_layer if isinstance(local_layer, dict) else {}
+    merged = {**bundle_layer, **local_layer}
+    for key in POLICY_BUNDLE_DENY_KEYS:
+        floor = local_layer.get(key)
+        if not isinstance(floor, list):
+            floor = local_default.get(key) if isinstance(local_default, dict) else None
+        union = []
+        for values in (bundle_layer.get(key), floor):
+            if isinstance(values, list):
+                for value in values:
+                    if value not in union:
+                        union.append(value)
+        if union:
+            merged[key] = union
+    return merged
+
+
+def compose_bundle_policy(bundle, local):
+    # A verified bundle supplies the baseline "default"/"clients" layers; the
+    # local policy document is layered on top. Local root keys (including the
+    # policyBundle stanza itself) are preserved.
+    bundle = bundle if isinstance(bundle, dict) else {}
+    local = local if isinstance(local, dict) else {}
+    local_default = local.get("default") if isinstance(local.get("default"), dict) else {}
+    composed = {k: v for k, v in local.items() if k not in ("default", "clients")}
+    composed["default"] = _merge_bundle_layer(
+        bundle.get("default"), local_default, local_default)
+    bundle_clients = bundle.get("clients") if isinstance(bundle.get("clients"), dict) else {}
+    local_clients = local.get("clients") if isinstance(local.get("clients"), dict) else {}
+    clients = {}
+    for name in list(bundle_clients) + [n for n in local_clients if n not in bundle_clients]:
+        clients[name] = _merge_bundle_layer(
+            bundle_clients.get(name), local_clients.get(name), local_default)
+    composed["clients"] = clients
+    return composed
+
+
+def _set_policy_bundle_state(path, lockfile, verified, digest):
+    _policy_bundle_state.update({
+        "path": path, "lockfile": lockfile,
+        "verified": bool(verified), "digest": digest,
+    })
+
+
+def policy_bundle_info():
+    # policyInfo view: path, verification result, truncated digest. Metadata
+    # only -- bundle CONTENTS are never returned, matching the existing rule
+    # that policyInfo discloses paths, not policy bodies.
+    state = dict(_policy_bundle_state)
+    if state.get("path") is None:
+        return None
+    return {
+        "path": state.get("path"),
+        "verified": bool(state.get("verified")),
+        "digest": short_digest(state.get("digest")),
+    }
+
+
+def _audit_policy_bundle_rejected(path, reason, expected, actual):
+    write_audit_event({
+        "ts": now_ms(),
+        "client": "host",
+        "action": "policyBundle",
+        "targets": [path] if path else [],
+        "decision": POLICY_BUNDLE_DECISION,
+        "reason": reason,
+        "requestId": None,
+        "expectedDigest": expected,
+        "actualDigest": actual,
+    })
+
+
+def load_local_policy():
+    # The local policy file only: fail-closed default and logs load errors.
     try:
         with open(POLICY_FILE) as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("policy root must be an object")
         return data
-    except FileNotFoundError as e:
-        logging.error(f"Could not load policy file {POLICY_FILE}: {e}")
-        return DEFAULT_POLICY
     except Exception as e:
         logging.error(f"Could not load policy file {POLICY_FILE}: {e}")
         return DEFAULT_POLICY
 
 
+def load_policy():
+    # The effective policy document: the local policy file, or -- when it names
+    # a policyBundle -- the VERIFIED bundle with the local file layered on top.
+    local = load_local_policy()
+    config = policy_bundle_config(local)
+    if config is None:
+        _set_policy_bundle_state(None, None, False, None)
+        return local
+    path, lockfile = config
+    doc, actual, expected, reason = verify_policy_bundle(path, lockfile)
+    if reason is not None:
+        _set_policy_bundle_state(path, lockfile, False, actual)
+        logging.error(
+            f"Rejected policy bundle {path or '<unset>'}: {reason} "
+            f"(expected {expected or 'none'}, actual {actual or 'none'}); "
+            "serving built-in fail-closed default policy")
+        _audit_policy_bundle_rejected(path, reason, expected, actual)
+        return DEFAULT_POLICY
+    _set_policy_bundle_state(path, lockfile, True, actual)
+    return compose_bundle_policy(doc, local)
+
+
+def _policy_source_signature():
+    # Every file the effective policy derives from, using the bundle paths the
+    # last load resolved. A swapped bundle or lockfile changes the signature, so
+    # its digest is re-verified instead of being trusted for the process's life.
+    path = _policy_bundle_state.get("path")
+    lockfile = _policy_bundle_state.get("lockfile")
+    return (
+        _file_mtime(POLICY_FILE),
+        path, _file_mtime(path) if path else None,
+        lockfile, _file_mtime(lockfile) if lockfile else None,
+    )
+
+
 def current_policy():
-    # Cached-with-mtime, matching token reload behavior: reload when the policy
-    # file's mtime changes (including absent -> present) so changes take effect
-    # without a host restart.
-    global _policy_cache, _policy_mtime
+    # Cached-with-mtime, matching token reload behavior: reload when any policy
+    # source's mtime changes (including absent -> present) so changes take
+    # effect without a host restart.
+    global _policy_cache, _policy_sig
     reloaded = False
     with _policy_lock:
-        mtime = _file_mtime(POLICY_FILE)
-        if mtime != _policy_mtime:
+        if _policy_source_signature() != _policy_sig:
             _policy_cache = load_policy()
-            _policy_mtime = mtime
+            # Recomputed AFTER the load: the load is what resolves the bundle
+            # paths this signature has to cover.
+            _policy_sig = _policy_source_signature()
             reloaded = True
         policy = _policy_cache
     if reloaded:
@@ -600,20 +970,24 @@ def current_policy():
         # (including audit masking) is armed before the first response arrives.
         for layer_name in ("default", *(policy.get("clients") or {})):
             load_secret_masks(policy_for_client(policy, layer_name).get('secretMaskFile'))
+        # Resolve the audit export sinks in the same pass, so a malformed
+        # control block is reported once at load rather than once per request.
+        prime_audit_export(policy)
     return policy
 
 
 _POLICY_LIST_KEYS = (
     'allowedActions', 'deniedActions', 'allowedOrigins', 'deniedOrigins',
-    'requireConfirmation', 'redactPatterns',
+    'requireConfirmation', 'redactPatterns', 'egressAllowlist',
 )
 _POLICY_BOOL_KEYS = ('redact', 'audit')
 # String-valued policy keys merged like bools: a later layer replaces the value.
 _POLICY_STR_KEYS = ('secretMaskFile', 'traceDir')
-# Map-valued policy keys merged PER KEY: a later layer overrides only the origin
-# patterns it names and inherits the rest, so a client layer can set one site's
-# mode without restating (or silently dropping) the default layer's site modes.
-_POLICY_MAP_KEYS = ('siteModes',)
+# Map-valued policy keys merged PER KEY: a later layer overrides only the keys it
+# names and inherits the rest, so a client layer can set one site's mode (or
+# tighten one DLP channel) without restating (or silently dropping) the default
+# layer's other entries.
+_POLICY_MAP_KEYS = ('siteModes', 'dlp', 'auditExport')
 
 
 def policy_for_client(policy, name):
@@ -764,6 +1138,18 @@ def origin_targets(origin):
     return normalize_url_targets(origin)
 
 
+def egress_targets(action, payload):
+    # Normalized policy targets for the outbound destination an action would
+    # cause, or [] when the action names no destination the host can see.
+    # batch/replayWorkflow deliberately resolve to [] here: their steps are each
+    # evaluated by evaluate_policy, so a smuggled step is reported with its own
+    # index instead of being flattened into the composite's verdict.
+    if action not in EGRESS_URL_ACTIONS or not isinstance(payload, dict):
+        return []
+    url = payload.get('url')
+    return normalize_url_targets(url) if isinstance(url, str) else []
+
+
 def policy_constrains_origins(policy, name):
     # True when the client's site policy is non-trivial, i.e. it could allow or
     # deny based on a tab's origin. Lets the host skip the tab-origin lookup
@@ -900,6 +1286,13 @@ def evaluate_policy(policy, name, action, payload, origins=None):
     allowed_actions = cp.get('allowedActions')
     if not action_matches(allowed_actions, action):
         return (False, f"action {action} not allowed", False, redact_enabled, audit_enabled, targets)
+    # Data-loss-prevention channel gate. Placed after the action gates and before
+    # anything that could forward, so a blocked channel is refused while the
+    # request is still just JSON: no file is opened, no frame is read. batch and
+    # replayWorkflow belong to no channel themselves; their steps are evaluated
+    # recursively below and produce "<batch|workflow> step N: dlp blocked".
+    if resolve_dlp_mode(cp, dlp_channel_for_action(action)) == 'block':
+        return (False, DLP_BLOCKED_ERROR, False, redact_enabled, audit_enabled, targets)
     confirm = action_matches(cp.get('requireConfirmation'), action)
     # Per-site permission mode. Applied to the confirmation requirement only,
     # and only after the action gates: every deny path below returns
@@ -962,6 +1355,20 @@ def evaluate_policy(policy, name, action, payload, origins=None):
         return (False, "target denied", False, redact_enabled, audit_enabled, targets)
     if targets and not target_matches(allowed_origins, targets):
         return (False, "target not allowed", False, redact_enabled, audit_enabled, targets)
+
+    # Egress allowlist (``egressAllowlist``): where the agent may make the
+    # browser SEND traffic, as opposed to which page it may act upon. Evaluated
+    # AFTER the action and site-target gates, so a denied action or a denied /
+    # non-allowed origin still wins and an egress grant can never widen site
+    # policy. Empty or absent means unconstrained.
+    egress_allow = cp.get('egressAllowlist')
+    if isinstance(egress_allow, list) and egress_allow and action in EGRESS_URL_ACTIONS:
+        e_targets = egress_targets(action, payload)
+        # Fail closed: an egress-bearing action whose destination the host cannot
+        # resolve is denied rather than forwarded unchecked.
+        if not e_targets or not target_matches(egress_allow, e_targets):
+            return (False, "egress not allowed", False, redact_enabled, audit_enabled,
+                    e_targets or targets)
     return (True, None, confirm, redact_enabled, audit_enabled, targets)
 
 
@@ -996,6 +1403,10 @@ def policy_verdict(policy, name, action, payload, origin=None):
         # "read_only" or "mutating". Computed from the payload, so a batch of
         # reads is read_only and a read whose flag changes state is mutating.
         "effectiveTier": effective_action_tier(action, payload),
+        # The resolved DLP mode for this action's channel, or null when the
+        # action belongs to no DLP channel.
+        "dlp": resolve_dlp_mode(policy_for_client(policy, name),
+                                dlp_channel_for_action(action)),
     }
     return verdict, targets
 
@@ -1016,7 +1427,7 @@ def plan_step_verdicts(policy, name, plan):
     return out
 
 
-def policy_denial(reason, action, targets, name, policy=None):
+def policy_denial(reason, action, targets, name, policy=None, payload=None):
     # Build a structured, actionable companion to the opaque "policy denied:
     # <reason>" error string. The error string itself stays byte-stable for API
     # and contract compatibility; this object tells a client exactly what to
@@ -1024,6 +1435,7 @@ def policy_denial(reason, action, targets, name, policy=None):
     # classifies the gate that rejected the request so a client can self-service
     # the right fix.
     batch_step = None
+    dlp_channel = None
     m = re.match(r"^(?:batch|workflow) step (\d+): (.*)$", reason or "")
     if m:
         batch_step = int(m.group(1))
@@ -1076,6 +1488,16 @@ def policy_denial(reason, action, targets, name, policy=None):
             f"Remove or narrow the matching {section}.deniedOrigins pattern in {POLICY_FILE}")
         suggested = {"op": "removePattern", "section": section, "list": "deniedOrigins",
                      "value": sample, "patterns": matched} if matched else None
+    elif reason == "egress not allowed":
+        kind = "egress"
+        sample = targets[0] if targets else None
+        section = section_for("egressAllowlist")
+        remediation = (
+            f"Add a host pattern covering {sample!r} to {section}.egressAllowlist in {POLICY_FILE}"
+            if sample else
+            f"Add the destination host to {section}.egressAllowlist in {POLICY_FILE}")
+        suggested = ({"op": "add", "section": section, "list": "egressAllowlist", "value": sample}
+                     if sample else None)
     elif reason and reason.endswith("denied") and reason.startswith("action "):
         kind = "action"
         section = section_for("deniedActions")
@@ -1091,6 +1513,29 @@ def policy_denial(reason, action, targets, name, policy=None):
             "The request carried no resolvable target origin; supply a valid "
             "url/domain/tabId so site policy can be evaluated")
         suggested = None
+    elif reason == DLP_BLOCKED_ERROR:
+        kind = "dlp"
+        cp = policy_for_client(policy or {}, name)
+        hit = dlp_blocked_target(cp, action, payload)
+        if hit:
+            # For a composite the outer action is "batch"/"replayWorkflow"; name
+            # the smuggled step's own action so the remediation is actionable.
+            action, dlp_channel = hit
+        # ``dlp`` is a MAP key, so section_for (which tests for a list) cannot
+        # resolve it. It is also merged per channel, so a client layer only
+        # governs the channel it names.
+        client_dlp = ((policy or {}).get("clients") or {}).get(name)
+        section = (f"clients.{name}"
+                   if isinstance(client_dlp, dict)
+                   and isinstance((client_dlp.get("dlp") or None), dict)
+                   and dlp_channel in (client_dlp.get("dlp") or {})
+                   else "default")
+        channel_name = dlp_channel or "the requested"
+        remediation = (
+            f"Set {section}.dlp.{channel_name} to 'audit' or 'allow' in {POLICY_FILE} "
+            f"to permit {action!r}")
+        suggested = ({"op": "setChannelMode", "section": section, "map": "dlp",
+                      "channel": dlp_channel, "value": "audit"} if dlp_channel else None)
     else:
         kind = "other"
         remediation = f"Review default policy in {POLICY_FILE}"
@@ -1104,6 +1549,8 @@ def policy_denial(reason, action, targets, name, policy=None):
         "remediation": remediation,
         "suggestedPatch": suggested,
         "batchStep": batch_step,
+        # The DLP channel that refused the request, or null for every other kind.
+        "dlpChannel": dlp_channel,
         "cli": "chrome-bridge policy doctor",
     }
 
@@ -1141,10 +1588,13 @@ def _persist_origin_grant(policy, name, origin):
     finally:
         if fd is not None:
             os.close(fd)
-    global _policy_cache, _policy_mtime
+    global _policy_cache, _policy_sig
     with _policy_lock:
         _policy_cache = updated
-        _policy_mtime = _file_mtime(POLICY_FILE)
+        # Force a full reload on the next read rather than recording the new
+        # signature: when a policyBundle is active the effective policy is the
+        # bundle composed with the local file, not the document just written.
+        _policy_sig = object()
     return updated
 
 
@@ -1342,6 +1792,11 @@ def write_audit_event(event):
     # Append one JSON line. Never writes payload/response bodies, and never any
     # known secretMaskFile value (a denial reason can quote a target). A write
     # failure is logged but never blocks browser automation.
+    #
+    # The local log is the source of truth. The optional ``auditExport`` sink is
+    # a MIRROR of the line that was just committed here: it runs after the local
+    # append has returned, on the already-masked event, behind its own lock, so
+    # export can never precede, replace, or delay the local write.
     try:
         event = mask_secrets_value(event, _known_secret_masks())
         line = json.dumps(event) + "\n"
@@ -1350,6 +1805,8 @@ def write_audit_event(event):
                 f.write(line)
     except Exception as e:
         logging.error(f"Could not write audit event to {AUDIT_LOG_FILE}: {e}")
+        return
+    forward_audit_export(event)
 
 
 def _audit(audit_enabled, client, action, targets, decision, reason, request_id):
@@ -1363,6 +1820,353 @@ def _audit(audit_enabled, client, action, targets, decision, reason, request_id)
         "decision": decision,
         "reason": reason,
         "requestId": request_id,
+    })
+
+
+# --- Audit export forwarder (policy ``auditExport``) ------------------------
+#
+# An ADDITIONAL sink for audit events that the local log already holds. Export
+# never computes a new event and never adds a field: it re-encodes the exact
+# masked object that ``write_audit_event`` just committed, so no payload body,
+# no response body, and no unmasked secret can reach a SIEM that the local log
+# does not already carry.
+#
+# Configuration is the ``auditExport`` policy map, merged per key across the
+# ``default`` and ``clients.<name>`` layers. ``format`` is jsonl, syslog, or
+# cef; ``destination`` is a local file path (jsonl/cef) or udp://host:port,
+# tcp://host:port, or a unix datagram socket path (syslog). Null or absent
+# disables export entirely.
+#
+# Fail closed and loud: a malformed control block, or a sink that refuses a
+# write, disables that sink for the life of the process after exactly one log
+# line and exactly one ``audit_export_unavailable`` audit event. Automation is
+# never blocked and never retried against a dead sink.
+
+AUDIT_EXPORT_FORMATS = ('jsonl', 'syslog', 'cef')
+
+# Bound on any network sink so a wedged collector cannot hold the export lock.
+AUDIT_EXPORT_TIMEOUT = 2.0
+
+# RFC 5424 framing constants. Facility local0 (16); severity 4 (warning) for
+# the deny/blackout class, 6 (informational) for everything else.
+_SYSLOG_FACILITY = 16
+_SYSLOG_SEVERITY_ALERT = 4
+_SYSLOG_SEVERITY_INFO = 6
+_SYSLOG_APP_NAME = 'chrome-bridge'
+_SYSLOG_SD_ID = 'chromeBridge@0'
+
+# ArcSight CEF header constants. The version field is the audit-export SCHEMA
+# version, not the product version: a receiver keys its field mapping off it.
+_CEF_VENDOR = 'ChromeBridge'
+_CEF_PRODUCT = 'NativeHost'
+_CEF_VERSION = '1.0'
+_CEF_SEVERITY_ALERT = 7
+_CEF_SEVERITY_INFO = 3
+
+# Fixed field order for syslog structured data, so a Python line and a Rust
+# line for the same event are byte-identical.
+_AUDIT_EXPORT_FIELDS = ('client', 'action', 'decision', 'reason', 'requestId', 'targets')
+
+# Key for the base (built-in + ``default``) export layer. Client names are
+# parsed from ``name:token`` lines, so a NUL can never collide with a real one.
+_POLICY_BASE_LAYER = '\x00'
+
+
+def audit_export_alerting(decision):
+    # Deny and blackout outcomes ride at the higher severity in both formats.
+    text = str(decision or '').lower()
+    return 'deny' in text or 'blackout' in text or 'unavailable' in text
+
+
+def _audit_export_scalar(value):
+    # Render one audit field. Absent/null/empty is "-"; a non-string leaf is
+    # rendered as compact JSON so both hosts agree byte for byte.
+    if value is None:
+        return '-'
+    if isinstance(value, str):
+        return value or '-'
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def _audit_export_field(event, key):
+    value = event.get(key)
+    if key == 'targets':
+        if not isinstance(value, list) or not value:
+            return '-'
+        return ",".join(_audit_export_scalar(v) for v in value)
+    return _audit_export_scalar(value)
+
+
+def _audit_export_epoch_ms(event):
+    ts = event.get('ts')
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    return int(ts)
+
+
+def _syslog_timestamp(event):
+    ms = _audit_export_epoch_ms(event)
+    if ms is None:
+        return '-'
+    seconds, millis = divmod(ms, 1000)
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(seconds)) + f".{millis:03d}Z"
+
+
+def _syslog_escape(text):
+    # RFC 5424 6.3.3: only these three characters are escaped in PARAM-VALUE.
+    return text.replace('\\', '\\\\').replace('"', '\\"').replace(']', '\\]')
+
+
+def _syslog_msgid(action):
+    # MSGID is PRINTUSASCII, capped so a long action cannot unbalance the line.
+    safe = ''.join(ch for ch in str(action or '') if 33 <= ord(ch) <= 126)
+    return safe[:32] or '-'
+
+
+def _cef_header_escape(text):
+    return (text.replace('\\', '\\\\').replace('|', '\\|')
+            .replace('\n', ' ').replace('\r', ' '))
+
+
+def _cef_value_escape(text):
+    return (text.replace('\\', '\\\\').replace('=', '\\=')
+            .replace('\n', '\\n').replace('\r', '\\n'))
+
+
+def format_audit_export_line(fmt, event):
+    # One export line for one audit event, without a trailing newline. Reads
+    # only fields the audit log already carries.
+    if fmt == 'jsonl':
+        return json.dumps(event, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    fields = {key: _audit_export_field(event, key) for key in _AUDIT_EXPORT_FIELDS}
+    alerting = audit_export_alerting(event.get('decision'))
+    if fmt == 'syslog':
+        pri = _SYSLOG_FACILITY * 8 + (
+            _SYSLOG_SEVERITY_ALERT if alerting else _SYSLOG_SEVERITY_INFO)
+        data = " ".join(f'{key}="{_syslog_escape(fields[key])}"'
+                        for key in _AUDIT_EXPORT_FIELDS)
+        return (f"<{pri}>1 {_syslog_timestamp(event)} - {_SYSLOG_APP_NAME} - "
+                f"{_syslog_msgid(event.get('action'))} [{_SYSLOG_SD_ID} {data}]")
+    if fmt == 'cef':
+        ms = _audit_export_epoch_ms(event)
+        header = "|".join((
+            "CEF:0", _CEF_VENDOR, _CEF_PRODUCT, _CEF_VERSION,
+            _cef_header_escape(fields['decision']),
+            _cef_header_escape(fields['action']),
+            str(_CEF_SEVERITY_ALERT if alerting else _CEF_SEVERITY_INFO),
+        ))
+        extension = " ".join((
+            f"rt={_cef_value_escape('-' if ms is None else str(ms))}",
+            f"suser={_cef_value_escape(fields['client'])}",
+            f"act={_cef_value_escape(fields['action'])}",
+            f"outcome={_cef_value_escape(fields['decision'])}",
+            f"externalId={_cef_value_escape(fields['requestId'])}",
+            f"reason={_cef_value_escape(fields['reason'])}",
+            "cs1Label=targets",
+            f"cs1={_cef_value_escape(fields['targets'])}",
+        ))
+        return f"{header}|{extension}"
+    raise ValueError(f"unknown auditExport format {fmt}")
+
+
+def normalize_audit_export(config):
+    # (normalized, error). Fail closed: anything present but malformed returns
+    # an error and disables export rather than falling back to a looser sink.
+    if config is None:
+        return None, None
+    if not isinstance(config, dict):
+        return None, "auditExport must be an object"
+    fmt = config.get('format')
+    destination = config.get('destination')
+    if fmt is None and destination is None:
+        return None, None
+    if not isinstance(fmt, str) or fmt not in AUDIT_EXPORT_FORMATS:
+        return None, "auditExport.format must be one of " + ", ".join(AUDIT_EXPORT_FORMATS)
+    if not isinstance(destination, str) or not destination.strip():
+        return None, "auditExport.destination must be a non-empty string"
+    rotate = config.get('rotateBytes')
+    if rotate is not None and (isinstance(rotate, bool) or not isinstance(rotate, int)
+                               or rotate <= 0):
+        return None, "auditExport.rotateBytes must be a positive integer"
+    retain = config.get('retainDays')
+    if retain is not None and (isinstance(retain, bool)
+                               or not isinstance(retain, (int, float)) or retain <= 0):
+        return None, "auditExport.retainDays must be a positive number"
+    destination = destination.strip()
+    return {
+        'format': fmt,
+        'destination': destination,
+        'rotateBytes': rotate,
+        'retainDays': retain,
+        'key': f"{fmt}|{destination}",
+    }, None
+
+
+# Serializes every export write (and therefore every rotation) under the
+# thread-per-connection model, exactly like _audit_write_lock does locally.
+# Separate from _audit_write_lock on purpose: a slow sink must never delay the
+# local append.
+_audit_export_lock = threading.Lock()
+_audit_export_state_lock = threading.Lock()
+_audit_export_layers = {}    # policy layer name -> normalized config or None
+_audit_export_disabled = set()  # sink keys already disabled for this process
+
+
+def prime_audit_export(policy):
+    # Resolve the merged auditExport for the base layer and every named client
+    # at policy load time. Sinks already disabled stay disabled: a reload must
+    # not silently re-arm a destination that already failed this process.
+    layers = {}
+    errors = []
+    for name in (_POLICY_BASE_LAYER, *(policy.get("clients") or {})):
+        normalized, error = normalize_audit_export(
+            policy_for_client(policy, name).get('auditExport'))
+        layers[name] = normalized
+        if error:
+            errors.append((name, error))
+    with _audit_export_state_lock:
+        _audit_export_layers.clear()
+        _audit_export_layers.update(layers)
+    for name, error in errors:
+        label = 'default' if name == _POLICY_BASE_LAYER else name
+        with _audit_export_state_lock:
+            if f"config|{label}" in _audit_export_disabled:
+                continue
+            _audit_export_disabled.add(f"config|{label}")
+        logging.error(f"Disabling auditExport for policy layer {label}: {error}")
+        write_audit_event({
+            "ts": now_ms(),
+            "client": None if name == _POLICY_BASE_LAYER else name,
+            "action": "auditExport",
+            "targets": [label],
+            "decision": "audit_export_unavailable",
+            "reason": error,
+            "requestId": None,
+        })
+
+
+def audit_export_sink(client):
+    # The sink for the client this event is attributed to, falling back to the
+    # base layer for host-level events that name no client.
+    with _audit_export_state_lock:
+        if isinstance(client, str) and client in _audit_export_layers:
+            return _audit_export_layers[client]
+        return _audit_export_layers.get(_POLICY_BASE_LAYER)
+
+
+def _audit_export_rotate(config, pending_bytes):
+    # Single-generation rotation, no compression. retainDays prunes an existing
+    # <destination>.1 older than the window before the new one replaces it, so a
+    # rotated generation never outlives the retention window.
+    rotate = config.get('rotateBytes')
+    if not rotate:
+        return
+    path = config['destination']
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size + pending_bytes <= rotate:
+        return
+    rotated = path + '.1'
+    retain = config.get('retainDays')
+    if retain:
+        mtime = _file_mtime(rotated)
+        if mtime is not None and (time.time() - mtime) > retain * 86400:
+            try:
+                os.remove(rotated)
+            except OSError:
+                pass
+    os.replace(path, rotated)
+
+
+def _audit_export_syslog(destination, line):
+    data = line.encode('utf-8')
+    for scheme in ('udp', 'tcp'):
+        prefix = scheme + '://'
+        if not destination.startswith(prefix):
+            continue
+        host, sep, port = destination[len(prefix):].rpartition(':')
+        if not sep or not host:
+            raise ValueError(f"syslog destination must be {prefix}host:port")
+        host = host.strip('[]')
+        kind = socket.SOCK_DGRAM if scheme == 'udp' else socket.SOCK_STREAM
+        family, socktype, proto, _canon, addr = socket.getaddrinfo(
+            host, int(port), 0, kind)[0]
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(AUDIT_EXPORT_TIMEOUT)
+            if scheme == 'tcp':
+                # RFC 6587 non-transparent framing: one LF-delimited message.
+                sock.connect(addr)
+                sock.sendall(data + b"\n")
+            else:
+                sock.sendto(data, addr)
+        finally:
+            sock.close()
+        return
+    if not hasattr(socket, 'AF_UNIX'):
+        raise ValueError("unix socket syslog destinations are unsupported on this platform")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(AUDIT_EXPORT_TIMEOUT)
+        sock.sendto(data, destination)
+    finally:
+        sock.close()
+
+
+def audit_export_emit(config, line):
+    if config['format'] == 'syslog':
+        _audit_export_syslog(config['destination'], line)
+        return
+    data = (line + "\n").encode('utf-8')
+    _audit_export_rotate(config, len(data))
+    with open(config['destination'], 'ab') as f:
+        f.write(data)
+
+
+def forward_audit_export(event):
+    # Mirror one already-written, already-masked audit event to the configured
+    # sink. Called only AFTER the local append succeeded.
+    config = audit_export_sink(event.get('client'))
+    if config is None:
+        return
+    key = config['key']
+    with _audit_export_state_lock:
+        if key in _audit_export_disabled:
+            return
+    failure = None
+    try:
+        line = format_audit_export_line(config['format'], event)
+    except Exception as e:
+        failure = str(e)
+    if failure is None:
+        with _audit_export_lock:
+            with _audit_export_state_lock:
+                if key in _audit_export_disabled:
+                    return
+            try:
+                audit_export_emit(config, line)
+            except Exception as e:
+                failure = str(e)
+    if failure is None:
+        return
+    with _audit_export_state_lock:
+        if key in _audit_export_disabled:
+            return
+        _audit_export_disabled.add(key)
+    logging.error(
+        f"Disabling auditExport sink {config['format']} -> {config['destination']}: {failure}")
+    # The sink is already marked dead, so this event's own forward is a no-op:
+    # exactly one audit_export_unavailable per sink, never a recursion.
+    write_audit_event({
+        "ts": now_ms(),
+        "client": event.get('client'),
+        "action": "auditExport",
+        "targets": [config['destination']],
+        "decision": "audit_export_unavailable",
+        "reason": failure,
+        "requestId": None,
     })
 
 
@@ -2200,6 +3004,8 @@ def handle_socket_client(client_socket):
                     "originDependent": origin_dependent,
                     "siteMode": resolve_site_mode(policy_for_client(policy, name), targets),
                     "effectiveTier": effective_action_tier(target_action, target_payload),
+                    "dlp": resolve_dlp_mode(policy_for_client(policy, name),
+                                            dlp_channel_for_action(target_action)),
                 }}
                 _audit(audit_enabled, name, "policyCheck", targets, "allow", None, None)
                 respond(resp, "allow")
@@ -2219,6 +3025,7 @@ def handle_socket_client(client_socket):
                     "policyFile": POLICY_FILE,
                     "policyFileExists": os.path.exists(POLICY_FILE),
                     "auditLogFile": AUDIT_LOG_FILE,
+                    "policyBundle": policy_bundle_info(),
                     "traceDir": trace_dir_for(policy, name),
                     "client": name,
                 }}
@@ -2266,7 +3073,7 @@ def handle_socket_client(client_socket):
             if not allowed:
                 _audit(audit_enabled, name, action, targets, "deny", reason, None)
                 respond({"success": False, "error": f"policy denied: {reason}",
-                         "policyDenial": policy_denial(reason, action, targets, name, policy)},
+                         "policyDenial": policy_denial(reason, action, targets, name, policy, payload)},
                         "deny", reason)
                 continue
 
@@ -2300,7 +3107,7 @@ def handle_socket_client(client_socket):
                     targets = targets + ["<unresolved-origin>"]
                     _audit(audit_enabled, name, action, targets, "deny", "tab origin unresolved", None)
                     respond({"success": False, "error": "policy denied: tab origin unresolved",
-                             "policyDenial": policy_denial("tab origin unresolved", action, targets, name, policy)},
+                             "policyDenial": policy_denial("tab origin unresolved", action, targets, name, policy, payload)},
                             "deny", "tab origin unresolved")
                     continue
                 allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
@@ -2314,7 +3121,7 @@ def handle_socket_client(client_socket):
                 if not allowed:
                     _audit(audit_enabled, name, action, targets, "deny", reason, None)
                     respond({"success": False, "error": f"policy denied: {reason}",
-                             "policyDenial": policy_denial(reason, action, targets, name, policy)},
+                             "policyDenial": policy_denial(reason, action, targets, name, policy, payload)},
                             "deny", reason)
                     continue
 
@@ -2354,6 +3161,25 @@ def handle_socket_client(client_socket):
                 respond({"success": False, "error": f"leased by {owner}"},
                         "lease_deny", f"leased by {owner}")
                 continue
+
+            # DLP: record the permitted channels and stamp the enforcing modes on
+            # the envelope. Runs once, here, after every gate and before the
+            # forward, so a request that never reaches Chrome never claims an
+            # audited transfer and one request writes at most one dlp_audit event.
+            _dlp_cp = policy_for_client(policy, name)
+            _dlp_audited = dlp_channels_in_mode(_dlp_cp, action, payload, 'audit')
+            if _dlp_audited:
+                # Channel names only: never a file name, a path, or frame data.
+                _audit(audit_enabled, name, action, targets, DLP_AUDIT_DECISION,
+                       ",".join(_dlp_audited), None)
+            # The extension refuses a blocked channel independently (see
+            # background.js dlpRefusal), so the host always overwrites this field:
+            # a client cannot loosen it by supplying its own.
+            _dlp_modes = dlp_modes_for_client(_dlp_cp)
+            if _dlp_modes:
+                cmd["dlp"] = _dlp_modes
+            else:
+                cmd.pop("dlp", None)
 
             # Send to extension, then block this connection until its response.
             # Most actions resolve well within SOCKET_IDLE_TIMEOUT, but waits and
