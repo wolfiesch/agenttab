@@ -119,6 +119,7 @@ POLICY_FILE = "/tmp/chrome-bridge-guard-policy.json"
 AUDIT_FILE = "/tmp/chrome-bridge-guard-audit.jsonl"
 SECRETS_FILE = "/tmp/chrome-bridge-guard-secrets.txt"
 TRACE_DIR = "/tmp/chrome-bridge-guard-traces"
+OTEL_FILE = "/tmp/chrome-bridge-guard-otel.jsonl"
 SCHEDULE_FILE = "/tmp/chrome-bridge-guard-schedules.json"
 WORKFLOW_FILE = "/tmp/chrome-bridge-guard-workflow.json"
 BAD_WORKFLOW_FILE = "/tmp/chrome-bridge-guard-workflow-invalid.json"
@@ -186,6 +187,20 @@ def audit_events():
         return []
 
 
+def wait_until_forwarded(action, timeout=10.0):
+    # Deterministic barrier for the in-flight-handoff cases. A handoff is only
+    # registered once the host actually forwards it, so probing after a fixed
+    # sleep is a race: whichever host is slower to start loses it, and which
+    # case fails then depends on process scheduling rather than on behavior.
+    # Block until the mock extension has actually seen the forward.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if action in forwarded_actions():
+            return True
+        time.sleep(0.02)
+    return False
+
+
 def trace_text(trace_id):
     # Raw artifact bytes, so a case can assert page content never reaches it.
     try:
@@ -197,6 +212,15 @@ def trace_text(trace_id):
 
 def trace_events(trace_id):
     return [json.loads(l) for l in trace_text(trace_id).splitlines() if l.strip()]
+
+
+def otel_spans(documents):
+    # Flatten OTLP/HTTP JSON documents into their spans.
+    return [span
+            for document in documents
+            for resource_spans in document.get("resourceSpans") or []
+            for scope_spans in resource_spans.get("scopeSpans") or []
+            for span in scope_spans.get("spans") or []]
 
 
 def forwarded_actions():
@@ -625,8 +649,10 @@ def run_against(label, cmd, env):
         r = c.req("policyCheck", {"action": "getCookies", "payload": {"domain": "mail.google.com"}})
         res = (r or {}).get("result", {})
         expect(set(res.keys()) == {"allowed", "reason", "confirmationRequired", "redact", "audit",
-                                   "originDependent", "siteMode"},
+                                   "originDependent", "siteMode", "effectiveTier"},
                f"{label}: policyCheck result keys = {sorted(res.keys())}")
+        expect(res.get("effectiveTier") == "mutating",
+               f"{label}: policyCheck getCookies should report a mutating effectiveTier, got {res}")
         expect(res.get("siteMode") is None,
                f"{label}: policyCheck with no siteModes configured should report null, got {res}")
         expect(res.get("allowed") is True, f"{label}: policyCheck getCookies should be allowed, got {res}")
@@ -749,6 +775,93 @@ def run_against(label, cmd, env):
         r = c.req("navigate", {"url": "https://docs.google.com/d"})
         expect(r and r.get("success") is True,
                f"{label}: client layer should override the same siteModes pattern, got {r}")
+        c.close()
+
+    # --- Effective tier: a read-only action whose payload sets a state-changing
+    #     flag is treated as mutating, so `manual` gates it. screencastFrames
+    #     drains the frame buffer unless the caller passes consume: false ---
+    write_policy(permissive_with(siteModes={"*://mail.google.com": "manual"}))
+    set_tab_origins({None: "https://github.com", 7: "https://mail.google.com"})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("screencastFrames", {"tabId": 7, "consume": True})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: consuming screencastFrames should be gated by manual, got {r}")
+        expect("screencastFrames" not in forwarded_actions(),
+               f"{label}: escalated screencastFrames must not forward, got {forwarded_actions()}")
+        r = c.req("screencastFrames", {"tabId": 7, "consume": False})
+        expect(r and r.get("success") is True,
+               f"{label}: non-consuming screencastFrames should stay read-only, got {r}")
+        expect("screencastFrames" in forwarded_actions(),
+               f"{label}: non-consuming screencastFrames should forward, got {forwarded_actions()}")
+        # An omitted consume defaults to true in the extension, so it escalates.
+        r = c.req("screencastFrames", {"tabId": 7})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: screencastFrames with a defaulted consume should be gated, got {r}")
+        c.close()
+
+    # --- Effective tier: batch is the union over its steps, so an all-read-only
+    #     batch is not force-gated by manual and one mutating step gates it ---
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("batch", {"tabId": 7, "steps": [{"action": "getHTML", "payload": {}}]})
+        expect(r and r.get("success") is True,
+               f"{label}: an all-read-only batch must not be force-gated by manual, got {r}")
+        r = c.req("batch", {"tabId": 7, "steps": [
+            {"action": "getHTML", "payload": {}},
+            {"action": "click", "payload": {"selector": "#x"}}]})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: a batch with one mutating step should be gated by manual, got {r}")
+        expect("click" not in forwarded_actions(),
+               f"{label}: gated batch must not forward its steps, got {forwarded_actions()}")
+        c.close()
+
+    # --- Effective tier: replayWorkflow follows the same union rule. The first
+    #     step pins the manual tab so the outer replay resolves that origin; the
+    #     second step decides the union without being gated on its own ---
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", {"tabId": 7, "workflow": {"steps": [
+            {"action": "getHTML", "payload": {"tabId": 7}},
+            {"action": "getHTML", "payload": {}}]}})
+        expect(r and r.get("success") is True,
+               f"{label}: an all-read-only replayWorkflow must not be gated, got {r}")
+        r = c.req("replayWorkflow", {"tabId": 7, "workflow": {"steps": [
+            {"action": "getHTML", "payload": {"tabId": 7}},
+            {"action": "reload", "payload": {}}]}})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: a replayWorkflow with a mutating step should be gated, got {r}")
+        expect("reload" not in forwarded_actions(),
+               f"{label}: gated replayWorkflow must not forward its steps, got {forwarded_actions()}")
+        # policyCheck reports the resolved tier for both shapes.
+        r = c.req("policyCheck", {"action": "batch", "payload": {
+            "tabId": 7, "steps": [{"action": "getHTML", "payload": {}}]}})
+        expect(((r or {}).get("result") or {}).get("effectiveTier") == "read_only",
+               f"{label}: policyCheck should report a read_only batch, got {r}")
+        r = c.req("policyCheck", {"action": "batch", "payload": {
+            "tabId": 7, "steps": [{"action": "click", "payload": {"selector": "#x"}}]}})
+        expect(((r or {}).get("result") or {}).get("effectiveTier") == "mutating",
+               f"{label}: policyCheck should report a mutating batch, got {r}")
+        r = c.req("screencastFrames", {"tabId": 7, "consume": False}, extra={"dryRun": True})
+        expect(((r or {}).get("verdict") or {}).get("effectiveTier") == "read_only",
+               f"{label}: dry run should report the payload-resolved tier, got {r}")
+        r = c.req("screencastFrames", {"tabId": 7, "consume": True}, extra={"dryRun": True})
+        expect(((r or {}).get("verdict") or {}).get("effectiveTier") == "mutating",
+               f"{label}: dry run should escalate a consuming screencastFrames, got {r}")
+        c.close()
+    set_tab_origins({None: "https://github.com"})
+
+    # --- Effective tier: cacheSelectors escalates on the mutating ops only ---
+    write_policy(permissive_with(siteModes={"*://github.com": "manual"}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("cacheSelectors", {"op": "list"})
+        expect(r and r.get("success") is True,
+               f"{label}: cacheSelectors list should stay read-only, got {r}")
+        for op in ("clear", "import"):
+            r = c.req("cacheSelectors", {"op": op})
+            expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+                   f"{label}: cacheSelectors {op} should be gated by manual, got {r}")
         c.close()
 
     # --- Structured policyDenial companion accompanies action denials ---
@@ -1121,10 +1234,78 @@ def run_against(label, cmd, env):
         c = Client("tok-alpha")
         r = c.req("replayWorkflow", workflow_payload(
             [{"action": "click", "payload": {"tabId": 9, "selector": "#a"}}], tabId=7))
-        expect(r and r.get("success") is False and str(r.get("error", "")).startswith("policy denied:"),
-               f"{label}: replay retargeted at a denied-origin tab should be denied, got {r}")
+        expect(r and r.get("success") is False
+               and "workflow step 0: target denied" in str(r.get("error", "")),
+               f"{label}: replay retargeted at a denied-origin tab should be denied by the retargeted origin, got {r}")
         expect("replayWorkflow" not in forwarded_actions(),
                f"{label}: denied retargeted replay must not forward, got {forwarded_actions()}")
+        c.close()
+    set_tab_origins({None: "https://github.com"})
+
+    # (f) T4-4: a step's `expect` clause is enumerated as a nested read-only
+    # `expect` step, so a postcondition aimed at a denied-origin tab is denied
+    # with the rest of the replay instead of riding in unexamined. The step's own
+    # action must be genuinely origin-exempt so the ONLY enumerated step that can
+    # need an origin is the expect clause: `navigate` carries its own url and is
+    # in ORIGIN_EXEMPT_ACTIONS, whereas `setCookie` is not exempt and would drag
+    # in the active tab (tabId None) and fail closed on that instead.
+    write_policy(permissive_with(deniedOrigins=["*://mail.google.com"]))
+    set_tab_origins({None: "https://github.com",
+                     7: "https://mail.google.com",
+                     9: "https://github.com"})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", workflow_payload(
+            [{"action": "navigate",
+              "payload": {"url": "https://github.com/one"},
+              "expect": {"mode": "selector", "selector": "#done"}}], tabId=7))
+        expect(r and r.get("success") is False and "workflow step 1:" in str(r.get("error", "")),
+               f"{label}: a nested expect clause on a denied origin should deny the replay, got {r}")
+        pd = (r or {}).get("policyDenial") or {}
+        # An origin denial identifies the step through `batchStep` plus the
+        # offending origin in `targets`. It does NOT rename `action` to the
+        # nested step: policy_denial() recovers a nested action only for
+        # action-type reasons, where it is embedded in the byte-stable reason
+        # text ("action <X> denied"). "target denied" carries no action name, and
+        # the reason string is deliberately byte-stable, so the outer action
+        # stays as-is rather than threading a step action through the whole
+        # evaluate_policy return contract for one cosmetic field.
+        expect(pd.get("batchStep") == 1 and pd.get("kind") == "origin"
+               and "https://mail.google.com" in (pd.get("targets") or []),
+               f"{label}: policyDenial should locate the enumerated expect step, got {pd}")
+        expect("replayWorkflow" not in forwarded_actions(),
+               f"{label}: a denied nested expect must not forward, got {forwarded_actions()}")
+        c.close()
+    set_tab_origins({None: "https://github.com"})
+
+    # (g) an allowed expect clause replays normally, and `expect` is not itself a
+    # denial trigger.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("replayWorkflow", workflow_payload(
+            [{"action": "click", "payload": {"tabId": 7, "selector": "#a"},
+              "expect": {"mode": "text", "text": "done"},
+              "retry": {"max": 2, "delayMs": 100}}]))
+        expect(r and r.get("success") is True,
+               f"{label}: an allowed nested expect should replay, got {r}")
+        expect("replayWorkflow" in forwarded_actions(),
+               f"{label}: allowed replay with an expect clause should forward, got {forwarded_actions()}")
+        c.close()
+
+    # (h) `expect` is a non-mutating assertion, so a `manual` site mode - which
+    # gates on the effective tier - must not force a confirmation for it, while a
+    # real mutation on the same origin still is gated.
+    write_policy(permissive_with(siteModes={"*://mail.google.com": "manual"}))
+    set_tab_origins({None: "https://github.com", 7: "https://mail.google.com"})
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("expect", {"tabId": 7, "mode": "selector", "selector": "#done"})
+        expect(r and r.get("success") is True,
+               f"{label}: expect is read-only and must not be gated by manual, got {r}")
+        r = c.req("reload", {"tabId": 7})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: manual should still gate a mutation on the same origin, got {r}")
         c.close()
     set_tab_origins({None: "https://github.com"})
 
@@ -1227,8 +1408,12 @@ def run_against(label, cmd, env):
         if isinstance(steps, list) and len(steps) == 4:
             expect(all(set(s.keys()) == {"step", "action", "allowed", "reason",
                                          "confirmationRequired", "redact", "audit",
-                                         "originDependent", "siteMode"} for s in steps),
+                                         "originDependent", "siteMode",
+                                         "effectiveTier"} for s in steps),
                    f"{label}: plan step verdict keys = {[sorted(s.keys()) for s in steps]}")
+            expect([s["effectiveTier"] for s in steps]
+                   == ["read_only", "mutating", "mutating", "mutating"],
+                   f"{label}: plan preview should report effectiveTier per step, got {steps}")
             expect([s["step"] for s in steps] == [0, 1, 2, 3],
                    f"{label}: plan steps should be indexed in order, got {steps}")
             expect(steps[0]["allowed"] is True,
@@ -1257,8 +1442,10 @@ def run_against(label, cmd, env):
                f"{label}: allowed dry run should report wouldForward, got {r}")
         expect(set(((r or {}).get("verdict") or {}).keys()) ==
                {"allowed", "reason", "confirmationRequired", "redact", "audit",
-                "originDependent", "siteMode"},
+                "originDependent", "siteMode", "effectiveTier"},
                f"{label}: dry run verdict keys = {sorted(((r or {}).get('verdict') or {}).keys())}")
+        expect(((r or {}).get("verdict") or {}).get("effectiveTier") == "read_only",
+               f"{label}: dry run getTabs should report a read_only effectiveTier, got {r}")
         r = c.req("getCookies", {"domain": "x.test"}, extra={"dryRun": True})
         expect(r and r.get("success") is True and r.get("dryRun") is True
                and r.get("wouldForward") is False
@@ -1394,7 +1581,7 @@ def run_against(label, cmd, env):
     # in-flight handoff for the duration. Blackout is enforced host-side before
     # policy, so nothing needs the (blocked) mock to answer.
     def handoff_result(action, payload):
-        if action == "waitForHandoff":
+        if action in ("waitForHandoff", "credentialHandoff"):
             # Long enough for the whole blacked-out action set to be probed while
             # the handoff is genuinely in flight.
             time.sleep(6)
@@ -1410,7 +1597,8 @@ def run_against(label, cmd, env):
         t = threading.Thread(target=lambda: handoff_response.append(
             watcher.req("waitForHandoff", {"message": "log in", "tabId": 7})))
         t.start()
-        time.sleep(0.5)
+        expect(wait_until_forwarded("waitForHandoff"),
+               f"{label}: handoff never reached the extension, cannot test the blackout")
         # Same client identity as the initiator: the blackout applies to every
         # client, including the one that asked for the handoff.
         r = observer.req("screenshot", {"tabId": 7})
@@ -1479,7 +1667,8 @@ def run_against(label, cmd, env):
         observer = Client("tok-alpha")
         t = threading.Thread(target=lambda: watcher.req("waitForHandoff", {"message": "log in"}))
         t.start()
-        time.sleep(0.5)
+        expect(wait_until_forwarded("waitForHandoff"),
+               f"{label}: tabless handoff never reached the extension")
         for payload in ({"tabId": 99}, {"tabId": 7}, {}):
             r = observer.req("screenshot", payload)
             expect(r and r.get("success") is False and r.get("error") == "handoff in progress"
@@ -1493,6 +1682,178 @@ def run_against(label, cmd, env):
                f"{label}: screenshot after a tabless handoff should be allowed again, got {r}")
         observer.close()
         watcher.close()
+
+    # (d) T4-3: credentialHandoff is the single-field narrowing of waitForHandoff
+    # and must open the identical blackout. Same delayed-mock pattern: the mock
+    # holds the response while the "human" types, so the handoff is genuinely in
+    # flight for the probes below.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env, result_fn=handoff_result):
+        watcher = Client("tok-alpha")
+        observer = Client("tok-alpha")
+        cred_response = []
+        t = threading.Thread(target=lambda: cred_response.append(
+            watcher.req("credentialHandoff", {"selector": "#password", "tabId": 7})))
+        t.start()
+        expect(wait_until_forwarded("credentialHandoff"),
+               f"{label}: credentialHandoff never reached the extension")
+        for blacked_out in ("screenshot", "getHTML", "observe"):
+            r = observer.req(blacked_out, {"tabId": 7})
+            expect(r and r.get("success") is False
+                   and r.get("error") == "handoff in progress"
+                   and r.get("blackout") is True,
+                   f"{label}: {blacked_out} during credentialHandoff should be blacked out, got {r}")
+            expect(blacked_out not in forwarded_actions(),
+                   f"{label}: blacked-out {blacked_out} must not forward during credentialHandoff, got {forwarded_actions()}")
+        blackouts = [e for e in audit_events() if e.get("decision") == "handoff_blackout"]
+        expect(len(blackouts) >= 3
+               and all(e.get("reason") == "handoff in progress" for e in blackouts),
+               f"{label}: credentialHandoff blackout should audit as handoff_blackout, got {blackouts}")
+        t.join(timeout=15)
+        expect(cred_response and (cred_response[0] or {}).get("success") is True,
+               f"{label}: credentialHandoff should complete, got {cred_response}")
+        for lifted in ("screenshot", "getHTML", "observe"):
+            r = observer.req(lifted, {"tabId": 7})
+            expect(r and r.get("success") is True,
+                   f"{label}: {lifted} after credentialHandoff should be allowed again, got {r}")
+        observer.close()
+        watcher.close()
+
+    # (e) A credentialHandoff with no tabId is GLOBAL, exactly like waitForHandoff.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env, result_fn=handoff_result):
+        watcher = Client("tok-alpha")
+        observer = Client("tok-alpha")
+        t = threading.Thread(target=lambda: watcher.req("credentialHandoff", {"selector": "#password"}))
+        t.start()
+        expect(wait_until_forwarded("credentialHandoff"),
+               f"{label}: tabless credentialHandoff never reached the extension")
+        for payload in ({"tabId": 99}, {"tabId": 7}, {}):
+            r = observer.req("observe", payload)
+            expect(r and r.get("success") is False and r.get("error") == "handoff in progress"
+                   and r.get("blackout") is True,
+                   f"{label}: tabless credentialHandoff should black out {payload}, got {r}")
+        expect("observe" not in forwarded_actions(),
+               f"{label}: globally blacked-out observe must not forward, got {forwarded_actions()}")
+        t.join(timeout=15)
+        r = observer.req("observe", {"tabId": 99})
+        expect(r and r.get("success") is True,
+               f"{label}: observe after a tabless credentialHandoff should be allowed again, got {r}")
+        observer.close()
+        watcher.close()
+
+    # --- Opt-in OpenTelemetry spans (BRIDGE_OTEL_ENABLED) ---------------------
+    # (a) Disabled is inert. An endpoint and a file sink are BOTH configured and
+    # BRIDGE_OTEL_ENABLED is left unset: no span file may appear (so no export
+    # ran and no collector was contacted), the response shape is unchanged, and
+    # the session trace artifact carries no span ids.
+    try:
+        os.remove(OTEL_FILE)
+    except FileNotFoundError:
+        pass
+    shutil.rmtree(TRACE_DIR, ignore_errors=True)
+    otel_off_env = dict(env)
+    otel_off_env["BRIDGE_OTEL_ENDPOINT"] = "http://127.0.0.1:9/v1/traces"
+    otel_off_env["BRIDGE_OTEL_FILE"] = OTEL_FILE
+    otel_off_env.pop("BRIDGE_OTEL_ENABLED", None)
+    write_policy(permissive_with(traceDir=TRACE_DIR))
+    otel_result = lambda a, p: {"title": "top-secret-page-title", "sessionId": "sess-otel"}
+    with Host(label, cmd, otel_off_env, result_fn=otel_result):
+        c = Client("tok-alpha")
+        r = c.req("createTaskSession", {"name": "demo"})
+        expect(r and set(r.keys()) == {"id", "success", "result"} and r.get("success") is True,
+               f"{label}: telemetry-off response shape should be unchanged, got {r}")
+        expect(not os.path.exists(OTEL_FILE),
+               f"{label}: no span file may be written while BRIDGE_OTEL_ENABLED is unset")
+        events = trace_events("sess-otel")
+        expect(len(events) == 1 and "otelTraceId" not in events[0] and "otelSpanId" not in events[0],
+               f"{label}: telemetry-off trace events must carry no span ids, got {events}")
+        c.close()
+
+    # (b) Enabled with a file sink: exactly one span document per request, the
+    # expected attribute keys, no payload or response content, and a known
+    # secret reaching a span only in masked form.
+    with open(SECRETS_FILE, "w") as f:
+        f.write("sessionKey=s3cr3t-trace-id\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    try:
+        os.remove(OTEL_FILE)
+    except FileNotFoundError:
+        pass
+    shutil.rmtree(TRACE_DIR, ignore_errors=True)
+    otel_on_env = dict(env)
+    otel_on_env["BRIDGE_OTEL_ENABLED"] = "1"
+    otel_on_env["BRIDGE_OTEL_FILE"] = OTEL_FILE
+    otel_on_env.pop("BRIDGE_OTEL_ENDPOINT", None)
+    write_policy(permissive_with(traceDir=TRACE_DIR, secretMaskFile=SECRETS_FILE))
+    with Host(label, cmd, otel_on_env, result_fn=otel_result):
+        c = Client("tok-alpha")
+        r = c.req("getTabs", {"traceId": "s3cr3t-trace-id"})
+        expect(r and r.get("success") is True,
+               f"{label}: a traced request should still succeed with spans on, got {r}")
+        raw = open(OTEL_FILE).read() if os.path.exists(OTEL_FILE) else ""
+        documents = [json.loads(l) for l in raw.splitlines() if l.strip()]
+        expect(len(documents) == 1,
+               f"{label}: one request should export exactly one span document, got {len(documents)}")
+        spans = otel_spans(documents)
+        roots = [s for s in spans if s.get("name") == "execute_tool getTabs"]
+        expect(len(roots) == 1,
+               f"{label}: one request span per request, got {[s.get('name') for s in spans]}")
+        root = roots[0] if roots else {}
+        attrs = {a.get("key"): a.get("value") for a in root.get("attributes") or []}
+        required = {"gen_ai.tool.name", "bridge.action", "bridge.client", "bridge.decision",
+                    "bridge.duration_ms", "bridge.tab_id_count", "bridge.success",
+                    "bridge.trace_id", "bridge.host"}
+        expect(required <= set(attrs),
+               f"{label}: span is missing attributes {sorted(required - set(attrs))}")
+        expect(attrs.get("bridge.action", {}).get("stringValue") == "getTabs"
+               and attrs.get("bridge.decision", {}).get("stringValue") == "extension_success"
+               and attrs.get("bridge.success", {}).get("boolValue") is True,
+               f"{label}: span should record the action, decision, and success, got {attrs}")
+        expect(len(root.get("traceId") or "") == 32 and len(root.get("spanId") or "") == 16,
+               f"{label}: span ids should be 16/8-byte hex, got {root}")
+        child_names = {s.get("name") for s in spans if s.get("parentSpanId") == root.get("spanId")}
+        expect({"bridge.policy_evaluate", "bridge.extension_forward"} <= child_names,
+               f"{label}: policy and forward child spans should be emitted, got {sorted(child_names)}")
+        expect("s3cr3t-trace-id" not in raw,
+               f"{label}: a known secret must never reach a span unmasked: {raw}")
+        expect("<masked:sessionKey>" in raw,
+               f"{label}: the span should carry the masked secret instead, got {raw}")
+        expect("top-secret-page-title" not in raw and "demo" not in raw,
+               f"{label}: spans must carry no payload or response content, got {raw}")
+
+        # The session trace artifact names the same span, so a local JSONL line
+        # and an exported span correlate.
+        events = trace_events("s3cr3t-trace-id")
+        expect(len(events) == 1 and events[0].get("otelTraceId") == root.get("traceId")
+               and events[0].get("otelSpanId") == root.get("spanId"),
+               f"{label}: trace artifact should carry the span ids, got {events}")
+
+        # An incoming traceparent is continued rather than replaced, and never
+        # reaches the extension.
+        incoming = "00-" + "a" * 32 + "-" + "b" * 16 + "-01"
+        r = c.req("getTabs", {}, extra={"traceparent": incoming})
+        expect(r and r.get("success") is True,
+               f"{label}: a request carrying a traceparent should succeed, got {r}")
+        with forwarded_lock:
+            forwarded_text = json.dumps(forwarded)
+        expect("traceparent" not in forwarded_text,
+               f"{label}: traceparent must be stripped before forwarding, got {forwarded_text}")
+        with open(OTEL_FILE) as f:
+            documents = [json.loads(l) for l in f.read().splitlines() if l.strip()]
+        continued = [s for s in otel_spans(documents) if s.get("traceId") == "a" * 32]
+        expect(continued and any(s.get("parentSpanId") == "b" * 16 for s in continued),
+               f"{label}: the caller's traceparent should be continued, got {continued}")
+        c.close()
+    try:
+        os.remove(SECRETS_FILE)
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(OTEL_FILE)
+    except FileNotFoundError:
+        pass
+    shutil.rmtree(TRACE_DIR, ignore_errors=True)
 
 
 
@@ -1545,6 +1906,26 @@ def check_classification_parity():
                "python/rust MUTATING parity drift: "
                f"py-only={sorted(bridge.MUTATING_ACTIONS - rust_mut)} "
                f"rust-only={sorted(rust_mut - bridge.MUTATING_ACTIONS)}")
+
+    # The payload escalation table must be byte-identical in intent across hosts:
+    # same (action, flag, kind) triples and the same enum values, or the two
+    # hosts would compute different effective tiers for the same request.
+    rm = re.search(r"const ESCALATING_PAYLOAD_FLAGS[^=]*=\s*\[(.*?)\n\];", rs, re.S)
+    expect(rm is not None, "rust: could not locate ESCALATING_PAYLOAD_FLAGS table")
+    if rm:
+        rust_rows = set()
+        for row in re.findall(r'\(\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)",\s*&\[([^\]]*)\]\s*\)', rm.group(1)):
+            action, flag, kind, values = row
+            rust_rows.add((action, flag, kind, tuple(re.findall(r'"([^"]+)"', values))))
+        py_rows = {(a, f, k, tuple(v)) for a, f, k, v in bridge.ESCALATING_PAYLOAD_FLAGS}
+        expect(py_rows == rust_rows,
+               "python/rust escalation table drift: "
+               f"py-only={sorted(py_rows - rust_rows)} rust-only={sorted(rust_rows - py_rows)}")
+    # And the tier helper must exist in both hosts under the contract name.
+    expect(callable(getattr(bridge, "effective_action_tier", None)),
+           "python: effective_action_tier is missing")
+    expect("fn effective_action_tier(" in rs,
+           "rust: effective_action_tier is missing")
 
 
 def main():

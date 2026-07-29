@@ -33,6 +33,17 @@ def _truthy(v):
     return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+def _http_request_headers():
+    """Headers of the current HTTP request, or ``None`` under stdio."""
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        request = request_ctx.get().request
+    except (ImportError, LookupError, AttributeError):
+        return None
+    return getattr(request, "headers", None)
+
+
 def _http_request_token():
     """Bridge token presented by the current HTTP request, if any.
 
@@ -46,13 +57,7 @@ def _http_request_token():
     ``None``, i.e. the ambient ``bridge_token.txt`` identity. The value is
     handed to the transport only and is never logged or echoed in errors.
     """
-    try:
-        from mcp.server.lowlevel.server import request_ctx
-
-        request = request_ctx.get().request
-    except (ImportError, LookupError, AttributeError):
-        return None
-    headers = getattr(request, "headers", None)
+    headers = _http_request_headers()
     if headers is None:
         return None
     scheme, _, value = (headers.get("authorization") or "").partition(" ")
@@ -61,15 +66,36 @@ def _http_request_token():
     return (headers.get("x-bridge-token") or "").strip() or None
 
 
+def _request_traceparent():
+    """W3C trace context to hand the host for this call.
+
+    Over HTTP the caller's ``traceparent`` header is read right next to the
+    per-request bridge token and passed through unchanged, so the host's request
+    span joins the caller's trace instead of starting a detached one. Under
+    stdio there is no incoming header, so a root trace is minted per tool call
+    -- but only when host spans are switched on: with ``BRIDGE_OTEL_ENABLED``
+    unset nothing is minted and nothing is sent.
+    """
+    headers = _http_request_headers()
+    if headers is not None:
+        incoming = (headers.get("traceparent") or "").strip()
+        if incoming:
+            return incoming
+    if not _truthy(os.environ.get("BRIDGE_OTEL_ENABLED", "")):
+        return None
+    return f"00-{os.urandom(16).hex()}-{os.urandom(8).hex()}-01"
+
+
 def call(action, payload=None, **kwargs):
     """``transport.call`` with the current request's bridge identity applied.
 
     Every tool and resource in this module calls the bridge through here, so
-    per-request HTTP tokens cover the whole surface without threading a token
-    argument through each tool signature. Behaviour is unchanged when no
-    per-request token is present.
+    per-request HTTP tokens and trace context cover the whole surface without
+    threading arguments through each tool signature. Behaviour is unchanged when
+    no per-request token is present and telemetry is off.
     """
     kwargs.setdefault("token", _http_request_token())
+    kwargs.setdefault("traceparent", _request_traceparent())
     return _bridge_call(action, payload, **kwargs)
 
 
@@ -486,6 +512,57 @@ def browser_wait_for(
     raise BridgeError(f"Unknown wait_for mode: {mode!r} (use load|selector|text|url).")
 
 
+def browser_expect(
+    mode: str,
+    tab_id: Optional[int] = None,
+    selector: Optional[str] = None,
+    text: Optional[str] = None,
+    url_substring: Optional[str] = None,
+    schema: Optional[dict] = None,
+    negate: bool = False,
+    timeout_ms: int = 5000,
+) -> str:
+    """Assert a deterministic postcondition and report pass or fail.
+
+    ``mode`` is one of ``selector``, ``text``, ``url``, ``schema``. ``selector``
+    passes when the selector resolves (CSS, semantic, frame, shadow, and
+    ``ref=eN`` grammar all work); ``text`` when the page text contains ``text``;
+    ``url`` when the tab URL contains ``url_substring``; ``schema`` when
+    structured extraction against ``schema`` reports no ``missingRequired``
+    errors. ``negate`` inverts the outcome, which is how absence is asserted.
+    The check polls until the condition holds or ``timeout_ms`` elapses.
+
+    This is an assertion, not a read: no model judges the outcome, and the result
+    carries only ``mode``, ``passed``, ``attempts``, ``elapsedMs``, and a short
+    ``reason`` when it failed. The matched element, the matched text, the tab URL,
+    and the extracted values are never returned.
+    """
+    payload: dict = {"tabId": resolve_tab_id(tab_id), "mode": mode, "timeoutMs": int(timeout_ms)}
+    if negate:
+        payload["negate"] = True
+    if mode == "selector":
+        if not selector:
+            raise BridgeError("expect mode 'selector' requires a selector.")
+        payload["selector"] = selector
+    elif mode == "text":
+        if not text:
+            raise BridgeError("expect mode 'text' requires text.")
+        payload["text"] = text
+    elif mode == "url":
+        if not url_substring:
+            raise BridgeError("expect mode 'url' requires url_substring.")
+        payload["urlSubstring"] = url_substring
+    elif mode == "schema":
+        if not isinstance(schema, dict) or not schema:
+            raise BridgeError("expect mode 'schema' requires a schema object.")
+        payload["schema"] = schema
+        if selector:
+            payload["selector"] = selector
+    else:
+        raise BridgeError(f"Unknown expect mode: {mode!r} (use selector|text|url|schema).")
+    return _text(call("expect", payload))
+
+
 def browser_tab_control(op: str, tab_id: Optional[int] = None) -> str:
     """Tab lifecycle control.
 
@@ -532,6 +609,12 @@ def browser_batch(
     evaluates the outer batch and every nested action against the normal policy,
     lease, origin, and confirmation gates. Use refs from ``browser_snapshot`` in
     selector fields; do not use this tool to bypass a confirmation requirement.
+
+    This tool's MCP annotation is statically mutating, because an annotation
+    cannot vary per call. The authoritative tier is computed host-side from the
+    actual steps: the batch is ``read_only`` only when every step is, and any
+    single mutating step makes the whole batch mutating. Ask
+    ``browser_policy_check`` for the ``effectiveTier`` of a specific batch.
     """
     if not isinstance(tab_id, int):
         raise ValueError("tab_id must be an integer")
@@ -596,9 +679,12 @@ def browser_policy_check(action: str, payload: Optional[dict] = None) -> str:
     the action to the extension, plus ``siteMode``: the per-site permission mode
     (``manual``/``auto``/``skip``, or null when no origin is known or no
     ``siteModes`` pattern matches) that the host folded into
-    ``confirmationRequired``. Policy is enforced in the native host, not by MCP
-    annotations, so this reflects the real security boundary. MCP deliberately
-    exposes no policy-mutation tool: change ``siteModes`` with
+    ``confirmationRequired``, and ``effectiveTier``: the tier the host enforces
+    for this exact action+payload (``read_only`` or ``mutating``), computed from
+    the payload rather than the action name alone. Policy is enforced in the
+    native host, not by MCP annotations, so this reflects the real security
+    boundary. MCP deliberately exposes no policy-mutation tool: change
+    ``siteModes`` with
     ``chrome-bridge policy site-mode <originPattern> manual|auto|skip``.
     """
     return _text(call("policyCheck", {"action": action, "payload": payload or {}}))
@@ -609,8 +695,8 @@ def browser_plan_preview(plan: list) -> str:
 
     ``plan`` is a list of up to 50 ``{"action": ..., "origin": ..., "payload":
     ...}`` steps. Each step gets its own verdict (allowed/reason/
-    confirmationRequired/redact/audit/originDependent/siteMode) plus its ``step``
-    index.
+    confirmationRequired/redact/audit/originDependent/siteMode/effectiveTier)
+    plus its ``step`` index.
 
     ``origin`` is an optional hypothetical tab origin used to resolve site
     policy for tab-scoped steps. Nothing is forwarded to the extension.
@@ -680,8 +766,11 @@ def _read_trace_events(trace_id, trace_dir):
     return path, events, malformed
 
 
+# ``otelTraceId``/``otelSpanId`` are populated only when the host's opt-in
+# OpenTelemetry spans are enabled, and read back as ``null`` otherwise.
 _TRACE_EVENT_FIELDS = ("ts", "action", "decision", "reason", "requestId", "durationMs",
-                       "targets", "traceId", "responseHash", "snapshotHash", "success")
+                       "targets", "traceId", "responseHash", "snapshotHash", "success",
+                       "otelTraceId", "otelSpanId")
 
 
 def browser_trace_summary(trace_id: str, trace_dir: Optional[str] = None) -> str:
@@ -731,7 +820,9 @@ def browser_trace_tail(trace_id: str, limit: int = 20, trace_dir: Optional[str] 
     """Return the most recent events of a local session trace artifact.
 
     Each event carries metadata only: timestamp, action, decision, reason,
-    request id, duration, tab ids, and response/snapshot hashes. Payload and
+    request id, duration, tab ids, and response/snapshot hashes, plus
+    ``otelTraceId``/``otelSpanId`` naming the exported span when the host's
+    opt-in OpenTelemetry spans are enabled (``null`` otherwise). Payload and
     response bodies are never stored in a trace and are never returned here.
     ``trace_dir`` overrides the host's configured ``traceDir``.
     """
@@ -816,6 +907,34 @@ def browser_wait_for_handoff(
     if tab_id is not None:
         payload["tabId"] = tab_id
     return _text(call("waitForHandoff", payload, read_timeout_ms=timeout_ms))
+
+
+def browser_credential_handoff(
+    selector: str,
+    message: Optional[str] = None,
+    mode: str = "filled",
+    timeout_ms: int = 120000,
+    tab_id: Optional[int] = None,
+) -> str:
+    """Hand ONE field to the human so a credential is typed straight into the page.
+
+    Use this instead of ``browser_fill`` for passwords, passphrases, recovery
+    codes, and one-time codes. The bridge focuses ``selector`` (CSS, semantic, or
+    ``ref=eN``), shows ``message``, and waits. The field value is NEVER read,
+    logged, or returned: the only value-derived datum in the response is
+    ``valueLength``, a character count. For the whole window the native host
+    holds a handoff blackout over the tab, so screenshot, getHTML, observe, and
+    every other observation action are denied to every client, including this
+    one. ``mode`` is ``filled`` (resolve once the field goes from empty to
+    non-empty and settles) or ``submitted`` (resolve on form submit or
+    navigation).
+    """
+    payload = {"selector": selector, "mode": mode, "timeoutMs": timeout_ms}
+    if message is not None:
+        payload["message"] = message
+    if tab_id is not None:
+        payload["tabId"] = tab_id
+    return _text(call("credentialHandoff", payload, read_timeout_ms=timeout_ms))
 
 
 def browser_save_pdf(
@@ -936,6 +1055,11 @@ def browser_screencast_save(
     NOT read-only overall: it consumes the extension's frame buffer and writes
     local files, replacing any ``frame-*``/``frames.json``/``screencast.mp4``
     artifacts a previous save left in the destination.
+
+    The MCP annotation is statically mutating for the same reason. Host-side the
+    underlying ``screencastFrames`` action is nominally read-only and escalates
+    to ``mutating`` because this tool always sends ``consume: true``, which
+    drains the extension's frame buffer irrecoverably.
     """
     tid = resolve_tab_id(tab_id)
     directory = os.path.abspath(os.path.expanduser(output_dir))
@@ -1217,6 +1341,7 @@ _TOOLS = [
     (browser_save_pdf, False, False),
     (browser_get_html, False, False),
     (browser_wait_for, False, False),
+    (browser_expect, False, False),
     (browser_policy_check, False, False),
     (browser_plan_preview, False, False),
     (browser_trace_summary, False, False),
@@ -1257,6 +1382,7 @@ _TOOLS = [
     (browser_tab_control, True, False),
     (browser_window_control, True, False),
     (browser_wait_for_handoff, True, False),
+    (browser_credential_handoff, True, False),
     (browser_resolve_cached_selector, True, False),
     (browser_set_cookie, True, True),
     (browser_delete_cookie, True, True),
@@ -1340,8 +1466,8 @@ def _with_lease_raw(func, manager):
     return wrapper
 
 
-def _with_lease_handoff(func, manager):
-    """Wrap ``browser_wait_for_handoff`` so the lease covers the whole wait.
+def _with_lease_handoff(func, manager, timeout_index=5):
+    """Wrap a human-handoff tool so the lease covers the whole wait.
 
     A handoff can run far longer than the default lease TTL; ensure with
     ``min_remaining_ms`` equal to the requested ``timeout_ms`` (defaulting to
@@ -1350,11 +1476,12 @@ def _with_lease_handoff(func, manager):
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        # timeout_ms is the 6th parameter (index 5): message, mode, selector,
-        # url_substring, text, timeout_ms. Callers may pass it positionally or
-        # by keyword; fall back to the tool's declared default otherwise.
-        if len(args) > 5:
-            timeout_ms = args[5]
+        # ``timeout_index`` is the positional index of timeout_ms in ``func``
+        # (5 for browser_wait_for_handoff, 3 for browser_credential_handoff).
+        # Callers may pass it positionally or by keyword; fall back to the
+        # tool's declared default otherwise.
+        if len(args) > timeout_index:
+            timeout_ms = args[timeout_index]
         elif "timeout_ms" in kwargs:
             timeout_ms = kwargs["timeout_ms"]
         else:
@@ -1397,6 +1524,9 @@ def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> FastM
             elif func is browser_wait_for_handoff:
                 # Long human handoff: hold the lease for the whole wait window.
                 tool_func = _with_lease_handoff(func, _lease_manager)
+            elif func is browser_credential_handoff:
+                # Same, for the single-field credential window.
+                tool_func = _with_lease_handoff(func, _lease_manager, 3)
             elif mutating and func not in _LEASE_TOOLS:
                 tool_func = _with_lease(func, _lease_manager)
         m.tool(annotations=ToolAnnotations(

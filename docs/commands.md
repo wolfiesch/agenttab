@@ -76,6 +76,32 @@ chrome-bridge waitForText <tabId> <text> [timeoutMs]
 chrome-bridge waitForUrl <tabId> <substring> [timeoutMs]
 ```
 
+### Deterministic postconditions
+
+```bash
+chrome-bridge expect <tabId> selector <selector> [--negate] [--timeout <ms>]
+chrome-bridge expect <tabId> text <expectedText> [--negate] [--timeout <ms>]
+chrome-bridge expect <tabId> url <urlSubstring> [--negate] [--timeout <ms>]
+chrome-bridge expect <tabId> schema <schemaPath> [--negate] [--timeout <ms>]
+```
+
+A wait answers "has this happened yet"; `expect` answers "did the thing I intended actually happen", and answers it as a **check with an exit code** rather than as prose a model has to grade. There is no model anywhere in the path: each mode is a deterministic evaluation against the same machinery the mutating actions use.
+
+- `selector` passes when the selector resolves. It goes through the normal locator grammar, so CSS, `text=`/`label=`/`role=`/`aria=`, `frame=... >> ...`, `shadow >>>`, and `ref=eN` all behave exactly as they do for a click.
+- `text` passes when the page text contains the string.
+- `url` passes when the tab URL contains the substring.
+- `schema` passes when structured extraction against the JSON Schema file at `<schemaPath>` reports no `missingRequired` errors. It reuses `extractStructured`, so the supported schema subset is identical.
+- `--negate` inverts the outcome. That is how you assert **absence**: the poll then runs until the condition stops holding.
+- `--timeout` polls (every 250 ms) until the condition holds or the deadline passes. Default 5000 ms, capped at 60000 ms.
+
+`expect` is an assertion, **not a read**. The response carries `mode`, `negate`, `passed`, `attempts`, `elapsedMs`, and - only when `passed` is `false` - a short `reason`. The matched element, the matched text, the tab URL, and the extracted values are never returned, so a failing assertion cannot be used as a back-door page read. The exit code is the deliverable: `0` when the condition held, `1` when it did not, which is what makes it composable.
+
+```bash
+chrome-bridge click 42 "text=Place order" \
+  && chrome-bridge expect 42 text "Order confirmed" --timeout 10000 \
+  && chrome-bridge expect 42 selector "#cart-badge" --negate
+```
+
 ### Batch sequences
 
 ```bash
@@ -218,7 +244,7 @@ Only same-origin (or inline `data:application/json`) maps are read, so resolutio
 
 `startMonitoring` leaves Chrome's debugger attached to the tab until `stopMonitoring`, so Chrome's debugger notice may persist across the browser while monitoring is active. `startInterception` leaves Fetch/debugger attached until `stopInterception`. `networkRequests` and `interceptedRequests` store URLs as origin plus pathname and report `hasQuery` instead of query strings. `downloadUrl` writes into Chrome's configured download location; Chrome rejects arbitrary absolute output paths. `storageState` writes cookies, localStorage, and sessionStorage to disk and prints metadata only. `setGeolocation` grants geolocation for the tab origin through Chrome content settings, applies a CDP geolocation override, and `clearGeolocation` resets that origin to `ask`.
 
-`policyCheck` is host-side and never forwards to Chrome: it reports what `bridge_policy.json` would decide (`allowed`, `reason`, `confirmationRequired`, `redact`, `audit`) for the given action/payload. Tab-scoped actions also include `originDependent: true` because the live tab origin is additionally checked at forward time.
+`policyCheck` is host-side and never forwards to Chrome: it reports what `bridge_policy.json` would decide (`allowed`, `reason`, `confirmationRequired`, `redact`, `audit`) for the given action/payload. Tab-scoped actions also include `originDependent: true` because the live tab origin is additionally checked at forward time. Every verdict - single, per plan step, and dry-run - also carries `effectiveTier`: `read_only` or `mutating` for that exact action **and payload**, which is the tier a `manual` `siteModes` origin gates on. It is computed from the payload, so `screencastFrames` with `consume: false` is `read_only` while the consuming default is `mutating`, and a `batch`/`replayWorkflow` is `read_only` only when every one of its steps is. See docs/security.md for the full escalation table.
 
 `policyCheck --plan` preflights a whole plan in one host-side call. The argument is a JSON array of up to 50 `{"action": ..., "origin": ..., "payload": ...}` steps; the response is `result.plan`, one verdict per step with the same fields plus the `step` index. `origin` is an optional hypothetical tab origin: supply it and a tab-scoped step is evaluated against that origin and reports `originDependent: false`, since the caller has already stated the origin the real request would carry. Nothing is forwarded and no state changes.
 
@@ -226,6 +252,12 @@ Every command also accepts the global `--dry-run` flag. The host runs the full p
 
 ```bash
 chrome-bridge --dry-run navigate https://github.com
+```
+
+Every command also accepts the global `--traceparent <value>` flag: a W3C trace-context header value naming the trace this run belongs to. The host continues that trace when its opt-in OpenTelemetry spans are enabled (`BRIDGE_OTEL_ENABLED`, see `docs/telemetry.md`) and otherwise ignores it; either way the field is host-only and stripped before anything reaches Chrome, exactly like the bridge token and `--dry-run`. A malformed value starts a fresh trace rather than failing the command.
+
+```bash
+chrome-bridge --traceparent 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 getTabs
 ```
 
 When an action such as `executeScript` is confirmation-gated, the response includes a one-use token and `resumeCommand`. Resume without rebuilding the original JSON:
@@ -259,13 +291,24 @@ chrome-bridge cache selectors import <path>
 
 A recording captures **only what this bridge dispatched**. Every mutating action that returns successfully through the extension's dispatch table is appended to each active recording; human clicks and keystrokes in the tab are never observed, and a failed action is never recorded. `--tab` scopes a recording to one tab (it still records profile-wide steps such as `setCookie` that carry no `tabId`); with no `--tab` the recording is global. Recordings live only in extension service-worker memory, capped at 500 steps, so a worker restart drops them - that is why `stop` hands the workflow back for you to persist.
 
-The serialized format is shared with `chrome-bridge schedule`: `{"version": 1, "name": ..., "steps": [{"action": ..., "payload": {...}, "wait": <ms>}], "policy": {"requiredOrigins": [...]}}`. `wait` is the recorded gap before the step, clamped to 10000 ms so a long human pause never stalls a replay. `requiredOrigins` collects every tab origin the recording touched.
+The serialized format is shared with `chrome-bridge schedule`: `{"version": 2, "name": ..., "steps": [{"action": ..., "payload": {...}, "wait": <ms>}], "policy": {"requiredOrigins": [...]}}`. `wait` is the recorded gap before the step, clamped to 10000 ms so a long human pause never stalls a replay. `requiredOrigins` collects every tab origin the recording touched.
+
+**Version 2 adds per-step postconditions.** Both new keys are optional and additive, so a `"version": 1` file has neither and replays byte-for-byte under the version-2 reader; `replay` accepts version 1 and version 2 and reports the file's own version back as `workflowVersion`.
+
+- `expect`: one object with the same shape as the `expect` payload minus `tabId` (`{mode, selector?, text?, urlSubstring?, schema?, negate?, timeoutMs?}`). It is evaluated against the step's effective tab after the step succeeds. The host enumerates it as a nested read-only `expect` step, so a postcondition is origin-checked like any other tab-scoped action.
+- `retry`: `{max, delayMs}`. `max` is clamped to `0..5`, `delayMs` to `0..10000`. Out-of-range, malformed, or missing values clamp rather than reject, so an over-eager workflow degrades into a bounded one instead of refusing to run.
+
+Recording never invents an `expect` clause - `startWorkflowRecording` cannot know what you meant to assert, so postconditions are authored or added to the file by hand.
 
 **Typed and stored values are redacted by default.** `type`/`fill` text, `setCookie` and `setStorageItem` values, `handleDialog` prompt text, and any payload key that looks like a credential (`token`, `password`, `secret`, `credential`, `authorization`, `api_key`) are recorded as `<redacted>`, and the step is marked `"requiresValue": true` with a `bindingKeys` entry such as `step3.text`. Replay refuses the **whole** workflow - before running any step - until every one of those keys is supplied with `--binding step3.text=<value>`, so a half-run macro can never stop at the password field. Start the recording with `--record-sensitive` (or send `recordSensitive: true` in a single action's payload) to keep a value verbatim; then the workflow file itself holds that secret.
 
 `stop` prints metadata only (step count, redacted step count, required bindings and origins, duration) and writes the workflow JSON to `bridge_workflow_last.json` in the repo, plus `--out <path>` when given. `save <path>` writes the stashed workflow to a caller path. Both files are git-ignored and mode `600`.
 
 `replay` reproduces real mutating actions through the normal host pipeline. **The host evaluates every step before the replay is forwarded at all:** it walks `workflow.steps[]`, applies the same `--tab` retargeting the extension will apply, and runs each step through the action, origin, `siteModes`, lease, and blackout gates. A denied step denies the whole replay (`policy denied: workflow step <n>: <reason>`); nothing runs. A step that still requires confirmation fails the replay with `policy denied: workflow step <n> requires confirmation` and no token is issued - a single outer approval cannot stand in for per-step approval, so grant that step through policy or a `skip` site mode instead. The extension then additionally refuses any step whose live tab origin is not in the workflow's `requiredOrigins`. `--tab` retargets every tab-scoped step at one tab; `--continue-on-error` records failures in place instead of stopping at the first one. Output is per-step metadata (`step`, `action`, `success`, `selfHealed`, result shape) - never page content.
+
+A step's postcondition runs **after** the step's own action reports success. If the assertion does not hold, the whole step - dispatch plus assertion - is re-run up to `retry.max` times with `retry.delayMs` between attempts. If it still does not hold, the step fails with `{"success": false, "err": "expect failed", "step": <index>, "action": ..., "expect": {"mode": ..., "reason": ...}}` and the usual `stopOnError` semantics apply (`--continue-on-error` keeps going). An `expect` clause that is malformed is a workflow authoring error and fails the step immediately without spending the retry budget.
+
+Every step in the replay result carries `attempts` and `retried`, and a step with a postcondition also carries `expectPassed`; the result totals add `retriedSteps` and `expectFailedSteps`. That is the evidence the run actually produced, not a model's account of it - and it is metadata only: no matched element, matched text, or extracted value ever appears in it.
 
 The **selector cache** makes replay deterministic. For `click`, `type`, `fill`, `select`, and `hover`, a *semantic* selector (`text=`, `label=`, `role=`, `aria=`) is resolved once and the concrete CSS path it landed on is cached against `(urlPattern, selector)`, where `urlPattern` is the tab's origin plus pathname. The next replay resolves **both** the cached path and the original semantic selector and uses the cached path only when the two land on the *same live DOM node* (compared by CDP backend node id). A cached path that still resolves but now points at a replacement element is discarded exactly like one that no longer resolves: the semantic selector wins, the cache is rewritten, and the step reports `"selfHealed": true`. That is deliberate - "the old CSS still matches something" is not evidence that it still matches what the author named. Imported entries are validated the same way at resolution time, so an edited cache file cannot make replay act on a substituted element. A **CSS selector is never cached and never retargeted**: it is a literal address, so a failing CSS step fails rather than silently clicking a different element. Frame- and shadow-scoped selectors resolve normally but are reported `cacheable: false`, because their CSS path is relative to another document.
 
@@ -283,6 +326,8 @@ chrome-bridge schedule remove <name>
 `schedule` registers a validated pointer to a replayable workflow file. **It runs nothing.** Chrome Bridge has no scheduler daemon and no timer: the command only appends an entry to git-ignored `bridge_schedules.json` (mode `600`, overridable with `BRIDGE_SCHEDULE_FILE`) and prints the `runCommand` you must wire into cron, launchd, systemd timers, a CI job, or a manual step. Every response carries `runsUnattended: false` for exactly that reason.
 
 The workflow file contract is `{version, name, steps: [{action, payload?, wait?}], policy: {requiredOrigins?}}`, where `wait` is milliseconds to pause after a step. `schedule workflow` validates that shape before writing anything and exits `2` with the offending step index if it does not hold. Give exactly one trigger: `--at` takes an ISO 8601 timestamp (a trailing `Z` is accepted), `--interval` takes whole seconds and rejects anything under 60. `--name` defaults to the workflow's own `name`, and re-registering an existing name replaces that entry instead of duplicating it.
+
+A version-2 step may also carry `expect` and `retry` (see above). `schedule workflow` accepts them without change: it validates `action`, `payload`, and `wait` and leaves the postcondition clauses to the replay that actually runs.
 
 An entry records the name, the absolute workflow path, the trigger, the step count, the workflow's declared `policy.requiredOrigins`, the registration timestamp, and the run command - never a step payload, because a recorded step can carry typed text or form values. Registration authorizes nothing: the host evaluates each replayed step against the live policy when it actually runs, so grant the origins first and decide the origin's `siteModes` mode before the first unattended run. See docs/security.md for the no-human-present trust model.
 
@@ -316,18 +361,21 @@ chrome-bridge searchTabs <query> [--regex] [--max-per-tab <count>] [--case-sensi
 
 `searchTabs` scans visible text in every open `http`/`https` tab and returns, per matching tab, the tab id, the origin host (never the full URL), the match count, and up to `--max-per-tab` snippets (default 5, capped at 20) of the match plus 80 characters of context on each side. `--regex` treats the query as a JavaScript regular expression and `--case-sensitive` disables the default case-insensitive match. Tabs that cannot be scripted (`chrome://` pages, the Chrome Web Store) are skipped silently and reported as `skippedTabs`.
 
-### Real-profile moat: session probe and human handoff
+### Real-profile moat: session probe, human handoff, credential handoff
 
-These two commands exploit what sets this bridge apart from Playwright/Puppeteer: it drives your **real, already-logged-in Chrome profile**, so existing sessions (cookies, SSO, passkeys) are ambient. Neither command ever reads, imports, or overwrites cookie values - they only observe and hand control to you.
+These commands exploit what sets this bridge apart from Playwright/Puppeteer: it drives your **real, already-logged-in Chrome profile**, so existing sessions (cookies, SSO, passkeys) are ambient. None of them ever reads, imports, or overwrites cookie values - they only observe and hand control to you.
 
 ```bash
 chrome-bridge sessionStatus <domain> [<domain> ...]
 chrome-bridge waitForHandoff <message> [mode] [selectorOrUrlOrText] [timeoutMs] [tabId]
+chrome-bridge credentialHandoff <tabId> <selector> [message] [--mode filled|submitted] [--timeout <milliseconds>]
 ```
 
 `sessionStatus` is a **redacted auth probe**: for each domain it reports cookie count, cookie *names* (never values), whether a session/auth cookie is present, and a `loggedIn` boolean - enough to decide "is this profile already signed in to X?" without exposing secrets. Treat its output as sensitive: cookie names plus logged-in status can reveal which accounts and sites the profile uses.
 
 `waitForHandoff` **pauses automation and hands control to you**: it focuses the target tab, changes its task-group label to `↗ Review needed`, shows a compact bottom card with your `message`, and blocks until the page reaches an expected state. It then restores the previous task state and resumes the agent. Use it for interactive steps an agent should not perform - login, 2FA, captcha, payment confirmation. `mode` is `manual` (default; resolves when you change the page), `selector`, `url`, or `text`; the positional argument after `mode` is the selector/URL-substring/text to wait for. `timeoutMs` defaults to 120000. The CLI raises its socket read timeout to cover the wait, so long handoffs do not time out in transport. Under MCP auto-lease, the cooperative lease is extended to span the whole handoff window so another agent cannot mutate the profile while you are acting. While the handoff is in flight the host also blacks out observation for every client - `screenshot`, `extractText`, `getHTML`, `storageState`, `printToPDF`, `searchTabs`, `getCurrentState`, and `screencastFrames` are denied with `handoff in progress` (scoped to the handoff's `tabId`, or all tabs when it has none), so nothing can watch you type credentials.
+
+`credentialHandoff` is `waitForHandoff` narrowed to **one field**, and it is the supported way to get a password, passphrase, recovery code, or one-time code into a page. Never route a secret through `fill`: that puts the value in a command line, in the request payload, and in whatever transcript the caller keeps. `credentialHandoff` instead drops every capture buffer for the tab, focuses the tab, window, and the field named by `selector` (CSS, semantic, or `ref=eN`; frame-scoped selectors are not supported), shows the banner with `message`, and waits for you to type. **The value is never read.** The injected probe returns only whether the field is present, whether it is empty, and how many characters it holds, so the only value-derived datum in the response is `valueLength`. `--mode filled` (default) resolves once the field goes from empty to non-empty and the length settles; `--mode submitted` resolves when the field's owning form submits or the page navigates. `--timeout` defaults to 120000 and the CLI raises its socket read timeout to cover the wait. For the whole window the native host holds a handoff blackout over the tab, so `screenshot`, `getHTML`, `observe`, and every other observation action are denied to every client - including the one that asked for the handoff. A successful response is `{success, tabId, selector, mode, filled, valueLength, elapsedMs, scrubbedCaptures}`; a timeout is `credential handoff timeout after <n>ms`.
 
 ## Raw-output safety
 

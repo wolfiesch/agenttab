@@ -455,10 +455,11 @@ fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
 }
 
 // --- Handoff telemetry blackout --------------------------------------------
-// While a waitForHandoff request is in flight through this host, the human is
-// typing credentials/2FA codes into the real tab. Any observation action would
-// capture that, so the host denies observation for the duration of the handoff
-// -- for every client, including the one that started the handoff.
+// While a waitForHandoff or credentialHandoff request is in flight through this
+// host, the human is typing credentials/2FA codes into the real tab. Any
+// observation action would capture that, so the host denies observation for the
+// duration of the handoff -- for every client, including the one that started
+// the handoff.
 //
 // Scope: a handoff whose payload carries a numeric tabId blacks out that tab
 // only; a handoff with no tabId is resolved to the active tab by the extension,
@@ -492,6 +493,9 @@ const HANDOFF_BLACKOUT_ACTIONS: [&str; 17] = [
     "startInterception",
 ];
 const HANDOFF_BLACKOUT_ERROR: &str = "handoff in progress";
+// Actions whose forward opens a blackout window. credentialHandoff is the
+// single-field narrowing of waitForHandoff and gets exactly the same treatment.
+const HANDOFF_ACTIONS: [&str; 2] = ["waitForHandoff", "credentialHandoff"];
 
 /// One in-flight handoff. `tab_id` None means GLOBAL (extension resolves the
 /// active tab, which the host cannot see).
@@ -637,13 +641,98 @@ fn non_skippable_confirmation(action: &str) -> bool {
     )
 }
 
-/// What `manual` gates: anything that changes browser/page/profile state plus
-/// the high-risk reads in the non-skippable set. Mirrors
-/// bridge.py::is_mutating_action.
-fn is_mutating_action(action: &str) -> bool {
-    mutating_actions().contains(&action)
+/// Name-only tier: anything that changes browser/page/profile state plus the
+/// high-risk reads in the non-skippable set. Mirrors
+/// bridge.py::base_action_tier.
+fn base_action_tier(action: &str) -> &'static str {
+    if mutating_actions().contains(&action)
         || destructive_actions().contains(&action)
         || non_skippable_confirmation(action)
+    {
+        "mutating"
+    } else {
+        "read_only"
+    }
+}
+
+/// Retained name-only predicate. Decisions use `effective_action_tier`, which
+/// also accounts for state-changing payload flags and batch step contents.
+/// Mirrors bridge.py::is_mutating_action.
+#[allow(dead_code)]
+fn is_mutating_action(action: &str) -> bool {
+    base_action_tier(action) == "mutating"
+}
+
+// --- Payload-driven tier escalation ----------------------------------------
+// A nominally read-only action is state-changing when its payload sets a flag
+// that mutates extension-side state. The table is data, not scattered
+// conditionals, so bridge.py and this host can be compared by eye.
+//
+// Entry: (action, flag, kind, enum values)
+//   not_false     - the extension reads `flag !== false`, so the flag is ON
+//                   unless the payload sets it to literal false (default ON).
+//   enum          - string flag; escalates when its value is in the listed set.
+//                   Absent means the extension's own default, never listed here.
+//   nonempty_list - escalates when the flag is a non-empty array, because the
+//                   extension merges caller-supplied entries into its own state.
+// Mirrors bridge.py::ESCALATING_PAYLOAD_FLAGS.
+const ESCALATING_PAYLOAD_FLAGS: [(&str, &str, &str, &[&str]); 3] = [
+    // screencastFrames drains the frame buffer irrecoverably unless the caller
+    // explicitly passes consume: false.
+    ("screencastFrames", "consume", "not_false", &[]),
+    // cacheSelectors op=list/export read; clear wipes the selector cache and
+    // import merges caller-supplied entries into it.
+    ("cacheSelectors", "op", "enum", &["clear", "import"]),
+    // resolveCachedSelector imports caller-supplied cache entries before
+    // resolving when payload.cache is a non-empty array.
+    ("resolveCachedSelector", "cache", "nonempty_list", &[]),
+];
+
+/// True when a base read-only action's payload carries a state-changing flag
+/// from ESCALATING_PAYLOAD_FLAGS. Mirrors bridge.py::payload_escalates_tier.
+fn payload_escalates_tier(action: &str, payload: Option<&Value>) -> bool {
+    for (f_action, flag, kind, values) in ESCALATING_PAYLOAD_FLAGS.iter() {
+        if *f_action != action {
+            continue;
+        }
+        let value = payload.and_then(|p| p.get(*flag));
+        let hit = match *kind {
+            "not_false" => value != Some(&Value::Bool(false)),
+            "enum" => matches!(value.and_then(|v| v.as_str()), Some(s) if values.contains(&s)),
+            "nonempty_list" => matches!(value.and_then(|v| v.as_array()), Some(a) if !a.is_empty()),
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// The tier every tier-dependent decision uses: "read_only" or "mutating",
+/// computed from the payload, not the action name alone. batch/replayWorkflow
+/// are the union over their steps: read_only only when every step resolves to
+/// read_only. A base read-only action escalates to mutating when its payload
+/// carries a state-changing flag. Mirrors bridge.py::effective_action_tier.
+fn effective_action_tier(action: &str, payload: Option<&Value>) -> &'static str {
+    if action == "batch" || action == "replayWorkflow" {
+        let steps = if action == "batch" {
+            step_payloads(payload)
+        } else {
+            workflow_step_payloads(payload)
+        };
+        for (s_action, s_payload) in steps {
+            if effective_action_tier(&s_action, Some(&s_payload)) == "mutating" {
+                return "mutating";
+            }
+        }
+        return "read_only";
+    }
+    if base_action_tier(action) == "mutating" || payload_escalates_tier(action, payload) {
+        "mutating"
+    } else {
+        "read_only"
+    }
 }
 
 /// Origin-exempt actions: their policy target is NOT the live tab origin, so the
@@ -1000,6 +1089,13 @@ const WORKFLOW_SELECTOR_ACTIONS: [&str; 5] = ["click", "type", "fill", "select",
 /// be bypassed either by hoisting tabId to the replay payload or by recording a
 /// step against a different tab. Steps with no action are skipped because the
 /// extension never dispatches them. Mirrors bridge.py::_workflow_step_payloads.
+///
+/// A version-2 step may carry an `expect` clause (T4-4). The extension evaluates
+/// it against the step's effective tab, so it is enumerated here as a synthetic
+/// `expect` step: a nested postcondition is then origin-checked like any other
+/// tab-scoped action instead of riding in unexamined. `expect` is a non-mutating
+/// assertion, so it appears in none of the mutating, sensitive, or destructive
+/// sets and stays on the read-only side of the action classification.
 fn workflow_step_payloads(payload: Option<&Value>) -> Vec<(String, Value)> {
     let mut out = Vec::new();
     let obj = match payload {
@@ -1025,7 +1121,19 @@ fn workflow_step_payloads(payload: Option<&Value>) -> Vec<(String, Value)> {
                 map.insert("tabId".to_string(), dt.clone());
             }
         }
+        let s_expect = step.get("expect").filter(|e| e.is_object()).cloned();
+        let step_tab = s_payload.get("tabId").filter(|v| !v.is_null()).cloned();
         out.push((s_action, s_payload));
+        if let Some(expect) = s_expect {
+            let mut e_payload = serde_json::Map::new();
+            if let Some(tab) = step_tab.or_else(|| default_tab.clone()) {
+                e_payload.insert("tabId".to_string(), tab);
+            }
+            if let Some(mode) = expect.get("mode").filter(|m| m.is_string()) {
+                e_payload.insert("mode".to_string(), mode.clone());
+            }
+            out.push(("expect".to_string(), Value::Object(e_payload)));
+        }
     }
     out
 }
@@ -1149,10 +1257,25 @@ fn resolve_site_mode(cp: &Value, targets: &[String]) -> Option<String> {
 /// `skip` removes one, `auto`/None leave requireConfirmation alone. Neither mode
 /// touches the action or origin gates, and `skip` can never waive a
 /// non-skippable action. Mirrors bridge.py::apply_site_mode.
-fn apply_site_mode(site_mode: Option<&str>, action: &str, confirm: bool) -> bool {
+///
+/// `manual` gates on the EFFECTIVE tier, so an all-read-only batch is not
+/// force-gated while one carrying a single mutating step is, and a read-only
+/// action whose payload sets a state-changing flag is.
+fn apply_site_mode(
+    site_mode: Option<&str>,
+    action: &str,
+    confirm: bool,
+    payload: Option<&Value>,
+) -> bool {
     match site_mode {
-        Some("manual") if is_mutating_action(action) => true,
-        Some("skip") if confirm && !non_skippable_confirmation(action) => false,
+        Some("manual") if effective_action_tier(action, payload) == "mutating" => true,
+        Some("skip")
+            if confirm
+                && !non_skippable_confirmation(action)
+                && !payload_escalates_tier(action, payload) =>
+        {
+            false
+        }
         _ => confirm,
     }
 }
@@ -1204,9 +1327,28 @@ fn evaluate_policy(
         resolve_site_mode(&cp, &targets).as_deref(),
         action,
         action_matches(cp.get("requireConfirmation"), action),
+        payload,
     );
 
     if action == "batch" {
+        // `batch` is origin-exempt for site policy because each step is checked
+        // against its own origin. The `manual` gate still has to see the origins
+        // the batch will act on, or hoisting actions into a batch would bypass a
+        // manual origin. Resolve the mode from the union of the step origins, and
+        // gate on the batch's EFFECTIVE tier so an all-read-only batch stays
+        // ungated while one carrying a mutating step does not.
+        let mut mode_targets = targets.clone();
+        for tab_key in tab_ids_needed(action, payload) {
+            if let Some(Some(origin)) = origins.get(&tab_key) {
+                mode_targets.extend(origin_targets(Some(origin.as_str())));
+            }
+        }
+        let confirm = apply_site_mode(
+            resolve_site_mode(&cp, &mode_targets).as_deref(),
+            action,
+            confirm,
+            payload,
+        );
         if confirm {
             return (true, None, true, redact_enabled, audit_enabled, targets);
         }
@@ -1299,6 +1441,10 @@ fn policy_verdict(
         // The origin's resolved site mode, or null when no origin is known yet
         // (no target resolved) or no configured pattern matches it.
         "siteMode": resolve_site_mode(&policy_for_client(policy, name), &targets),
+        // The tier the host actually enforces for this action+payload:
+        // "read_only" or "mutating". Computed from the payload, so a batch of
+        // reads is read_only and a read whose flag changes state is mutating.
+        "effectiveTier": effective_action_tier(action, payload),
     });
     (verdict, targets)
 }
@@ -1839,18 +1985,24 @@ fn trace_request(
     request_id: Option<&str>,
     started_ms: u128,
 ) {
-    let dir = match trace_dir_for(policy, client, host_dir) {
-        Some(d) => d,
-        None => return,
+    let dir = trace_dir_for(policy, client, host_dir);
+    // The session trace id is also the span's `bridge.trace_id`, so it is
+    // resolved when either sink is active.
+    let trace_id = if dir.is_some() || OTEL_CONFIG.enabled {
+        trace_id_for(action, payload, response)
+    } else {
+        None
     };
-    let trace_id = match trace_id_for(action, payload, response) {
-        Some(t) => t,
-        None => return,
+    let otel = otel_finish_request(logger, client, action, payload, response, decision,
+                                   request_id, trace_id.as_deref());
+    let (dir, trace_id) = match (dir, trace_id) {
+        (Some(d), Some(t)) => (d, t),
+        _ => return,
     };
     let secrets = known_secret_masks();
     let safe_response = mask_secrets_value(response.clone(), &secrets);
     let snapshot = trace_snapshot_subobject(&safe_response);
-    let event = json!({
+    let mut event = json!({
         "ts": now_ms() as u64,
         "client": client,
         "action": action,
@@ -1864,7 +2016,386 @@ fn trace_request(
         "snapshotHash": snapshot.as_ref().map(trace_hash),
         "success": safe_response.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
     });
+    if let (Some((otel_trace_id, otel_span_id)), Value::Object(map)) = (otel, &mut event) {
+        map.insert("otelTraceId".to_string(), Value::String(otel_trace_id));
+        map.insert("otelSpanId".to_string(), Value::String(otel_span_id));
+    }
     write_trace_event(&dir, &trace_id, logger, &event);
+}
+
+// --- OpenTelemetry spans (opt-in, process-level configuration) --------------
+//
+// Mirrors bridge.py: the same env vars, the same span names, the same attribute
+// keys, and the same OTLP/HTTP JSON document. Off by default and inert -- with
+// BRIDGE_OTEL_ENABLED unset nothing here allocates, opens a file, or creates a
+// socket. This is process-level configuration, NOT policy: a policy layer
+// cannot switch tracing on for one client, and tracing can never change a
+// policy decision.
+//
+// A span carries the action, client, host decision, effective action tier,
+// duration, tab-id count, success, request id, and session trace id. It never
+// carries a payload, a response body, page content, cookies, storage values,
+// tokens, credential values, selectors, or URLs, and every string attribute is
+// masked with the same secretMaskFile values the audit log uses.
+//
+// Transport scope: this host builds the identical OTLP/HTTP JSON document but
+// posts it with a minimal std::net HTTP/1.1 writer, so only a cleartext
+// http:// endpoint is supported. An https:// endpoint is refused with one log
+// line rather than linking a TLS stack into the host; the local file sink
+// (BRIDGE_OTEL_FILE) works identically for both hosts.
+
+struct OtelConfig {
+    enabled: bool,
+    endpoint: String,
+    file: String,
+    service_name: String,
+}
+
+fn otel_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_default().trim().to_string()
+}
+
+/// Read once at first use. Configuration is fixed for the process lifetime, so
+/// a request never re-reads the environment.
+static OTEL_CONFIG: std::sync::LazyLock<OtelConfig> = std::sync::LazyLock::new(|| {
+    let service_name = otel_env("BRIDGE_OTEL_SERVICE_NAME");
+    OtelConfig {
+        enabled: matches!(
+            otel_env("BRIDGE_OTEL_ENABLED").to_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        endpoint: otel_env("BRIDGE_OTEL_ENDPOINT"),
+        file: otel_env("BRIDGE_OTEL_FILE"),
+        service_name: if service_name.is_empty() {
+            "chrome-bridge".to_string()
+        } else {
+            service_name
+        },
+    }
+});
+
+/// OTLP enum values, inlined so no SDK is needed to emit a valid document.
+const OTEL_KIND_INTERNAL: i64 = 1;
+const OTEL_KIND_SERVER: i64 = 2;
+const OTEL_STATUS_OK: i64 = 1;
+const OTEL_STATUS_ERROR: i64 = 2;
+const OTEL_EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
+const OTEL_EXPORT_QUEUE_MAX: usize = 256;
+
+struct OtelRequest {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    start_ns: u128,
+    children: Vec<(&'static str, u128, u128)>,
+}
+
+// One connection is served by one thread, so a thread local scopes the request
+// span without threading a context object through the request pipeline.
+thread_local! {
+    static OTEL_REQUEST: std::cell::RefCell<Option<OtelRequest>> =
+        std::cell::RefCell::new(None);
+}
+
+static OTEL_FILE_LOCK: Mutex<()> = Mutex::new(());
+static OTEL_EXPORT_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static OTEL_SENDER: Mutex<Option<std::sync::mpsc::SyncSender<String>>> = Mutex::new(None);
+
+fn otel_now_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn otel_id(hex_len: usize) -> String {
+    let mut out = uuid::Uuid::new_v4().to_string().replace('-', "");
+    out.truncate(hex_len);
+    out
+}
+
+/// (trace_id, parent_span_id) from a W3C traceparent, or None when absent or
+/// malformed. An unparsable value starts a fresh trace rather than failing the
+/// request. Mirrors bridge.py::parse_traceparent.
+fn parse_traceparent(value: Option<&str>) -> Option<(String, String)> {
+    let raw = value?.trim().to_lowercase();
+    let parts: Vec<&str> = raw.split('-').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let hex = |s: &str, n: usize| s.len() == n && s.chars().all(|c| c.is_ascii_hexdigit());
+    if !hex(parts[0], 2) || !hex(parts[1], 32) || !hex(parts[2], 16) || !hex(parts[3], 2) {
+        return None;
+    }
+    if parts[0] == "ff"
+        || parts[1].chars().all(|c| c == '0')
+        || parts[2].chars().all(|c| c == '0')
+    {
+        return None;
+    }
+    Some((parts[1].to_string(), parts[2].to_string()))
+}
+
+/// Open the request span for this thread, continuing the caller's trace when it
+/// sent a traceparent and starting a new root trace otherwise.
+fn otel_begin_request(traceparent: Option<&str>) {
+    if !OTEL_CONFIG.enabled {
+        return;
+    }
+    let (trace_id, parent_span_id) = match parse_traceparent(traceparent) {
+        Some((trace_id, parent)) => (trace_id, Some(parent)),
+        None => (otel_id(32), None),
+    };
+    let request = OtelRequest {
+        trace_id,
+        span_id: otel_id(16),
+        parent_span_id,
+        start_ns: otel_now_ns(),
+        children: Vec::new(),
+    };
+    OTEL_REQUEST.with(|slot| *slot.borrow_mut() = Some(request));
+}
+
+/// Start time for a child span, or 0 when telemetry is off so the disabled path
+/// is a single flag read and the recorder below does nothing.
+fn otel_child_start() -> u128 {
+    if OTEL_CONFIG.enabled {
+        otel_now_ns()
+    } else {
+        0
+    }
+}
+
+fn otel_child_end(name: &'static str, start_ns: u128) {
+    if start_ns == 0 {
+        return;
+    }
+    let end_ns = otel_now_ns();
+    OTEL_REQUEST.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            ctx.children.push((name, start_ns, end_ns));
+        }
+    });
+}
+
+fn otel_attr(key: &str, value: Value) -> Value {
+    let wrapped = match &value {
+        Value::Bool(b) => json!({"boolValue": b}),
+        Value::Number(n) if n.is_f64() => json!({"doubleValue": n}),
+        Value::Number(n) => json!({"intValue": n.to_string()}),
+        Value::String(s) => json!({"stringValue": s}),
+        other => json!({"stringValue": other.to_string()}),
+    };
+    json!({"key": key, "value": wrapped})
+}
+
+/// Drop absent attributes and mask every string before it leaves the host.
+fn otel_attrs(pairs: Vec<(&str, Option<Value>)>, secrets: &[(String, String)]) -> Value {
+    let mut out: Vec<Value> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let value = match value {
+            Some(Value::String(s)) => Value::String(mask_secret_text(&s, secrets)),
+            Some(other) => other,
+            None => continue,
+        };
+        out.push(otel_attr(key, value));
+    }
+    Value::Array(out)
+}
+
+/// Close the request span, emit it with its children, and return
+/// (traceId, spanId) so the session trace artifact can name the same span.
+/// Returns None when telemetry is off, which keeps the artifact and the
+/// response byte-identical to an untraced host.
+#[allow(clippy::too_many_arguments)]
+fn otel_finish_request(
+    logger: &Arc<Logger>,
+    client: &str,
+    action: &str,
+    payload: Option<&Value>,
+    response: &Value,
+    decision: &str,
+    request_id: Option<&str>,
+    session_trace_id: Option<&str>,
+) -> Option<(String, String)> {
+    if !OTEL_CONFIG.enabled {
+        return None;
+    }
+    let ctx = OTEL_REQUEST.with(|slot| slot.borrow_mut().take())?;
+    let end_ns = otel_now_ns();
+    let secrets = known_secret_masks();
+    let success = response.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let targets = trace_targets(action, payload, response);
+    // OpenTelemetry GenAI tool-execution convention for the span name and the
+    // gen_ai.* attributes; everything host-specific lives under bridge.*.
+    let span_name = if action.is_empty() {
+        "execute_tool".to_string()
+    } else {
+        format!("execute_tool {}", action)
+    };
+    let status_code = if success { OTEL_STATUS_OK } else { OTEL_STATUS_ERROR };
+    let mut span = json!({
+        "traceId": &ctx.trace_id,
+        "spanId": &ctx.span_id,
+        "name": span_name,
+        "kind": OTEL_KIND_SERVER,
+        "startTimeUnixNano": ctx.start_ns.to_string(),
+        "endTimeUnixNano": end_ns.to_string(),
+        "attributes": otel_attrs(vec![
+            ("gen_ai.tool.name", Some(json!(action))),
+            ("gen_ai.tool.type", Some(json!("extension"))),
+            ("bridge.action", Some(json!(action))),
+            ("bridge.client", Some(json!(client))),
+            ("bridge.decision", Some(json!(decision))),
+            ("bridge.effective_tier", Some(json!(effective_action_tier(action, payload)))),
+            ("bridge.duration_ms",
+             Some(json!((end_ns.saturating_sub(ctx.start_ns) / 1_000_000) as u64))),
+            ("bridge.tab_id_count", Some(json!(targets.len() as u64))),
+            ("bridge.success", Some(json!(success))),
+            ("bridge.request_id", request_id.map(|v| json!(v))),
+            ("bridge.trace_id", session_trace_id.map(|v| json!(v))),
+            ("bridge.host", Some(json!("rust"))),
+        ], &secrets),
+        "status": {"code": status_code},
+    });
+    if let (Some(parent), Value::Object(map)) = (ctx.parent_span_id.as_ref(), &mut span) {
+        map.insert("parentSpanId".to_string(), json!(parent));
+    }
+    let mut spans = vec![span];
+    for (name, start_ns, child_end_ns) in &ctx.children {
+        spans.push(json!({
+            "traceId": &ctx.trace_id,
+            "spanId": otel_id(16),
+            "parentSpanId": &ctx.span_id,
+            "name": name,
+            "kind": OTEL_KIND_INTERNAL,
+            "startTimeUnixNano": start_ns.to_string(),
+            "endTimeUnixNano": child_end_ns.to_string(),
+            "attributes": otel_attrs(vec![
+                ("bridge.action", Some(json!(action))),
+                ("bridge.duration_ms",
+                 Some(json!((child_end_ns.saturating_sub(*start_ns) / 1_000_000) as u64))),
+            ], &secrets),
+            "status": {"code": OTEL_STATUS_OK},
+        }));
+    }
+    otel_export(logger, spans);
+    Some((ctx.trace_id, ctx.span_id))
+}
+
+/// Best effort, exactly like an audit-log write failure: one log line, then the
+/// request continues. A broken sink is disabled for the rest of the process so
+/// it cannot cost every later request a retry.
+fn otel_export(logger: &Arc<Logger>, spans: Vec<Value>) {
+    let cfg = &*OTEL_CONFIG;
+    if spans.is_empty() || OTEL_EXPORT_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let document = json!({"resourceSpans": [{
+        "resource": {"attributes": [
+            otel_attr("service.name", json!(cfg.service_name)),
+            otel_attr("telemetry.sdk.name", json!("chrome-bridge")),
+            otel_attr("telemetry.sdk.language", json!("rust")),
+        ]},
+        "scopeSpans": [{"scope": {"name": "chrome-bridge.host"}, "spans": spans}]
+    }]});
+    let encoded = match serde_json::to_string(&document) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if !cfg.file.is_empty() {
+        let result = match OTEL_FILE_LOCK.lock() {
+            Ok(_guard) => OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&cfg.file)
+                .and_then(|mut f| writeln!(f, "{}", encoded)),
+            Err(e) => Err(io::Error::other(format!("otel file lock poisoned: {}", e))),
+        };
+        if let Err(e) = result {
+            OTEL_EXPORT_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            log_error(logger, &format!("OpenTelemetry export disabled after failure: {}", e));
+            return;
+        }
+    }
+    if !cfg.endpoint.is_empty() {
+        otel_enqueue(logger, encoded);
+    }
+}
+
+/// The OTLP POST runs on a background thread, so a slow or dead collector can
+/// never add latency to a browser request. A full queue drops the document.
+fn otel_enqueue(logger: &Arc<Logger>, encoded: String) {
+    let mut guard = match OTEL_SENDER.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guard.is_none() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(OTEL_EXPORT_QUEUE_MAX);
+        let worker_logger = Arc::clone(logger);
+        std::thread::spawn(move || {
+            let mut logged = false;
+            for document in rx {
+                if let Err(e) = otel_post(&document) {
+                    if !logged {
+                        logged = true;
+                        log_error(&worker_logger, &format!(
+                            "OpenTelemetry OTLP export failed (further failures silent): {}", e));
+                    }
+                }
+            }
+        });
+        *guard = Some(tx);
+    }
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.try_send(encoded);
+    }
+}
+
+/// Minimal OTLP/HTTP POST over std::net. Cleartext http:// only; see the scope
+/// note above.
+fn otel_post(encoded: &str) -> io::Result<()> {
+    let cfg = &*OTEL_CONFIG;
+    let mut url = cfg.endpoint.clone();
+    if !url.contains("/v1/traces") {
+        url = format!("{}/v1/traces", url.trim_end_matches('/'));
+    }
+    let parsed = url::Url::parse(&url)
+        .map_err(|e| io::Error::other(format!("invalid BRIDGE_OTEL_ENDPOINT: {}", e)))?;
+    if parsed.scheme() != "http" {
+        return Err(io::Error::other(format!(
+            "the Rust host posts OTLP over cleartext http only, not {}; \
+             use BRIDGE_OTEL_FILE or a local http collector",
+            parsed.scheme()
+        )));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| io::Error::other("BRIDGE_OTEL_ENDPOINT has no host"))?
+        .to_string();
+    let port = parsed.port().unwrap_or(80);
+    let mut path = parsed.path().to_string();
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let mut stream = TcpStream::connect((host.as_str(), port))?;
+    stream.set_write_timeout(Some(OTEL_EXPORT_TIMEOUT))?;
+    stream.set_read_timeout(Some(OTEL_EXPORT_TIMEOUT))?;
+    let head = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        path, host, port, encoded.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(encoded.as_bytes())?;
+    stream.flush()?;
+    // Drain the status line so the collector sees a well-behaved client; the
+    // body is never inspected.
+    let mut buf = [0u8; 512];
+    let _ = stream.read(&mut buf);
+    Ok(())
 }
 
 const REDACT_KEY_SUBSTRINGS: [&str; 7] =
@@ -2235,12 +2766,17 @@ fn handle_socket_client(
             }
         };
 
-        // Never forward secrets, host-only confirmation fields, or the
-        // request-level dry-run flag to the extension.
+        // Never forward secrets, host-only confirmation fields, the
+        // request-level dry-run flag, or the caller's W3C trace context to the
+        // extension.
         let mut dry_run = false;
+        let mut traceparent: Option<String> = None;
         let mut confirmation_token = if let Value::Object(map) = &mut cmd {
             map.remove("token");
             dry_run = map.remove("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            traceparent = map
+                .remove("traceparent")
+                .and_then(|v| v.as_str().map(|s| s.to_string()));
             map.remove("confirmationToken")
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
         } else {
@@ -2252,6 +2788,7 @@ fn handle_socket_client(
         // Start of the traced window: every exit below emits at most one trace
         // event, measured from here.
         let trace_started = now_ms();
+        otel_begin_request(traceparent.as_deref());
 
         // Dry run stops before any state change: no confirmation resume, no
         // lease acquisition, no interactive origin approval, no tab-origin
@@ -2438,6 +2975,7 @@ fn handle_socket_client(
                 "originDependent": origin_dependent,
                 "siteMode": resolve_site_mode(
                     &policy_for_client(&policy_value, &client_name), &targets),
+                "effectiveTier": effective_action_tier(target_action, target_payload),
             }});
             audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &targets, "allow", None, None);
             trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
@@ -2500,8 +3038,10 @@ fn handle_socket_client(
         // Phase 1: action-level and payload-target checks needing no extension
         // round-trip. These run before the lease gate, preserving prior
         // precedence (policy denial wins over a lease for payload targets).
+        let otel_policy_started = otel_child_start();
         let (allowed, _reason, _confirm, redact_enabled, audit_enabled, targets) =
             evaluate_policy(&policy_value, &client_name, &action, payload.as_ref(), &empty_origins);
+        otel_child_end("bridge.policy_evaluate", otel_policy_started);
         if !allowed {
             let reason = _reason.unwrap_or_default();
             audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
@@ -2648,20 +3188,24 @@ fn handle_socket_client(
             let ce = client_name.clone();
             let ac = action.clone();
             let tg = targets.clone();
-            // A waitForHandoff forward opens a telemetry blackout for the whole
+            // A handoff forward (see HANDOFF_ACTIONS) opens a blackout for the whole
             // time the human is interacting with the tab; the guard drops it on
             // every exit path (response, extension error, or timeout).
             let _handoff_guard = HandoffGuard {
                 handoffs,
-                handle: if action == "waitForHandoff" {
+                handle: if HANDOFF_ACTIONS.contains(&action.as_str()) {
                     register_handoff(handoffs, handoff_tab_id(payload.as_ref()), &client_name)
                 } else {
                     None
                 },
             };
-            forward_to_extension(cmd, pending, stdout, logger, resp_timeout, |rid| {
-                audit(h, l, audit_enabled, &ce, &ac, &tg, "allow", None, Some(rid));
-            })
+            let otel_forward_started = otel_child_start();
+            let forwarded =
+                forward_to_extension(cmd, pending, stdout, logger, resp_timeout, |rid| {
+                    audit(h, l, audit_enabled, &ce, &ac, &tg, "allow", None, Some(rid));
+                });
+            otel_child_end("bridge.extension_forward", otel_forward_started);
+            forwarded
         };
         match response {
             Some(response) => {

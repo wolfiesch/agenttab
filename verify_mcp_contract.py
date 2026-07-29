@@ -240,6 +240,21 @@ def main():
     server.browser_wait_for("url", tab_id=11, url_substring="x.test")
     expect(last_request() == ("waitForUrl", {"tabId": 11, "substring": "x.test", "timeoutMs": 10000}), "wait_for url mismatch")
 
+    # 7a. expect modes map to the one `expect` action, with only assertion fields.
+    server.browser_expect("selector", tab_id=11, selector="#done")
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "selector", "timeoutMs": 5000, "selector": "#done"}),
+           "expect selector payload mismatch")
+    server.browser_expect("text", tab_id=11, text="Done", negate=True, timeout_ms=1500)
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "text", "timeoutMs": 1500, "negate": True, "text": "Done"}),
+           "expect text/negate payload mismatch")
+    server.browser_expect("url", tab_id=11, url_substring="x.test")
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "url", "timeoutMs": 5000, "urlSubstring": "x.test"}),
+           "expect url payload mismatch")
+    server.browser_expect("schema", tab_id=11, schema={"type": "object"}, selector="#s")
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "schema", "timeoutMs": 5000,
+                                         "schema": {"type": "object"}, "selector": "#s"}),
+           "expect schema payload mismatch")
+
     # 8. tab_control ops.
     for op, act in [("activate", "activateTab"), ("close", "closeTab"), ("reload", "reload"), ("back", "goBack"), ("forward", "goForward")]:
         server.browser_tab_control(op, tab_id=11)
@@ -444,6 +459,15 @@ def main():
            "wait_for_handoff should be present in a normal build")
     expect("browser_wait_for_handoff" not in _tool_names(server.build_server(readonly=True)),
            "wait_for_handoff must be hidden under readonly")
+
+    # 19f-2. expect is a read-only assertion, so it survives a readonly build and
+    #        carries the read-only annotation.
+    expect("browser_expect" in _tool_names(server.build_server(readonly=True)),
+           "expect is read-only and must survive a readonly build")
+    expect(tools["browser_expect"].annotations.readOnlyHint is True,
+           "expect should be annotated readOnlyHint=True")
+    expect(tools["browser_expect"].annotations.destructiveHint is False,
+           "expect must not be annotated destructive")
 
     # 19g. search_tabs is sensitive: its snippets carry content from every open
     #      tab of the real profile, so it is gated like history and bookmarks.

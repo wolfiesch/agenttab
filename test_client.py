@@ -116,6 +116,12 @@ def parse_observe_args(args):
 # Chrome. Set once in main() and applied to every request this process sends.
 DRY_RUN = False
 
+# Global ``--traceparent <value>``: a W3C trace-context header value naming the
+# trace this run belongs to. The host continues that trace when its opt-in
+# OpenTelemetry spans are enabled (BRIDGE_OTEL_ENABLED) and otherwise ignores
+# it; either way the field is stripped host-side and never reaches Chrome.
+TRACEPARENT = None
+
 
 def env_float(name, default):
     value = os.environ.get(name)
@@ -189,6 +195,8 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         }
         if DRY_RUN or dry_run:
             cmd["dryRun"] = True
+        if TRACEPARENT:
+            cmd["traceparent"] = TRACEPARENT
         if isinstance(confirmation_token, str) and confirmation_token:
             cmd["confirmationToken"] = confirmation_token
         sock.sendall((json.dumps(cmd) + "\n").encode('utf-8'))
@@ -1679,9 +1687,70 @@ def _workflow_replay(rest):
         _save_cache_entries(entries)
         result["cacheFile"] = ACTION_CACHE_FILE
         result["cacheEntries"] = len(entries)
+    # T4-4 evidence: each step in the printed result carries `attempts`,
+    # `retried`, and - when the step authored an `expect` clause - `expectPassed`
+    # plus an `expect` block naming the mode and the failure reason. The
+    # `retriedSteps` and `expectFailedSteps` totals summarize the same facts. All
+    # of it is assertion metadata; no matched page content is ever included.
     if response is not None:
         print(json.dumps(response, indent=2))
     return exit_code
+
+
+# --- T4-4: deterministic postconditions -------------------------------------
+#
+# The host answers one closed question and returns only mode, passed, attempts,
+# elapsedMs, and a short reason, so nothing printed here can carry page text,
+# matched content, or extracted values. The exit code is the point: 0 when the
+# condition held, 1 when it did not, so a shell script or CI job can gate on a
+# real browser postcondition with no model in the loop.
+EXPECT_MODES = ("selector", "text", "url", "schema")
+
+
+def cmd_expect(args):
+    tab_id = parse_int(args[2], "tabId")
+    mode = args[3]
+    if mode not in EXPECT_MODES:
+        print(f"Error: expect mode must be one of {', '.join(EXPECT_MODES)}", file=sys.stderr)
+        return 2
+    value = args[4]
+    payload = {"tabId": tab_id, "mode": mode}
+    if mode == "selector":
+        payload["selector"] = value
+    elif mode == "text":
+        payload["text"] = value
+    elif mode == "url":
+        payload["urlSubstring"] = value
+    else:
+        schema = _read_json_file(expand_output_path(value))
+        if not isinstance(schema, dict):
+            print(f"Error: {value} is not a JSON Schema object", file=sys.stderr)
+            return 2
+        payload["schema"] = schema
+    index = 5
+    while index < len(args):
+        flag = args[index]
+        if flag == "--negate":
+            payload["negate"] = True
+        elif flag == "--timeout":
+            index += 1
+            if index >= len(args):
+                print("Missing value for --timeout", file=sys.stderr)
+                return 2
+            payload["timeoutMs"] = parse_int(args[index], "timeoutMs")
+        else:
+            print(f"Unknown expect option: {flag}", file=sys.stderr)
+            return 2
+        index += 1
+    exit_code, response, stderr = send_command_data("expect", payload)
+    if stderr:
+        print(stderr, file=sys.stderr)
+    if response is not None:
+        print(json.dumps(response, indent=2))
+    if exit_code != 0:
+        return exit_code
+    # A well-formed assertion that did not hold is still a failing check.
+    return 0 if (result_payload(response) or {}).get("passed") is True else 1
 
 
 def cmd_workflow(args):
@@ -1843,6 +1912,7 @@ def print_usage():
     print("")
     print("Global flags:")
     print("  --dry-run                         Report the host verdict without touching Chrome")
+    print("  --traceparent <value>             W3C trace context this run continues (opt-in host spans)")
     print("")
     print("    selectors: CSS, ref=e<N> (from observe), css=<selector>, label=<text>, text=<text>,")
     print("               role=<role>[name=<text>], aria=<accessible-name>,")
@@ -1883,6 +1953,10 @@ COMMAND_HELP = {
     "github-attach-pr-body": (
         "chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]",
         "On a GitHub pull-request page, open the body editor, attach the files, wait for GitHub CDN links, and save without replacing existing text.",
+    ),
+    "credentialHandoff": (
+        "chrome-bridge credentialHandoff <tabId> <selector> [message] [--mode filled|submitted] [--timeout <milliseconds>]",
+        "Hand one field to the human so a password, passphrase, or one-time code is typed straight into the page. The bridge focuses the field and waits; it never reads or returns the value, and the host blacks out every observation action for the tab until the window closes.",
     ),
     "taskSession": (
         "chrome-bridge taskSession create|navigate|show|state|close ...",
@@ -1947,6 +2021,18 @@ COMMAND_HELP = {
         "exfiltrate tokens or cookies, run a shell command, click allow, disable policy). Returns risk (low|medium|high), matches with kind, severity, and a snippet "
         "capped at 160 characters, plus scannedChars. The scan is heuristic: a hit is a warning, never a permission grant or denial, and a clean result is not a guarantee.",
     ),
+    "expect": (
+        "chrome-bridge expect <tabId> selector|text|url|schema <value> [--negate] [--timeout <ms>]",
+        "Assert a deterministic postcondition and exit 0 only when it holds, so it composes in shell scripts and CI. "
+        "<value> is the selector (CSS or semantic, including ref=), the expected page text, the expected URL substring, "
+        "or the path to a JSON Schema file for schema mode. selector passes when the selector resolves; text when the page "
+        "text contains the string; url when the tab URL contains the substring; schema when structured extraction against "
+        "that schema reports no missingRequired errors. --negate inverts the outcome, which is how absence is asserted. "
+        "The check polls until the condition holds or --timeout elapses (default 5000ms, capped at 60000ms). No model is "
+        "involved, and the result carries only mode, passed, attempts, elapsedMs, and a short reason when it failed: the "
+        "matched element, the matched text, the tab URL, and the extracted values are never returned. Exit code is 1 when "
+        "the assertion did not hold.",
+    ),
     "workflow": (
         "chrome-bridge workflow record start|stop|save ... | chrome-bridge workflow replay <path> [--binding key=value]",
         "Record the actions THIS BRIDGE dispatches into a replayable workflow, and replay one later without a model. "
@@ -1995,6 +2081,7 @@ COMMAND_USAGES = {
     "waitForSelector": "chrome-bridge waitForSelector <tabId> <selector> [timeoutMs]",
     "waitForText": "chrome-bridge waitForText <tabId> <text> [timeoutMs]",
     "waitForUrl": "chrome-bridge waitForUrl <tabId> <substring> [timeoutMs]",
+    "expect": "chrome-bridge expect <tabId> selector|text|url|schema <value> [--negate] [--timeout <ms>]",
     "getCurrentState": "chrome-bridge getCurrentState <tabId>",
     "screenshot": "chrome-bridge screenshot <tabId> <outputPath> [--visible]",
     "extractText": "chrome-bridge extractText <tabId> [maxChars]",
@@ -2031,6 +2118,7 @@ COMMAND_USAGES = {
     "performanceMetrics": "chrome-bridge performanceMetrics <tabId>",
     "sessionStatus": "chrome-bridge sessionStatus <domain> [domain...]",
     "waitForHandoff": "chrome-bridge waitForHandoff <message> [mode] [target] [timeoutMs] [tabId]",
+    "credentialHandoff": "chrome-bridge credentialHandoff <tabId> <selector> [message] [--mode filled|submitted] [--timeout <milliseconds>]",
     "policyCheck": "chrome-bridge policyCheck <action> [payloadJson] | chrome-bridge policyCheck --plan '<jsonArray>'",
     "batch": "chrome-bridge batch <stepsJson> [tabId] [--continue-on-error]",
     "printToPDF": "chrome-bridge printToPDF <tabId> <outputPath> [--landscape] [--scale <factor>]",
@@ -2055,10 +2143,18 @@ def print_command_help(command):
     return 0
 
 def main():
-    global DRY_RUN
+    global DRY_RUN, TRACEPARENT
     if "--dry-run" in sys.argv[1:]:
         DRY_RUN = True
         sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--dry-run"]
+
+    if "--traceparent" in sys.argv[1:]:
+        index = sys.argv.index("--traceparent")
+        if index + 1 >= len(sys.argv):
+            print("Usage: --traceparent <value>", file=sys.stderr)
+            sys.exit(64)
+        TRACEPARENT = sys.argv[index + 1]
+        sys.argv = sys.argv[:index] + sys.argv[index + 2:]
 
     if len(sys.argv) < 2:
         print_usage()
@@ -2176,6 +2272,10 @@ def main():
     elif action == "waitForUrl":
         require_args(args, 4, "Usage: python3 test_client.py waitForUrl <tabId> <substring> [timeoutMs]")
         sys.exit(send_command("waitForUrl", {"tabId": parse_int(args[2], "tabId"), "substring": args[3], "timeoutMs": parse_timeout(args, 4)}))
+    elif action == "expect":
+        require_args(args, 5, "Usage: python3 test_client.py expect <tabId> selector|text|url|schema <value> "
+                              "[--negate] [--timeout <ms>]")
+        sys.exit(cmd_expect(args))
     elif action == "screenshot":
         require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath> [--visible]")
         visible = len(args) > 4 and args[4] == "--visible"
@@ -2541,6 +2641,43 @@ def main():
         if len(args) > 6:
             payload["tabId"] = parse_int(args[6], "tabId")
         sys.exit(send_command("waitForHandoff", payload, read_timeout_ms=timeoutMs))
+    elif action == "credentialHandoff":
+        require_args(args, 4, "Usage: python3 test_client.py credentialHandoff <tabId> <selector> [message] [--mode filled|submitted] [--timeout <milliseconds>]")
+        mode = "filled"
+        timeout_ms = 120000
+        positional = []
+        index = 4
+        while index < len(args):
+            if args[index] == "--mode":
+                if index + 1 >= len(args):
+                    print("Missing value for --mode", file=sys.stderr)
+                    sys.exit(2)
+                mode = args[index + 1]
+                if mode not in ("filled", "submitted"):
+                    print("--mode must be filled or submitted", file=sys.stderr)
+                    sys.exit(2)
+                index += 2
+                continue
+            if args[index] == "--timeout":
+                if index + 1 >= len(args):
+                    print("Missing value for --timeout", file=sys.stderr)
+                    sys.exit(2)
+                timeout_ms = parse_int(args[index + 1], "timeoutMs")
+                index += 2
+                continue
+            positional.append(args[index])
+            index += 1
+        payload = {
+            "tabId": parse_int(args[2], "tabId"),
+            "selector": args[3],
+            "mode": mode,
+            "timeoutMs": timeout_ms,
+        }
+        if positional:
+            payload["message"] = positional[0]
+        # The human types the secret during this window, so the socket read must
+        # outlast it exactly as the waitForHandoff path does.
+        sys.exit(send_command("credentialHandoff", payload, read_timeout_ms=timeout_ms))
     elif action == "setCpuThrottling":
         require_args(args, 4, "Usage: python3 test_client.py setCpuThrottling <tabId> <rate>")
         sys.exit(send_command("setCpuThrottling", {

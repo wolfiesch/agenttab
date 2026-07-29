@@ -111,6 +111,7 @@ class PersistentBridgeConnection:
         confirmation_token=None,
         dry_run=False,
         token=None,
+        traceparent=None,
     ):
         payload = dict(payload or {})
         if read_timeout_ms is None:
@@ -141,6 +142,10 @@ class PersistentBridgeConnection:
         command = {"action": action, "payload": payload, "token": resolved_token}
         if dry_run:
             command["dryRun"] = True
+        # W3C trace context. The host strips it before forwarding and only acts
+        # on it when its opt-in OpenTelemetry spans are enabled.
+        if isinstance(traceparent, str) and traceparent:
+            command["traceparent"] = traceparent
         if isinstance(confirmation_token, str) and confirmation_token:
             command["confirmationToken"] = confirmation_token
         encoded = (json.dumps(command) + "\n").encode("utf-8")
@@ -171,12 +176,15 @@ _connection = PersistentBridgeConnection()
 
 
 def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False,
-         token=None):
+         token=None, traceparent=None):
     """Send one action and return its result without ambiguous replays.
 
     The persistent connection is serialized for newline framing. It reconnects
     only before a send when no live socket exists; any failure after ``sendall``
     closes the socket and surfaces an error so mutating actions cannot run twice.
+
+    ``traceparent`` is the W3C trace context this call belongs to, taken from the
+    incoming HTTP request or minted per tool call under stdio.
     """
     with _call_lock:
         exit_code, response, stderr = _connection.request(
@@ -186,6 +194,7 @@ def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dr
             confirmation_token=confirmation_token,
             dry_run=dry_run,
             token=token,
+            traceparent=traceparent,
         )
 
     if response is None:

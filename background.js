@@ -618,6 +618,9 @@ async function dispatchAction(action, payload) {
       case "waitForHandoff":
         result = await waitForHandoff(payload);
         break;
+      case "credentialHandoff":
+        result = await credentialHandoff(payload);
+        break;
       case "setCookie":
         result = await setCookie(payload);
         break;
@@ -656,6 +659,9 @@ async function dispatchAction(action, payload) {
         break;
       case "cacheSelectors":
         result = cacheSelectors(payload);
+        break;
+      case "expect":
+        result = await expectAssertion(payload);
         break;
       case "__tabOrigin":
         result = await tabOrigin(payload.tabId);
@@ -1997,6 +2003,144 @@ async function waitForText(tabId, text, timeoutMs) {
     await sleep(250);
   }
   return { success: false, err: "Timed out waiting for text", text, timeoutMs };
+}
+
+// --- T4-4: deterministic postconditions ------------------------------------
+//
+// `expect` is an ASSERTION, not a read. It answers one closed question - does
+// this condition hold - with a boolean, an attempt count, and a short reason
+// when it does not. It never returns the matched element, the matched text, the
+// tab URL, or any extracted value, so a caller cannot smuggle a page read
+// through a postcondition. No model is involved at any point: every mode is a
+// deterministic check against the same locator, page-text, tab-url, and
+// structured-extraction paths the mutating actions already use, which is why a
+// semantic selector or a `ref=` handle behaves here exactly as it does for a
+// click.
+const EXPECT_MODES = ["selector", "text", "url", "schema"];
+const EXPECT_DEFAULT_TIMEOUT_MS = 5000;
+// A postcondition must not be able to pin the bridge on one request; a caller
+// that needs a longer wait should compose several assertions.
+const EXPECT_MAX_TIMEOUT_MS = 60000;
+const EXPECT_POLL_MS = 250;
+
+// Reject an unusable assertion up front instead of polling to the deadline and
+// reporting a failure the caller would read as "the page is wrong".
+function normalizeExpectSpec(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const mode = String(source.mode || "");
+  if (!EXPECT_MODES.includes(mode)) {
+    return { err: `expect requires mode to be one of ${EXPECT_MODES.join(", ")}` };
+  }
+  if (mode === "selector" && !source.selector) return { err: "expect mode 'selector' requires selector" };
+  if (mode === "text" && !source.text) return { err: "expect mode 'text' requires text" };
+  if (mode === "url" && !source.urlSubstring) return { err: "expect mode 'url' requires urlSubstring" };
+  if (mode === "schema" && (!source.schema || typeof source.schema !== "object")) {
+    return { err: "expect mode 'schema' requires a schema object" };
+  }
+  const timeout = Number(source.timeoutMs);
+  return {
+    spec: {
+      mode,
+      selector: source.selector,
+      text: source.text,
+      urlSubstring: source.urlSubstring,
+      schema: source.schema,
+      maxChars: source.maxChars,
+      negate: source.negate === true,
+      timeoutMs: Number.isFinite(timeout) && timeout > 0
+        ? Math.min(timeout, EXPECT_MAX_TIMEOUT_MS)
+        : EXPECT_DEFAULT_TIMEOUT_MS
+    }
+  };
+}
+
+// One evaluation. Returns {held} plus a `reason` describing only WHY the
+// condition did not hold, or {fatal} for a caller error that polling cannot fix.
+async function expectConditionHolds(tabId, spec) {
+  if (spec.mode === "selector") {
+    let locator;
+    try {
+      locator = parseActionLocator(spec.selector, tabId);
+    } catch (error) {
+      return { fatal: locatorError(error) };
+    }
+    const found = await resolveActionTarget(tabId, locator);
+    return { held: found.success !== false, reason: "selector did not resolve" };
+  }
+  if (spec.mode === "text") {
+    return {
+      held: await pageContainsText(tabId, spec.text),
+      reason: "page text did not contain the expected string"
+    };
+  }
+  if (spec.mode === "url") {
+    let url = "";
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      url = tab.url || "";
+    } catch (error) {
+      return { fatal: { success: false, err: `No such tab ${tabId}` } };
+    }
+    return { held: url.includes(spec.urlSubstring), reason: "tab URL did not contain the expected substring" };
+  }
+  // schema: reuse extractStructured so there is exactly one extraction
+  // implementation. Only the SHAPE of its errors is inspected; the extracted
+  // values are discarded here and never travel back to the caller.
+  const extracted = await extractStructured(tabId, spec.schema, spec.selector, spec.maxChars);
+  if (extracted.success === false) return { fatal: extracted };
+  const missing = (extracted.errors || []).filter((item) => item && item.code === "missingRequired");
+  return {
+    held: missing.length === 0,
+    reason: `structured extraction reported ${missing.length} missingRequired error(s)`
+  };
+}
+
+// Polls until the condition holds or the deadline passes. `negate: true` inverts
+// the outcome, which is how absence is asserted: the poll then runs until the
+// condition stops holding.
+async function evaluateExpectation(tabId, raw) {
+  if (typeof tabId !== "number") return { success: false, err: "expect requires a numeric tabId" };
+  const normalized = normalizeExpectSpec(raw);
+  if (normalized.err) return { success: false, err: normalized.err };
+  const spec = normalized.spec;
+  const started = Date.now();
+  const deadline = started + spec.timeoutMs;
+  let attempts = 0;
+  let reason = null;
+  for (;;) {
+    attempts += 1;
+    const outcome = await expectConditionHolds(tabId, spec);
+    if (outcome.fatal) return outcome.fatal;
+    if (spec.negate ? !outcome.held : outcome.held) {
+      return {
+        success: true,
+        mode: spec.mode,
+        negate: spec.negate,
+        passed: true,
+        attempts,
+        elapsedMs: Date.now() - started
+      };
+    }
+    reason = spec.negate
+      ? "condition still held and negate expected it not to"
+      : (outcome.reason || "condition did not hold");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(EXPECT_POLL_MS, remaining));
+  }
+  return {
+    success: true,
+    mode: spec.mode,
+    negate: spec.negate,
+    passed: false,
+    attempts,
+    elapsedMs: Date.now() - started,
+    reason: reason || "condition did not hold"
+  };
+}
+
+async function expectAssertion(payload) {
+  return evaluateExpectation(payload?.tabId, payload);
 }
 
 async function getCurrentState(tabId) {
@@ -4488,6 +4632,247 @@ async function waitForHandoff(payload) {
   }
 }
 
+// Credential handoff: a narrowing of waitForHandoff to one field. The human
+// types the secret straight into the page, so the value never enters the
+// bridge. Everything injected below reports presence, emptiness and a character
+// count only -- never the field value, never a hash of it -- and the native host
+// holds the same in-flight handoff blackout for the tab across the whole window,
+// so no observation action can read the field either.
+//
+// The locator is resolved once through the shared locator machinery (so semantic
+// selectors and ref=eN work, both of which need the debugger), then the resolved
+// element is tagged with a one-shot random marker attribute. The wait itself
+// polls that marker through chrome.scripting, so the debugger is not held for
+// the minutes a human may take and concurrent bridge work is not locked out.
+const CREDENTIAL_PROBE_INTERVAL_MS = 250;
+const CREDENTIAL_STABLE_POLLS = 3;
+const CREDENTIAL_DEFAULT_MESSAGE = "Enter your credential, then continue.";
+const CREDENTIAL_MARKER_ATTR = "data-chrome-bridge-credential";
+
+function credentialMarkerToken() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID().replace(/-/g, "");
+  }
+  return `cred${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+}
+
+function credentialArmExpression(locator, token) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
+    const armed = self.__chromeBridgeCredentialArmed;
+    if (armed && armed.form && armed.handler) {
+      armed.form.removeEventListener('submit', armed.handler, true);
+    }
+    self.__chromeBridgeCredentialSubmitted = false;
+    el.setAttribute(${JSON.stringify(CREDENTIAL_MARKER_ATTR)}, ${JSON.stringify(token)});
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    try { el.focus({ preventScroll: true }); } catch (_e) { el.focus(); }
+    const form = typeof el.closest === 'function' ? el.closest('form') : null;
+    if (form) {
+      const handler = () => { self.__chromeBridgeCredentialSubmitted = true; };
+      form.addEventListener('submit', handler, true);
+      self.__chromeBridgeCredentialArmed = { form, handler };
+    } else {
+      self.__chromeBridgeCredentialArmed = null;
+    }
+    // The raw value stays inside the page: only its length leaves this frame.
+    const raw = 'value' in el ? el.value : el.textContent;
+    const length = typeof raw === 'string' ? raw.length : 0;
+    return { success: true, present: true, empty: length === 0, length, hasForm: !!form };
+  })()`;
+}
+
+// Injected by chrome.scripting: self-contained, no closure over the worker.
+function credentialFieldProbe(attr, token) {
+  const selector = '[' + attr + '="' + token + '"]';
+  const find = (root) => {
+    if (!root || typeof root.querySelector !== 'function') return null;
+    const hit = root.querySelector(selector);
+    if (hit) return hit;
+    for (const el of root.querySelectorAll('*')) {
+      if (!el.shadowRoot) continue;
+      const nested = find(el.shadowRoot);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  const submitted = self.__chromeBridgeCredentialSubmitted === true;
+  const el = find(document);
+  if (!el) return { present: false, empty: true, length: 0, submitted };
+  const raw = 'value' in el ? el.value : el.textContent;
+  const length = typeof raw === 'string' ? raw.length : 0;
+  return {
+    present: true,
+    empty: length === 0,
+    length,
+    submitted,
+    focused: document.activeElement === el
+  };
+}
+
+function credentialFieldDisarm(attr, token) {
+  const armed = self.__chromeBridgeCredentialArmed;
+  if (armed && armed.form && armed.handler) {
+    armed.form.removeEventListener('submit', armed.handler, true);
+  }
+  self.__chromeBridgeCredentialArmed = null;
+  self.__chromeBridgeCredentialSubmitted = false;
+  const selector = '[' + attr + '="' + token + '"]';
+  const strip = (root) => {
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    for (const el of root.querySelectorAll(selector)) el.removeAttribute(attr);
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) strip(el.shadowRoot);
+    }
+  };
+  strip(document);
+  return true;
+}
+
+async function credentialProbe(tabId, token) {
+  const absent = { present: false, empty: true, length: 0, submitted: false };
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: credentialFieldProbe,
+      args: [CREDENTIAL_MARKER_ATTR, token]
+    });
+    const value = results[0]?.result;
+    return value && typeof value === "object" ? value : absent;
+  } catch (_error) {
+    // A navigation mid-poll tears the frame out; the caller decides what that
+    // means for the requested mode.
+    return absent;
+  }
+}
+
+async function credentialDisarm(tabId, token) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: credentialFieldDisarm,
+      args: [CREDENTIAL_MARKER_ATTR, token]
+    });
+  } catch (_error) {
+    // Best-effort: a replaced document took the marker and listener with it.
+  }
+}
+
+async function credentialHandoff(payload) {
+  payload = payload || {};
+  const selector = payload.selector;
+  if (typeof selector !== "string" || !selector.trim()) {
+    return { success: false, err: "selector is required" };
+  }
+  const mode = payload.mode === undefined || payload.mode === null ? "filled" : payload.mode;
+  if (mode !== "filled" && mode !== "submitted") {
+    return { success: false, err: "credentialHandoff mode must be 'filled' or 'submitted'" };
+  }
+  const timeoutMs = payload.timeoutMs || 120000;
+  let tabId = payload.tabId;
+  if (tabId === undefined || tabId === null) {
+    const active = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = active[0] && active[0].id;
+  }
+  if (tabId === undefined || tabId === null) {
+    return { success: false, err: "No target tab for handoff" };
+  }
+  let locator;
+  try {
+    locator = parseActionLocator(selector, tabId);
+  } catch (error) {
+    return locatorError(error);
+  }
+  if (locator.frames.length) {
+    return { success: false, err: "credentialHandoff does not support frame-scoped selectors" };
+  }
+  // Buffers go first: nothing may still be capturing the tab by the time it is
+  // focused, so no collector window can span the credential entry.
+  const scrubbed = await scrubCapturesForHandoff(tabId);
+  const tab = await chrome.tabs.update(tabId, { active: true });
+  if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+  const taskSession = await findTaskSessionForTab(tabId);
+  const previousState = taskSession?.session?.state || "working";
+  if (taskSession) await updateTaskSessionState(taskSession.sessionId, "needs_user");
+  const startedAt = Date.now();
+  const token = credentialMarkerToken();
+  await showHandoffOverlay(tabId, payload.message || CREDENTIAL_DEFAULT_MESSAGE);
+  try {
+    const armed = await withDebugger(tabId, async (target) => {
+      const staged = await stageLocatorRefs(target, [locator], null);
+      if (staged.success === false) return staged;
+      const lookup = await evaluateInContext(target, credentialArmExpression(locator, token), null);
+      const value = lookup.val || lookup;
+      if (!lookup.success || value.success === false) return value;
+      return value;
+    });
+    if (armed.success === false) return { ...armed, scrubbedCaptures: scrubbed };
+    const startUrl = (await chrome.tabs.get(tabId)).url || "";
+    let baseline = armed.length;
+    let lastLength = baseline;
+    let lastNonZero = 0;
+    let stable = 0;
+    const done = () => ({
+      success: true,
+      tabId,
+      selector,
+      mode,
+      filled: true,
+      valueLength: lastNonZero,
+      elapsedMs: Date.now() - startedAt,
+      scrubbedCaptures: scrubbed
+    });
+    const deadline = deadlineFrom(timeoutMs);
+    while (Date.now() <= deadline) {
+      await sleep(CREDENTIAL_PROBE_INTERVAL_MS);
+      const navigated = ((await chrome.tabs.get(tabId)).url || "") !== startUrl;
+      const state = await credentialProbe(tabId, token);
+      if (state.submitted === true && mode === "submitted") return done();
+      if (state.present !== true) {
+        // The document was replaced under the marker. In submitted mode that is
+        // the completion signal; in filled mode a credential already observed as
+        // entered still counts.
+        if (mode === "submitted" && navigated) return done();
+        if (mode === "filled" && lastNonZero > 0) return done();
+        continue;
+      }
+      const length = state.length;
+      if (length === 0) baseline = 0;
+      else lastNonZero = length;
+      stable = length === lastLength ? stable + 1 : 0;
+      lastLength = length;
+      if (mode === "submitted") {
+        if (navigated) return done();
+        continue;
+      }
+      if (length > 0 && length !== baseline && stable >= CREDENTIAL_STABLE_POLLS) return done();
+    }
+    return {
+      success: false,
+      err: `credential handoff timeout after ${timeoutMs}ms`,
+      tabId,
+      selector,
+      mode,
+      scrubbedCaptures: scrubbed
+    };
+  } finally {
+    await credentialDisarm(tabId, token);
+    await hideHandoffOverlay(tabId);
+    if (taskSession) {
+      try {
+        await updateTaskSessionState(taskSession.sessionId, previousState);
+      } catch (_error) {
+        // The task can be closed while the user is completing a handoff.
+      }
+    }
+  }
+}
+
 // Cookie and web-storage write ops. Responses echo identifiers only (cookie
 // name/domain, storage scope/key) and never the stored value, so raw output can
 // be pasted without leaking credentials.
@@ -4795,7 +5180,15 @@ async function searchTabs(payload) {
 // policy grants to perform. Recordings live solely in service-worker memory: a
 // worker restart drops them, which is why `stopWorkflowRecording` returns the
 // serialized workflow for the caller to persist.
-const WORKFLOW_VERSION = 1;
+// Version 2 adds the optional per-step `expect` and `retry` clauses (T4-4).
+// Both are additive, so a version-1 file has neither and replays byte-for-byte
+// under the version-2 reader; replay therefore accepts both versions.
+const WORKFLOW_VERSION = 2;
+const WORKFLOW_REPLAYABLE_VERSIONS = [1, 2];
+// Bounded retry: a postcondition that keeps failing must end the step, not turn
+// a workflow into an unbounded poll of a page that is never going to settle.
+const WORKFLOW_MAX_RETRIES = 5;
+const WORKFLOW_MAX_RETRY_DELAY_MS = 10000;
 const WORKFLOW_STEP_LIMIT = 500;
 // A recorded human pause can be minutes long; replay waits at most this per
 // step so a workflow never stalls the bridge on a gap nobody meant to keep.
@@ -5290,6 +5683,18 @@ function applyWorkflowBindings(stepPayload, index, bindings) {
   }
 }
 
+// Bounded retry budget for one step. A missing, malformed, or out-of-range
+// clause clamps into 0..WORKFLOW_MAX_RETRIES and 0..WORKFLOW_MAX_RETRY_DELAY_MS
+// rather than being rejected, so an over-eager authored workflow degrades into
+// a bounded one instead of refusing to run.
+function workflowStepRetry(step) {
+  const raw = step && typeof step.retry === "object" && step.retry ? step.retry : {};
+  return {
+    max: Math.min(WORKFLOW_MAX_RETRIES, Math.max(0, Math.floor(Number(raw.max) || 0))),
+    delayMs: Math.min(WORKFLOW_MAX_RETRY_DELAY_MS, Math.max(0, Math.floor(Number(raw.delayMs) || 0)))
+  };
+}
+
 // Replays a semantic selector through the cache. Returns the selector to use
 // plus whether the cached mapping had to be re-resolved. A CSS selector is
 // returned untouched: it is never re-pointed at another element.
@@ -5313,8 +5718,11 @@ async function replayWorkflow(payload) {
   if (!workflow || typeof workflow !== "object") {
     return { success: false, err: "replayWorkflow requires a workflow object" };
   }
-  if (workflow.version !== undefined && Number(workflow.version) !== WORKFLOW_VERSION) {
-    return { success: false, err: `Unsupported workflow version ${workflow.version}; expected ${WORKFLOW_VERSION}` };
+  if (workflow.version !== undefined && !WORKFLOW_REPLAYABLE_VERSIONS.includes(Number(workflow.version))) {
+    return {
+      success: false,
+      err: `Unsupported workflow version ${workflow.version}; expected ${WORKFLOW_REPLAYABLE_VERSIONS.join(" or ")}`
+    };
   }
   const steps = Array.isArray(workflow.steps) ? workflow.steps : null;
   if (!steps) return { success: false, err: "workflow.steps must be an array" };
@@ -5350,6 +5758,8 @@ async function replayWorkflow(payload) {
   const results = [];
   let selfHealedSteps = 0;
   let failed = 0;
+  let retriedSteps = 0;
+  let expectFailedSteps = 0;
 
   workflowReplayDepth += 1;
   try {
@@ -5385,36 +5795,79 @@ async function replayWorkflow(payload) {
         }
       }
 
-      const healing = await selectorForReplay(step.action, stepPayload);
-      const originalSelector = stepPayload.selector;
-      if (healing.selector !== undefined) stepPayload.selector = healing.selector;
-      try {
-        let result = await dispatchAction(step.action, stepPayload);
-        let selfHealed = healing.selfHealed === true;
-        const cachedMiss = result && typeof result === "object" && !Array.isArray(result) && result.success === false;
-        // A cached CSS path that resolves but no longer behaves gets one
-        // re-resolution through the original semantic selector.
-        if (cachedMiss && healing.cached && originalSelector !== stepPayload.selector) {
-          const refreshed = await resolveCachedSelector({ tabId: stepPayload.tabId, selector: originalSelector, refresh: true });
-          if (refreshed.success !== false) {
-            stepPayload.selector = refreshed.resolvedSelector || originalSelector;
-            result = await dispatchAction(step.action, stepPayload);
-            selfHealed = true;
+      // T4-4: an authored `expect` clause turns the step into a postcondition.
+      // A bounded `retry` re-runs the whole step - dispatch plus assertion - so
+      // a page that needed one more beat can settle, and a page that is simply
+      // wrong fails the step with evidence instead of a hopeful success.
+      const retry = workflowStepRetry(step);
+      const expectSpec = step.expect && typeof step.expect === "object" ? step.expect : null;
+      let attempts = 0;
+      let outcome = null;
+      while (outcome === null) {
+        attempts += 1;
+        const healing = await selectorForReplay(step.action, stepPayload);
+        const originalSelector = stepPayload.selector;
+        if (healing.selector !== undefined) stepPayload.selector = healing.selector;
+        try {
+          let result = await dispatchAction(step.action, stepPayload);
+          let selfHealed = healing.selfHealed === true;
+          const cachedMiss = result && typeof result === "object" && !Array.isArray(result) && result.success === false;
+          // A cached CSS path that resolves but no longer behaves gets one
+          // re-resolution through the original semantic selector.
+          if (cachedMiss && healing.cached && originalSelector !== stepPayload.selector) {
+            const refreshed = await resolveCachedSelector({ tabId: stepPayload.tabId, selector: originalSelector, refresh: true });
+            if (refreshed.success !== false) {
+              stepPayload.selector = refreshed.resolvedSelector || originalSelector;
+              result = await dispatchAction(step.action, stepPayload);
+              selfHealed = true;
+            }
           }
+          if (result && typeof result === "object" && !Array.isArray(result) && result.success === false) {
+            outcome = { failure: { success: false, selfHealed, err: result.err || result.error || "step reported success=false" } };
+          } else if (!expectSpec) {
+            outcome = { success: { selfHealed, resultSummary: summarizeRecordedResult(result) } };
+          } else {
+            const assertion = await evaluateExpectation(
+              typeof stepPayload.tabId === "number" ? stepPayload.tabId : defaultTabId,
+              expectSpec
+            );
+            if (assertion.success === false) {
+              // An unusable assertion is a workflow authoring error; retrying it
+              // would only burn the retry budget on the same rejection.
+              outcome = { failure: { success: false, selfHealed, err: assertion.err || "expect is not a valid assertion" } };
+            } else if (assertion.passed) {
+              outcome = { success: { selfHealed, resultSummary: summarizeRecordedResult(result), expectPassed: true } };
+            } else if (attempts <= retry.max) {
+              if (retry.delayMs > 0) await sleep(retry.delayMs);
+            } else {
+              outcome = {
+                failure: {
+                  success: false,
+                  selfHealed,
+                  err: "expect failed",
+                  expectPassed: false,
+                  expect: { mode: assertion.mode, reason: assertion.reason || "condition did not hold" }
+                }
+              };
+            }
+          }
+        } catch (error) {
+          outcome = { failure: { success: false, selfHealed: healing.selfHealed === true, err: error.message } };
         }
-        if (result && typeof result === "object" && !Array.isArray(result) && result.success === false) {
-          failed += 1;
-          results.push({ ...entry, success: false, selfHealed, err: result.err || result.error || "step reported success=false" });
-          if (halt) break;
-          continue;
-        }
-        if (selfHealed) selfHealedSteps += 1;
-        results.push({ ...entry, success: true, selfHealed, resultSummary: summarizeRecordedResult(result) });
-      } catch (error) {
-        failed += 1;
-        results.push({ ...entry, success: false, selfHealed: healing.selfHealed === true, err: error.message });
-        if (halt) break;
       }
+      // Per-step evidence: how many times the step ran and whether the
+      // postcondition held. `attempts` is 1 for a step with no expect clause.
+      const stepEntry = { ...entry, attempts, retried: attempts > 1 };
+      if (attempts > 1) retriedSteps += 1;
+      if (outcome.failure) {
+        failed += 1;
+        if (outcome.failure.expectPassed === false) expectFailedSteps += 1;
+        results.push({ ...stepEntry, ...outcome.failure });
+        if (halt) break;
+        continue;
+      }
+      if (outcome.success.selfHealed) selfHealedSteps += 1;
+      results.push({ ...stepEntry, success: true, ...outcome.success });
     }
   } finally {
     workflowReplayDepth -= 1;
@@ -5423,12 +5876,16 @@ async function replayWorkflow(payload) {
   return {
     success: failed === 0,
     name: workflow.name || null,
+    // The reader version, so an accepted version-1 file is still identifiable.
     version: WORKFLOW_VERSION,
+    workflowVersion: workflow.version === undefined ? null : Number(workflow.version),
     tabId: defaultTabId ?? null,
     stepCount: steps.length,
     ranSteps: results.length,
     failedSteps: failed,
     selfHealedSteps,
+    retriedSteps,
+    expectFailedSteps,
     steps: results,
     cache: selectorCacheEntries()
   };

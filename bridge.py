@@ -291,10 +291,11 @@ def handle_lease_action(action, payload, name):
         return {"success": True, "result": {"owner": owner, "expiresAt": expires_at, "now": now_ms()}}
 
 # --- Handoff telemetry blackout ---------------------------------------------
-# While a waitForHandoff request is in flight through this host, the human is
-# typing credentials/2FA codes into the real tab. Any observation action would
-# capture that, so the host denies observation for the duration of the handoff
-# -- for every client, including the one that started the handoff.
+# While a waitForHandoff or credentialHandoff request is in flight through this
+# host, the human is typing credentials/2FA codes into the real tab. Any
+# observation action would capture that, so the host denies observation for the
+# duration of the handoff -- for every client, including the one that started
+# the handoff.
 #
 # Scope: a handoff whose payload carries a numeric tabId blacks out that tab
 # only; a handoff with no tabId is resolved to the active tab by the extension,
@@ -316,6 +317,9 @@ HANDOFF_BLACKOUT_ACTIONS = {
     'startMonitoring', 'startScreencast', 'startInterception',
 }
 HANDOFF_BLACKOUT_ERROR = 'handoff in progress'
+# Actions whose forward opens a blackout window. credentialHandoff is the
+# single-field narrowing of waitForHandoff and gets exactly the same treatment.
+HANDOFF_ACTIONS = {'waitForHandoff', 'credentialHandoff'}
 
 _handoff_lock = threading.Lock()
 _handoff_seq = 0
@@ -333,7 +337,7 @@ def handoff_tab_id(payload):
 
 
 def register_handoff(tab_id, client):
-    # Called immediately before a waitForHandoff forward; the returned handle
+    # Called immediately before a handoff forward; the returned handle
     # must be released in a finally so no exit path leaves a stale blackout.
     global _handoff_seq
     with _handoff_lock:
@@ -427,13 +431,89 @@ NON_SKIPPABLE_CONFIRMATIONS = {
 }
 
 
-def is_mutating_action(action):
-    # What ``manual`` gates: anything that changes browser/page/profile state
-    # plus the high-risk reads in the non-skippable set. Fail-safe by policy of
-    # the surrounding sets, not by guessing about unknown action names.
-    return (action in MUTATING_ACTIONS
+def base_action_tier(action):
+    # Name-only tier: anything that changes browser/page/profile state plus the
+    # high-risk reads in the non-skippable set. Fail-safe by policy of the
+    # surrounding sets, not by guessing about unknown action names.
+    if (action in MUTATING_ACTIONS
             or action in DESTRUCTIVE_ACTIONS
-            or action in NON_SKIPPABLE_CONFIRMATIONS)
+            or action in NON_SKIPPABLE_CONFIRMATIONS):
+        return 'mutating'
+    return 'read_only'
+
+
+def is_mutating_action(action):
+    # Retained name-only predicate. Decisions use effective_action_tier, which
+    # also accounts for state-changing payload flags and batch step contents.
+    return base_action_tier(action) == 'mutating'
+
+
+# --- Payload-driven tier escalation ----------------------------------------
+# A nominally read-only action is state-changing when its payload sets a flag
+# that mutates extension-side state. The table is data, not scattered
+# conditionals, so bridge.py and host-rs/src/main.rs can be compared by eye.
+#
+# Entry: (action, flag, kind, enum values)
+#   not_false     - the extension reads ``flag !== false``, so the flag is ON
+#                   unless the payload sets it to literal false (default ON).
+#   enum          - string flag; escalates when its value is in the listed set.
+#                   Absent means the extension's own default, which is never
+#                   listed here.
+#   nonempty_list - escalates when the flag is a non-empty array, because the
+#                   extension merges caller-supplied entries into its own state.
+ESCALATING_PAYLOAD_FLAGS = (
+    # screencastFrames drains the frame buffer irrecoverably unless the caller
+    # explicitly passes consume: false.
+    ('screencastFrames', 'consume', 'not_false', ()),
+    # cacheSelectors op=list/export read; clear wipes the selector cache and
+    # import merges caller-supplied entries into it.
+    ('cacheSelectors', 'op', 'enum', ('clear', 'import')),
+    # resolveCachedSelector imports caller-supplied cache entries before
+    # resolving when payload.cache is a non-empty array.
+    ('resolveCachedSelector', 'cache', 'nonempty_list', ()),
+)
+
+
+def payload_escalates_tier(action, payload):
+    # True when a base read-only action's payload carries a state-changing flag
+    # from ESCALATING_PAYLOAD_FLAGS.
+    payload = payload if isinstance(payload, dict) else {}
+    for f_action, flag, kind, values in ESCALATING_PAYLOAD_FLAGS:
+        if f_action != action:
+            continue
+        value = payload.get(flag)
+        if kind == 'not_false':
+            if value is not False:
+                return True
+        elif kind == 'enum':
+            if isinstance(value, str) and value in values:
+                return True
+        elif kind == 'nonempty_list':
+            if isinstance(value, list) and value:
+                return True
+    return False
+
+
+def effective_action_tier(action, payload=None):
+    # The tier every tier-dependent decision uses: "read_only" or "mutating",
+    # computed from the payload, not the action name alone.
+    #   - batch/replayWorkflow are the union over their steps: read_only only
+    #     when every step resolves to read_only.
+    #   - a base read-only action escalates to mutating when its payload carries
+    #     a state-changing flag.
+    action = action if isinstance(action, str) else ''
+    if action in ('batch', 'replayWorkflow'):
+        steps = (_step_payloads(payload) if action == 'batch'
+                 else _workflow_step_payloads(payload))
+        for s_action, s_payload in steps:
+            if effective_action_tier(s_action, s_payload) == 'mutating':
+                return 'mutating'
+        return 'read_only'
+    if base_action_tier(action) == 'mutating':
+        return 'mutating'
+    if payload_escalates_tier(action, payload):
+        return 'mutating'
+    return 'read_only'
 
 
 # Origin-exempt actions: their policy target is NOT the live tab origin, so the
@@ -658,14 +738,20 @@ def resolve_site_mode(cp, targets):
     return best[1] if best else None
 
 
-def apply_site_mode(site_mode, action, confirm):
+def apply_site_mode(site_mode, action, confirm, payload=None):
     # Fold the site mode into the confirmation requirement. ``manual`` adds a
     # gate, ``skip`` removes one, ``auto``/None leave requireConfirmation alone.
     # Neither mode touches the action or origin gates, and ``skip`` can never
     # waive a non-skippable action, so an unattended pre-approval stays bounded.
-    if site_mode == 'manual' and is_mutating_action(action):
+    #
+    # ``manual`` gates on the EFFECTIVE tier, so an all-read-only batch is not
+    # force-gated while one carrying a single mutating step is, and a read-only
+    # action whose payload sets a state-changing flag is.
+    if site_mode == 'manual' and effective_action_tier(action, payload) == 'mutating':
         return True
-    if site_mode == 'skip' and confirm and action not in NON_SKIPPABLE_CONFIRMATIONS:
+    if (site_mode == 'skip' and confirm
+            and action not in NON_SKIPPABLE_CONFIRMATIONS
+            and not payload_escalates_tier(action, payload)):
         return False
     return confirm
 
@@ -725,6 +811,14 @@ def _workflow_step_payloads(payload):
     # cannot be bypassed either by hoisting tabId to the replay payload or by
     # recording a step against a different tab. Steps with no action are skipped
     # because the extension never dispatches them.
+    #
+    # A version-2 step may carry an ``expect`` clause (T4-4). The extension
+    # evaluates it against the step's effective tab, so it is enumerated here as
+    # a synthetic ``expect`` step: a nested postcondition is then origin-checked
+    # like any other tab-scoped action instead of riding in unexamined. ``expect``
+    # is a non-mutating assertion, so it appears in none of the mutating,
+    # sensitive, or destructive sets and stays on the read-only side of the
+    # action classification.
     payload = payload if isinstance(payload, dict) else {}
     workflow = payload.get('workflow')
     steps = workflow.get('steps') if isinstance(workflow, dict) else None
@@ -743,6 +837,16 @@ def _workflow_step_payloads(payload):
                 'tabId' in s_payload or s_action in WORKFLOW_SELECTOR_ACTIONS):
             s_payload['tabId'] = default_tab
         yield s_action, s_payload
+        s_expect = step.get('expect')
+        if isinstance(s_expect, dict):
+            e_payload = {}
+            if s_payload.get('tabId') is not None:
+                e_payload['tabId'] = s_payload['tabId']
+            elif default_tab is not None:
+                e_payload['tabId'] = default_tab
+            if isinstance(s_expect.get('mode'), str):
+                e_payload['mode'] = s_expect['mode']
+            yield 'expect', e_payload
 
 
 def tab_ids_needed(action, payload):
@@ -800,11 +904,23 @@ def evaluate_policy(policy, name, action, payload, origins=None):
     # Per-site permission mode. Applied to the confirmation requirement only,
     # and only after the action gates: every deny path below returns
     # confirm=False explicitly, so a deny still outranks any mode.
-    confirm = apply_site_mode(resolve_site_mode(cp, targets), action, confirm)
+    confirm = apply_site_mode(resolve_site_mode(cp, targets), action, confirm, payload)
 
     # For batch, only inspect steps once the batch action itself is allowed and
     # does not require confirmation.
     if action == 'batch':
+        # ``batch`` is origin-exempt for site policy because each step is checked
+        # against its own origin. The ``manual`` gate still has to see the
+        # origins the batch will act on, or hoisting actions into a batch would
+        # bypass a manual origin. Resolve the mode from the union of the step
+        # origins, and gate on the batch's EFFECTIVE tier so an all-read-only
+        # batch stays ungated while one carrying a mutating step does not.
+        mode_targets = list(targets)
+        for tab_id in tab_ids_needed(action, payload):
+            step_origin = origins.get(tab_id)
+            if step_origin:
+                mode_targets.extend(origin_targets(step_origin))
+        confirm = apply_site_mode(resolve_site_mode(cp, mode_targets), action, confirm, payload)
         if confirm:
             return (True, None, True, redact_enabled, audit_enabled, targets)
         step_confirm = False
@@ -876,6 +992,10 @@ def policy_verdict(policy, name, action, payload, origin=None):
         # The origin's resolved site mode, or null when no origin is known yet
         # (no target resolved) or no configured pattern matches it.
         "siteMode": resolve_site_mode(policy_for_client(policy, name), targets),
+        # The tier the host actually enforces for this action+payload:
+        # "read_only" or "mutating". Computed from the payload, so a batch of
+        # reads is read_only and a read whose flag changes state is mutating.
+        "effectiveTier": effective_action_tier(action, payload),
     }
     return verdict, targets
 
@@ -1375,18 +1495,21 @@ def trace_request(policy, client, action, payload, response, decision, reason,
     # Exactly one event per fully-processed, trace-eligible request. Secret
     # masking is applied before hashing and before anything is written, so a
     # known credential cannot reach the artifact even through a hash preimage.
-    if policy is None or not client:
-        return
-    trace_dir = trace_dir_for(policy, client)
-    if not trace_dir:
-        return
-    trace_id = trace_id_for(action, payload, response)
-    if not trace_id:
+    #
+    # This is also the single terminal hook for the opt-in OpenTelemetry span
+    # (see below): the span is emitted for every fully-processed request, even
+    # when no traceDir is configured, and when both are on the artifact carries
+    # the span's ids so a local JSONL line and an exported span correlate.
+    trace_dir = trace_dir_for(policy, client) if policy is not None and client else None
+    trace_id = trace_id_for(action, payload, response) if (trace_dir or OTEL_ENABLED) else None
+    otel = otel_finish_request(client, action, payload, response, decision,
+                               request_id, trace_id)
+    if not trace_dir or not trace_id:
         return
     secrets = _known_secret_masks()
     safe_response = mask_secrets_value(response, secrets) if isinstance(response, dict) else {}
     snapshot = trace_snapshot_subobject(safe_response)
-    write_trace_event(trace_dir, trace_id, {
+    event = {
         "ts": now_ms(),
         "client": client,
         "action": action,
@@ -1399,7 +1522,292 @@ def trace_request(policy, client, action, payload, response, decision, reason,
         "responseHash": trace_hash(safe_response),
         "snapshotHash": trace_hash(snapshot) if snapshot is not None else None,
         "success": bool(safe_response.get("success")) if isinstance(safe_response, dict) else False,
-    })
+    }
+    if otel is not None:
+        event["otelTraceId"], event["otelSpanId"] = otel
+    write_trace_event(trace_dir, trace_id, event)
+
+
+# --- OpenTelemetry spans (opt-in, process-level configuration) --------------
+#
+# Off by default and inert. With BRIDGE_OTEL_ENABLED unset nothing below runs,
+# no extra module is imported, no file is opened, and no socket is created; the
+# request path is the same one an untraced host takes. This is process-level
+# configuration, NOT policy: a policy layer cannot switch tracing on for one
+# client, and tracing can never change a policy decision.
+#
+# What a span carries: the action name, the resolved client name, the host
+# decision, the effective action tier, the duration, how many tab ids the
+# request touched, success, the host-generated request id, and the session
+# trace id. What a span NEVER carries: request payloads, response bodies, page
+# content, cookies, storage values, tokens, confirmation tokens, credential
+# values, selectors, or URLs. No attribute value is copied out of a payload or
+# an extension response except the caller's own trace/session id, and every
+# string attribute is run through the same secretMaskFile masking the audit log
+# uses before it is exported.
+
+OTEL_ENABLED = os.environ.get('BRIDGE_OTEL_ENABLED', '').strip().lower() in (
+    '1', 'true', 'yes', 'on')
+OTEL_ENDPOINT = os.environ.get('BRIDGE_OTEL_ENDPOINT', '').strip()
+# Local span sink. The endpoint is the network sink; this is the offline one,
+# used for contract tests and for looking at spans with no collector running.
+OTEL_FILE = os.environ.get('BRIDGE_OTEL_FILE', '').strip()
+OTEL_SERVICE_NAME = os.environ.get('BRIDGE_OTEL_SERVICE_NAME', '').strip() or 'chrome-bridge'
+OTEL_EXPORT_TIMEOUT_SECONDS = 2.0
+OTEL_EXPORT_QUEUE_MAX = 256
+
+# OTLP enum values, inlined so no SDK is required to produce a valid document.
+_OTEL_KIND_INTERNAL = 1
+_OTEL_KIND_SERVER = 2
+_OTEL_STATUS_OK = 1
+_OTEL_STATUS_ERROR = 2
+
+_TRACEPARENT_RE = re.compile(r'^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$')
+_OTEL_ZERO_TRACE = '0' * 32
+_OTEL_ZERO_SPAN = '0' * 16
+
+# Per-connection-thread request context. Each socket connection is served by
+# one thread, so a thread local scopes a request span without threading a
+# context object through the whole request pipeline.
+_otel_local = threading.local()
+_otel_file_lock = threading.Lock()
+_otel_queue = None
+_otel_queue_lock = threading.Lock()
+_otel_export_disabled = False
+
+
+def parse_traceparent(value):
+    # (trace_id, parent_span_id) from a W3C traceparent header/field, or None
+    # when absent or malformed. An unparsable value starts a fresh trace rather
+    # than failing the request.
+    if not isinstance(value, str):
+        return None
+    match = _TRACEPARENT_RE.match(value.strip().lower())
+    if not match:
+        return None
+    version, trace_id, span_id, _flags = match.groups()
+    if version == 'ff' or trace_id == _OTEL_ZERO_TRACE or span_id == _OTEL_ZERO_SPAN:
+        return None
+    return trace_id, span_id
+
+
+def _otel_id(n_bytes):
+    return os.urandom(n_bytes).hex()
+
+
+def otel_begin_request(traceparent=None):
+    # Open the request span for this thread, continuing the caller's trace when
+    # it sent a traceparent and starting a new root trace otherwise. The client
+    # and action are supplied at close time, so a confirmation resume (which
+    # replaces both) still reports as one span with one start time.
+    if not OTEL_ENABLED:
+        return
+    parsed = parse_traceparent(traceparent)
+    trace_id, parent_span_id = parsed if parsed else (_otel_id(16), None)
+    _otel_local.ctx = {
+        "traceId": trace_id,
+        "spanId": _otel_id(8),
+        "parentSpanId": parent_span_id,
+        "startNs": time.time_ns(),
+        "children": [],
+    }
+
+
+class _OtelChildSpan:
+    """Times one child span and records it on this thread's request context."""
+
+    __slots__ = ("name", "start_ns")
+
+    def __init__(self, name):
+        self.name = name
+        self.start_ns = time.time_ns()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        ctx = getattr(_otel_local, "ctx", None)
+        if ctx is not None:
+            ctx["children"].append((self.name, self.start_ns, time.time_ns()))
+        return False
+
+
+class _OtelNoSpan:
+    """The disabled path: a shared no-op so `with` costs nothing measurable."""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+_OTEL_NO_SPAN = _OtelNoSpan()
+
+
+def otel_span(name):
+    if not OTEL_ENABLED or getattr(_otel_local, "ctx", None) is None:
+        return _OTEL_NO_SPAN
+    return _OtelChildSpan(name)
+
+
+def _otel_attr(key, value):
+    if isinstance(value, bool):
+        return {"key": key, "value": {"boolValue": value}}
+    if isinstance(value, int):
+        return {"key": key, "value": {"intValue": str(value)}}
+    if isinstance(value, float):
+        return {"key": key, "value": {"doubleValue": value}}
+    return {"key": key, "value": {"stringValue": str(value)}}
+
+
+def _otel_attrs(pairs, secrets):
+    # Drop absent attributes and mask every string before it leaves the host.
+    out = []
+    for key, value in pairs:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = mask_secret_text(value, secrets)
+        out.append(_otel_attr(key, value))
+    return out
+
+
+def otel_finish_request(client, action, payload, response, decision, request_id,
+                        session_trace_id):
+    # Close the request span, emit it with its children, and return
+    # (traceId, spanId) so the session trace artifact can name the same span.
+    # Returns None when telemetry is off, which keeps the artifact and the
+    # response byte-identical to an untraced host.
+    ctx = getattr(_otel_local, "ctx", None)
+    if not OTEL_ENABLED or ctx is None:
+        return None
+    _otel_local.ctx = None
+    end_ns = time.time_ns()
+    secrets = _known_secret_masks()
+    success = bool(response.get("success")) if isinstance(response, dict) else False
+    targets = trace_targets(action, payload, response if isinstance(response, dict) else {})
+    span = {
+        # OpenTelemetry GenAI tool-execution convention for the span name and
+        # gen_ai.* attributes; everything host-specific lives under bridge.*.
+        "traceId": ctx["traceId"],
+        "spanId": ctx["spanId"],
+        "name": f"execute_tool {action}" if action else "execute_tool",
+        "kind": _OTEL_KIND_SERVER,
+        "startTimeUnixNano": str(ctx["startNs"]),
+        "endTimeUnixNano": str(end_ns),
+        "attributes": _otel_attrs([
+            ("gen_ai.tool.name", action),
+            ("gen_ai.tool.type", "extension"),
+            ("bridge.action", action),
+            ("bridge.client", client),
+            ("bridge.decision", decision),
+            ("bridge.effective_tier", effective_action_tier(action, payload)),
+            ("bridge.duration_ms", int((end_ns - ctx["startNs"]) // 1_000_000)),
+            ("bridge.tab_id_count", len(targets)),
+            ("bridge.success", success),
+            ("bridge.request_id", request_id),
+            ("bridge.trace_id", session_trace_id),
+            ("bridge.host", "python"),
+        ], secrets),
+        "status": {"code": _OTEL_STATUS_OK if success else _OTEL_STATUS_ERROR},
+    }
+    if ctx["parentSpanId"]:
+        span["parentSpanId"] = ctx["parentSpanId"]
+    spans = [span]
+    for name, start_ns, child_end_ns in ctx["children"]:
+        spans.append({
+            "traceId": ctx["traceId"],
+            "spanId": _otel_id(8),
+            "parentSpanId": ctx["spanId"],
+            "name": name,
+            "kind": _OTEL_KIND_INTERNAL,
+            "startTimeUnixNano": str(start_ns),
+            "endTimeUnixNano": str(child_end_ns),
+            "attributes": _otel_attrs([
+                ("bridge.action", action),
+                ("bridge.duration_ms", int((child_end_ns - start_ns) // 1_000_000)),
+            ], secrets),
+            "status": {"code": _OTEL_STATUS_OK},
+        })
+    otel_export(spans)
+    return ctx["traceId"], ctx["spanId"]
+
+
+def otel_resource_attributes():
+    return [
+        _otel_attr("service.name", OTEL_SERVICE_NAME),
+        _otel_attr("telemetry.sdk.name", "chrome-bridge"),
+        _otel_attr("telemetry.sdk.language", "python"),
+    ]
+
+
+def otel_export(spans):
+    # Best effort, exactly like an audit-log write failure: one log line, then
+    # the request continues. A broken sink is disabled for the rest of the
+    # process so it cannot cost every later request a retry.
+    global _otel_export_disabled
+    if not spans or _otel_export_disabled:
+        return
+    try:
+        encoded = json.dumps({"resourceSpans": [{
+            "resource": {"attributes": otel_resource_attributes()},
+            "scopeSpans": [{"scope": {"name": "chrome-bridge.host"}, "spans": spans}],
+        }]})
+        if OTEL_FILE:
+            with _otel_file_lock:
+                with open(OTEL_FILE, 'a') as f:
+                    f.write(encoded + "\n")
+        if OTEL_ENDPOINT:
+            _otel_enqueue(encoded)
+    except Exception as e:
+        _otel_export_disabled = True
+        logging.error(f"OpenTelemetry export disabled after failure: {e}")
+
+
+def _otel_enqueue(encoded):
+    # The OTLP POST runs on a background daemon thread, so a slow or dead
+    # collector can never add latency to a browser request. A full queue drops
+    # the oldest-possible document rather than blocking.
+    global _otel_queue
+    with _otel_queue_lock:
+        if _otel_queue is None:
+            _otel_queue = queue.Queue(maxsize=OTEL_EXPORT_QUEUE_MAX)
+            threading.Thread(target=_otel_export_loop, daemon=True).start()
+    try:
+        _otel_queue.put_nowait(encoded)
+    except queue.Full:
+        pass
+
+
+def _otel_export_loop():
+    logged = False
+    while True:
+        encoded = _otel_queue.get()
+        try:
+            _otel_post(encoded)
+        except Exception as e:
+            if not logged:
+                logged = True
+                logging.error(f"OpenTelemetry OTLP export failed (further failures silent): {e}")
+
+
+def _otel_post(encoded):
+    # Lazy import: with telemetry off (or with no endpoint) urllib.request is
+    # never imported, so the disabled path adds no import cost. No
+    # opentelemetry SDK is required -- the document below IS the OTLP/HTTP JSON
+    # wire format, so a collector needs nothing else installed here.
+    import urllib.request
+    url = OTEL_ENDPOINT
+    if '/v1/traces' not in url:
+        url = url.rstrip('/') + '/v1/traces'
+    request = urllib.request.Request(
+        url, data=encoded.encode('utf-8'),
+        headers={"Content-Type": "application/json"}, method='POST')
+    with urllib.request.urlopen(request, timeout=OTEL_EXPORT_TIMEOUT_SECONDS) as resp:
+        resp.read()
 
 
 _REDACT_KEY_SUBSTRINGS = ('token', 'secret', 'password', 'cookie', 'session', 'csrf', 'auth')
@@ -1641,10 +2049,15 @@ def handle_socket_client(client_socket):
             # Request-level dry run: never forwarded to the extension, and never
             # left in the command even when false.
             dry_run = cmd.pop("dryRun", None) is True
+            # W3C trace context: a caller may name the trace this request belongs
+            # to. Host-only, like the token and dryRun, so it is stripped before
+            # anything is forwarded to the extension.
+            traceparent = cmd.pop("traceparent", None)
 
             action = cmd.get("action")
             trace_ctx.update({"client": name, "action": action,
                               "payload": cmd.get("payload") or {}, "started": now_ms()})
+            otel_begin_request(traceparent)
 
             # Dry run stops before any state change: no confirmation resume, no
             # lease acquisition, no interactive origin approval, no tab-origin
@@ -1786,6 +2199,7 @@ def handle_socket_client(client_socket):
                     "audit": audit_enabled,
                     "originDependent": origin_dependent,
                     "siteMode": resolve_site_mode(policy_for_client(policy, name), targets),
+                    "effectiveTier": effective_action_tier(target_action, target_payload),
                 }}
                 _audit(audit_enabled, name, "policyCheck", targets, "allow", None, None)
                 respond(resp, "allow")
@@ -1833,8 +2247,9 @@ def handle_socket_client(client_socket):
             # wins over leases for payload-determined targets, but interactive
             # origin approval is deferred behind lease ownership so a non-owner
             # cannot pop UI or mutate policy for an action that cannot run.
-            allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
-                policy, name, action, payload)
+            with otel_span("bridge.policy_evaluate"):
+                allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
+                    policy, name, action, payload)
             if not allowed and reason == "target not allowed" and _policy_approval_enabled():
                 with lease_lock:
                     owner, _ = _lease_status_locked()
@@ -1946,16 +2361,17 @@ def handle_socket_client(client_socket):
             # that window (plus headroom) so the host does not time out before
             # the extension legitimately finishes.
             # Audit "allow" with the generated id before the action is forwarded.
-            # A waitForHandoff forward opens a telemetry blackout for the whole
+            # A handoff forward (see HANDOFF_ACTIONS) opens a blackout for the whole
             # time the human is interacting with the tab; the finally releases it
             # on every exit path (response, extension error, or timeout).
             handoff_handle = None
-            if action == 'waitForHandoff':
+            if action in HANDOFF_ACTIONS:
                 handoff_handle = register_handoff(handoff_tab_id(payload), name)
             try:
-                req_id, response = forward_to_extension(
-                    cmd, resp_timeout,
-                    on_registered=lambda rid: _audit(audit_enabled, name, action, targets, "allow", None, rid))
+                with otel_span("bridge.extension_forward"):
+                    req_id, response = forward_to_extension(
+                        cmd, resp_timeout,
+                        on_registered=lambda rid: _audit(audit_enabled, name, action, targets, "allow", None, rid))
             finally:
                 clear_handoff(handoff_handle)
             if response is None:
