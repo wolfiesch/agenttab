@@ -688,6 +688,14 @@ def _timed_request(step_timings, action, payload):
     step_timings.append({"name": action, "durationMs": round((time.perf_counter() - started) * 1000, 3)})
     return result
 
+def _timed_navigation_settle(step_timings):
+    started = time.perf_counter()
+    time.sleep(0.2)
+    step_timings.append({
+        "name": "navigationSettle",
+        "durationMs": round((time.perf_counter() - started) * 1000, 3),
+    })
+
 
 def _snapshot_nodes(snapshot, key=None):
     if isinstance(snapshot, list):
@@ -736,6 +744,7 @@ def _run_primitive_workflow(base_url, timeout_ms):
     try:
         navigation = _timed_request(timings, "navigate", {"url": base_url, "active": False})
         tab_id = navigation["tabId"]
+        _timed_navigation_settle(timings)
         _timed_request(timings, "waitForSelector", {
             "tabId": tab_id, "selector": "#workflow-title", "timeoutMs": timeout_ms,
         })
@@ -790,6 +799,7 @@ def _run_task_batch_workflow(base_url, timeout_ms):
             "sessionId": session_id, "url": base_url, "active": False, "reuse": True,
         })
         tab_id = navigation["tabId"]
+        _timed_navigation_settle(timings)
         _timed_request(timings, "waitForSelector", {
             "tabId": tab_id, "selector": "#workflow-title", "timeoutMs": timeout_ms,
         })
