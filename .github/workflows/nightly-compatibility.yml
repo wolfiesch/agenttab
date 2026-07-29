@@ -41,6 +41,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Create an isolated Python environment
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/chrome-bridge-nightly-venv"
+          echo "$RUNNER_TEMP/chrome-bridge-nightly-venv/bin" >> "$GITHUB_PATH"
+
       - name: Install the MCP bridge
         run: python3 -m pip install -e ./mcp
 
