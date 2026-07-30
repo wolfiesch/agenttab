@@ -44,10 +44,11 @@ chrome-bridge/
 |---|---|
 | `extension/manifest.json` | Public unkeyed MV3 source manifest. `setup.sh` and `deploy.sh --with-local-key` write a keyed copy into the local extension directory for a deterministic unpacked ID. |
 | `extension/background.js` | Service worker: connects to the native host, runs browser actions, and uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep. |
-| `wake.html`, `wake.js` | Legacy explicit recovery page retained for packaging compatibility. The CLI and broker never open it during routine retries. |
+| `wake.html`, `wake.js` | One-shot extension page used for explicit recovery and background reload. A `?reload=1` request removes its trigger before calling `chrome.runtime.reload()`; the replacement worker reconnects through its normal startup path. Routine retries never open the page. |
 | `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
 | `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
 | `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
+| `scripts/reload_unpacked_extension.sh` | macOS development helper that opens the keyed extension's one-shot reload page with `open -g`, so an already-running Chrome stays in the background and no accessibility or Computer Use interaction is required. It starts Chrome if the browser is closed. |
 | `.github/workflows/ci.yml` | Pull-request and `main` push gates for syntax, offline contracts, Rust parity, benchmarks, and packaging checks. |
 | `.github/workflows/release.yml` | Tag-driven release workflow for `v*` tags after the CI command set passes. |
 | `scripts/package_release.py` | Stdlib release packager for source archives, unpacked extension bundles, and Rust host binaries. |
@@ -206,6 +207,43 @@ Stable extension identity: the script never creates, reads, or packages `extensi
 
 If you need a locally packed CRX with a stable ID instead, keep the private key outside the repository (never commit it) and pass it to Chrome's "Pack extension" flow; the repository stays key-free either way.
 
+## Managed distribution: shipping one policy to a fleet
+
+Chrome Bridge has no server, so an org baseline travels as a file plus a digest. The host applies the file only when the digest matches, which makes distribution channel-agnostic: MDM, config management, a signed package, or a shared read-only mount all work, because the lockfile - not the transport - is what authorizes the bundle.
+
+On the admin's machine, author the baseline and pin it:
+
+```bash
+cp bridge_policy_bundle.example.json org-policy.json
+# edit org-policy.json: default + clients layers, exactly like bridge_policy.json
+chrome-bridge policy bundle lock org-policy.json --lockfile org-policy.lock
+```
+
+`policy bundle lock` writes the bundle's SHA-256 into the lockfile (mode `600`). Editing the bundle later changes its digest, so re-run the same command; it refuses to repin a lockfile that holds a different digest unless you pass `--force`, which keeps an accidental edit from silently becoming the new baseline. `bridge_policy_bundle.lock.example` ships a placeholder digest of all zeros that can never verify - a real digest must come from this command.
+
+Ship both files to each machine (same directory, any path the host user can read), then point the machine's local policy at them:
+
+```json
+{
+  "policyBundle": {
+    "path": "/etc/chrome-bridge/org-policy.json",
+    "lockfile": "/etc/chrome-bridge/org-policy.lock"
+  }
+}
+```
+
+Confirm on the machine:
+
+```bash
+chrome-bridge policy bundle verify /etc/chrome-bridge/org-policy.json \
+  --lockfile /etc/chrome-bridge/org-policy.lock
+chrome-bridge policy bundle show
+```
+
+`verify` exits `0` only on a match; `show` reports what the running host resolved (`path`, `verified`, and a 12-character digest) and exits `1` when the active bundle is unverified. If a machine reports `verified: false`, the host is serving the built-in fail-closed default policy - only `ping`, `policyCheck`, `policyInfo`, and lease actions - and `chrome-bridge audit tail` shows one `policy_bundle_rejected` entry with the expected and actual digests.
+
+Two properties matter operationally. A machine's local `bridge_policy.json` still layers on top of the bundle, so a stricter machine can tighten the baseline without a separate bundle. And a bundle can never loosen a local deny list: composed `deniedActions`/`deniedOrigins` are the union of the bundle's and the machine's. To roll out a change, update the bundle, re-run `policy bundle lock`, and ship both files together - shipping a new bundle without its lockfile fails every machine closed rather than leaving the old policy in force. See docs/security.md for the full precedence and verification rules.
+
 ## Launchd broker mode
 
 Broker mode is optional on macOS. launchd keeps a small Python broker listening on public port `9223`; Chrome-launched Python or Rust native hosts bind backend port `19223`. Clients keep using `BRIDGE_PORT=9223`, or no override. On first install, `setup-broker.sh` seeds the state-dir token from the repo token so the existing `chrome-bridge` CLI keeps working; if both token files already exist and differ, the script warns and clients should set `BRIDGE_TOKEN_FILE` to the state token path.
@@ -249,6 +287,15 @@ tail -f bridge_debug.log
 ```
 
 Run `python3 scripts/diagnose_install.py` for a read-only comparison of repository and deployed files plus broker/backend connection state. It never launches Chrome or opens a tab.
+
+After deploying service-worker changes on macOS, reload the unpacked extension without focusing Chrome:
+
+```bash
+./scripts/reload_unpacked_extension.sh
+chrome-bridge ready 10000 250
+```
+
+The helper opens a background extension tab that requests one reload. Chrome tears down the old extension page, and the replacement worker reconnects through its normal startup path. If Chrome is closed, `open` starts it. Use the `chrome://extensions/` reload button only if this bounded path fails.
 
 - `Connection refused` after retry in direct mode: Chrome is closed, no bridge extension is enabled, or the native connection is down. Routine retries never open Chrome or create a tab. Open Chrome normally, then inspect the extension service worker and `bridge_debug.log`.
 - MCP says `server not connected` while `chrome-bridge ping` works: update to a build containing the packaged-startup path fix, then restart the MCP client once so it launches the corrected server. The MCP package now adds `BRIDGE_REPO_ROOT` before importing repo-local helpers and retries one safe pre-send connection failure automatically; a separate `PYTHONPATH` entry is no longer required.

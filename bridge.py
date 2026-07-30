@@ -4,6 +4,7 @@ import os
 import struct
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import socket
 import threading
 import uuid
@@ -20,11 +21,19 @@ from urllib.parse import urlparse
 # Resolve paths relative to this script so the install is location-independent.
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-# Configure local logging
+# Configure bounded local logging. Routine wire chatter stays at DEBUG so a
+# long automation session does not grow the default log without limit.
+_log_handler = RotatingFileHandler(
+    os.environ.get('BRIDGE_LOG_FILE', os.path.join(SCRIPT_DIR, 'bridge_debug.log')),
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
+    encoding='utf-8',
+    delay=True,
+)
 logging.basicConfig(
-    filename=os.environ.get('BRIDGE_LOG_FILE', os.path.join(SCRIPT_DIR, 'bridge_debug.log')),
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[_log_handler],
 )
 
 # Maps in-flight request id -> queue.Queue the handler thread blocks on for
@@ -230,14 +239,14 @@ def read_message():
     message_length = struct.unpack('@I', raw_length)[0]
     message_data = sys.stdin.buffer.read(message_length).decode('utf-8')
     # Do not log payload bodies: responses can contain cookies/DOM secrets.
-    logging.info(f"Read message from extension ({message_length} bytes)")
+    logging.debug("Read message from extension (%s bytes)", message_length)
     return json.loads(message_data)
 
 def write_message(message):
     encoded_message = json.dumps(message).encode('utf-8')
-    logging.info(
-        f"Forwarding to extension: id={message.get('id')} "
-        f"action={message.get('action')} ({len(encoded_message)} bytes)")
+    logging.debug(
+        "Forwarding to extension: id=%s action=%s (%s bytes)",
+        message.get('id'), message.get('action'), len(encoded_message))
     with stdout_lock:
         sys.stdout.buffer.write(struct.pack('@I', len(encoded_message)))
         sys.stdout.buffer.write(encoded_message)
@@ -282,10 +291,11 @@ def handle_lease_action(action, payload, name):
         return {"success": True, "result": {"owner": owner, "expiresAt": expires_at, "now": now_ms()}}
 
 # --- Handoff telemetry blackout ---------------------------------------------
-# While a waitForHandoff request is in flight through this host, the human is
-# typing credentials/2FA codes into the real tab. Any observation action would
-# capture that, so the host denies observation for the duration of the handoff
-# -- for every client, including the one that started the handoff.
+# While a waitForHandoff or credentialHandoff request is in flight through this
+# host, the human is typing credentials/2FA codes into the real tab. Any
+# observation action would capture that, so the host denies observation for the
+# duration of the handoff -- for every client, including the one that started
+# the handoff.
 #
 # Scope: a handoff whose payload carries a numeric tabId blacks out that tab
 # only; a handoff with no tabId is resolved to the active tab by the extension,
@@ -303,10 +313,13 @@ HANDOFF_BLACKOUT_ACTIONS = {
     'screenshot', 'extractText', 'getHTML', 'storageState', 'printToPDF',
     'searchTabs', 'getCurrentState', 'screencastFrames',
     'extractStructured', 'scanPromptInjection', 'consoleMessages',
-    'observe', 'networkRequests', 'interceptedRequests',
+    'observe', 'navigateAndSnapshot', 'networkRequests', 'interceptedRequests',
     'startMonitoring', 'startScreencast', 'startInterception',
 }
 HANDOFF_BLACKOUT_ERROR = 'handoff in progress'
+# Actions whose forward opens a blackout window. credentialHandoff is the
+# single-field narrowing of waitForHandoff and gets exactly the same treatment.
+HANDOFF_ACTIONS = {'waitForHandoff', 'credentialHandoff'}
 
 _handoff_lock = threading.Lock()
 _handoff_seq = 0
@@ -324,7 +337,7 @@ def handoff_tab_id(payload):
 
 
 def register_handoff(tab_id, client):
-    # Called immediately before a waitForHandoff forward; the returned handle
+    # Called immediately before a handoff forward; the returned handle
     # must be released in a finally so no exit path leaves a stale blackout.
     global _handoff_seq
     with _handoff_lock:
@@ -361,6 +374,36 @@ def handoff_blackout(action, payload):
                 return True
     return False
 
+
+COMPOSITE_HANDOFF_ERROR = 'handoff not allowed in a composite'
+
+
+def composite_handoff_reason(action, payload):
+    # A handoff nested inside a composite can never be given a meaningful
+    # blackout. runBatch and replayWorkflow dispatch every remaining step inside
+    # the extension, so the steps AFTER the handoff never pass back through this
+    # host: a batch of [credentialHandoff, screenshot] would capture the tab
+    # while the human is still typing, with no gate in between. Registering the
+    # handoff for the composite would not help, because the blackout is enforced
+    # per request and there is only one request. The safe rule is that a handoff
+    # is a TOP-LEVEL action only, so the whole composite is refused before
+    # anything is forwarded. Nested composites are walked with the same step
+    # extractors used everywhere else, so tabId defaulting/retargeting applies.
+    # Returns the byte-stable denial reason, or None when no step is a handoff.
+    if action not in ('batch', 'replayWorkflow'):
+        return None
+    if action == 'batch':
+        prefix, steps = 'batch step', _step_payloads(payload)
+    else:
+        prefix, steps = 'workflow step', _workflow_step_payloads(payload)
+    for i, (s_action, s_payload) in enumerate(steps):
+        if s_action in HANDOFF_ACTIONS:
+            return f"{prefix} {i}: {COMPOSITE_HANDOFF_ERROR}"
+        nested = composite_handoff_reason(s_action, s_payload)
+        if nested:
+            return f"{prefix} {i}: {nested}"
+    return None
+
 # --- Host-enforced guardrails: policy, audit, redaction ---------------------
 # Policy is enforced in the host request path so every local client (Python or
 # Rust host, raw TCP/CLI, MCP) is governed by the same rules before any action
@@ -377,7 +420,8 @@ SENSITIVE_ACTIONS = {
     'startInterception', 'downloadUrl', 'screencastFrames',
 }
 MUTATING_ACTIONS = {
-    'navigate', 'click', 'clickAt', 'type', 'fill', 'hover', 'scroll', 'press', 'drag',
+    'navigate', 'navigateAndSnapshot', 'click', 'clickAt', 'type', 'fill',
+    'insertRichText', 'hover', 'scroll', 'press', 'drag',
     'select', 'uploadFile', 'activateTab', 'closeTab', 'reload', 'goBack',
     'goForward', 'windowControl', 'setViewport', 'setGeolocation', 'clearGeolocation',
     'setCpuThrottling', 'setNetworkConditions', 'clearNetworkConditions',
@@ -418,13 +462,89 @@ NON_SKIPPABLE_CONFIRMATIONS = {
 }
 
 
-def is_mutating_action(action):
-    # What ``manual`` gates: anything that changes browser/page/profile state
-    # plus the high-risk reads in the non-skippable set. Fail-safe by policy of
-    # the surrounding sets, not by guessing about unknown action names.
-    return (action in MUTATING_ACTIONS
+def base_action_tier(action):
+    # Name-only tier: anything that changes browser/page/profile state plus the
+    # high-risk reads in the non-skippable set. Fail-safe by policy of the
+    # surrounding sets, not by guessing about unknown action names.
+    if (action in MUTATING_ACTIONS
             or action in DESTRUCTIVE_ACTIONS
-            or action in NON_SKIPPABLE_CONFIRMATIONS)
+            or action in NON_SKIPPABLE_CONFIRMATIONS):
+        return 'mutating'
+    return 'read_only'
+
+
+def is_mutating_action(action):
+    # Retained name-only predicate. Decisions use effective_action_tier, which
+    # also accounts for state-changing payload flags and batch step contents.
+    return base_action_tier(action) == 'mutating'
+
+
+# --- Payload-driven tier escalation ----------------------------------------
+# A nominally read-only action is state-changing when its payload sets a flag
+# that mutates extension-side state. The table is data, not scattered
+# conditionals, so bridge.py and host-rs/src/main.rs can be compared by eye.
+#
+# Entry: (action, flag, kind, enum values)
+#   not_false     - the extension reads ``flag !== false``, so the flag is ON
+#                   unless the payload sets it to literal false (default ON).
+#   enum          - string flag; escalates when its value is in the listed set.
+#                   Absent means the extension's own default, which is never
+#                   listed here.
+#   nonempty_list - escalates when the flag is a non-empty array, because the
+#                   extension merges caller-supplied entries into its own state.
+ESCALATING_PAYLOAD_FLAGS = (
+    # screencastFrames drains the frame buffer irrecoverably unless the caller
+    # explicitly passes consume: false.
+    ('screencastFrames', 'consume', 'not_false', ()),
+    # cacheSelectors op=list/export read; clear wipes the selector cache and
+    # import merges caller-supplied entries into it.
+    ('cacheSelectors', 'op', 'enum', ('clear', 'import')),
+    # resolveCachedSelector imports caller-supplied cache entries before
+    # resolving when payload.cache is a non-empty array.
+    ('resolveCachedSelector', 'cache', 'nonempty_list', ()),
+)
+
+
+def payload_escalates_tier(action, payload):
+    # True when a base read-only action's payload carries a state-changing flag
+    # from ESCALATING_PAYLOAD_FLAGS.
+    payload = payload if isinstance(payload, dict) else {}
+    for f_action, flag, kind, values in ESCALATING_PAYLOAD_FLAGS:
+        if f_action != action:
+            continue
+        value = payload.get(flag)
+        if kind == 'not_false':
+            if value is not False:
+                return True
+        elif kind == 'enum':
+            if isinstance(value, str) and value in values:
+                return True
+        elif kind == 'nonempty_list':
+            if isinstance(value, list) and value:
+                return True
+    return False
+
+
+def effective_action_tier(action, payload=None):
+    # The tier every tier-dependent decision uses: "read_only" or "mutating",
+    # computed from the payload, not the action name alone.
+    #   - batch/replayWorkflow are the union over their steps: read_only only
+    #     when every step resolves to read_only.
+    #   - a base read-only action escalates to mutating when its payload carries
+    #     a state-changing flag.
+    action = action if isinstance(action, str) else ''
+    if action in ('batch', 'replayWorkflow'):
+        steps = (_step_payloads(payload) if action == 'batch'
+                 else _workflow_step_payloads(payload))
+        for s_action, s_payload in steps:
+            if effective_action_tier(s_action, s_payload) == 'mutating':
+                return 'mutating'
+        return 'read_only'
+    if base_action_tier(action) == 'mutating':
+        return 'mutating'
+    if payload_escalates_tier(action, payload):
+        return 'mutating'
+    return 'read_only'
 
 
 # Origin-exempt actions: their policy target is NOT the live tab origin, so the
@@ -434,7 +554,7 @@ def is_mutating_action(action):
 # origin-checked against the live tab (fail-safe: a new tab action is protected
 # by default rather than silently exempt).
 ORIGIN_EXEMPT_ACTIONS = {
-    'ping', 'getTabs', 'navigate', 'downloadUrl', 'getCookies', 'sessionStatus',
+    'ping', 'getTabs', 'navigate', 'navigateAndSnapshot', 'downloadUrl', 'getCookies', 'sessionStatus',
     'createTaskSession', 'getTaskSessions', 'updateTaskSessionState', 'closeTaskSession',
     'navigateTaskSession', 'batch', 'lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo',
 }
@@ -444,7 +564,137 @@ ORIGIN_EXEMPT_ACTIONS = {
 # "unknown action" so the reserved surface is not externally reachable.
 RESERVED_ACTIONS = {'__tabOrigin'}
 
-TARGET_REQUIRED_ACTIONS = {'navigate', 'navigateTaskSession', 'downloadUrl', 'getCookies'}
+TARGET_REQUIRED_ACTIONS = {'navigate', 'navigateTaskSession', 'navigateAndSnapshot', 'downloadUrl', 'getCookies'}
+
+# Actions that make the browser issue a NEW outbound request to a host named in
+# the request payload, so the host can bound the destination before forwarding.
+# ``setCookie`` is included because it writes a cookie scoped to its ``url``,
+# which the browser then attaches to its next request to that host, so it stages
+# egress even though the write itself is local.
+#
+# Deliberately NOT here, because the host cannot see the destination and must not
+# imply coverage it does not have (see docs/security.md):
+#   - in-page navigation the agent causes by clicking a link or submitting a form
+#     (``click``, ``press``, ``type``, ``fill``, ``drag``): the destination is
+#     decided by page markup the host never parses.
+#   - script-driven requests (``executeScript``, ``executeScriptCDP``): the URL
+#     lives inside the script body.
+#   - resource loads a page makes on its own (subresources, XHR, beacons).
+#   - ``uploadFile``/``githubAttach*``: the upload goes to the tab's own origin,
+#     which site policy already governs.
+#   - ``startInterception`` in ``fulfill`` mode: the extension fulfills from the
+#     inline ``body``, so it fetches nothing and creates no new egress.
+#   - ``deleteCookie``: names a url but removes state and sends nothing.
+EGRESS_URL_ACTIONS = {'navigate', 'navigateTaskSession', 'navigateAndSnapshot', 'downloadUrl', 'setCookie'}
+
+# --- Data-loss-prevention channels (policy key ``dlp``) ---------------------
+# ``dlp`` is a map of CHANNEL -> MODE:
+#   allow - default; current behavior, nothing is added.
+#   audit - the action runs, and exactly one ``dlp_audit`` audit event naming
+#           the channel is written. The event carries no file contents, no file
+#           paths, and no frame data -- only the channel name.
+#   block - the action is denied with reason ``dlp blocked`` BEFORE it is
+#           forwarded, so Chrome never opens the file and the extension never
+#           dispatches the handler.
+# Merged as a map key (see _POLICY_MAP_KEYS), so a client layer can tighten one
+# channel without restating the rest.
+DLP_CHANNELS = ('clipboard', 'upload', 'download', 'screenShare')
+DLP_MODES = ('allow', 'audit', 'block')
+DLP_BLOCKED_ERROR = 'dlp blocked'
+DLP_AUDIT_DECISION = 'dlp_audit'
+
+# Which action belongs to which channel. Only chokepoints the BRIDGE ITSELF owns
+# appear here, because a mode must mean enforcement rather than aspiration:
+#   upload      - the three actions that hand local file paths to CDP
+#                 ``DOM.setFileInputFiles``.
+#   download    - ``downloadUrl``, the only action that starts a browser download.
+#   screenShare - the screencast capture start and the frame read.
+# ``clipboard`` is DECLARED but has no entry: no bridge action reads or writes the
+# clipboard, and a page-driven copy/paste never crosses the bridge, so there is
+# nothing here to gate. See docs/security.md; do not add aspirational entries.
+DLP_ACTION_CHANNELS = {
+    'uploadFile': 'upload',
+    'githubAttachUploadedFiles': 'upload',
+    'githubAttachPrBody': 'upload',
+    'downloadUrl': 'download',
+    'startScreencast': 'screenShare',
+    'screencastFrames': 'screenShare',
+}
+
+
+def dlp_channel_for_action(action):
+    # The DLP channel this action belongs to, or None when it belongs to none.
+    return DLP_ACTION_CHANNELS.get(action if isinstance(action, str) else '')
+
+
+def resolve_dlp_mode(cp, channel):
+    # The mode governing ``channel`` for this client, or None when ``channel`` is
+    # not a DLP channel. Fail closed: a channel configured with anything outside
+    # DLP_MODES resolves to ``block`` rather than being silently ignored, because
+    # a typo in a data-loss control must not widen it.
+    if channel not in DLP_CHANNELS:
+        return None
+    dlp = cp.get('dlp')
+    if dlp is None:
+        return 'allow'
+    if not isinstance(dlp, dict):
+        return 'block'
+    if channel not in dlp:
+        return 'allow'
+    mode = dlp.get(channel)
+    return mode if isinstance(mode, str) and mode in DLP_MODES else 'block'
+
+
+def dlp_modes_for_client(cp):
+    # The non-default channel modes for this client, for stamping onto a
+    # forwarded request so the extension can refuse independently. Channels in
+    # ``allow`` are omitted, so an unconfigured policy changes no envelope.
+    modes = {}
+    for channel in DLP_CHANNELS:
+        mode = resolve_dlp_mode(cp, channel)
+        if mode and mode != 'allow':
+            modes[channel] = mode
+    return modes
+
+
+def dlp_channels_in_mode(cp, action, payload, mode):
+    # Channels resolving to ``mode`` for this request, recursing into composites
+    # so a batch or replayWorkflow step is seen. Ordered by DLP_CHANNELS and
+    # deduplicated, so both hosts report the same string for the same request.
+    found = set()
+
+    def walk(w_action, w_payload):
+        if w_action in ('batch', 'replayWorkflow'):
+            steps = (_step_payloads(w_payload) if w_action == 'batch'
+                     else _workflow_step_payloads(w_payload))
+            for s_action, s_payload in steps:
+                walk(s_action, s_payload)
+            return
+        channel = dlp_channel_for_action(w_action)
+        if channel and resolve_dlp_mode(cp, channel) == mode:
+            found.add(channel)
+
+    walk(action if isinstance(action, str) else '', payload)
+    return [c for c in DLP_CHANNELS if c in found]
+
+
+def dlp_blocked_target(cp, action, payload):
+    # (action, channel) of the first blocked chokepoint in this request, walking
+    # composite steps in dispatch order so a denial can name the smuggled step's
+    # own action rather than the enclosing ``batch``.
+    if action in ('batch', 'replayWorkflow'):
+        steps = (_step_payloads(payload) if action == 'batch'
+                 else _workflow_step_payloads(payload))
+        for s_action, s_payload in steps:
+            hit = dlp_blocked_target(cp, s_action, s_payload)
+            if hit:
+                return hit
+        return None
+    channel = dlp_channel_for_action(action)
+    if channel and resolve_dlp_mode(cp, channel) == 'block':
+        return (action, channel)
+    return None
+
 
 # Built-in fail-closed default. A policy file must explicitly opt into browser
 # automation beyond host-side liveness/policy/lease operations.
@@ -462,10 +712,19 @@ DEFAULT_POLICY = {
             "*://[[]::1[]]", "*://[[]::1[]]:*",
         ],
         "requireConfirmation": [],
+        # Where the agent may make the browser SEND traffic. Empty means
+        # unconstrained, preserving behavior for policies that never set it.
+        "egressAllowlist": [],
         "siteModes": {},
+        # Per-channel data-loss-prevention modes (see DLP_CHANNELS). An absent
+        # channel is "allow", preserving behavior for policies that never set it.
+        "dlp": {},
         "redactPatterns": [],
         "secretMaskFile": None,
         "traceDir": None,
+        # Optional forwarder for audit events that were already written locally
+        # (see the audit export section). Null/absent disables export entirely.
+        "auditExport": None,
         "redact": True,
         "audit": True,
     },
@@ -474,57 +733,556 @@ DEFAULT_POLICY = {
 
 _policy_lock = threading.Lock()
 _policy_cache = DEFAULT_POLICY
-_policy_mtime = object()
+# Signature of every file the effective policy derives from. A fresh sentinel
+# object never equals a real signature, so the first read always loads.
+_policy_sig = object()
+
+# --- Content-addressed org policy bundles (policy key ``policyBundle``) -----
+# An org distributes one policy document out of band and pins it by digest:
+#
+#   "policyBundle": {"path": "/etc/chrome-bridge/org-policy.json",
+#                    "lockfile": "/etc/chrome-bridge/org-policy.lock"}
+#
+# read from the ROOT of the local policy file (its ``default`` layer is also
+# accepted). The host applies the bundle ONLY when the bundle's sha256 equals
+# the ``sha256`` recorded in the lockfile. Every other outcome -- unreadable
+# bundle, unreadable or malformed lockfile, malformed bundle, digest mismatch,
+# malformed policyBundle stanza -- fails closed to the BUILT-IN default policy
+# (never the last verified bundle), is logged, and is audited as
+# ``policy_bundle_rejected`` carrying both digests. The reload signature covers
+# the bundle and lockfile mtimes, so a swapped bundle is re-verified on the
+# next request and each rejection is audited once per change, not per request.
+#
+# Precedence for a VERIFIED bundle:
+#   built-in default -> bundle default/clients -> local bridge_policy.json
+# so a local operator can always tighten on top of the org baseline. The one
+# thing a local layer can never do is LOOSEN it. What "tighten" means is not
+# the same for every key -- a longer allow list is looser while a longer deny
+# list is tighter -- so composition is per key and monotonic, driven by
+# POLICY_BUNDLE_COMPOSITION below rather than by a plain local override.
+
+POLICY_BUNDLE_DECISION = 'policy_bundle_rejected'
+POLICY_BUNDLE_MISCONFIGURED = 'policy bundle misconfigured'
+POLICY_BUNDLE_UNREADABLE = 'policy bundle unreadable'
+POLICY_BUNDLE_MALFORMED = 'policy bundle malformed'
+POLICY_BUNDLE_LOCK_UNREADABLE = 'policy bundle lockfile unreadable'
+POLICY_BUNDLE_LOCK_MALFORMED = 'policy bundle lockfile malformed'
+POLICY_BUNDLE_MISMATCH = 'policy bundle digest mismatch'
+# A composition conflict is a policy MISCONFIGURATION, not a tampered bundle,
+# but it fails closed on the same path and with the same audit decision: two
+# different nontrivial globs on one allow-list key have no intersection that is
+# representable as a pattern list. See _bundle_intersect_lists.
+POLICY_BUNDLE_CONFLICT = 'policy bundle composition conflict'
+
+# How one policy key composes when a VERIFIED bundle is layered under the local
+# policy file. Every rule is monotonic: the composed value is at most as
+# permissive as the bundle's. Keys absent from this table keep plain
+# local-over-bundle precedence because they carry neither allow/deny authority
+# nor authority over what leaves the host (``traceDir``, ``auditExport``, and
+# the local root keys). Kept as a flat table, like ESCALATING_PAYLOAD_FLAGS, so
+# the Rust host's copy can be compared against it by eye.
+#
+#   allow     Explicit INTERSECTION of two allow-list PATTERN lists. Every entry
+#             is classified by _bundle_pattern_kind as the bare wildcard ``*``,
+#             an exact literal (no ``*``, ``?`` or ``[``), or a nontrivial glob,
+#             and only those three cases are composed:
+#               * on the BUNDLE side the bundle does not constrain the list, so
+#                 the local list stands; on the LOCAL side it can never widen a
+#                 constrained bundle list.
+#               A literal survives when the OTHER side's patterns permit it as a
+#                 NAME -- the one direction in which matching a pattern against
+#                 a string is sound.
+#               Two IDENTICAL nontrivial globs compose to that glob. A BUNDLE
+#                 glob the local list does not restate is dropped, which only
+#                 ever tightens.
+#             A LOCAL nontrivial glob with no identical counterpart, against a
+#             bundle list carrying a nontrivial glob of its own, has no
+#             representable intersection. Rather than guess, or silently keep
+#             the broader side and drop the local narrowing, composition fails
+#             closed: the bundle is REJECTED exactly like a bad digest, with
+#             POLICY_BUNDLE_CONFLICT naming the key and both patterns. An EMPTY
+#             allow list denies everything, so it is the tight end of this rule,
+#             never "unconstrained".
+#   egress    The same intersection, except that for ``egressAllowlist`` EMPTY
+#             means unconstrained: an empty bundle list leaves the local list
+#             alone, and an empty local list keeps the bundle's list rather
+#             than silently lifting the constraint.
+#   deny      UNION. More entries is tighter for these keys -- more denied
+#             patterns, more confirmation-gated actions, more response-masking
+#             regexes -- so an org baseline can add entries and a local layer
+#             can add more, and a local ``[]`` can never erase the bundle's.
+#   dlp       Per-channel STRICTEST mode by POLICY_BUNDLE_DLP_ORDER.
+#   siteMode  Per-pattern STRICTEST mode by POLICY_BUNDLE_SITE_MODE_ORDER.
+#   onlyTrue  Boolean whose ``true`` is the tight value: bundle true wins.
+#   paths     UNION of the bundle's and the local layer's file paths, bundle
+#             first, deduplicated, empties dropped. A single surviving path
+#             composes to that bare string, so a plain string ``secretMaskFile``
+#             keeps working unchanged; two distinct paths compose to a LIST and
+#             the loader reads every entry. A local layer can add its own
+#             secrets, never drop the org's.
+POLICY_BUNDLE_COMPOSITION = (
+    ('allowedActions', 'allow'),
+    ('allowedOrigins', 'allow'),
+    ('egressAllowlist', 'egress'),
+    ('deniedActions', 'deny'),
+    ('deniedOrigins', 'deny'),
+    ('requireConfirmation', 'deny'),
+    ('redactPatterns', 'deny'),
+    ('dlp', 'dlp'),
+    ('siteModes', 'siteMode'),
+    ('redact', 'onlyTrue'),
+    ('audit', 'onlyTrue'),
+    ('secretMaskFile', 'paths'),
+)
+
+# Strictest-first mode orders, with the rank an UNRECOGNISED value composes at.
+# Each unknown rank mirrors what that key's enforcement path already does with a
+# typo, so composition never makes a typo mean something it does not mean at
+# request time: resolve_dlp_mode fails an unknown channel mode closed to
+# ``block`` (rank 0), while resolve_site_mode ignores an unknown site mode,
+# which is identical in effect to ``auto`` (rank 1).
+POLICY_BUNDLE_DLP_ORDER = ('block', 'audit', 'allow')
+POLICY_BUNDLE_DLP_UNKNOWN_RANK = 0
+POLICY_BUNDLE_SITE_MODE_ORDER = ('manual', 'auto', 'skip')
+POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK = 1
+
+# policyInfo and the CLI report a truncated digest: enough to compare two
+# installs by eye, never enough to reconstruct any bundle content.
+POLICY_BUNDLE_DIGEST_CHARS = 12
+
+_policy_bundle_state = {"path": None, "lockfile": None, "verified": False, "digest": None}
 
 
-def load_policy():
-    # fail-closed default and logs parse/load errors.
+def short_digest(digest):
+    if not isinstance(digest, str) or not digest:
+        return None
+    return digest[:POLICY_BUNDLE_DIGEST_CHARS]
+
+
+def policy_bundle_config(doc):
+    # (path, lockfile) from the local policy document; ("", "") when the stanza
+    # is present but unusable (fail closed); None when no bundle is configured.
+    if not isinstance(doc, dict):
+        return None
+    holders = [doc]
+    if isinstance(doc.get("default"), dict):
+        holders.append(doc["default"])
+    for holder in holders:
+        cfg = holder.get("policyBundle")
+        if cfg is None:
+            continue
+        if not isinstance(cfg, dict):
+            return ("", "")
+        path = cfg.get("path")
+        lockfile = cfg.get("lockfile")
+        if not isinstance(path, str) or not path.strip():
+            return ("", "")
+        if not isinstance(lockfile, str) or not lockfile.strip():
+            return ("", "")
+        return (os.path.expanduser(path.strip()), os.path.expanduser(lockfile.strip()))
+    return None
+
+
+def read_lock_digest(path):
+    # (digest, reason). The lockfile is JSON: {"sha256": "<64 lowercase hex>"}.
+    # Any other shape is malformed and therefore fails closed.
+    try:
+        with open(path) as f:
+            raw = f.read()
+    except OSError:
+        return None, POLICY_BUNDLE_LOCK_UNREADABLE
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    if not isinstance(data, dict):
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    digest = data.get("sha256")
+    if not isinstance(digest, str):
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    digest = digest.strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return None, POLICY_BUNDLE_LOCK_MALFORMED
+    return digest, None
+
+
+def verify_policy_bundle(path, lockfile):
+    # (document, actualDigest, expectedDigest, reason). ``reason`` is None only
+    # when the digest matched AND the bundle parsed as a JSON object. The digest
+    # is compared BEFORE parsing so an unpinned document is never interpreted.
+    if not path or not lockfile:
+        return None, None, None, POLICY_BUNDLE_MISCONFIGURED
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+    except OSError:
+        return None, None, None, POLICY_BUNDLE_UNREADABLE
+    actual = hashlib.sha256(raw).hexdigest()
+    expected, reason = read_lock_digest(lockfile)
+    if reason is not None:
+        return None, actual, expected, reason
+    if actual != expected:
+        return None, actual, expected, POLICY_BUNDLE_MISMATCH
+    try:
+        doc = json.loads(raw.decode('utf-8'))
+    except Exception:
+        return None, actual, expected, POLICY_BUNDLE_MALFORMED
+    if not isinstance(doc, dict):
+        return None, actual, expected, POLICY_BUNDLE_MALFORMED
+    return doc, actual, expected, None
+
+
+def _bundle_path_list(value):
+    # The usable file paths in a ``paths`` value: a bare string is one path, a
+    # list is its string entries, in order, deduplicated with empties dropped.
+    raw = value if isinstance(value, list) else [value]
+    paths = []
+    for path in raw:
+        if isinstance(path, str) and path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _bundle_value_usable(rule, value):
+    # Whether ``value`` has the shape ``rule`` can compose. A wrong-shaped local
+    # entry is treated as absent so it can never dilute the bundle by accident.
+    if rule in ('allow', 'egress', 'deny'):
+        return isinstance(value, list)
+    if rule in ('dlp', 'siteMode'):
+        return isinstance(value, dict)
+    if rule == 'onlyTrue':
+        return isinstance(value, bool)
+    if rule == 'paths':
+        return _bundle_path_list(value) != []
+    return False
+
+
+def _bundle_local_value(key, rule, local_layer, local_default):
+    # The local value this key composes against: the layer's own entry when it
+    # has the shape the rule expects, else the local ``default`` layer's entry.
+    # That fallback mirrors how a client layer inherits the default layer at
+    # enforcement time, so a client-scoped bundle key is composed against the
+    # local floor that would actually apply to that client.
+    for holder in (local_layer, local_default):
+        if not isinstance(holder, dict):
+            continue
+        value = holder.get(key)
+        if _bundle_value_usable(rule, value):
+            return value
+    return None
+
+
+# The glob metacharacters fnmatch honours. A pattern free of all three matches
+# exactly one name, which is what makes an exact-literal intersection decidable.
+_BUNDLE_GLOB_METACHARS = '*?['
+BUNDLE_PATTERN_WILDCARD = 'wildcard'
+BUNDLE_PATTERN_LITERAL = 'literal'
+BUNDLE_PATTERN_GLOB = 'glob'
+
+
+class _BundleCompositionConflict(Exception):
+    # Raised when composing one key would require intersecting two different
+    # nontrivial globs. Carries the audit/log reason; load_policy turns it into
+    # the same fail-closed rejection a bad digest gets.
+    pass
+
+
+def _bundle_pattern_kind(pattern):
+    # The one classification shared by the ``allow`` and ``egress`` rules, so
+    # the two can never drift: the bare wildcard, an exact literal, or a
+    # nontrivial glob.
+    if pattern == '*':
+        return BUNDLE_PATTERN_WILDCARD
+    if any(c in pattern for c in _BUNDLE_GLOB_METACHARS):
+        return BUNDLE_PATTERN_GLOB
+    return BUNDLE_PATTERN_LITERAL
+
+
+def _bundle_conflict_reason(key, bundle_pattern, local_pattern):
+    return (f'{POLICY_BUNDLE_CONFLICT}: {key} bundle pattern "{bundle_pattern}" '
+            f'and local pattern "{local_pattern}" are different globs with no '
+            f'representable intersection')
+
+
+def _bundle_intersect_lists(key, bundle_list, local_list):
+    # Explicit intersection of two allow-list PATTERN lists, bundle order first,
+    # deduplicated. Testing one side's pattern STRING against the other side's
+    # patterns would not be an intersection at all (fnmatch("foo*", "foo?") is
+    # true both ways), so each entry is classified first:
+    #   wildcard  the bare ``*``; survives only when the other side is also
+    #             unconstrained, so a local ``*`` never widens the bundle.
+    #   literal   survives when the other side permits it as a NAME.
+    #   glob      survives when the other side is unconstrained or restates the
+    #             identical glob. A BUNDLE glob the local list does not restate
+    #             is dropped (a tightening). A LOCAL glob the bundle does not
+    #             restate, against a bundle list that has a glob of its own, is
+    #             a narrowing that cannot be represented: raise rather than
+    #             silently drop it or keep the broader side.
+    bundle = [v for v in bundle_list if isinstance(v, str)]
+    local = [v for v in local_list if isinstance(v, str)]
+    out = []
+    for source, constraint, local_side in ((bundle, local, False), (local, bundle, True)):
+        unconstrained = any(p == '*' for p in constraint)
+        constraint_globs = [p for p in constraint
+                            if _bundle_pattern_kind(p) == BUNDLE_PATTERN_GLOB]
+        for pattern in source:
+            kind = _bundle_pattern_kind(pattern)
+            if kind == BUNDLE_PATTERN_WILDCARD:
+                keep = unconstrained
+            elif kind == BUNDLE_PATTERN_LITERAL:
+                keep = action_matches(constraint, pattern)
+            elif unconstrained or pattern in constraint:
+                keep = True
+            elif local_side and constraint_globs:
+                raise _BundleCompositionConflict(
+                    _bundle_conflict_reason(key, constraint_globs[0], pattern))
+            else:
+                keep = False
+            if keep and pattern not in out:
+                out.append(pattern)
+    return out
+
+
+def _bundle_mode_rank(order, unknown_rank, mode):
+    return order.index(mode) if mode in order else unknown_rank
+
+
+def _bundle_strictest_mode(order, unknown_rank, bundle_mode, local_mode):
+    # The stricter of the two raw values by ``order`` (tightest first); the
+    # bundle wins a tie, so an equal local restatement is a no-op.
+    bundle_rank = _bundle_mode_rank(order, unknown_rank, bundle_mode)
+    local_rank = _bundle_mode_rank(order, unknown_rank, local_mode)
+    return bundle_mode if bundle_rank <= local_rank else local_mode
+
+
+def _compose_bundle_key(key, rule, bundle_value, local_value):
+    # The composed value for one key, or None when the bundle does not
+    # constrain that key and the plain local-over-bundle result already stands.
+    # Raises _BundleCompositionConflict when the two sides cannot be intersected
+    # (see _bundle_intersect_lists); ``key`` is carried only to name it.
+    if rule == 'deny':
+        union = []
+        for values in (bundle_value, local_value):
+            if isinstance(values, list):
+                for value in values:
+                    if value not in union:
+                        union.append(value)
+        return union or None
+    if rule in ('allow', 'egress'):
+        if not isinstance(bundle_value, list):
+            return None
+        if rule == 'egress' and not bundle_value:
+            return None
+        if rule == 'allow' and any(v == '*' for v in bundle_value):
+            return None
+        if not isinstance(local_value, list):
+            return list(bundle_value)
+        if rule == 'egress' and not local_value:
+            return list(bundle_value)
+        return _bundle_intersect_lists(key, bundle_value, local_value)
+    if rule in ('dlp', 'siteMode'):
+        if not isinstance(bundle_value, dict):
+            return None
+        if rule == 'dlp':
+            order, unknown = POLICY_BUNDLE_DLP_ORDER, POLICY_BUNDLE_DLP_UNKNOWN_RANK
+        else:
+            order, unknown = (POLICY_BUNDLE_SITE_MODE_ORDER,
+                              POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK)
+        composed = dict(local_value) if isinstance(local_value, dict) else {}
+        for name, mode in bundle_value.items():
+            if name in composed:
+                composed[name] = _bundle_strictest_mode(order, unknown, mode, composed[name])
+            else:
+                composed[name] = mode
+        return composed
+    if rule == 'onlyTrue':
+        return True if bundle_value is True else None
+    if rule == 'paths':
+        # Union of both sides' paths, bundle first: a local layer can add its
+        # own secret dictionary but can never displace the bundle's. One path
+        # stays a bare string so an unbundled policy is untouched.
+        union = _bundle_path_list(bundle_value)
+        for path in _bundle_path_list(local_value):
+            if path not in union:
+                union.append(path)
+        if not union:
+            return None
+        return union[0] if len(union) == 1 else union
+    return None
+
+
+def _merge_bundle_layer(bundle_layer, local_layer, local_default):
+    # Local layer keys override the bundle's, EXCEPT the keys named in
+    # POLICY_BUNDLE_COMPOSITION, which compose monotonically so the local layer
+    # can only tighten the org baseline. See that table for the per-key rule.
+    bundle_layer = bundle_layer if isinstance(bundle_layer, dict) else {}
+    local_layer = local_layer if isinstance(local_layer, dict) else {}
+    merged = {**bundle_layer, **local_layer}
+    for key, rule in POLICY_BUNDLE_COMPOSITION:
+        composed = _compose_bundle_key(
+            key, rule, bundle_layer.get(key),
+            _bundle_local_value(key, rule, local_layer, local_default))
+        if composed is not None:
+            merged[key] = composed
+    return merged
+
+
+def compose_bundle_policy(bundle, local):
+    # A verified bundle supplies the baseline "default"/"clients" layers; the
+    # local policy document is layered on top. Local root keys (including the
+    # policyBundle stanza itself) are preserved.
+    bundle = bundle if isinstance(bundle, dict) else {}
+    local = local if isinstance(local, dict) else {}
+    local_default = local.get("default") if isinstance(local.get("default"), dict) else {}
+    composed = {k: v for k, v in local.items() if k not in ("default", "clients")}
+    composed["default"] = _merge_bundle_layer(
+        bundle.get("default"), local_default, local_default)
+    bundle_clients = bundle.get("clients") if isinstance(bundle.get("clients"), dict) else {}
+    local_clients = local.get("clients") if isinstance(local.get("clients"), dict) else {}
+    clients = {}
+    for name in list(bundle_clients) + [n for n in local_clients if n not in bundle_clients]:
+        clients[name] = _merge_bundle_layer(
+            bundle_clients.get(name), local_clients.get(name), local_default)
+    composed["clients"] = clients
+    return composed
+
+
+def _set_policy_bundle_state(path, lockfile, verified, digest):
+    _policy_bundle_state.update({
+        "path": path, "lockfile": lockfile,
+        "verified": bool(verified), "digest": digest,
+    })
+
+
+def policy_bundle_info():
+    # policyInfo view: path, verification result, truncated digest. Metadata
+    # only -- bundle CONTENTS are never returned, matching the existing rule
+    # that policyInfo discloses paths, not policy bodies.
+    state = dict(_policy_bundle_state)
+    if state.get("path") is None:
+        return None
+    return {
+        "path": state.get("path"),
+        "verified": bool(state.get("verified")),
+        "digest": short_digest(state.get("digest")),
+    }
+
+
+def _audit_policy_bundle_rejected(path, reason, expected, actual):
+    write_audit_event({
+        "ts": now_ms(),
+        "client": "host",
+        "action": "policyBundle",
+        "targets": [path] if path else [],
+        "decision": POLICY_BUNDLE_DECISION,
+        "reason": reason,
+        "requestId": None,
+        "expectedDigest": expected,
+        "actualDigest": actual,
+    })
+
+
+def load_local_policy():
+    # The local policy file only: fail-closed default and logs load errors.
     try:
         with open(POLICY_FILE) as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("policy root must be an object")
         return data
-    except FileNotFoundError as e:
-        logging.error(f"Could not load policy file {POLICY_FILE}: {e}")
-        return DEFAULT_POLICY
     except Exception as e:
         logging.error(f"Could not load policy file {POLICY_FILE}: {e}")
         return DEFAULT_POLICY
 
 
+def load_policy():
+    # The effective policy document: the local policy file, or -- when it names
+    # a policyBundle -- the VERIFIED bundle with the local file layered on top.
+    local = load_local_policy()
+    config = policy_bundle_config(local)
+    if config is None:
+        _set_policy_bundle_state(None, None, False, None)
+        return local
+    path, lockfile = config
+    doc, actual, expected, reason = verify_policy_bundle(path, lockfile)
+    composed = None
+    if reason is None:
+        # A verified bundle can still be MISCONFIGURED against the local layer.
+        # That rejection reuses this same path -- one log line, one audit event,
+        # the built-in default served -- so it is reported once per change by the
+        # mtime-based reload check rather than on every request.
+        try:
+            composed = compose_bundle_policy(doc, local)
+        except _BundleCompositionConflict as conflict:
+            reason = str(conflict)
+    if reason is not None:
+        _set_policy_bundle_state(path, lockfile, False, actual)
+        logging.error(
+            f"Rejected policy bundle {path or '<unset>'}: {reason} "
+            f"(expected {expected or 'none'}, actual {actual or 'none'}); "
+            "serving built-in fail-closed default policy")
+        _audit_policy_bundle_rejected(path, reason, expected, actual)
+        return DEFAULT_POLICY
+    _set_policy_bundle_state(path, lockfile, True, actual)
+    return composed
+
+
+def _policy_source_signature():
+    # Every file the effective policy derives from, using the bundle paths the
+    # last load resolved. A swapped bundle or lockfile changes the signature, so
+    # its digest is re-verified instead of being trusted for the process's life.
+    path = _policy_bundle_state.get("path")
+    lockfile = _policy_bundle_state.get("lockfile")
+    return (
+        _file_mtime(POLICY_FILE),
+        path, _file_mtime(path) if path else None,
+        lockfile, _file_mtime(lockfile) if lockfile else None,
+    )
+
+
 def current_policy():
-    # Cached-with-mtime, matching token reload behavior: reload when the policy
-    # file's mtime changes (including absent -> present) so changes take effect
-    # without a host restart.
-    global _policy_cache, _policy_mtime
+    # Cached-with-mtime, matching token reload behavior: reload when any policy
+    # source's mtime changes (including absent -> present) so changes take
+    # effect without a host restart.
+    global _policy_cache, _policy_sig
     reloaded = False
     with _policy_lock:
-        mtime = _file_mtime(POLICY_FILE)
-        if mtime != _policy_mtime:
+        if _policy_source_signature() != _policy_sig:
             _policy_cache = load_policy()
-            _policy_mtime = mtime
+            # Recomputed AFTER the load: the load is what resolves the bundle
+            # paths this signature has to cover.
+            _policy_sig = _policy_source_signature()
             reloaded = True
         policy = _policy_cache
     if reloaded:
         # Load every configured secretMaskFile at policy load time so masking
         # (including audit masking) is armed before the first response arrives.
+        # A composed value can be a LIST of paths (see the ``paths`` rule in
+        # POLICY_BUNDLE_COMPOSITION); load_secret_masks primes every entry.
         for layer_name in ("default", *(policy.get("clients") or {})):
             load_secret_masks(policy_for_client(policy, layer_name).get('secretMaskFile'))
+        # Resolve the audit export sinks in the same pass, so a malformed
+        # control block is reported once at load rather than once per request.
+        prime_audit_export(policy)
     return policy
 
 
 _POLICY_LIST_KEYS = (
     'allowedActions', 'deniedActions', 'allowedOrigins', 'deniedOrigins',
-    'requireConfirmation', 'redactPatterns',
+    'requireConfirmation', 'redactPatterns', 'egressAllowlist',
 )
 _POLICY_BOOL_KEYS = ('redact', 'audit')
 # String-valued policy keys merged like bools: a later layer replaces the value.
-_POLICY_STR_KEYS = ('secretMaskFile', 'traceDir')
-# Map-valued policy keys merged PER KEY: a later layer overrides only the origin
-# patterns it names and inherits the rest, so a client layer can set one site's
-# mode without restating (or silently dropping) the default layer's site modes.
-_POLICY_MAP_KEYS = ('siteModes',)
+_POLICY_STR_KEYS = ('traceDir',)
+# File-path policy keys merged like strings, except that the value may also be a
+# LIST of paths: bundle composition can compose the org's path with the local
+# one (see the ``paths`` rule in POLICY_BUNDLE_COMPOSITION).
+_POLICY_PATH_KEYS = ('secretMaskFile',)
+# Map-valued policy keys merged PER KEY: a later layer overrides only the keys it
+# names and inherits the rest, so a client layer can set one site's mode (or
+# tighten one DLP channel) without restating (or silently dropping) the default
+# layer's other entries.
+_POLICY_MAP_KEYS = ('siteModes', 'dlp', 'auditExport')
 
 
 def policy_for_client(policy, name):
@@ -544,6 +1302,12 @@ def policy_for_client(policy, name):
         for key in _POLICY_STR_KEYS:
             if isinstance(layer.get(key), str):
                 merged[key] = layer[key]
+        for key in _POLICY_PATH_KEYS:
+            value = layer.get(key)
+            if isinstance(value, str):
+                merged[key] = value
+            elif isinstance(value, list):
+                merged[key] = list(value)
         for key in _POLICY_MAP_KEYS:
             if isinstance(layer.get(key), dict):
                 merged[key] = {**(merged.get(key) or {}), **layer[key]}
@@ -574,7 +1338,7 @@ def targets_from_payload(action, payload):
     # Ordered list of normalized policy targets derived from a request payload.
     if not isinstance(payload, dict):
         return []
-    if action in ('navigate', 'navigateTaskSession', 'downloadUrl'):
+    if action in ('navigate', 'navigateTaskSession', 'navigateAndSnapshot', 'downloadUrl'):
         url = payload.get('url')
         return normalize_url_targets(url) if isinstance(url, str) else []
     if action == 'getCookies':
@@ -649,14 +1413,20 @@ def resolve_site_mode(cp, targets):
     return best[1] if best else None
 
 
-def apply_site_mode(site_mode, action, confirm):
+def apply_site_mode(site_mode, action, confirm, payload=None):
     # Fold the site mode into the confirmation requirement. ``manual`` adds a
     # gate, ``skip`` removes one, ``auto``/None leave requireConfirmation alone.
     # Neither mode touches the action or origin gates, and ``skip`` can never
     # waive a non-skippable action, so an unattended pre-approval stays bounded.
-    if site_mode == 'manual' and is_mutating_action(action):
+    #
+    # ``manual`` gates on the EFFECTIVE tier, so an all-read-only batch is not
+    # force-gated while one carrying a single mutating step is, and a read-only
+    # action whose payload sets a state-changing flag is.
+    if site_mode == 'manual' and effective_action_tier(action, payload) == 'mutating':
         return True
-    if site_mode == 'skip' and confirm and action not in NON_SKIPPABLE_CONFIRMATIONS:
+    if (site_mode == 'skip' and confirm
+            and action not in NON_SKIPPABLE_CONFIRMATIONS
+            and not payload_escalates_tier(action, payload)):
         return False
     return confirm
 
@@ -667,6 +1437,18 @@ def origin_targets(origin):
     if not isinstance(origin, str) or not origin:
         return []
     return normalize_url_targets(origin)
+
+
+def egress_targets(action, payload):
+    # Normalized policy targets for the outbound destination an action would
+    # cause, or [] when the action names no destination the host can see.
+    # batch/replayWorkflow deliberately resolve to [] here: their steps are each
+    # evaluated by evaluate_policy, so a smuggled step is reported with its own
+    # index instead of being flattened into the composite's verdict.
+    if action not in EGRESS_URL_ACTIONS or not isinstance(payload, dict):
+        return []
+    url = payload.get('url')
+    return normalize_url_targets(url) if isinstance(url, str) else []
 
 
 def policy_constrains_origins(policy, name):
@@ -716,6 +1498,14 @@ def _workflow_step_payloads(payload):
     # cannot be bypassed either by hoisting tabId to the replay payload or by
     # recording a step against a different tab. Steps with no action are skipped
     # because the extension never dispatches them.
+    #
+    # A version-2 step may carry an ``expect`` clause (T4-4). The extension
+    # evaluates it against the step's effective tab, so it is enumerated here as
+    # a synthetic ``expect`` step: a nested postcondition is then origin-checked
+    # like any other tab-scoped action instead of riding in unexamined. ``expect``
+    # is a non-mutating assertion, so it appears in none of the mutating,
+    # sensitive, or destructive sets and stays on the read-only side of the
+    # action classification.
     payload = payload if isinstance(payload, dict) else {}
     workflow = payload.get('workflow')
     steps = workflow.get('steps') if isinstance(workflow, dict) else None
@@ -734,6 +1524,16 @@ def _workflow_step_payloads(payload):
                 'tabId' in s_payload or s_action in WORKFLOW_SELECTOR_ACTIONS):
             s_payload['tabId'] = default_tab
         yield s_action, s_payload
+        s_expect = step.get('expect')
+        if isinstance(s_expect, dict):
+            e_payload = {}
+            if s_payload.get('tabId') is not None:
+                e_payload['tabId'] = s_payload['tabId']
+            elif default_tab is not None:
+                e_payload['tabId'] = default_tab
+            if isinstance(s_expect.get('mode'), str):
+                e_payload['mode'] = s_expect['mode']
+            yield 'expect', e_payload
 
 
 def tab_ids_needed(action, payload):
@@ -787,15 +1587,34 @@ def evaluate_policy(policy, name, action, payload, origins=None):
     allowed_actions = cp.get('allowedActions')
     if not action_matches(allowed_actions, action):
         return (False, f"action {action} not allowed", False, redact_enabled, audit_enabled, targets)
+    # Data-loss-prevention channel gate. Placed after the action gates and before
+    # anything that could forward, so a blocked channel is refused while the
+    # request is still just JSON: no file is opened, no frame is read. batch and
+    # replayWorkflow belong to no channel themselves; their steps are evaluated
+    # recursively below and produce "<batch|workflow> step N: dlp blocked".
+    if resolve_dlp_mode(cp, dlp_channel_for_action(action)) == 'block':
+        return (False, DLP_BLOCKED_ERROR, False, redact_enabled, audit_enabled, targets)
     confirm = action_matches(cp.get('requireConfirmation'), action)
     # Per-site permission mode. Applied to the confirmation requirement only,
     # and only after the action gates: every deny path below returns
     # confirm=False explicitly, so a deny still outranks any mode.
-    confirm = apply_site_mode(resolve_site_mode(cp, targets), action, confirm)
+    confirm = apply_site_mode(resolve_site_mode(cp, targets), action, confirm, payload)
 
     # For batch, only inspect steps once the batch action itself is allowed and
     # does not require confirmation.
     if action == 'batch':
+        # ``batch`` is origin-exempt for site policy because each step is checked
+        # against its own origin. The ``manual`` gate still has to see the
+        # origins the batch will act on, or hoisting actions into a batch would
+        # bypass a manual origin. Resolve the mode from the union of the step
+        # origins, and gate on the batch's EFFECTIVE tier so an all-read-only
+        # batch stays ungated while one carrying a mutating step does not.
+        mode_targets = list(targets)
+        for tab_id in tab_ids_needed(action, payload):
+            step_origin = origins.get(tab_id)
+            if step_origin:
+                mode_targets.extend(origin_targets(step_origin))
+        confirm = apply_site_mode(resolve_site_mode(cp, mode_targets), action, confirm, payload)
         if confirm:
             return (True, None, True, redact_enabled, audit_enabled, targets)
         step_confirm = False
@@ -837,6 +1656,20 @@ def evaluate_policy(policy, name, action, payload, origins=None):
         return (False, "target denied", False, redact_enabled, audit_enabled, targets)
     if targets and not target_matches(allowed_origins, targets):
         return (False, "target not allowed", False, redact_enabled, audit_enabled, targets)
+
+    # Egress allowlist (``egressAllowlist``): where the agent may make the
+    # browser SEND traffic, as opposed to which page it may act upon. Evaluated
+    # AFTER the action and site-target gates, so a denied action or a denied /
+    # non-allowed origin still wins and an egress grant can never widen site
+    # policy. Empty or absent means unconstrained.
+    egress_allow = cp.get('egressAllowlist')
+    if isinstance(egress_allow, list) and egress_allow and action in EGRESS_URL_ACTIONS:
+        e_targets = egress_targets(action, payload)
+        # Fail closed: an egress-bearing action whose destination the host cannot
+        # resolve is denied rather than forwarded unchecked.
+        if not e_targets or not target_matches(egress_allow, e_targets):
+            return (False, "egress not allowed", False, redact_enabled, audit_enabled,
+                    e_targets or targets)
     return (True, None, confirm, redact_enabled, audit_enabled, targets)
 
 
@@ -867,6 +1700,14 @@ def policy_verdict(policy, name, action, payload, origin=None):
         # The origin's resolved site mode, or null when no origin is known yet
         # (no target resolved) or no configured pattern matches it.
         "siteMode": resolve_site_mode(policy_for_client(policy, name), targets),
+        # The tier the host actually enforces for this action+payload:
+        # "read_only" or "mutating". Computed from the payload, so a batch of
+        # reads is read_only and a read whose flag changes state is mutating.
+        "effectiveTier": effective_action_tier(action, payload),
+        # The resolved DLP mode for this action's channel, or null when the
+        # action belongs to no DLP channel.
+        "dlp": resolve_dlp_mode(policy_for_client(policy, name),
+                                dlp_channel_for_action(action)),
     }
     return verdict, targets
 
@@ -887,7 +1728,7 @@ def plan_step_verdicts(policy, name, plan):
     return out
 
 
-def policy_denial(reason, action, targets, name, policy=None):
+def policy_denial(reason, action, targets, name, policy=None, payload=None):
     # Build a structured, actionable companion to the opaque "policy denied:
     # <reason>" error string. The error string itself stays byte-stable for API
     # and contract compatibility; this object tells a client exactly what to
@@ -895,6 +1736,7 @@ def policy_denial(reason, action, targets, name, policy=None):
     # classifies the gate that rejected the request so a client can self-service
     # the right fix.
     batch_step = None
+    dlp_channel = None
     m = re.match(r"^(?:batch|workflow) step (\d+): (.*)$", reason or "")
     if m:
         batch_step = int(m.group(1))
@@ -947,6 +1789,16 @@ def policy_denial(reason, action, targets, name, policy=None):
             f"Remove or narrow the matching {section}.deniedOrigins pattern in {POLICY_FILE}")
         suggested = {"op": "removePattern", "section": section, "list": "deniedOrigins",
                      "value": sample, "patterns": matched} if matched else None
+    elif reason == "egress not allowed":
+        kind = "egress"
+        sample = targets[0] if targets else None
+        section = section_for("egressAllowlist")
+        remediation = (
+            f"Add a host pattern covering {sample!r} to {section}.egressAllowlist in {POLICY_FILE}"
+            if sample else
+            f"Add the destination host to {section}.egressAllowlist in {POLICY_FILE}")
+        suggested = ({"op": "add", "section": section, "list": "egressAllowlist", "value": sample}
+                     if sample else None)
     elif reason and reason.endswith("denied") and reason.startswith("action "):
         kind = "action"
         section = section_for("deniedActions")
@@ -962,6 +1814,29 @@ def policy_denial(reason, action, targets, name, policy=None):
             "The request carried no resolvable target origin; supply a valid "
             "url/domain/tabId so site policy can be evaluated")
         suggested = None
+    elif reason == DLP_BLOCKED_ERROR:
+        kind = "dlp"
+        cp = policy_for_client(policy or {}, name)
+        hit = dlp_blocked_target(cp, action, payload)
+        if hit:
+            # For a composite the outer action is "batch"/"replayWorkflow"; name
+            # the smuggled step's own action so the remediation is actionable.
+            action, dlp_channel = hit
+        # ``dlp`` is a MAP key, so section_for (which tests for a list) cannot
+        # resolve it. It is also merged per channel, so a client layer only
+        # governs the channel it names.
+        client_dlp = ((policy or {}).get("clients") or {}).get(name)
+        section = (f"clients.{name}"
+                   if isinstance(client_dlp, dict)
+                   and isinstance((client_dlp.get("dlp") or None), dict)
+                   and dlp_channel in (client_dlp.get("dlp") or {})
+                   else "default")
+        channel_name = dlp_channel or "the requested"
+        remediation = (
+            f"Set {section}.dlp.{channel_name} to 'audit' or 'allow' in {POLICY_FILE} "
+            f"to permit {action!r}")
+        suggested = ({"op": "setChannelMode", "section": section, "map": "dlp",
+                      "channel": dlp_channel, "value": "audit"} if dlp_channel else None)
     else:
         kind = "other"
         remediation = f"Review default policy in {POLICY_FILE}"
@@ -975,6 +1850,8 @@ def policy_denial(reason, action, targets, name, policy=None):
         "remediation": remediation,
         "suggestedPatch": suggested,
         "batchStep": batch_step,
+        # The DLP channel that refused the request, or null for every other kind.
+        "dlpChannel": dlp_channel,
         "cli": "chrome-bridge policy doctor",
     }
 
@@ -1012,10 +1889,13 @@ def _persist_origin_grant(policy, name, origin):
     finally:
         if fd is not None:
             os.close(fd)
-    global _policy_cache, _policy_mtime
+    global _policy_cache, _policy_sig
     with _policy_lock:
         _policy_cache = updated
-        _policy_mtime = _file_mtime(POLICY_FILE)
+        # Force a full reload on the next read rather than recording the new
+        # signature: when a policyBundle is active the effective policy is the
+        # bundle composed with the local file, not the document just written.
+        _policy_sig = object()
     return updated
 
 
@@ -1129,12 +2009,35 @@ _secret_mask_warned = set()  # paths already warned about (warn once)
 _secret_mask_known = {}    # value -> name, union of everything ever loaded
 
 
-def load_secret_masks(path):
-    # Parse ``name=value`` lines from the policy's secretMaskFile. Blank lines
-    # and ``#`` comments are ignored; a missing/unreadable file disables masking
-    # for that path after one warning. Cached by mtime like the policy itself,
-    # so edits apply without a host restart. Entries are ordered longest value
-    # first so an overlapping shorter secret cannot pre-empt a longer one.
+def load_secret_masks(paths):
+    # Entries for the policy's secretMaskFile, which is either a single path or
+    # a LIST of paths (bundle composition unions the org's path with the local
+    # one; see the ``paths`` rule in POLICY_BUNDLE_COMPOSITION). The result is
+    # the union of every path's entries, still ordered longest value first so an
+    # overlapping shorter secret cannot pre-empt a longer one. Each path is
+    # loaded and cached independently, so one missing file never disables the
+    # others.
+    if isinstance(paths, str):
+        return _load_secret_mask_path(paths)
+    if not isinstance(paths, list):
+        return []
+    entries = []
+    seen = set()
+    for path in paths:
+        for name, value in _load_secret_mask_path(path):
+            if value in seen:
+                continue
+            seen.add(value)
+            entries.append((name, value))
+    entries.sort(key=lambda e: len(e[1]), reverse=True)
+    return entries
+
+
+def _load_secret_mask_path(path):
+    # Parse ``name=value`` lines from one secretMaskFile path. Blank lines and
+    # ``#`` comments are ignored; a missing/unreadable file disables masking for
+    # that path after one warning. Cached by mtime like the policy itself, so
+    # edits apply without a host restart.
     if not isinstance(path, str) or not path:
         return []
     with _secret_mask_lock:
@@ -1213,6 +2116,13 @@ def write_audit_event(event):
     # Append one JSON line. Never writes payload/response bodies, and never any
     # known secretMaskFile value (a denial reason can quote a target). A write
     # failure is logged but never blocks browser automation.
+    #
+    # The local log is the source of truth and this append is synchronous. The
+    # optional ``auditExport`` sink is a MIRROR of the line just committed here:
+    # the already-masked event is handed to a bounded queue drained by one
+    # background worker (see queue_audit_export), so export can never precede,
+    # replace, or delay the local write, and a slow or dead collector can never
+    # add latency to the request thread.
     try:
         event = mask_secrets_value(event, _known_secret_masks())
         line = json.dumps(event) + "\n"
@@ -1221,6 +2131,8 @@ def write_audit_event(event):
                 f.write(line)
     except Exception as e:
         logging.error(f"Could not write audit event to {AUDIT_LOG_FILE}: {e}")
+        return
+    queue_audit_export(event)
 
 
 def _audit(audit_enabled, client, action, targets, decision, reason, request_id):
@@ -1237,6 +2149,423 @@ def _audit(audit_enabled, client, action, targets, decision, reason, request_id)
     })
 
 
+# --- Audit export forwarder (policy ``auditExport``) ------------------------
+#
+# An ADDITIONAL sink for audit events that the local log already holds. Export
+# never computes a new event and never adds a field: it re-encodes the exact
+# masked object that ``write_audit_event`` just committed, so no payload body,
+# no response body, and no unmasked secret can reach a SIEM that the local log
+# does not already carry.
+#
+# Configuration is the ``auditExport`` policy map, merged per key across the
+# ``default`` and ``clients.<name>`` layers. ``format`` is jsonl, syslog, or
+# cef; ``destination`` is a local file path (jsonl/cef) or udp://host:port,
+# tcp://host:port, or a unix datagram socket path (syslog). Null or absent
+# disables export entirely.
+#
+# Fail closed and loud: a malformed control block, or a sink that refuses a
+# write, disables that sink for the life of the process after exactly one log
+# line and exactly one ``audit_export_unavailable`` audit event. Automation is
+# never blocked and never retried against a dead sink.
+#
+# Off the request path: the local append stays synchronous, then the masked
+# event is queued for one background daemon worker (see queue_audit_export), so
+# DNS, a slow TCP collector, or an NFS write costs the request thread nothing.
+
+AUDIT_EXPORT_FORMATS = ('jsonl', 'syslog', 'cef')
+
+# Bound on any network sink so a wedged collector cannot hold the export lock.
+AUDIT_EXPORT_TIMEOUT = 2.0
+
+# RFC 5424 framing constants. Facility local0 (16); severity 4 (warning) for
+# the deny/blackout class, 6 (informational) for everything else.
+_SYSLOG_FACILITY = 16
+_SYSLOG_SEVERITY_ALERT = 4
+_SYSLOG_SEVERITY_INFO = 6
+_SYSLOG_APP_NAME = 'chrome-bridge'
+_SYSLOG_SD_ID = 'chromeBridge@0'
+
+# ArcSight CEF header constants. The version field is the audit-export SCHEMA
+# version, not the product version: a receiver keys its field mapping off it.
+_CEF_VENDOR = 'ChromeBridge'
+_CEF_PRODUCT = 'NativeHost'
+_CEF_VERSION = '1.0'
+_CEF_SEVERITY_ALERT = 7
+_CEF_SEVERITY_INFO = 3
+
+# Fixed field order for syslog structured data, so a Python line and a Rust
+# line for the same event are byte-identical.
+_AUDIT_EXPORT_FIELDS = ('client', 'action', 'decision', 'reason', 'requestId', 'targets')
+
+# Key for the base (built-in + ``default``) export layer. Client names are
+# parsed from ``name:token`` lines, so a NUL can never collide with a real one.
+_POLICY_BASE_LAYER = '\x00'
+
+
+def audit_export_alerting(decision):
+    # Deny and blackout outcomes ride at the higher severity in both formats.
+    text = str(decision or '').lower()
+    return 'deny' in text or 'blackout' in text or 'unavailable' in text
+
+
+def _audit_export_scalar(value):
+    # Render one audit field. Absent/null/empty is "-"; a non-string leaf is
+    # rendered as compact JSON so both hosts agree byte for byte.
+    if value is None:
+        return '-'
+    if isinstance(value, str):
+        return value or '-'
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+
+
+def _audit_export_field(event, key):
+    value = event.get(key)
+    if key == 'targets':
+        if not isinstance(value, list) or not value:
+            return '-'
+        return ",".join(_audit_export_scalar(v) for v in value)
+    return _audit_export_scalar(value)
+
+
+def _audit_export_epoch_ms(event):
+    ts = event.get('ts')
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    return int(ts)
+
+
+def _syslog_timestamp(event):
+    ms = _audit_export_epoch_ms(event)
+    if ms is None:
+        return '-'
+    seconds, millis = divmod(ms, 1000)
+    return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(seconds)) + f".{millis:03d}Z"
+
+
+def _syslog_escape(text):
+    # RFC 5424 6.3.3: only these three characters are escaped in PARAM-VALUE.
+    return text.replace('\\', '\\\\').replace('"', '\\"').replace(']', '\\]')
+
+
+def _syslog_msgid(action):
+    # MSGID is PRINTUSASCII, capped so a long action cannot unbalance the line.
+    safe = ''.join(ch for ch in str(action or '') if 33 <= ord(ch) <= 126)
+    return safe[:32] or '-'
+
+
+def _cef_header_escape(text):
+    return (text.replace('\\', '\\\\').replace('|', '\\|')
+            .replace('\n', ' ').replace('\r', ' '))
+
+
+def _cef_value_escape(text):
+    return (text.replace('\\', '\\\\').replace('=', '\\=')
+            .replace('\n', '\\n').replace('\r', '\\n'))
+
+
+def format_audit_export_line(fmt, event):
+    # One export line for one audit event, without a trailing newline. Reads
+    # only fields the audit log already carries.
+    if fmt == 'jsonl':
+        return json.dumps(event, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    fields = {key: _audit_export_field(event, key) for key in _AUDIT_EXPORT_FIELDS}
+    alerting = audit_export_alerting(event.get('decision'))
+    if fmt == 'syslog':
+        pri = _SYSLOG_FACILITY * 8 + (
+            _SYSLOG_SEVERITY_ALERT if alerting else _SYSLOG_SEVERITY_INFO)
+        data = " ".join(f'{key}="{_syslog_escape(fields[key])}"'
+                        for key in _AUDIT_EXPORT_FIELDS)
+        return (f"<{pri}>1 {_syslog_timestamp(event)} - {_SYSLOG_APP_NAME} - "
+                f"{_syslog_msgid(event.get('action'))} [{_SYSLOG_SD_ID} {data}]")
+    if fmt == 'cef':
+        ms = _audit_export_epoch_ms(event)
+        header = "|".join((
+            "CEF:0", _CEF_VENDOR, _CEF_PRODUCT, _CEF_VERSION,
+            _cef_header_escape(fields['decision']),
+            _cef_header_escape(fields['action']),
+            str(_CEF_SEVERITY_ALERT if alerting else _CEF_SEVERITY_INFO),
+        ))
+        extension = " ".join((
+            f"rt={_cef_value_escape('-' if ms is None else str(ms))}",
+            f"suser={_cef_value_escape(fields['client'])}",
+            f"act={_cef_value_escape(fields['action'])}",
+            f"outcome={_cef_value_escape(fields['decision'])}",
+            f"externalId={_cef_value_escape(fields['requestId'])}",
+            f"reason={_cef_value_escape(fields['reason'])}",
+            "cs1Label=targets",
+            f"cs1={_cef_value_escape(fields['targets'])}",
+        ))
+        return f"{header}|{extension}"
+    raise ValueError(f"unknown auditExport format {fmt}")
+
+
+def normalize_audit_export(config):
+    # (normalized, error). Fail closed: anything present but malformed returns
+    # an error and disables export rather than falling back to a looser sink.
+    if config is None:
+        return None, None
+    if not isinstance(config, dict):
+        return None, "auditExport must be an object"
+    fmt = config.get('format')
+    destination = config.get('destination')
+    if fmt is None and destination is None:
+        return None, None
+    if not isinstance(fmt, str) or fmt not in AUDIT_EXPORT_FORMATS:
+        return None, "auditExport.format must be one of " + ", ".join(AUDIT_EXPORT_FORMATS)
+    if not isinstance(destination, str) or not destination.strip():
+        return None, "auditExport.destination must be a non-empty string"
+    rotate = config.get('rotateBytes')
+    if rotate is not None and (isinstance(rotate, bool) or not isinstance(rotate, int)
+                               or rotate <= 0):
+        return None, "auditExport.rotateBytes must be a positive integer"
+    retain = config.get('retainDays')
+    if retain is not None and (isinstance(retain, bool)
+                               or not isinstance(retain, (int, float)) or retain <= 0):
+        return None, "auditExport.retainDays must be a positive number"
+    destination = destination.strip()
+    return {
+        'format': fmt,
+        'destination': destination,
+        'rotateBytes': rotate,
+        'retainDays': retain,
+        'key': f"{fmt}|{destination}",
+    }, None
+
+
+# Serializes every export write (and therefore every rotation) under the
+# thread-per-connection model, exactly like _audit_write_lock does locally.
+# Separate from _audit_write_lock on purpose: a slow sink must never delay the
+# local append. Held only by the export worker thread now, never by a request
+# thread, so rotation and retention pruning also run off the request path.
+_audit_export_lock = threading.Lock()
+_audit_export_state_lock = threading.Lock()
+_audit_export_layers = {}    # policy layer name -> normalized config or None
+_audit_export_disabled = set()  # sink keys already disabled for this process
+
+# Bounded hand-off from the request thread to the single export worker. One
+# FIFO queue drained by one worker, so events reach the sink in exactly the
+# order they were appended locally. Each queue entry is an immutable
+# ``(event, config)`` snapshot: the sink is resolved ONCE, on the request
+# thread, and the worker forwards to exactly that sink. A policy reload while
+# events are queued therefore can neither reroute an already-authorized event
+# to a destination configured later nor drop it. When the queue is full the
+# NEWEST event is dropped (the same choice the OTLP exporter makes) and
+# counted: the local audit log still holds every event, so a drop costs
+# completeness of the mirror, never of the record. The queue and its thread are
+# created on the first event that actually has a sink, so a host with no
+# auditExport starts no thread.
+AUDIT_EXPORT_QUEUE_MAX = 1024
+_audit_export_queue = None
+_audit_export_queue_lock = threading.Lock()
+_audit_export_dropped = 0
+
+
+def prime_audit_export(policy):
+    # Resolve the merged auditExport for the base layer and every named client
+    # at policy load time. Sinks already disabled stay disabled: a reload must
+    # not silently re-arm a destination that already failed this process.
+    layers = {}
+    errors = []
+    for name in (_POLICY_BASE_LAYER, *(policy.get("clients") or {})):
+        normalized, error = normalize_audit_export(
+            policy_for_client(policy, name).get('auditExport'))
+        layers[name] = normalized
+        if error:
+            errors.append((name, error))
+    with _audit_export_state_lock:
+        _audit_export_layers.clear()
+        _audit_export_layers.update(layers)
+    for name, error in errors:
+        label = 'default' if name == _POLICY_BASE_LAYER else name
+        with _audit_export_state_lock:
+            if f"config|{label}" in _audit_export_disabled:
+                continue
+            _audit_export_disabled.add(f"config|{label}")
+        logging.error(f"Disabling auditExport for policy layer {label}: {error}")
+        write_audit_event({
+            "ts": now_ms(),
+            "client": None if name == _POLICY_BASE_LAYER else name,
+            "action": "auditExport",
+            "targets": [label],
+            "decision": "audit_export_unavailable",
+            "reason": error,
+            "requestId": None,
+        })
+
+
+def audit_export_sink(client):
+    # The sink for the client this event is attributed to, falling back to the
+    # base layer for host-level events that name no client.
+    with _audit_export_state_lock:
+        if isinstance(client, str) and client in _audit_export_layers:
+            return _audit_export_layers[client]
+        return _audit_export_layers.get(_POLICY_BASE_LAYER)
+
+
+def _audit_export_rotate(config, pending_bytes):
+    # Single-generation rotation, no compression. retainDays prunes an existing
+    # <destination>.1 older than the window before the new one replaces it, so a
+    # rotated generation never outlives the retention window.
+    rotate = config.get('rotateBytes')
+    if not rotate:
+        return
+    path = config['destination']
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size + pending_bytes <= rotate:
+        return
+    rotated = path + '.1'
+    retain = config.get('retainDays')
+    if retain:
+        mtime = _file_mtime(rotated)
+        if mtime is not None and (time.time() - mtime) > retain * 86400:
+            try:
+                os.remove(rotated)
+            except OSError:
+                pass
+    os.replace(path, rotated)
+
+
+def _audit_export_syslog(destination, line):
+    data = line.encode('utf-8')
+    for scheme in ('udp', 'tcp'):
+        prefix = scheme + '://'
+        if not destination.startswith(prefix):
+            continue
+        host, sep, port = destination[len(prefix):].rpartition(':')
+        if not sep or not host:
+            raise ValueError(f"syslog destination must be {prefix}host:port")
+        host = host.strip('[]')
+        kind = socket.SOCK_DGRAM if scheme == 'udp' else socket.SOCK_STREAM
+        family, socktype, proto, _canon, addr = socket.getaddrinfo(
+            host, int(port), 0, kind)[0]
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(AUDIT_EXPORT_TIMEOUT)
+            if scheme == 'tcp':
+                # RFC 6587 non-transparent framing: one LF-delimited message.
+                sock.connect(addr)
+                sock.sendall(data + b"\n")
+            else:
+                sock.sendto(data, addr)
+        finally:
+            sock.close()
+        return
+    if not hasattr(socket, 'AF_UNIX'):
+        raise ValueError("unix socket syslog destinations are unsupported on this platform")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(AUDIT_EXPORT_TIMEOUT)
+        sock.sendto(data, destination)
+    finally:
+        sock.close()
+
+
+def audit_export_emit(config, line):
+    if config['format'] == 'syslog':
+        _audit_export_syslog(config['destination'], line)
+        return
+    data = (line + "\n").encode('utf-8')
+    _audit_export_rotate(config, len(data))
+    with open(config['destination'], 'ab') as f:
+        f.write(data)
+
+
+def queue_audit_export(event):
+    # Hand one already-written, already-masked audit event to the export worker.
+    # Runs on the REQUEST thread, so it must never do I/O: the only work here is
+    # resolving the sink and a non-blocking put. The resolved config travels
+    # WITH the event, so the worker never re-resolves the sink and a policy
+    # reload cannot reroute a queued event. The nested
+    # ``audit_export_unavailable`` write below re-enters this function from the
+    # worker, but the sink is already marked disabled by then, so it returns at
+    # the disabled check and nothing recurses.
+    global _audit_export_queue, _audit_export_dropped
+    config = audit_export_sink(event.get('client'))
+    if config is None:
+        return
+    with _audit_export_state_lock:
+        if config['key'] in _audit_export_disabled:
+            return
+    with _audit_export_queue_lock:
+        if _audit_export_queue is None:
+            _audit_export_queue = queue.Queue(maxsize=AUDIT_EXPORT_QUEUE_MAX)
+            threading.Thread(target=_audit_export_loop, daemon=True).start()
+        pending = _audit_export_queue
+    try:
+        # dict(config) freezes the snapshot: prime_audit_export replaces layer
+        # entries wholesale, but copying costs nothing and keeps the queued
+        # config provably immune to any future in-place edit.
+        pending.put_nowait((event, dict(config)))
+    except queue.Full:
+        with _audit_export_queue_lock:
+            _audit_export_dropped += 1
+            dropped = _audit_export_dropped
+        if dropped == 1:
+            logging.error(
+                f"auditExport queue full ({AUDIT_EXPORT_QUEUE_MAX} events); dropping the "
+                "newest events (further drops silent). The local audit log still holds "
+                "every event.")
+
+
+def _audit_export_loop():
+    # One worker draining one FIFO queue: sink order equals local append order.
+    while True:
+        event, config = _audit_export_queue.get()
+        try:
+            forward_audit_export(event, config)
+        except Exception as e:
+            logging.error(f"auditExport worker error: {e}")
+
+
+def forward_audit_export(event, config):
+    # Mirror one already-written, already-masked audit event to the sink that
+    # was in force when the event was produced. ``config`` is the snapshot the
+    # request thread enqueued, never a freshly resolved sink: an event is
+    # delivered to the destination that authorized it, or not at all. Runs on
+    # the export worker thread, only AFTER the local append succeeded, so every
+    # blocking step below is off the request path.
+    key = config['key']
+    with _audit_export_state_lock:
+        if key in _audit_export_disabled:
+            return
+    failure = None
+    try:
+        line = format_audit_export_line(config['format'], event)
+    except Exception as e:
+        failure = str(e)
+    if failure is None:
+        with _audit_export_lock:
+            with _audit_export_state_lock:
+                if key in _audit_export_disabled:
+                    return
+            try:
+                audit_export_emit(config, line)
+            except Exception as e:
+                failure = str(e)
+    if failure is None:
+        return
+    with _audit_export_state_lock:
+        if key in _audit_export_disabled:
+            return
+        _audit_export_disabled.add(key)
+    logging.error(
+        f"Disabling auditExport sink {config['format']} -> {config['destination']}: {failure}")
+    # The sink is already marked dead, so this event's own forward is a no-op:
+    # exactly one audit_export_unavailable per sink, never a recursion.
+    write_audit_event({
+        "ts": now_ms(),
+        "client": event.get('client'),
+        "action": "auditExport",
+        "targets": [config['destination']],
+        "decision": "audit_export_unavailable",
+        "reason": failure,
+        "requestId": None,
+    })
+
+
 # --- Session trace artifacts (policy ``traceDir``) --------------------------
 #
 # When a policy layer sets ``traceDir``, the host appends exactly one JSONL
@@ -1247,7 +2576,7 @@ def _audit(audit_enabled, client, action, targets, decision, reason, request_id)
 # change" without ever storing what was read, typed, or returned. No payload
 # body, no response body, no tokens.
 
-TRACE_SESSION_ACTIONS = {'createTaskSession', 'navigateTaskSession', 'closeTaskSession'}
+TRACE_SESSION_ACTIONS = {'createTaskSession', 'navigateTaskSession', 'navigateAndSnapshot', 'closeTaskSession'}
 
 # Trace file names are derived from caller-supplied ids, so everything outside
 # this set collapses to "_" and the name is capped: a traceId can never escape
@@ -1259,7 +2588,7 @@ _TRACE_ID_MAX = 80
 # Response keys whose array values are an observe snapshot (or its diff). Their
 # hash lets a reader tell "the page changed" from "the page is unchanged"
 # without the snapshot itself ever being written.
-_TRACE_SNAPSHOT_KEYS = ('nodes', 'snapshot', 'diff')
+_TRACE_SNAPSHOT_KEYS = ('nodes', 'snapshot', 'diff', 'observe')
 
 _trace_write_lock = threading.Lock()
 
@@ -1366,18 +2695,21 @@ def trace_request(policy, client, action, payload, response, decision, reason,
     # Exactly one event per fully-processed, trace-eligible request. Secret
     # masking is applied before hashing and before anything is written, so a
     # known credential cannot reach the artifact even through a hash preimage.
-    if policy is None or not client:
-        return
-    trace_dir = trace_dir_for(policy, client)
-    if not trace_dir:
-        return
-    trace_id = trace_id_for(action, payload, response)
-    if not trace_id:
+    #
+    # This is also the single terminal hook for the opt-in OpenTelemetry span
+    # (see below): the span is emitted for every fully-processed request, even
+    # when no traceDir is configured, and when both are on the artifact carries
+    # the span's ids so a local JSONL line and an exported span correlate.
+    trace_dir = trace_dir_for(policy, client) if policy is not None and client else None
+    trace_id = trace_id_for(action, payload, response) if (trace_dir or OTEL_ENABLED) else None
+    otel = otel_finish_request(client, action, payload, response, decision,
+                               request_id, trace_id)
+    if not trace_dir or not trace_id:
         return
     secrets = _known_secret_masks()
     safe_response = mask_secrets_value(response, secrets) if isinstance(response, dict) else {}
     snapshot = trace_snapshot_subobject(safe_response)
-    write_trace_event(trace_dir, trace_id, {
+    event = {
         "ts": now_ms(),
         "client": client,
         "action": action,
@@ -1390,7 +2722,292 @@ def trace_request(policy, client, action, payload, response, decision, reason,
         "responseHash": trace_hash(safe_response),
         "snapshotHash": trace_hash(snapshot) if snapshot is not None else None,
         "success": bool(safe_response.get("success")) if isinstance(safe_response, dict) else False,
-    })
+    }
+    if otel is not None:
+        event["otelTraceId"], event["otelSpanId"] = otel
+    write_trace_event(trace_dir, trace_id, event)
+
+
+# --- OpenTelemetry spans (opt-in, process-level configuration) --------------
+#
+# Off by default and inert. With BRIDGE_OTEL_ENABLED unset nothing below runs,
+# no extra module is imported, no file is opened, and no socket is created; the
+# request path is the same one an untraced host takes. This is process-level
+# configuration, NOT policy: a policy layer cannot switch tracing on for one
+# client, and tracing can never change a policy decision.
+#
+# What a span carries: the action name, the resolved client name, the host
+# decision, the effective action tier, the duration, how many tab ids the
+# request touched, success, the host-generated request id, and the session
+# trace id. What a span NEVER carries: request payloads, response bodies, page
+# content, cookies, storage values, tokens, confirmation tokens, credential
+# values, selectors, or URLs. No attribute value is copied out of a payload or
+# an extension response except the caller's own trace/session id, and every
+# string attribute is run through the same secretMaskFile masking the audit log
+# uses before it is exported.
+
+OTEL_ENABLED = os.environ.get('BRIDGE_OTEL_ENABLED', '').strip().lower() in (
+    '1', 'true', 'yes', 'on')
+OTEL_ENDPOINT = os.environ.get('BRIDGE_OTEL_ENDPOINT', '').strip()
+# Local span sink. The endpoint is the network sink; this is the offline one,
+# used for contract tests and for looking at spans with no collector running.
+OTEL_FILE = os.environ.get('BRIDGE_OTEL_FILE', '').strip()
+OTEL_SERVICE_NAME = os.environ.get('BRIDGE_OTEL_SERVICE_NAME', '').strip() or 'chrome-bridge'
+OTEL_EXPORT_TIMEOUT_SECONDS = 2.0
+OTEL_EXPORT_QUEUE_MAX = 256
+
+# OTLP enum values, inlined so no SDK is required to produce a valid document.
+_OTEL_KIND_INTERNAL = 1
+_OTEL_KIND_SERVER = 2
+_OTEL_STATUS_OK = 1
+_OTEL_STATUS_ERROR = 2
+
+_TRACEPARENT_RE = re.compile(r'^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$')
+_OTEL_ZERO_TRACE = '0' * 32
+_OTEL_ZERO_SPAN = '0' * 16
+
+# Per-connection-thread request context. Each socket connection is served by
+# one thread, so a thread local scopes a request span without threading a
+# context object through the whole request pipeline.
+_otel_local = threading.local()
+_otel_file_lock = threading.Lock()
+_otel_queue = None
+_otel_queue_lock = threading.Lock()
+_otel_export_disabled = False
+
+
+def parse_traceparent(value):
+    # (trace_id, parent_span_id) from a W3C traceparent header/field, or None
+    # when absent or malformed. An unparsable value starts a fresh trace rather
+    # than failing the request.
+    if not isinstance(value, str):
+        return None
+    match = _TRACEPARENT_RE.match(value.strip().lower())
+    if not match:
+        return None
+    version, trace_id, span_id, _flags = match.groups()
+    if version == 'ff' or trace_id == _OTEL_ZERO_TRACE or span_id == _OTEL_ZERO_SPAN:
+        return None
+    return trace_id, span_id
+
+
+def _otel_id(n_bytes):
+    return os.urandom(n_bytes).hex()
+
+
+def otel_begin_request(traceparent=None):
+    # Open the request span for this thread, continuing the caller's trace when
+    # it sent a traceparent and starting a new root trace otherwise. The client
+    # and action are supplied at close time, so a confirmation resume (which
+    # replaces both) still reports as one span with one start time.
+    if not OTEL_ENABLED:
+        return
+    parsed = parse_traceparent(traceparent)
+    trace_id, parent_span_id = parsed if parsed else (_otel_id(16), None)
+    _otel_local.ctx = {
+        "traceId": trace_id,
+        "spanId": _otel_id(8),
+        "parentSpanId": parent_span_id,
+        "startNs": time.time_ns(),
+        "children": [],
+    }
+
+
+class _OtelChildSpan:
+    """Times one child span and records it on this thread's request context."""
+
+    __slots__ = ("name", "start_ns")
+
+    def __init__(self, name):
+        self.name = name
+        self.start_ns = time.time_ns()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        ctx = getattr(_otel_local, "ctx", None)
+        if ctx is not None:
+            ctx["children"].append((self.name, self.start_ns, time.time_ns()))
+        return False
+
+
+class _OtelNoSpan:
+    """The disabled path: a shared no-op so `with` costs nothing measurable."""
+
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+_OTEL_NO_SPAN = _OtelNoSpan()
+
+
+def otel_span(name):
+    if not OTEL_ENABLED or getattr(_otel_local, "ctx", None) is None:
+        return _OTEL_NO_SPAN
+    return _OtelChildSpan(name)
+
+
+def _otel_attr(key, value):
+    if isinstance(value, bool):
+        return {"key": key, "value": {"boolValue": value}}
+    if isinstance(value, int):
+        return {"key": key, "value": {"intValue": str(value)}}
+    if isinstance(value, float):
+        return {"key": key, "value": {"doubleValue": value}}
+    return {"key": key, "value": {"stringValue": str(value)}}
+
+
+def _otel_attrs(pairs, secrets):
+    # Drop absent attributes and mask every string before it leaves the host.
+    out = []
+    for key, value in pairs:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = mask_secret_text(value, secrets)
+        out.append(_otel_attr(key, value))
+    return out
+
+
+def otel_finish_request(client, action, payload, response, decision, request_id,
+                        session_trace_id):
+    # Close the request span, emit it with its children, and return
+    # (traceId, spanId) so the session trace artifact can name the same span.
+    # Returns None when telemetry is off, which keeps the artifact and the
+    # response byte-identical to an untraced host.
+    ctx = getattr(_otel_local, "ctx", None)
+    if not OTEL_ENABLED or ctx is None:
+        return None
+    _otel_local.ctx = None
+    end_ns = time.time_ns()
+    secrets = _known_secret_masks()
+    success = bool(response.get("success")) if isinstance(response, dict) else False
+    targets = trace_targets(action, payload, response if isinstance(response, dict) else {})
+    span = {
+        # OpenTelemetry GenAI tool-execution convention for the span name and
+        # gen_ai.* attributes; everything host-specific lives under bridge.*.
+        "traceId": ctx["traceId"],
+        "spanId": ctx["spanId"],
+        "name": f"execute_tool {action}" if action else "execute_tool",
+        "kind": _OTEL_KIND_SERVER,
+        "startTimeUnixNano": str(ctx["startNs"]),
+        "endTimeUnixNano": str(end_ns),
+        "attributes": _otel_attrs([
+            ("gen_ai.tool.name", action),
+            ("gen_ai.tool.type", "extension"),
+            ("bridge.action", action),
+            ("bridge.client", client),
+            ("bridge.decision", decision),
+            ("bridge.effective_tier", effective_action_tier(action, payload)),
+            ("bridge.duration_ms", int((end_ns - ctx["startNs"]) // 1_000_000)),
+            ("bridge.tab_id_count", len(targets)),
+            ("bridge.success", success),
+            ("bridge.request_id", request_id),
+            ("bridge.trace_id", session_trace_id),
+            ("bridge.host", "python"),
+        ], secrets),
+        "status": {"code": _OTEL_STATUS_OK if success else _OTEL_STATUS_ERROR},
+    }
+    if ctx["parentSpanId"]:
+        span["parentSpanId"] = ctx["parentSpanId"]
+    spans = [span]
+    for name, start_ns, child_end_ns in ctx["children"]:
+        spans.append({
+            "traceId": ctx["traceId"],
+            "spanId": _otel_id(8),
+            "parentSpanId": ctx["spanId"],
+            "name": name,
+            "kind": _OTEL_KIND_INTERNAL,
+            "startTimeUnixNano": str(start_ns),
+            "endTimeUnixNano": str(child_end_ns),
+            "attributes": _otel_attrs([
+                ("bridge.action", action),
+                ("bridge.duration_ms", int((child_end_ns - start_ns) // 1_000_000)),
+            ], secrets),
+            "status": {"code": _OTEL_STATUS_OK},
+        })
+    otel_export(spans)
+    return ctx["traceId"], ctx["spanId"]
+
+
+def otel_resource_attributes():
+    return [
+        _otel_attr("service.name", OTEL_SERVICE_NAME),
+        _otel_attr("telemetry.sdk.name", "chrome-bridge"),
+        _otel_attr("telemetry.sdk.language", "python"),
+    ]
+
+
+def otel_export(spans):
+    # Best effort, exactly like an audit-log write failure: one log line, then
+    # the request continues. A broken sink is disabled for the rest of the
+    # process so it cannot cost every later request a retry.
+    global _otel_export_disabled
+    if not spans or _otel_export_disabled:
+        return
+    try:
+        encoded = json.dumps({"resourceSpans": [{
+            "resource": {"attributes": otel_resource_attributes()},
+            "scopeSpans": [{"scope": {"name": "chrome-bridge.host"}, "spans": spans}],
+        }]})
+        if OTEL_FILE:
+            with _otel_file_lock:
+                with open(OTEL_FILE, 'a') as f:
+                    f.write(encoded + "\n")
+        if OTEL_ENDPOINT:
+            _otel_enqueue(encoded)
+    except Exception as e:
+        _otel_export_disabled = True
+        logging.error(f"OpenTelemetry export disabled after failure: {e}")
+
+
+def _otel_enqueue(encoded):
+    # The OTLP POST runs on a background daemon thread, so a slow or dead
+    # collector can never add latency to a browser request. A full queue drops
+    # the oldest-possible document rather than blocking.
+    global _otel_queue
+    with _otel_queue_lock:
+        if _otel_queue is None:
+            _otel_queue = queue.Queue(maxsize=OTEL_EXPORT_QUEUE_MAX)
+            threading.Thread(target=_otel_export_loop, daemon=True).start()
+    try:
+        _otel_queue.put_nowait(encoded)
+    except queue.Full:
+        pass
+
+
+def _otel_export_loop():
+    logged = False
+    while True:
+        encoded = _otel_queue.get()
+        try:
+            _otel_post(encoded)
+        except Exception as e:
+            if not logged:
+                logged = True
+                logging.error(f"OpenTelemetry OTLP export failed (further failures silent): {e}")
+
+
+def _otel_post(encoded):
+    # Lazy import: with telemetry off (or with no endpoint) urllib.request is
+    # never imported, so the disabled path adds no import cost. No
+    # opentelemetry SDK is required -- the document below IS the OTLP/HTTP JSON
+    # wire format, so a collector needs nothing else installed here.
+    import urllib.request
+    url = OTEL_ENDPOINT
+    if '/v1/traces' not in url:
+        url = url.rstrip('/') + '/v1/traces'
+    request = urllib.request.Request(
+        url, data=encoded.encode('utf-8'),
+        headers={"Content-Type": "application/json"}, method='POST')
+    with urllib.request.urlopen(request, timeout=OTEL_EXPORT_TIMEOUT_SECONDS) as resp:
+        resp.read()
 
 
 _REDACT_KEY_SUBSTRINGS = ('token', 'secret', 'password', 'cookie', 'session', 'csrf', 'auth')
@@ -1531,6 +3148,7 @@ def _redact_response_patterns(action, response, redact_enabled, patterns=None, p
     if action in (
         'getHTML', 'extractText', 'executeScript', 'executeScriptCDP',
         'searchTabs', 'extractStructured', 'scanPromptInjection', 'consoleMessages',
+        'observe', 'getCurrentState', 'navigateAndSnapshot',
     ):
         compiled = _compile_patterns(patterns)
         if not compiled:
@@ -1632,10 +3250,15 @@ def handle_socket_client(client_socket):
             # Request-level dry run: never forwarded to the extension, and never
             # left in the command even when false.
             dry_run = cmd.pop("dryRun", None) is True
+            # W3C trace context: a caller may name the trace this request belongs
+            # to. Host-only, like the token and dryRun, so it is stripped before
+            # anything is forwarded to the extension.
+            traceparent = cmd.pop("traceparent", None)
 
             action = cmd.get("action")
             trace_ctx.update({"client": name, "action": action,
                               "payload": cmd.get("payload") or {}, "started": now_ms()})
+            otel_begin_request(traceparent)
 
             # Dry run stops before any state change: no confirmation resume, no
             # lease acquisition, no interactive origin approval, no tab-origin
@@ -1664,6 +3287,12 @@ def handle_socket_client(client_socket):
                     verdict["allowed"] = False
                     verdict["reason"] = HANDOFF_BLACKOUT_ERROR
                     verdict["blackout"] = True
+                # A handoff nested in a composite is refused outright, so the
+                # dry run must report the same verdict the real request meets.
+                nested_handoff = composite_handoff_reason(action, cmd.get("payload") or {})
+                if nested_handoff:
+                    verdict["allowed"] = False
+                    verdict["reason"] = nested_handoff
                 # Host-answered actions resolve without Chrome, so they would
                 # never forward even when fully allowed.
                 host_side = action in ('lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo', 'confirm')
@@ -1777,6 +3406,9 @@ def handle_socket_client(client_socket):
                     "audit": audit_enabled,
                     "originDependent": origin_dependent,
                     "siteMode": resolve_site_mode(policy_for_client(policy, name), targets),
+                    "effectiveTier": effective_action_tier(target_action, target_payload),
+                    "dlp": resolve_dlp_mode(policy_for_client(policy, name),
+                                            dlp_channel_for_action(target_action)),
                 }}
                 _audit(audit_enabled, name, "policyCheck", targets, "allow", None, None)
                 respond(resp, "allow")
@@ -1796,6 +3428,7 @@ def handle_socket_client(client_socket):
                     "policyFile": POLICY_FILE,
                     "policyFileExists": os.path.exists(POLICY_FILE),
                     "auditLogFile": AUDIT_LOG_FILE,
+                    "policyBundle": policy_bundle_info(),
                     "traceDir": trace_dir_for(policy, name),
                     "client": name,
                 }}
@@ -1819,13 +3452,26 @@ def handle_socket_client(client_socket):
                 }, "handoff_blackout", HANDOFF_BLACKOUT_ERROR)
                 continue
 
+            # A handoff nested in a composite is refused outright (see
+            # composite_handoff_reason): the composite's later steps run inside
+            # the extension, so no blackout could cover them. Denied here, before
+            # policy evaluation, so nothing is forwarded.
+            nested_handoff = composite_handoff_reason(action, payload)
+            if nested_handoff:
+                _audit(audit_enabled, name, action, [], "deny", nested_handoff, None)
+                respond({"success": False, "error": f"policy denied: {nested_handoff}",
+                         "policyDenial": policy_denial(nested_handoff, action, [], name, policy, payload)},
+                        "deny", nested_handoff)
+                continue
+
             # Host-enforced policy, phase 1: action-level and payload-target
             # checks that need no extension round-trip. Plain policy denial still
             # wins over leases for payload-determined targets, but interactive
             # origin approval is deferred behind lease ownership so a non-owner
             # cannot pop UI or mutate policy for an action that cannot run.
-            allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
-                policy, name, action, payload)
+            with otel_span("bridge.policy_evaluate"):
+                allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
+                    policy, name, action, payload)
             if not allowed and reason == "target not allowed" and _policy_approval_enabled():
                 with lease_lock:
                     owner, _ = _lease_status_locked()
@@ -1842,7 +3488,7 @@ def handle_socket_client(client_socket):
             if not allowed:
                 _audit(audit_enabled, name, action, targets, "deny", reason, None)
                 respond({"success": False, "error": f"policy denied: {reason}",
-                         "policyDenial": policy_denial(reason, action, targets, name, policy)},
+                         "policyDenial": policy_denial(reason, action, targets, name, policy, payload)},
                         "deny", reason)
                 continue
 
@@ -1876,7 +3522,7 @@ def handle_socket_client(client_socket):
                     targets = targets + ["<unresolved-origin>"]
                     _audit(audit_enabled, name, action, targets, "deny", "tab origin unresolved", None)
                     respond({"success": False, "error": "policy denied: tab origin unresolved",
-                             "policyDenial": policy_denial("tab origin unresolved", action, targets, name, policy)},
+                             "policyDenial": policy_denial("tab origin unresolved", action, targets, name, policy, payload)},
                             "deny", "tab origin unresolved")
                     continue
                 allowed, reason, confirm, redact_enabled, audit_enabled, targets = evaluate_policy(
@@ -1890,7 +3536,7 @@ def handle_socket_client(client_socket):
                 if not allowed:
                     _audit(audit_enabled, name, action, targets, "deny", reason, None)
                     respond({"success": False, "error": f"policy denied: {reason}",
-                             "policyDenial": policy_denial(reason, action, targets, name, policy)},
+                             "policyDenial": policy_denial(reason, action, targets, name, policy, payload)},
                             "deny", reason)
                     continue
 
@@ -1931,22 +3577,42 @@ def handle_socket_client(client_socket):
                         "lease_deny", f"leased by {owner}")
                 continue
 
+            # DLP: record the permitted channels and stamp the enforcing modes on
+            # the envelope. Runs once, here, after every gate and before the
+            # forward, so a request that never reaches Chrome never claims an
+            # audited transfer and one request writes at most one dlp_audit event.
+            _dlp_cp = policy_for_client(policy, name)
+            _dlp_audited = dlp_channels_in_mode(_dlp_cp, action, payload, 'audit')
+            if _dlp_audited:
+                # Channel names only: never a file name, a path, or frame data.
+                _audit(audit_enabled, name, action, targets, DLP_AUDIT_DECISION,
+                       ",".join(_dlp_audited), None)
+            # The extension refuses a blocked channel independently (see
+            # background.js dlpRefusal), so the host always overwrites this field:
+            # a client cannot loosen it by supplying its own.
+            _dlp_modes = dlp_modes_for_client(_dlp_cp)
+            if _dlp_modes:
+                cmd["dlp"] = _dlp_modes
+            else:
+                cmd.pop("dlp", None)
+
             # Send to extension, then block this connection until its response.
             # Most actions resolve well within SOCKET_IDLE_TIMEOUT, but waits and
             # human-handoff carry a payload timeoutMs that can exceed it; cover
             # that window (plus headroom) so the host does not time out before
             # the extension legitimately finishes.
             # Audit "allow" with the generated id before the action is forwarded.
-            # A waitForHandoff forward opens a telemetry blackout for the whole
+            # A handoff forward (see HANDOFF_ACTIONS) opens a blackout for the whole
             # time the human is interacting with the tab; the finally releases it
             # on every exit path (response, extension error, or timeout).
             handoff_handle = None
-            if action == 'waitForHandoff':
+            if action in HANDOFF_ACTIONS:
                 handoff_handle = register_handoff(handoff_tab_id(payload), name)
             try:
-                req_id, response = forward_to_extension(
-                    cmd, resp_timeout,
-                    on_registered=lambda rid: _audit(audit_enabled, name, action, targets, "allow", None, rid))
+                with otel_span("bridge.extension_forward"):
+                    req_id, response = forward_to_extension(
+                        cmd, resp_timeout,
+                        on_registered=lambda rid: _audit(audit_enabled, name, action, targets, "allow", None, rid))
             finally:
                 clear_handoff(handoff_handle)
             if response is None:
@@ -1992,7 +3658,7 @@ def socket_server_loop():
     while True:
         try:
             client_sock, addr = server.accept()
-            logging.info(f"Accepted connection from {addr}")
+            logging.debug("Accepted connection from %s", addr)
             t = threading.Thread(target=handle_socket_client, args=(client_sock,), daemon=True)
             t.start()
         except Exception as e:
@@ -2012,6 +3678,13 @@ def main():
     while True:
         try:
             msg = read_message()
+            if msg.get("action") == "hostHandshake" and not msg.get("id"):
+                write_message({
+                    "action": "hostAcknowledged",
+                    "protocolVersion": 1,
+                })
+                logging.debug("Acknowledged extension native-host handshake.")
+                continue
             # If the extension sent a response to a command we initiated
             msg_id = msg.get("id")
             if msg_id:
@@ -2024,7 +3697,7 @@ def main():
                 else:
                     logging.info(f"Received message with ID {msg_id} but no pending request was found.")
             else:
-                logging.info(f"Received message from Chrome with no ID: {msg}")
+                logging.debug("Received message from Chrome with no ID: %s", msg)
         except Exception as e:
             logging.error(f"Error in main loop: {e}", exc_info=True)
             break

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import glob
+import hashlib
 import json
 import os
 import re
@@ -116,8 +117,39 @@ def parse_observe_args(args):
 # Chrome. Set once in main() and applied to every request this process sends.
 DRY_RUN = False
 
+# Global ``--traceparent <value>``: a W3C trace-context header value naming the
+# trace this run belongs to. The host continues that trace when its opt-in
+# OpenTelemetry spans are enabled (BRIDGE_OTEL_ENABLED) and otherwise ignores
+# it; either way the field is stripped host-side and never reaches Chrome.
+TRACEPARENT = None
 
-def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False):
+
+def env_float(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def response_timeout_seconds(read_timeout_ms=None):
+    """Keep the wire read deadline beyond broker and extension deadlines."""
+    broker_timeout = env_float("BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS", 10.0)
+    configured = os.environ.get("BRIDGE_RESPONSE_TIMEOUT_SECONDS")
+    if configured is None:
+        timeout = max(15.0, broker_timeout + 5.0)
+    else:
+        timeout = env_float("BRIDGE_RESPONSE_TIMEOUT_SECONDS", max(15.0, broker_timeout + 5.0))
+    if isinstance(read_timeout_ms, (int, float)) and read_timeout_ms > 0:
+        timeout = max(timeout, read_timeout_ms / 1000 + 10.0)
+    return timeout
+
+
+def send_command_data(
+        action, payload=None, read_timeout_ms=None, confirmation_token=None,
+        dry_run=False, connect_timeout_seconds=None, response_timeout_seconds_override=None):
     if payload is None:
         payload = {}
 
@@ -135,7 +167,16 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         return 2, None, "Error: could not read bridge token. Is bridge_token.txt present?"
 
     port = int(os.environ.get('BRIDGE_PORT', 9223))
-    retry_seconds = float(os.environ.get('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45))
+    retry_seconds = (
+        env_float('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45.0)
+        if connect_timeout_seconds is None
+        else max(0.0, float(connect_timeout_seconds))
+    )
+    response_timeout = (
+        response_timeout_seconds(read_timeout_ms)
+        if response_timeout_seconds_override is None
+        else max(0.1, float(response_timeout_seconds_override))
+    )
     deadline = time.monotonic() + retry_seconds
     sock = None
 
@@ -143,13 +184,11 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         while True:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(15)
+                sock.settimeout(min(15.0, max(0.1, response_timeout)))
                 sock.connect(('127.0.0.1', port))
-                # Connect uses a short timeout; the post-connect read can be much
-                # longer (e.g. human-handoff waits), with headroom over the
-                # extension-side deadline so the wire never times out first.
-                if read_timeout_ms is not None:
-                    sock.settimeout(max(15, read_timeout_ms / 1000 + 10))
+                # Use a post-connect deadline with headroom over both the broker's
+                # backend wait and any extension-side action deadline.
+                sock.settimeout(response_timeout)
                 break
             except ConnectionRefusedError:
                 try:
@@ -158,7 +197,7 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
                     pass
                 if time.monotonic() >= deadline:
                     raise
-                time.sleep(0.5)
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
         cmd = {
             "action": action,
@@ -167,6 +206,8 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         }
         if DRY_RUN or dry_run:
             cmd["dryRun"] = True
+        if TRACEPARENT:
+            cmd["traceparent"] = TRACEPARENT
         if isinstance(confirmation_token, str) and confirmation_token:
             cmd["confirmationToken"] = confirmation_token
         sock.sendall((json.dumps(cmd) + "\n").encode('utf-8'))
@@ -189,9 +230,9 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         return 1, None, "Received empty response from bridge."
     except socket.timeout:
         return 124, None, (
-            "Error: timed out waiting for the extension to respond. "
-            "Is the extension's service worker active? Open chrome://extensions, "
-            f"click 'service worker' to wake it, then check {os.path.join(SCRIPT_DIR, 'bridge_debug.log')}."
+            f"Error: timed out after {response_timeout:g}s waiting for a bridge response. "
+            "The broker/native-host connection may be unavailable, or the extension "
+            "may be stalled. Check bridge_debug.log and run chrome-bridge doctor."
         )
     except ConnectionRefusedError:
         return 111, None, (
@@ -623,6 +664,9 @@ _BUILTIN_DEFAULT_LISTS = {
         "*://*.local", "*://*.local:*",
         "*://[[]::1[]]", "*://[[]::1[]]:*",
     ],
+    # Where the agent may make the browser SEND traffic. Empty (the built-in
+    # default) means unconstrained.
+    "egressAllowlist": [],
 }
 
 
@@ -653,10 +697,47 @@ def _policy_add_to_list(policy, client, list_key, value, explicit):
     return True
 
 
+def _policy_remove_from_list(policy, client, list_key, value, explicit):
+    # Mirror of _policy_add_to_list. A missing list is seeded from the inherited
+    # effective list first, so clearing a pattern the default layer supplied
+    # actually takes effect for a client layer instead of silently doing nothing.
+    container, key = _policy_section(policy, client, explicit)
+    section = container.setdefault(key, {})
+    if list_key not in section:
+        section[list_key] = _effective_inherited_list(policy, container, key, list_key)
+    lst = section[list_key]
+    if value not in lst:
+        return False
+    while value in lst:
+        lst.remove(value)
+    return True
+
+
 # The host's accepted values for a siteModes entry, mirrored from bridge.py
 # SITE_MODES / host-rs SITE_MODES. Validated locally so a typo is rejected here
 # instead of being silently ignored by the host at evaluation time.
 _SITE_MODES = ("manual", "auto", "skip")
+
+# The host's DLP channels and modes, mirrored from bridge.py DLP_CHANNELS /
+# DLP_MODES and host-rs DLP_CHANNELS / DLP_MODES. Validated locally so a typo is
+# rejected here rather than resolving to the host's fail-closed ``block``.
+_DLP_CHANNELS = ("clipboard", "upload", "download", "screenShare")
+_DLP_MODES = ("allow", "audit", "block")
+
+
+def _policy_set_dlp_mode(policy, client, channel, mode, explicit):
+    # dlp is merged per channel by both hosts, so a client-layer entry never drops
+    # the default layer's other channels and needs no inherited seeding.
+    container, key = _policy_section(policy, client, explicit)
+    section = container.setdefault(key, {})
+    modes = section.get("dlp")
+    if not isinstance(modes, dict):
+        modes = {}
+        section["dlp"] = modes
+    if modes.get(channel) == mode:
+        return False
+    modes[channel] = mode
+    return True
 
 
 def _policy_set_site_mode(policy, client, pattern, mode, explicit):
@@ -684,10 +765,163 @@ def _policy_clear_site_mode(policy, client, pattern, explicit):
     return True
 
 
+# --- Content-addressed org policy bundles (host key ``policyBundle``) -------
+# These subcommands hash a bundle and manage its lockfile. They print METADATA
+# only -- path, digest, match -- never bundle contents, matching what the
+# host's policyInfo discloses.
+
+# Truncated digest length, mirroring bridge.py POLICY_BUNDLE_DIGEST_CHARS and
+# host-rs POLICY_BUNDLE_DIGEST_CHARS.
+POLICY_BUNDLE_DIGEST_CHARS = 12
+
+POLICY_BUNDLE_USAGE = (
+    "Usage: python3 test_client.py policy bundle "
+    "<verify|lock|show> [<bundlePath> --lockfile <lockPath>] [--force]")
+
+
+def _flag_value(args, flag):
+    # (value, remaining). Returns (None, args) when the flag is absent.
+    if flag not in args:
+        return None, args
+    index = args.index(flag)
+    if index + 1 >= len(args):
+        return None, args
+    return args[index + 1], args[:index] + args[index + 2:]
+
+
+def _bundle_digest(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        print(f"Error: cannot read policy bundle {path}: {exc}", file=sys.stderr)
+        return None
+    return digest.hexdigest()
+
+
+def _read_bundle_lock(path):
+    # (digest, status). status is "ok", "missing", or "malformed"; the host
+    # treats anything but a 64-hex ``sha256`` string as malformed and fails
+    # closed, so this mirrors that check instead of guessing.
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "malformed"
+    except Exception:
+        return None, "malformed"
+    if not isinstance(data, dict):
+        return None, "malformed"
+    digest = data.get("sha256")
+    if not isinstance(digest, str):
+        return None, "malformed"
+    digest = digest.strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return None, "malformed"
+    return digest, "ok"
+
+
+def _write_bundle_lock(path, bundle_path, digest):
+    # Mode 600 like the policy file: the lockfile is what authorizes an org
+    # baseline to take effect on this machine.
+    encoded = json.dumps({
+        "sha256": digest,
+        "bundle": os.path.basename(bundle_path),
+        "updated": datetime.now().astimezone().replace(microsecond=0).isoformat(),
+    }, indent=2) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+        os.write(fd, encoded.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _cmd_policy_bundle(args):
+    # verify/lock are local file operations and deliberately do NOT require a
+    # running host: an admin locks a bundle before the host ever loads it.
+    verb = args[3] if len(args) > 3 else ""
+    rest = list(args[4:])
+    force = "--force" in rest
+    rest = [a for a in rest if a != "--force"]
+    lockfile, rest = _flag_value(rest, "--lockfile")
+    bundle_path = rest[0] if rest else ""
+    if verb == "show":
+        info = _policy_paths()
+        if info is None:
+            return 1
+        bundle = info.get("policyBundle")
+        if not bundle:
+            print(json.dumps({
+                "policyFile": info.get("policyFile"),
+                "policyBundle": None,
+                "note": "No policyBundle configured; the local policy file is the only source.",
+            }, indent=2))
+            return 0
+        print(json.dumps({"policyFile": info.get("policyFile"),
+                          "policyBundle": bundle}, indent=2))
+        return 0 if bundle.get("verified") else 1
+    if verb not in ("verify", "lock") or not bundle_path or not lockfile:
+        print(POLICY_BUNDLE_USAGE, file=sys.stderr)
+        return 2
+    digest = _bundle_digest(bundle_path)
+    if digest is None:
+        return 1
+    expected, status = _read_bundle_lock(lockfile)
+    if verb == "verify":
+        matched = status == "ok" and expected == digest
+        exit_code = 0 if matched else 1
+        print(json.dumps({
+            "bundle": bundle_path,
+            "lockfile": lockfile,
+            "lockfileStatus": status,
+            "digest": digest,
+            "shortDigest": digest[:POLICY_BUNDLE_DIGEST_CHARS],
+            "expected": expected,
+            "match": matched,
+            "exitCode": exit_code,
+        }, indent=2))
+        if not matched:
+            print("Policy bundle does not match its lockfile; the host will "
+                  "fail closed to the built-in default policy.", file=sys.stderr)
+        return exit_code
+    if status == "malformed" and not force:
+        print(f"Error: lockfile {lockfile} is malformed; re-run with --force to "
+              "overwrite it.", file=sys.stderr)
+        return 1
+    if status == "ok" and expected != digest and not force:
+        print(f"Error: lockfile {lockfile} pins {expected[:POLICY_BUNDLE_DIGEST_CHARS]} "
+              f"but {bundle_path} hashes to {digest[:POLICY_BUNDLE_DIGEST_CHARS]}; "
+              "re-run with --force to repin.", file=sys.stderr)
+        return 1
+    _write_bundle_lock(lockfile, bundle_path, digest)
+    print(json.dumps({
+        "bundle": bundle_path,
+        "lockfile": lockfile,
+        "digest": digest,
+        "shortDigest": digest[:POLICY_BUNDLE_DIGEST_CHARS],
+        "changed": expected != digest,
+        "forced": bool(force and status == "ok" and expected != digest),
+    }, indent=2))
+    return 0
+
+
 def cmd_policy(args):
     sub = args[2] if len(args) > 2 else ""
     if sub == "info":
         return send_command("policyInfo")
+    if sub == "bundle":
+        # Handled before _policy_paths: verify/lock are offline file operations
+        # an admin runs before (or without) a running host.
+        return _cmd_policy_bundle(args)
     info = _policy_paths()
     if info is None:
         return 1
@@ -730,6 +964,33 @@ def cmd_policy(args):
         print(json.dumps({"success": True, "changed": changed, "origin": args[3],
                           "policyFile": policy_file}, indent=2))
         return 0
+    if sub == "allow-egress":
+        # Egress is CLI-managed only: MCP exposes no policy mutation.
+        require_args(args, 4, "Usage: python3 test_client.py policy allow-egress <pattern> [client]")
+        explicit = len(args) > 4
+        target_client = args[4] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_add_to_list(policy, target_client, "egressAllowlist", args[3], explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        print(json.dumps({"success": True, "changed": changed, "egress": args[3],
+                          "policyFile": policy_file}, indent=2))
+        return 0
+    if sub == "clear-egress":
+        require_args(args, 4, "Usage: python3 test_client.py policy clear-egress <pattern> [client]")
+        explicit = len(args) > 4
+        target_client = args[4] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_remove_from_list(policy, target_client, "egressAllowlist", args[3], explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        print(json.dumps({"success": True, "changed": changed, "egress": args[3],
+                          "policyFile": policy_file}, indent=2))
+        return 0
     if sub == "site-mode":
         require_args(args, 5, "Usage: python3 test_client.py policy site-mode <originPattern> manual|auto|skip [client]")
         mode = args[4]
@@ -760,8 +1021,37 @@ def cmd_policy(args):
         print(json.dumps({"success": True, "changed": changed, "origin": args[3],
                           "policyFile": policy_file}, indent=2))
         return 0
+    if sub == "dlp":
+        require_args(args, 5, "Usage: python3 test_client.py policy dlp <clipboard|upload|download|screenShare> allow|audit|block [client]")
+        channel = args[3]
+        mode = args[4]
+        if channel not in _DLP_CHANNELS:
+            print(f"DLP channel must be one of {', '.join(_DLP_CHANNELS)}", file=sys.stderr)
+            return 2
+        if mode not in _DLP_MODES:
+            print(f"DLP mode must be one of {', '.join(_DLP_MODES)}", file=sys.stderr)
+            return 2
+        explicit = len(args) > 5
+        target_client = args[5] if explicit else client
+        policy = _load_policy_file(policy_file) or {}
+        changed = _policy_set_dlp_mode(policy, target_client, channel, mode, explicit)
+        if changed:
+            _write_policy_file(policy_file, policy)
+        else:
+            _restrict_policy_file_perms(policy_file)
+        out = {"success": True, "changed": changed, "channel": channel,
+               "dlp": mode, "policyFile": policy_file}
+        if channel == "clipboard":
+            # Never let a policy edit imply coverage the bridge does not have.
+            out["note"] = ("clipboard is a declared channel with no bridge chokepoint: no "
+                           "bridge action reads or writes the clipboard and a page-driven copy "
+                           "never crosses the bridge, so this mode records intent and "
+                           "enforces nothing.")
+        print(json.dumps(out, indent=2))
+        return 0
     print("Usage: python3 test_client.py policy "
-          "<info|show|doctor|allow-action|allow-origin|site-mode|clear-site-mode> ...", file=sys.stderr)
+          "<info|show|doctor|bundle|allow-action|allow-origin|allow-egress|clear-egress|"
+          "site-mode|clear-site-mode|dlp> ...", file=sys.stderr)
     return 64
 
 
@@ -817,6 +1107,8 @@ def _policy_doctor(audit_file, policy_file):
             suggestion = {"cli": f"policy allow-origin '{targets[0]}'"}
         elif reason == "target denied" and targets:
             suggestion = {"manual": f"Remove or narrow the deniedOrigins pattern matching '{targets[0]}' in {policy_file}"}
+        elif reason == "egress not allowed" and targets:
+            suggestion = {"cli": f"policy allow-egress '{targets[0]}'"}
         denials.append({"action": action, "reason": reason, "targets": targets,
                         "batchStep": batch_step, "suggestion": suggestion})
     print(json.dumps({"policyFile": policy_file, "auditLogFile": audit_file,
@@ -1223,6 +1515,118 @@ def _audit_summary(since_ms):
     return 0
 
 
+# --- One-shot audit export (chrome-bridge audit export) --------------------
+#
+# Backfill, or a way to prove a destination works before enabling ``auditExport``
+# in policy. Independent of policy: it re-encodes lines the LOCAL audit log
+# already holds, using the host's own encoders so a CLI line and a live
+# forwarded line are the same bytes. Prints metadata only, never an exported
+# line: the audit log holds no payloads, and nothing here reconstructs one.
+
+AUDIT_EXPORT_USAGE = (
+    "Usage: chrome-bridge audit export --format <jsonl|syslog|cef> "
+    "--destination <path|udp://host:port|tcp://host:port|unix-socket-path> "
+    "[--since <ISO8601|7d|12h>] [--limit N] [--dry-run]")
+
+
+def _import_bridge():
+    # The host owns the export encoders. The CLI must not carry a second copy
+    # that could drift from what a SIEM actually receives.
+    if SCRIPT_DIR not in sys.path:
+        sys.path.insert(0, SCRIPT_DIR)
+    import bridge
+    return bridge
+
+
+def _parse_audit_export_args(rest):
+    # Returns (format, destination, since_ms, limit) or None on a usage error.
+    fmt = destination = None
+    since_ms = limit = None
+    index = 0
+    while index < len(rest):
+        flag = rest[index]
+        value = rest[index + 1] if index + 1 < len(rest) else None
+        if flag not in ("--format", "--destination", "--since", "--limit"):
+            print(f"Unknown option for audit export: {flag}", file=sys.stderr)
+            return None
+        if value is None:
+            print(f"Error: {flag} expects a value", file=sys.stderr)
+            return None
+        if flag == "--format":
+            fmt = value
+        elif flag == "--destination":
+            destination = value
+        elif flag == "--since":
+            since_ms = _parse_since(value)
+        else:
+            limit = parse_int(value, "limit")
+            if limit <= 0:
+                print("Error: --limit must be a positive integer", file=sys.stderr)
+                return None
+        index += 2
+    return fmt, destination, since_ms, limit
+
+
+def _audit_export(fmt, destination, since_ms, limit, dry_run):
+    bridge = _import_bridge()
+    if fmt not in bridge.AUDIT_EXPORT_FORMATS:
+        print(f"Error: --format must be one of {', '.join(bridge.AUDIT_EXPORT_FORMATS)}",
+              file=sys.stderr)
+        return 64
+    if not dry_run and not destination:
+        print("Error: --destination is required unless --dry-run is set", file=sys.stderr)
+        return 64
+    path, entries, malformed, exit_code = _load_audit_log()
+    if entries is None:
+        return exit_code
+    selected = []
+    undated = 0
+    for event in entries:
+        if since_ms is not None:
+            ms = _audit_event_ms(event)
+            if ms is None:
+                undated += 1
+                continue
+            if ms < since_ms:
+                continue
+        selected.append(event)
+    if limit is not None and limit < len(selected):
+        selected = selected[-limit:]
+    lines = []
+    unformattable = 0
+    for event in selected:
+        try:
+            lines.append(bridge.format_audit_export_line(fmt, event))
+        except Exception:
+            unformattable += 1
+    total_bytes = sum(len(line.encode("utf-8")) + 1 for line in lines)
+    if not dry_run:
+        # No rotation or retention on a backfill: the operator named this exact
+        # destination, and silently renaming their file would be a surprise.
+        config = {"format": fmt, "destination": destination,
+                  "rotateBytes": None, "retainDays": None}
+        try:
+            for line in lines:
+                bridge.audit_export_emit(config, line)
+        except Exception as exc:
+            print(f"Error: could not export to {destination}: {exc}", file=sys.stderr)
+            return 1
+    print(json.dumps({
+        "auditLog": path,
+        "format": fmt,
+        "destination": destination or "-",
+        "dryRun": dry_run,
+        "eventsRead": len(entries),
+        "eventsSelected": len(selected),
+        "eventsExported": 0 if dry_run else len(lines),
+        "bytes": total_bytes,
+        "skippedMalformed": malformed,
+        "skippedUnformattable": unformattable,
+        "skippedUndated": undated,
+    }, indent=2))
+    return 0
+
+
 def cmd_audit(args):
     sub = args[2] if len(args) > 2 else ""
     if sub == "tail":
@@ -1240,7 +1644,20 @@ def cmd_audit(args):
                 return 64
             since_ms = _parse_since(args[4])
         return _audit_summary(since_ms)
-    print("Usage: python3 test_client.py audit <tail [count] | summary [--since <ISO8601|7d|12h|30m>]>",
+    if sub == "export":
+        parsed = _parse_audit_export_args(args[3:])
+        if parsed is None:
+            print(AUDIT_EXPORT_USAGE, file=sys.stderr)
+            return 64
+        fmt, destination, since_ms, limit = parsed
+        # --dry-run is the process-wide flag, already stripped from argv.
+        if fmt is None:
+            print(AUDIT_EXPORT_USAGE, file=sys.stderr)
+            return 64
+        return _audit_export(fmt, destination, since_ms, limit, DRY_RUN)
+    print("Usage: python3 test_client.py audit <tail [count] "
+          "| summary [--since <ISO8601|7d|12h|30m>] "
+          "| export --format <jsonl|syslog|cef> --destination <dest>>",
           file=sys.stderr)
     return 64
 
@@ -1657,9 +2074,70 @@ def _workflow_replay(rest):
         _save_cache_entries(entries)
         result["cacheFile"] = ACTION_CACHE_FILE
         result["cacheEntries"] = len(entries)
+    # T4-4 evidence: each step in the printed result carries `attempts`,
+    # `retried`, and - when the step authored an `expect` clause - `expectPassed`
+    # plus an `expect` block naming the mode and the failure reason. The
+    # `retriedSteps` and `expectFailedSteps` totals summarize the same facts. All
+    # of it is assertion metadata; no matched page content is ever included.
     if response is not None:
         print(json.dumps(response, indent=2))
     return exit_code
+
+
+# --- T4-4: deterministic postconditions -------------------------------------
+#
+# The host answers one closed question and returns only mode, passed, attempts,
+# elapsedMs, and a short reason, so nothing printed here can carry page text,
+# matched content, or extracted values. The exit code is the point: 0 when the
+# condition held, 1 when it did not, so a shell script or CI job can gate on a
+# real browser postcondition with no model in the loop.
+EXPECT_MODES = ("selector", "text", "url", "schema")
+
+
+def cmd_expect(args):
+    tab_id = parse_int(args[2], "tabId")
+    mode = args[3]
+    if mode not in EXPECT_MODES:
+        print(f"Error: expect mode must be one of {', '.join(EXPECT_MODES)}", file=sys.stderr)
+        return 2
+    value = args[4]
+    payload = {"tabId": tab_id, "mode": mode}
+    if mode == "selector":
+        payload["selector"] = value
+    elif mode == "text":
+        payload["text"] = value
+    elif mode == "url":
+        payload["urlSubstring"] = value
+    else:
+        schema = _read_json_file(expand_output_path(value))
+        if not isinstance(schema, dict):
+            print(f"Error: {value} is not a JSON Schema object", file=sys.stderr)
+            return 2
+        payload["schema"] = schema
+    index = 5
+    while index < len(args):
+        flag = args[index]
+        if flag == "--negate":
+            payload["negate"] = True
+        elif flag == "--timeout":
+            index += 1
+            if index >= len(args):
+                print("Missing value for --timeout", file=sys.stderr)
+                return 2
+            payload["timeoutMs"] = parse_int(args[index], "timeoutMs")
+        else:
+            print(f"Unknown expect option: {flag}", file=sys.stderr)
+            return 2
+        index += 1
+    exit_code, response, stderr = send_command_data("expect", payload)
+    if stderr:
+        print(stderr, file=sys.stderr)
+    if response is not None:
+        print(json.dumps(response, indent=2))
+    if exit_code != 0:
+        return exit_code
+    # A well-formed assertion that did not hold is still a failing check.
+    return 0 if (result_payload(response) or {}).get("passed") is True else 1
 
 
 def cmd_workflow(args):
@@ -1787,6 +2265,163 @@ def cmd_cache(args):
     print(CACHE_USAGE, file=sys.stderr)
     return 64
 
+def cmd_doctor():
+    script = os.path.join(SCRIPT_DIR, "scripts", "diagnose_install.py")
+    return subprocess.run([sys.executable, script], check=False).returncode
+
+
+def bridge_readiness(timeout_ms=5000, poll_interval_ms=250):
+    timeout_ms = max(0, min(30000, int(timeout_ms)))
+    poll_interval_ms = max(50, min(1000, int(poll_interval_ms)))
+    started = time.monotonic()
+    deadline = started + timeout_ms / 1000.0
+    attempts = 0
+    endpoint_status = "refused"
+    extension_status = "unavailable"
+    reason = "browser unavailable"
+    ready = False
+
+    while True:
+        attempts += 1
+        remaining = max(0.1, deadline - time.monotonic())
+        exit_code, response, stderr = send_command_data(
+            "ping",
+            connect_timeout_seconds=min(0.25, remaining),
+            response_timeout_seconds_override=remaining,
+        )
+        if response is not None:
+            endpoint_status = "reachable"
+            if response.get("success") is True and response.get("result") == "pong":
+                extension_status = "connected"
+                reason = None
+                ready = True
+                break
+            reason = response.get("error") or stderr or "bridge reported failure"
+            if response.get("error") == "unauthorized":
+                break
+            if response.get("status") == "browser_unavailable":
+                extension_status = "unavailable"
+            else:
+                extension_status = "stalled"
+                break
+        elif exit_code == 124:
+            endpoint_status = "reachable"
+            extension_status = "stalled"
+            reason = stderr or "bridge response timed out"
+            break
+        else:
+            endpoint_status = "refused"
+            extension_status = "unavailable"
+            reason = stderr or "browser unavailable"
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(poll_interval_ms / 1000.0, max(0.0, deadline - time.monotonic())))
+
+    if ready:
+        backend = "reachable"
+    elif endpoint_status == "reachable" and extension_status == "unavailable":
+        backend = "unavailable"
+    else:
+        backend = "unknown"
+    return {
+        "ready": ready,
+        "endpoint": f"127.0.0.1:{int(os.environ.get('BRIDGE_PORT', 9223))}",
+        "endpointStatus": endpoint_status,
+        "backend": backend,
+        "extension": extension_status,
+        "attempts": attempts,
+        "elapsedMs": round((time.monotonic() - started) * 1000),
+        "reason": reason,
+    }
+
+
+def cmd_ready(args):
+    timeout_ms = parse_int(args[2], "timeoutMs") if len(args) > 2 else 5000
+    poll_interval_ms = parse_int(args[3], "pollIntervalMs") if len(args) > 3 else 250
+    result = bridge_readiness(timeout_ms, poll_interval_ms)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ready"] else 1
+
+
+def cmd_navigate_and_snapshot(args):
+    require_args(args, 3, "Usage: chrome-bridge navigateAndSnapshot <url> [options]")
+    payload = {"url": args[2], "waitMode": "load", "compact": True, "limit": 50}
+    rest = args[3:]
+    index = 0
+    while index < len(rest):
+        flag = rest[index]
+        if flag in {"--foreground", "--new", "--full", "--diff"}:
+            if flag == "--foreground":
+                payload["active"] = True
+            elif flag == "--new":
+                payload["reuse"] = False
+            elif flag == "--full":
+                payload["compact"] = False
+            else:
+                payload["diff"] = True
+            index += 1
+            continue
+        if flag not in {
+                "--session", "--wait", "--selector", "--url-substring",
+                "--timeout", "--limit", "--role", "--name"}:
+            print(f"Unknown navigateAndSnapshot option: {flag}", file=sys.stderr)
+            return 2
+        if index + 1 >= len(rest):
+            print(f"Missing value for {flag}", file=sys.stderr)
+            return 2
+        value = rest[index + 1]
+        if flag == "--session":
+            payload["sessionId"] = value
+        elif flag == "--wait":
+            if value not in {"load", "url", "selector"}:
+                print("--wait must be load, url, or selector", file=sys.stderr)
+                return 2
+            payload["waitMode"] = value
+        elif flag == "--selector":
+            payload["selector"] = value
+        elif flag == "--url-substring":
+            payload["urlSubstring"] = value
+        elif flag == "--timeout":
+            payload["timeoutMs"] = parse_int(value, "timeoutMs")
+        elif flag == "--limit":
+            payload["limit"] = parse_int(value, "limit")
+        elif flag == "--role":
+            payload["roles"] = [part.strip() for part in value.split(",") if part.strip()]
+        else:
+            payload["name"] = value
+        index += 2
+    if payload["waitMode"] == "selector" and not payload.get("selector"):
+        print("--selector is required with --wait selector", file=sys.stderr)
+        return 2
+    if payload["waitMode"] == "url" and not payload.get("urlSubstring"):
+        print("--url-substring is required with --wait url", file=sys.stderr)
+        return 2
+    return send_command("navigateAndSnapshot", payload, payload.get("timeoutMs"))
+
+
+def cmd_insert_rich_text(args):
+    require_args(
+        args,
+        5,
+        "Usage: chrome-bridge insertRichText <tabId> <selector> <nodesJsonPath> [--append]",
+    )
+    with open(args[4], "r", encoding="utf-8") as handle:
+        nodes = json.load(handle)
+    if not isinstance(nodes, list) or not nodes:
+        print("nodesJsonPath must contain a non-empty JSON array", file=sys.stderr)
+        return 2
+    unknown = [arg for arg in args[5:] if arg != "--append"]
+    if unknown:
+        print(f"Unknown insertRichText option: {unknown[0]}", file=sys.stderr)
+        return 2
+    return send_command("insertRichText", {
+        "tabId": parse_int(args[2], "tabId"),
+        "selector": args[3],
+        "nodes": nodes,
+        "clear": "--append" not in args[5:],
+    })
+
+
 def print_usage():
     print("Usage:")
     print("  chrome-bridge <command> [arguments]")
@@ -1795,11 +2430,15 @@ def print_usage():
     print("")
     print("Common commands:")
     print("  ping                              Check bridge health")
+    print("  ready [timeoutMs] [pollMs]        Wait once for endpoint, backend, and extension readiness")
+    print("  doctor                            Diagnose install drift and live bridge state")
     print("  getTabs                           List open tabs")
     print("  navigate <url> [--foreground]     Open a tab in the background by default")
+    print("  navigateAndSnapshot <url> [...]   Navigate, wait, and return one accessibility snapshot")
     print("  observe <tabId> [filters]         Concise accessibility view with ref=eN ids; --full, --diff")
     print("  click <tabId> <selector>          Click by ref, CSS, text, ARIA name, label, or role")
     print("  fill <tabId> <selector> <text>    Clear and fill a form field")
+    print("  insertRichText <tabId> <selector> <nodesJsonPath> [--append]")
     print("  screenshot <tabId> <path>         Save a background-safe screenshot")
     print("  github-attach-pr-body <tabId> <files...>")
     print("                                    Edit a GitHub PR body, attach files, and save")
@@ -1815,6 +2454,7 @@ def print_usage():
     print("")
     print("Global flags:")
     print("  --dry-run                         Report the host verdict without touching Chrome")
+    print("  --traceparent <value>             W3C trace context this run continues (opt-in host spans)")
     print("")
     print("    selectors: CSS, ref=e<N> (from observe), css=<selector>, label=<text>, text=<text>,")
     print("               role=<role>[name=<text>], aria=<accessible-name>,")
@@ -1823,6 +2463,25 @@ def print_usage():
 
 
 COMMAND_HELP = {
+    "doctor": (
+        "chrome-bridge doctor",
+        "Check the registered manifest, durable launcher and runtime, deployed extension, "
+        "last successful response, and broker/native-backend connection state without exposing secrets.",
+    ),
+    "ready": (
+        "chrome-bridge ready [timeoutMs] [pollIntervalMs]",
+        "Wait once for the bridge endpoint, native backend, and extension, then print one bounded status object.",
+    ),
+    "navigateAndSnapshot": (
+        "chrome-bridge navigateAndSnapshot <url> [--session <id>] [--wait load|url|selector] "
+        "[--selector <selector>] [--url-substring <text>] [--timeout <ms>] [--foreground] "
+        "[--new] [--full] [--diff] [--limit <count>] [--role <roles>] [--name <text>]",
+        "Navigate or reuse a task-session tab, wait deterministically, and return a compact accessibility snapshot in one request.",
+    ),
+    "insertRichText": (
+        "chrome-bridge insertRichText <tabId> <selector> <nodesJsonPath> [--append]",
+        "Insert a constrained JSON rich-text node tree into a contenteditable editor without arbitrary page script execution.",
+    ),
     "observe": (
         "chrome-bridge observe <tabId> [--compact|--full] [--diff] [--role <role[,role...]>] [--name <text>] [--limit <count>]",
         "Print a compact accessibility view by default. Filters are applied before the limit. "
@@ -1851,21 +2510,29 @@ COMMAND_HELP = {
         "chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]",
         "On a GitHub pull-request page, open the body editor, attach the files, wait for GitHub CDN links, and save without replacing existing text.",
     ),
+    "credentialHandoff": (
+        "chrome-bridge credentialHandoff <tabId> <selector> [message] [--mode filled|submitted] [--timeout <milliseconds>]",
+        "Hand one field to the human so a password, passphrase, or one-time code is typed straight into the page. The bridge focuses the field and waits; it never reads or returns the value, and the host blacks out every observation action for the tab until the window closes.",
+    ),
     "taskSession": (
         "chrome-bridge taskSession create|navigate|show|state|close ...",
         "Create and manage tabs owned by one task. Set state to working, needs_user, or completed.",
     ),
     "policy": (
-        "chrome-bridge policy info|show|doctor|allow-action|allow-origin|site-mode|clear-site-mode ...",
-        "Inspect the active local policy, explain recent denials, add a narrow action/origin grant, or set an origin's permission mode (manual gates every mutation, skip pre-approves confirmations that are not on the non-skippable list).",
+        "chrome-bridge policy info|show|doctor|bundle|allow-action|allow-origin|allow-egress|clear-egress|site-mode|clear-site-mode|dlp ...",
+        "Inspect the active local policy, explain recent denials, verify or lock a content-addressed org policy bundle, add a narrow action/origin grant, bound where automation may send traffic (egressAllowlist), set an origin's permission mode (manual gates every mutation, skip pre-approves confirmations that are not on the non-skippable list), or set a DLP channel mode (dlp <clipboard|upload|download|screenShare> allow|audit|block).",
     ),
     "schedule": (
         "chrome-bridge schedule workflow <workflowPath> --at <ISO8601>|--interval <seconds> [--name <name>] | schedule list | schedule remove <name>",
         "Register local metadata for a replayable workflow file. This starts nothing: Chrome Bridge runs no daemon and no timer, so an OS scheduler (cron, launchd, systemd) or a human must invoke the printed runCommand, and host policy still authorizes every step at run time.",
     ),
     "audit": (
-        "chrome-bridge audit tail [count] | audit summary [--since <ISO8601|7d|12h|30m>]",
-        "Read the local audit log: recent decisions as columns, or aggregate counts. Metadata only, never payloads.",
+        "chrome-bridge audit tail [count] | audit summary [--since <ISO8601|7d|12h|30m>] | "
+        "audit export --format <jsonl|syslog|cef> --destination <dest> "
+        "[--since <ISO8601|7d|12h>] [--limit N] [--dry-run]",
+        "Read the local audit log: recent decisions as columns, or aggregate counts. Metadata only, never payloads. "
+        "export re-encodes the existing local log to a file or syslog collector for backfill, or to prove a "
+        "destination before enabling the auditExport policy key; --dry-run formats and counts without writing.",
     ),
     "trace": (
         "chrome-bridge trace summary <traceId> | trace tail <traceId> [count] [--trace-dir <dir>]",
@@ -1913,6 +2580,18 @@ COMMAND_HELP = {
         "Scan page text for instruction-like patterns aimed at an agent, its tools, its secrets, or its policy (ignore previous instructions, reveal the system prompt, "
         "exfiltrate tokens or cookies, run a shell command, click allow, disable policy). Returns risk (low|medium|high), matches with kind, severity, and a snippet "
         "capped at 160 characters, plus scannedChars. The scan is heuristic: a hit is a warning, never a permission grant or denial, and a clean result is not a guarantee.",
+    ),
+    "expect": (
+        "chrome-bridge expect <tabId> selector|text|url|schema <value> [--negate] [--timeout <ms>]",
+        "Assert a deterministic postcondition and exit 0 only when it holds, so it composes in shell scripts and CI. "
+        "<value> is the selector (CSS or semantic, including ref=), the expected page text, the expected URL substring, "
+        "or the path to a JSON Schema file for schema mode. selector passes when the selector resolves; text when the page "
+        "text contains the string; url when the tab URL contains the substring; schema when structured extraction against "
+        "that schema reports no missingRequired errors. --negate inverts the outcome, which is how absence is asserted. "
+        "The check polls until the condition holds or --timeout elapses (default 5000ms, capped at 60000ms). No model is "
+        "involved, and the result carries only mode, passed, attempts, elapsedMs, and a short reason when it failed: the "
+        "matched element, the matched text, the tab URL, and the extracted values are never returned. Exit code is 1 when "
+        "the assertion did not hold.",
     ),
     "workflow": (
         "chrome-bridge workflow record start|stop|save ... | chrome-bridge workflow replay <path> [--binding key=value]",
@@ -1962,6 +2641,7 @@ COMMAND_USAGES = {
     "waitForSelector": "chrome-bridge waitForSelector <tabId> <selector> [timeoutMs]",
     "waitForText": "chrome-bridge waitForText <tabId> <text> [timeoutMs]",
     "waitForUrl": "chrome-bridge waitForUrl <tabId> <substring> [timeoutMs]",
+    "expect": "chrome-bridge expect <tabId> selector|text|url|schema <value> [--negate] [--timeout <ms>]",
     "getCurrentState": "chrome-bridge getCurrentState <tabId>",
     "screenshot": "chrome-bridge screenshot <tabId> <outputPath> [--visible]",
     "extractText": "chrome-bridge extractText <tabId> [maxChars]",
@@ -1998,6 +2678,7 @@ COMMAND_USAGES = {
     "performanceMetrics": "chrome-bridge performanceMetrics <tabId>",
     "sessionStatus": "chrome-bridge sessionStatus <domain> [domain...]",
     "waitForHandoff": "chrome-bridge waitForHandoff <message> [mode] [target] [timeoutMs] [tabId]",
+    "credentialHandoff": "chrome-bridge credentialHandoff <tabId> <selector> [message] [--mode filled|submitted] [--timeout <milliseconds>]",
     "policyCheck": "chrome-bridge policyCheck <action> [payloadJson] | chrome-bridge policyCheck --plan '<jsonArray>'",
     "batch": "chrome-bridge batch <stepsJson> [tabId] [--continue-on-error]",
     "printToPDF": "chrome-bridge printToPDF <tabId> <outputPath> [--landscape] [--scale <factor>]",
@@ -2022,10 +2703,18 @@ def print_command_help(command):
     return 0
 
 def main():
-    global DRY_RUN
+    global DRY_RUN, TRACEPARENT
     if "--dry-run" in sys.argv[1:]:
         DRY_RUN = True
         sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--dry-run"]
+
+    if "--traceparent" in sys.argv[1:]:
+        index = sys.argv.index("--traceparent")
+        if index + 1 >= len(sys.argv):
+            print("Usage: --traceparent <value>", file=sys.stderr)
+            sys.exit(64)
+        TRACEPARENT = sys.argv[index + 1]
+        sys.argv = sys.argv[:index] + sys.argv[index + 2:]
 
     if len(sys.argv) < 2:
         print_usage()
@@ -2045,13 +2734,19 @@ def main():
     if len(args) > 2 and args[2] in {"-h", "--help"}:
         sys.exit(print_command_help(action))
 
+    if action == "doctor":
+        sys.exit(cmd_doctor())
     if action == "ping":
         sys.exit(send_command("ping"))
+    elif action == "ready":
+        sys.exit(cmd_ready(args))
     elif action == "navigate":
         require_args(args, 3, "Missing URL.")
         foreground = len(args) > 3 and args[3] == "--foreground"
         payload = {"url": args[2], "active": foreground}
         sys.exit(send_command("navigate", payload))
+    elif action == "navigateAndSnapshot":
+        sys.exit(cmd_navigate_and_snapshot(args))
     elif action == "getTabs":
         sys.exit(send_command("getTabs"))
     elif action == "taskSession":
@@ -2141,6 +2836,10 @@ def main():
     elif action == "waitForUrl":
         require_args(args, 4, "Usage: python3 test_client.py waitForUrl <tabId> <substring> [timeoutMs]")
         sys.exit(send_command("waitForUrl", {"tabId": parse_int(args[2], "tabId"), "substring": args[3], "timeoutMs": parse_timeout(args, 4)}))
+    elif action == "expect":
+        require_args(args, 5, "Usage: python3 test_client.py expect <tabId> selector|text|url|schema <value> "
+                              "[--negate] [--timeout <ms>]")
+        sys.exit(cmd_expect(args))
     elif action == "screenshot":
         require_args(args, 4, "Usage: python3 test_client.py screenshot <tabId> <outputPath> [--visible]")
         visible = len(args) > 4 and args[4] == "--visible"
@@ -2230,6 +2929,8 @@ def main():
     elif action == "fill":
         require_args(args, 5, "Usage: python3 test_client.py fill <tabId> <selector> <text>")
         sys.exit(send_command("fill", {"tabId": parse_int(args[2], "tabId"), "selector": args[3], "text": args[4]}))
+    elif action == "insertRichText":
+        sys.exit(cmd_insert_rich_text(args))
     elif action == "select":
         require_args(args, 5, "Usage: python3 test_client.py select <tabId> <selector> <value>")
         sys.exit(send_command("select", {"tabId": parse_int(args[2], "tabId"), "selector": args[3], "value": args[4]}))
@@ -2506,6 +3207,43 @@ def main():
         if len(args) > 6:
             payload["tabId"] = parse_int(args[6], "tabId")
         sys.exit(send_command("waitForHandoff", payload, read_timeout_ms=timeoutMs))
+    elif action == "credentialHandoff":
+        require_args(args, 4, "Usage: python3 test_client.py credentialHandoff <tabId> <selector> [message] [--mode filled|submitted] [--timeout <milliseconds>]")
+        mode = "filled"
+        timeout_ms = 120000
+        positional = []
+        index = 4
+        while index < len(args):
+            if args[index] == "--mode":
+                if index + 1 >= len(args):
+                    print("Missing value for --mode", file=sys.stderr)
+                    sys.exit(2)
+                mode = args[index + 1]
+                if mode not in ("filled", "submitted"):
+                    print("--mode must be filled or submitted", file=sys.stderr)
+                    sys.exit(2)
+                index += 2
+                continue
+            if args[index] == "--timeout":
+                if index + 1 >= len(args):
+                    print("Missing value for --timeout", file=sys.stderr)
+                    sys.exit(2)
+                timeout_ms = parse_int(args[index + 1], "timeoutMs")
+                index += 2
+                continue
+            positional.append(args[index])
+            index += 1
+        payload = {
+            "tabId": parse_int(args[2], "tabId"),
+            "selector": args[3],
+            "mode": mode,
+            "timeoutMs": timeout_ms,
+        }
+        if positional:
+            payload["message"] = positional[0]
+        # The human types the secret during this window, so the socket read must
+        # outlast it exactly as the waitForHandoff path does.
+        sys.exit(send_command("credentialHandoff", payload, read_timeout_ms=timeout_ms))
     elif action == "setCpuThrottling":
         require_args(args, 4, "Usage: python3 test_client.py setCpuThrottling <tabId> <rate>")
         sys.exit(send_command("setCpuThrottling", {

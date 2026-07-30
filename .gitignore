@@ -23,6 +23,11 @@ bridge-host-launch.cmd
 bridge_policy*.json
 bridge_policy*.json.*
 !bridge_policy.example.json
+# Org policy bundle distributed by an admin plus its digest lockfile. The
+# bundle itself is already covered by bridge_policy*.json above.
+bridge_policy_bundle*.lock
+!bridge_policy_bundle.example.json
+!bridge_policy_bundle.lock.example
 # Local scheduled-workflow metadata (absolute workflow paths, no daemon)
 bridge_schedules.json
 
@@ -31,6 +36,12 @@ bridge_debug.log
 bridge_audit.jsonl
 # Session trace artifacts written by the host when policy sets traceDir
 bridge_traces/
+# Audit export sinks written by the host when policy sets auditExport, plus
+# their single rotated generation. The tracked sample lines live in
+# bridge_audit_export.example.
+bridge_audit_export.jsonl
+bridge_audit_export.cef
+bridge_audit_export.*.1
 # Local semantic-selector resolution cache and the last stopped workflow
 # recording (both hold site DOM paths and replayable mutating actions)
 bridge_action_cache.json
@@ -43,6 +54,7 @@ mcp/uv.lock
 .venv/
 mcp/.venv/
 .wip/
+.perf/
 
 # Build output (release archives, store upload zip)
 dist/

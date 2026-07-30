@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import datetime
+import hashlib
 import http.server
 import json
-import re
 import os
+import platform
+import re
 import shutil
 import signal
 import socket
@@ -12,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -132,7 +136,14 @@ FIXTURE_PAGE = b"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <title>Benchmark Fixture</title>
-  <style>body { font-family: sans-serif; min-height: 1600px; }</style>
+  <style>
+    body { font-family: sans-serif; min-height: 1600px; margin: 24px; }
+    #workflow { display: grid; gap: 12px; max-width: 760px; padding: 20px; border: 1px solid #ccc; }
+    #workflow label { display: grid; gap: 4px; }
+    #workflow-body, .section-body { min-height: 88px; }
+    #workflow-catalog { max-height: 320px; overflow: auto; border: 1px solid #ddd; }
+    .catalog-row { display: grid; grid-template-columns: 50px 1fr 100px; padding: 4px 8px; }
+  </style>
 </head>
 <body>
   <h1>Benchmark Fixture</h1>
@@ -148,6 +159,26 @@ FIXTURE_PAGE = b"""<!doctype html>
   <button id="fetch">Fetch</button>
   <button id="alert">Alert</button>
   <div id="status">ready</div>
+  <main id="workflow" aria-label="Complex workflow fixture">
+    <h2>Article workspace</h2>
+    <label for="workflow-title">Article title</label>
+    <input id="workflow-title" autocomplete="off">
+    <label for="workflow-body">Article body</label>
+    <textarea id="workflow-body"></textarea>
+    <label for="workflow-category">Category</label>
+    <select id="workflow-category">
+      <option value="engineering">Engineering</option>
+      <option value="research">Research</option>
+      <option value="design">Design</option>
+    </select>
+    <div>
+      <button id="workflow-add-section" type="button">Add section</button>
+      <button id="workflow-save" type="button">Save draft</button>
+    </div>
+    <div id="workflow-sections" aria-live="polite"></div>
+    <output id="workflow-result" aria-live="polite">Draft not saved</output>
+    <div id="workflow-catalog" aria-label="Large result catalog"></div>
+  </main>
   <div id="shadow-host"></div>
   <iframe id="frame" srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;body&gt;&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;select id=&quot;frame-select&quot;&gt;&lt;option value=&quot;one&quot;&gt;One&lt;/option&gt;&lt;option value=&quot;two&quot;&gt;Two&lt;/option&gt;&lt;/select&gt;&lt;input id=&quot;frame-file&quot; type=&quot;file&quot;&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); }); document.getElementById(&quot;frame-select&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-select&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-file&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-file&quot;, count: this.files.length}, &quot;*&quot;); });&lt;/script&gt;&lt;/body&gt;&lt;/html&gt;"></iframe>
   <script>
@@ -160,6 +191,37 @@ FIXTURE_PAGE = b"""<!doctype html>
     shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button><label>Shadow input<input id="shadow-input"></label><select id="shadow-kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>';
     shadowRoot.getElementById('shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
     window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; if (event.data && event.data.type === 'frame-select') window.__frameSelect = event.data.value; if (event.data && event.data.type === 'frame-file') window.__frameFileCount = event.data.count; });
+    const catalog = document.getElementById('workflow-catalog');
+    catalog.innerHTML = Array.from({length: 150}, (_, index) =>
+      '<div class="catalog-row" data-row="' + index + '"><span>' + index +
+      '</span><span>Benchmark catalog item ' + index + '</span><button type="button">Inspect ' +
+      index + '</button></div>').join('');
+    let workflowSectionCount = 0;
+    document.getElementById('workflow-add-section').addEventListener('click', () => {
+      workflowSectionCount += 1;
+      const label = document.createElement('label');
+      label.textContent = 'Section ' + workflowSectionCount;
+      const textarea = document.createElement('textarea');
+      textarea.className = 'section-body';
+      textarea.setAttribute('aria-label', 'Section ' + workflowSectionCount);
+      label.appendChild(textarea);
+      document.getElementById('workflow-sections').appendChild(label);
+    });
+    document.getElementById('workflow-category').addEventListener('change', event => {
+      catalog.dataset.category = event.target.value;
+      catalog.prepend(...Array.from(catalog.children).reverse());
+    });
+    document.getElementById('workflow-save').addEventListener('click', () => {
+      const title = document.getElementById('workflow-title').value;
+      const body = document.getElementById('workflow-body').value;
+      const category = document.getElementById('workflow-category').value;
+      const sections = document.querySelectorAll('.section-body');
+      const sectionText = Array.from(sections).map(node => node.value).join('|');
+      const result = document.getElementById('workflow-result');
+      result.dataset.saved = 'true';
+      result.textContent = 'Saved ' + title + ' | ' + body.length + ' chars | ' +
+        category + ' | ' + sections.length + ' sections | ' + sectionText;
+    });
     document.getElementById('btn').addEventListener('click', () => {
       document.getElementById('status').textContent = 'clicked:' + document.getElementById('q').value;
     });
@@ -300,10 +362,28 @@ def _build_bridge_payload(verb, args):
         if BENCHMARK_QUIET:
             payload["active"] = False
         return "navigate", payload
+    if verb == "createTaskSession":
+        return "createTaskSession", {"name": args[0]}
+    if verb == "navigateTaskSession":
+        return "navigateTaskSession", {
+            "sessionId": args[0],
+            "url": args[1],
+            "active": False,
+            "reuse": True,
+        }
+    if verb == "closeTaskSession":
+        return "closeTaskSession", {"sessionId": args[0]}
+    if verb == "observe":
+        payload = {"tabId": int(args[0]), "compact": True}
+        if len(args) > 1 and args[1] == "diff":
+            payload["diff"] = True
+        return "observe", payload
     if verb == "waitForLoad":
         return "waitForLoad", {"tabId": int(args[0]), "timeoutMs": int(args[1])}
     if verb == "waitForSelector":
         return "waitForSelector", {"tabId": int(args[0]), "selector": args[1], "timeoutMs": int(args[2])}
+    if verb == "waitForText":
+        return "waitForText", {"tabId": int(args[0]), "text": args[1], "timeoutMs": int(args[2])}
     if verb == "click":
         return "click", {"tabId": int(args[0]), "selector": args[1]}
     if verb == "fill":
@@ -358,12 +438,18 @@ class BridgeClient:
         self._timeout = timeout
         self._sock = None
         self._buffer = b""
+        self.connections = 0
+        self.requests = 0
+        self.reconnects = 0
+        self.bytes_sent = 0
+        self.bytes_received = 0
 
     def _connect(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self._timeout)
         sock.connect(("127.0.0.1", self._port))
         self._sock = sock
+        self.connections += 1
         self._buffer = b""
 
     def _recv_line(self):
@@ -371,24 +457,44 @@ class BridgeClient:
             chunk = self._sock.recv(65536)
             if not chunk:
                 raise ConnectionError("bridge closed the connection")
+            self.bytes_received += len(chunk)
             self._buffer += chunk
         line, self._buffer = self._buffer.split(b"\n", 1)
         return line
 
     def request(self, action, payload):
         cmd = json.dumps({"action": action, "payload": payload, "token": self._token}) + "\n"
-        # One transparent reconnect: the host may have idled the socket shut.
+        self.requests += 1
+        encoded = cmd.encode("utf-8")
+        # One transparent reconnect, but only for failures that happened before
+        # any byte reached the host: the host may have idled the socket shut.
+        # Once ``sendall`` returns, delivery is ambiguous, so a read failure is
+        # surfaced instead of replaying a possibly-executed action. This matches
+        # the MCP transport, which never replays a timeout or empty response.
         for attempt in range(2):
+            sent = False
             try:
                 if self._sock is None:
                     self._connect()
-                self._sock.sendall(cmd.encode("utf-8"))
+                self._sock.sendall(encoded)
+                sent = True
+                self.bytes_sent += len(encoded)
                 line = self._recv_line()
                 return json.loads(line.decode("utf-8"))
             except (OSError, ConnectionError) as exc:
                 self.close()
+                if sent:
+                    raise RuntimeError(
+                        f"bridge request failed after the command was sent: {exc}. "
+                        "Not retried because the action may already have run."
+                    )
                 if attempt == 1:
                     raise RuntimeError(f"bridge request failed: {exc}")
+                self.reconnects += 1
+            except ValueError as exc:
+                # Malformed response line: the action already reached the host.
+                self.close()
+                raise RuntimeError(f"bridge returned an unparsable response: {exc}")
         raise RuntimeError("bridge request failed")
 
     def close(self):
@@ -509,6 +615,386 @@ def finish_results(adapter, iterations, results):
         "comparison": COMPARISON_METADATA,
         "scorecard": build_scorecard(adapter, operations),
     }
+
+RUNTIME_IDENTITY_FILES = (
+    "benchmark_harness.py",
+    "bridge.py",
+    "broker.py",
+    "test_client.py",
+    "background.js",
+    "mcp/chrome_bridge_mcp/transport.py",
+    "mcp/chrome_bridge_mcp/server.py",
+)
+
+
+def _runtime_hash():
+    digest = hashlib.sha256()
+    for relative in RUNTIME_IDENTITY_FILES:
+        path = SCRIPT_DIR / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _git_output(*args):
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(SCRIPT_DIR), *args],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _artifact_path(path):
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(SCRIPT_DIR))
+    except ValueError:
+        return sanitize_error(resolved)
+
+
+def build_run_metadata(args, started_at, duration_ms):
+    status = _git_output("status", "--porcelain", "--untracked-files=no")
+    return {
+        "runId": args.run_id or uuid.uuid4().hex,
+        "startedAt": started_at,
+        "sourceHash": _git_output("rev-parse", "HEAD") or "unknown",
+        "sourceDirty": bool(status),
+        "builtHash": _runtime_hash(),
+        "buildMode": "python-source+unpacked-extension",
+        "buildReuse": False,
+        "scenario": args.scenario,
+        "adapter": args.adapter,
+        "iterations": args.iterations,
+        "warmups": args.warmups,
+        "timeoutSeconds": args.timeout_seconds,
+        "artifactPath": _artifact_path(args.output),
+        "durationMs": round(duration_ms, 3),
+        "machine": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+            "browser": os.environ.get("CHROME_BRIDGE_BROWSER_VERSION", "unknown"),
+        },
+        "claimBoundary": "end-to-end local browser workflow",
+    }
+
+
+def _require_bridge_result(response, action):
+    if not isinstance(response, dict) or response.get("success") is not True:
+        error = response.get("error") if isinstance(response, dict) else response
+        raise RuntimeError(f"{action} failed: {error or 'no successful response'}")
+    result = response.get("result")
+    if isinstance(result, dict) and result.get("success") is False:
+        raise RuntimeError(f"{action} failed: {result.get('err') or result.get('error') or 'extension error'}")
+    return result
+
+
+def _timed_request(step_timings, action, payload):
+    started = time.perf_counter()
+    result = _require_bridge_result(get_bridge_client().request(action, payload), action)
+    step_timings.append({"name": action, "durationMs": round((time.perf_counter() - started) * 1000, 3)})
+    return result
+
+def _timed_navigation_settle(step_timings):
+    started = time.perf_counter()
+    time.sleep(0.2)
+    step_timings.append({
+        "name": "navigationSettle",
+        "durationMs": round((time.perf_counter() - started) * 1000, 3),
+    })
+
+
+def _snapshot_nodes(snapshot, key=None):
+    if isinstance(snapshot, list):
+        return snapshot
+    if not isinstance(snapshot, dict):
+        return []
+    if key and isinstance(snapshot.get(key), list):
+        return snapshot[key]
+    for candidate in ("nodes", "added"):
+        if isinstance(snapshot.get(candidate), list):
+            return snapshot[candidate]
+    return []
+
+
+def _find_ref(snapshot, role, name, key=None):
+    for node in _snapshot_nodes(snapshot, key=key):
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("role", "")).lower() == role.lower() and node.get("name") == name:
+            ref = node.get("ref")
+            if ref:
+                return f"ref={ref}"
+    raise RuntimeError(f"observe did not return ref for {role} {name!r}")
+
+
+def _transport_counters():
+    client = get_bridge_client()
+    return {
+        "requests": client.requests,
+        "connections": client.connections,
+        "reconnects": client.reconnects,
+        "bytesSent": client.bytes_sent,
+        "bytesReceived": client.bytes_received,
+    }
+
+
+def _counter_delta(before, after):
+    return {key: after[key] - before[key] for key in before}
+
+
+def _run_primitive_workflow(base_url, timeout_ms):
+    timings = []
+    before = _transport_counters()
+    tab_id = None
+    started = time.perf_counter()
+    try:
+        navigation = _timed_request(timings, "navigate", {"url": base_url, "active": False})
+        tab_id = navigation["tabId"]
+        _timed_navigation_settle(timings)
+        _timed_request(timings, "waitForSelector", {
+            "tabId": tab_id, "selector": "#workflow-title", "timeoutMs": timeout_ms,
+        })
+        _timed_request(timings, "fill", {
+            "tabId": tab_id, "selector": "#workflow-title", "text": "Benchmark Article",
+        })
+        _timed_request(timings, "fill", {
+            "tabId": tab_id,
+            "selector": "#workflow-body",
+            "text": "A repeatable multi-field article workflow with deterministic content.",
+        })
+        _timed_request(timings, "select", {
+            "tabId": tab_id, "selector": "#workflow-category", "value": "research",
+        })
+        _timed_request(timings, "click", {"tabId": tab_id, "selector": "#workflow-add-section"})
+        _timed_request(timings, "waitForSelector", {
+            "tabId": tab_id, "selector": ".section-body", "timeoutMs": timeout_ms,
+        })
+        _timed_request(timings, "fill", {
+            "tabId": tab_id, "selector": ".section-body", "text": "Measured section",
+        })
+        _timed_request(timings, "click", {"tabId": tab_id, "selector": "#workflow-save"})
+        _timed_request(timings, "waitForText", {
+            "tabId": tab_id, "text": "Saved Benchmark Article", "timeoutMs": timeout_ms,
+        })
+        extracted = _timed_request(timings, "extractText", {"tabId": tab_id, "maxChars": 4000})
+        text = extracted.get("text", "") if isinstance(extracted, dict) else str(extracted or "")
+        if "Saved Benchmark Article" not in text or "Measured section" not in text:
+            raise RuntimeError("primitive workflow verification text was incomplete")
+    finally:
+        if tab_id is not None:
+            with contextlib_suppress():
+                _timed_request(timings, "closeTab", {"tabId": tab_id})
+    after = _transport_counters()
+    return {
+        "success": True,
+        "durationMs": round((time.perf_counter() - started) * 1000, 3),
+        "steps": timings,
+        "transport": _counter_delta(before, after),
+    }
+
+
+def _run_task_batch_workflow(base_url, timeout_ms):
+    timings = []
+    before = _transport_counters()
+    session_id = None
+    started = time.perf_counter()
+    try:
+        session = _timed_request(timings, "createTaskSession", {"name": "Complex workflow benchmark"})
+        session_id = session["sessionId"]
+        navigation = _timed_request(timings, "navigateTaskSession", {
+            "sessionId": session_id, "url": base_url, "active": False, "reuse": True,
+        })
+        tab_id = navigation["tabId"]
+        _timed_navigation_settle(timings)
+        _timed_request(timings, "waitForSelector", {
+            "tabId": tab_id, "selector": "#workflow-title", "timeoutMs": timeout_ms,
+        })
+        snapshot_options = {
+            "tabId": tab_id,
+            "compact": True,
+            "roles": ["textbox", "combobox", "button"],
+            "limit": 500,
+        }
+        snapshot = _timed_request(timings, "observe", snapshot_options)
+        title_ref = _find_ref(snapshot, "textbox", "Article title")
+        body_ref = _find_ref(snapshot, "textbox", "Article body")
+        category_ref = _find_ref(snapshot, "combobox", "Category")
+        add_ref = _find_ref(snapshot, "button", "Add section")
+        save_ref = _find_ref(snapshot, "button", "Save draft")
+        first_steps = [
+            {"action": "fill", "payload": {"selector": title_ref, "text": "Benchmark Article"}},
+            {
+                "action": "fill",
+                "payload": {
+                    "selector": body_ref,
+                    "text": "A repeatable multi-field article workflow with deterministic content.",
+                },
+            },
+            {"action": "select", "payload": {"selector": category_ref, "value": "research"}},
+            {"action": "click", "payload": {"selector": add_ref}},
+            {
+                "action": "waitForSelector",
+                "timeoutMs": timeout_ms,
+                "payload": {"selector": ".section-body"},
+            },
+        ]
+        _timed_request(timings, "batch", {
+            "tabId": tab_id, "steps": first_steps, "stopOnError": True,
+        })
+        diff = _timed_request(timings, "observe", {**snapshot_options, "diff": True})
+        section_ref = _find_ref(diff, "textbox", "Section 1", key="added")
+        second_steps = [
+            {"action": "fill", "payload": {"selector": section_ref, "text": "Measured section"}},
+            {"action": "click", "payload": {"selector": save_ref}},
+            {
+                "action": "waitForText",
+                "timeoutMs": timeout_ms,
+                "payload": {"text": "Saved Benchmark Article"},
+            },
+        ]
+        _timed_request(timings, "batch", {
+            "tabId": tab_id, "steps": second_steps, "stopOnError": True,
+        })
+        extracted = _timed_request(timings, "extractText", {"tabId": tab_id, "maxChars": 4000})
+        text = extracted.get("text", "") if isinstance(extracted, dict) else str(extracted or "")
+        if "Saved Benchmark Article" not in text or "Measured section" not in text:
+            raise RuntimeError("task-batch workflow verification text was incomplete")
+    finally:
+        if session_id is not None:
+            with contextlib_suppress():
+                _timed_request(timings, "closeTaskSession", {"sessionId": session_id})
+    after = _transport_counters()
+    return {
+        "success": True,
+        "durationMs": round((time.perf_counter() - started) * 1000, 3),
+        "steps": timings,
+        "transport": _counter_delta(before, after),
+    }
+
+
+def _workflow_summary(mode, cold, warmups, measured):
+    # A run that failed after its command bytes reached the host has no timing:
+    # it is reported but excluded from the medians rather than counted as 0 ms.
+    completed = [run for run in measured if run.get("durationMs") is not None]
+    failed = [run for run in measured if run.get("durationMs") is None]
+    durations = [run["durationMs"] for run in completed]
+    requests = [
+        run["transport"]["requests"] for run in completed
+        if isinstance(run.get("transport"), dict)
+    ]
+    return {
+        "mode": mode,
+        "cold": cold,
+        "discardedWarmups": warmups,
+        "warm": measured,
+        "warmMeasuredRuns": len(completed),
+        "warmFailedRuns": len(failed),
+        "warmFailures": [run.get("error") for run in failed],
+        "warmMedianMs": calculate_median(durations),
+        "warmMedianRequests": calculate_median(requests),
+        "coldDefinition": "first workflow after benchmark process start",
+        "warmDefinition": "measured workflows after the cold run and discarded warmups",
+    }
+
+
+def _attempt_workflow(runner, base_url, timeout_ms):
+    # Post-send transport failures are no longer retried, so a measured
+    # iteration can legitimately produce no timing. Surface it as a failed run
+    # instead of aborting the whole benchmark or contributing a bogus duration.
+    try:
+        return runner(base_url, timeout_ms)
+    except Exception as exc:
+        return {"success": False, "error": sanitize_error(str(exc))}
+
+
+def run_complex_workflow(args, base_url):
+    runner = _run_primitive_workflow if args.workflow_mode == "primitive" else _run_task_batch_workflow
+    timeout_ms = int(args.timeout_seconds * 1000)
+    if args.iterations <= 0:
+        return _workflow_summary(args.workflow_mode, None, [], [])
+    cold = _attempt_workflow(runner, base_url, timeout_ms)
+    discarded = [_attempt_workflow(runner, base_url, timeout_ms) for _ in range(args.warmups)]
+    measured = [_attempt_workflow(runner, base_url, timeout_ms) for _ in range(args.iterations)]
+    return _workflow_summary(args.workflow_mode, cold, discarded, measured)
+
+
+def _unused_local_port():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def run_broker_diagnostic(args):
+    frontend_port = _unused_local_port()
+    backend_port = _unused_local_port()
+    with tempfile.TemporaryDirectory(prefix="bridge-broker-benchmark-") as tmp:
+        env = os.environ.copy()
+        env.update({
+            "BRIDGE_BROKER_PORT": str(frontend_port),
+            "BRIDGE_BACKEND_PORT": str(backend_port),
+            "BRIDGE_BROKER_LOG_FILE": str(Path(tmp) / "broker.log"),
+            "BRIDGE_PORT": str(frontend_port),
+            "BRIDGE_CONNECT_TIMEOUT_SECONDS": "1",
+        })
+        broker = subprocess.Popen(
+            [sys.executable, str(SCRIPT_DIR / "broker.py")],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    probe = socket.create_connection(("127.0.0.1", frontend_port), timeout=0.1)
+                    probe.close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            started = time.perf_counter()
+            proc = subprocess.run(
+                [sys.executable, str(CLIENT), "ping"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=args.timeout_seconds,
+                check=False,
+            )
+            duration_ms = (time.perf_counter() - started) * 1000
+            combined = f"{proc.stdout}\n{proc.stderr}"
+            classification = (
+                "browser_unavailable"
+                if "browser unavailable" in combined or "backend unavailable" in combined
+                else "client_timeout"
+                if "timed out" in combined
+                else "other"
+            )
+            return {
+                "durationMs": round(duration_ms, 3),
+                "exitCode": proc.returncode,
+                "classification": classification,
+                "expectedBackendWaitSeconds": 3,
+                "clientTimeoutSeconds": 15,
+            }
+        finally:
+            broker.terminate()
+            with contextlib_suppress():
+                broker.wait(timeout=3)
+            if broker.poll() is None:
+                broker.kill()
 
 
 def record_op(results, op_name, capability, duration_ms, error=None):
@@ -1311,33 +1797,74 @@ def initial_results():
 def handle_run(args):
     global BENCHMARK_QUIET
     BENCHMARK_QUIET = bool(getattr(args, "quiet", False))
+    for name, default in (
+        ("scenario", "operations"),
+        ("warmups", 0),
+        ("workflow_mode", "task-batch"),
+        ("timeout_seconds", 30),
+        ("run_id", None),
+    ):
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    started_clock = time.perf_counter()
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
     base_url = args.base_url
     server = None
-    if args.adapter in {"chrome-bridge", "playwright", "puppeteer", "chrome-devtools-mcp"} and args.iterations > 0 and not base_url:
+    needs_fixture = args.scenario in {"operations", "complex-workflow"}
+    if (
+        needs_fixture
+        and args.adapter in {"chrome-bridge", "playwright", "puppeteer", "chrome-devtools-mcp"}
+        and args.iterations > 0
+        and not base_url
+    ):
         server, base_url = start_fixture_server()
     results = initial_results()
     try:
-        if args.iterations > 0 and args.adapter in {"playwright", "puppeteer", "chrome-devtools-mcp"}:
-            enforce_browser_rss_limit(args.browser_rss_limit_mb)
-        if args.adapter == "noop":
-            for _ in range(args.iterations):
-                run_noop(results)
-        elif args.adapter == "chrome-bridge":
-            for _ in range(args.iterations):
-                run_chrome_bridge_iteration(results, base_url)
-        elif args.adapter == "playwright":
-            run_playwright(args, results, base_url)
-        elif args.adapter == "puppeteer":
-            run_puppeteer(args, results, base_url)
-            if args.iterations > 0:
+        if args.scenario == "complex-workflow":
+            if args.adapter != "chrome-bridge":
+                raise ValueError("complex-workflow currently requires --adapter chrome-bridge")
+            output_data = {
+                "schemaVersion": 2,
+                "adapter": args.adapter,
+                "scenario": args.scenario,
+                "workflow": run_complex_workflow(args, base_url),
+            }
+        elif args.scenario == "broker-diagnostic":
+            if args.adapter != "chrome-bridge":
+                raise ValueError("broker-diagnostic requires --adapter chrome-bridge")
+            output_data = {
+                "schemaVersion": 2,
+                "adapter": args.adapter,
+                "scenario": args.scenario,
+                "brokerDiagnostic": run_broker_diagnostic(args) if args.iterations > 0 else None,
+            }
+        elif args.scenario == "operations":
+            if args.iterations > 0 and args.adapter in {"playwright", "puppeteer", "chrome-devtools-mcp"}:
                 enforce_browser_rss_limit(args.browser_rss_limit_mb)
-        elif args.adapter == "chrome-devtools-mcp":
-            run_chrome_devtools_mcp(args, results, base_url)
-            if args.iterations > 0:
-                enforce_browser_rss_limit(args.browser_rss_limit_mb)
+            if args.adapter == "noop":
+                for _ in range(args.iterations):
+                    run_noop(results)
+            elif args.adapter == "chrome-bridge":
+                for _ in range(args.iterations):
+                    run_chrome_bridge_iteration(results, base_url)
+            elif args.adapter == "playwright":
+                run_playwright(args, results, base_url)
+            elif args.adapter == "puppeteer":
+                run_puppeteer(args, results, base_url)
+                if args.iterations > 0:
+                    enforce_browser_rss_limit(args.browser_rss_limit_mb)
+            elif args.adapter == "chrome-devtools-mcp":
+                run_chrome_devtools_mcp(args, results, base_url)
+                if args.iterations > 0:
+                    enforce_browser_rss_limit(args.browser_rss_limit_mb)
+            else:
+                raise ValueError(f"Unknown adapter: {args.adapter}")
+            output_data = finish_results(args.adapter, args.iterations, results)
+            output_data["scenario"] = args.scenario
         else:
-            raise ValueError(f"Unknown adapter: {args.adapter}")
-        output_data = finish_results(args.adapter, args.iterations, results)
+            raise ValueError(f"Unknown scenario: {args.scenario}")
+        duration_ms = (time.perf_counter() - started_clock) * 1000
+        output_data["run"] = build_run_metadata(args, started_at, duration_ms)
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(output_data, indent=2), encoding="utf-8")
@@ -1671,7 +2198,27 @@ def main():
         default="noop",
         help="Harness adapter to use",
     )
+    run_parser.add_argument(
+        "--scenario",
+        choices=["operations", "complex-workflow", "broker-diagnostic"],
+        default="operations",
+        help="Benchmark scenario to run",
+    )
     run_parser.add_argument("--iterations", type=int, default=2, help="Number of benchmark iterations")
+    run_parser.add_argument("--warmups", type=int, default=1, help="Discarded warm workflow iterations")
+    run_parser.add_argument(
+        "--workflow-mode",
+        choices=["primitive", "task-batch"],
+        default="task-batch",
+        help="Automation strategy for the complex-workflow scenario",
+    )
+    run_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=30,
+        help="Per-step and outer benchmark timeout",
+    )
+    run_parser.add_argument("--run-id", help="Stable run identifier; generated when omitted")
     run_parser.add_argument("--output", required=True, help="Path to write JSON results")
     run_parser.add_argument("--base-url", help="Base URL of target page for live benchmarking")
     run_parser.add_argument(

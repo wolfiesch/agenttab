@@ -57,8 +57,13 @@ EXCLUDED_GLOBS = {
     "*.policy",
 }
 
+# Public templates that must ship even though a secret-shaped EXCLUDED_GLOBS
+# pattern matches their name. `bridge_policy*.json` deliberately sweeps every
+# local policy document, which would otherwise drop the tracked bundle example.
 ALWAYS_INCLUDE_PATHS = {
     "bridge_policy.example.json",
+    "bridge_policy_bundle.example.json",
+    "bridge_policy_bundle.lock.example",
 }
 
 

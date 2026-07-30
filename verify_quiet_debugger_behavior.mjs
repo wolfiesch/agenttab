@@ -15,18 +15,22 @@ async function flush(count = 6) {
   for (let index = 0; index < count; index += 1) await Promise.resolve();
 }
 
-export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {}) {
+export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reconnectState = null } = {}) {
   const listeners = { detach: null, removed: null };
   const localState = {
     [SESSION_KEY]: clone(sessions),
     chromeBridgePreferences: { showAgentPointer: true, ...clone(preferences) },
   };
+  if (reconnectState) localState.reconnectState = clone(reconnectState);
   const tabState = new Map(Object.entries(tabs).map(([id, tab]) => [Number(id), { id: Number(id), ...clone(tab) }]));
   const attachedTabs = new Set();
   const heldTabGets = new Map();
   const pendingDetaches = [];
   const lateDetachEvents = [];
   const fakeTimers = new Map();
+  const nativeMessages = [];
+  let nativeMessageListener = null;
+  let nativeDisconnectListener = null;
   let nextTimerId = 1;
   let nextTabId = 1000;
 
@@ -42,7 +46,19 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
     detachEventAfterCallback: false,
     failNextDetach: false,
     scriptResult: [],
+    nativeMessages,
+    emitNativeMessage(message) {
+      assert.ok(nativeMessageListener, 'expected native message listener');
+      nativeMessageListener(clone(message));
+    },
+    disconnectNative() {
+      assert.ok(nativeDisconnectListener, 'expected native disconnect listener');
+      nativeDisconnectListener();
+    },
     commandResult(method) {
+      if (method === 'Runtime.evaluate') {
+        return { result: { value: { success: true, x: 10, y: 20, width: 30, height: 40 } } };
+      }
       if (method === 'Accessibility.getFullAXTree') {
         return {
           nodes: [
@@ -86,9 +102,9 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
     lastError: null,
     connectNative() {
       return {
-        onMessage: { addListener() {} },
-        onDisconnect: { addListener() {} },
-        postMessage() {},
+        onMessage: { addListener(listener) { nativeMessageListener = listener; } },
+        onDisconnect: { addListener(listener) { nativeDisconnectListener = listener; } },
+        postMessage(message) { nativeMessages.push(clone(message)); },
       };
     },
     onMessage: { addListener() {} },
@@ -217,7 +233,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
 
   const context = vm.createContext({
     chrome,
-    console: { log() {}, warn() {}, error() {} },
+    console: { debug() {}, log() {}, warn() {}, error() {} },
     URL,
     TextEncoder,
     btoa: (value) => Buffer.from(value, 'binary').toString('base64'),
@@ -238,6 +254,8 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
       withDebugger,
       withTaskDebugger,
       detachTaskDebugger,
+      resolveActionTarget,
+      clickSelector,
       startMonitoring,
       stopMonitoring,
       loadTaskSessions,
@@ -260,6 +278,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {} } = {
     api: context.__bridgeTest,
     controller,
     sessions: () => clone(localState[SESSION_KEY] || {}),
+    reconnectState: () => clone(localState.reconnectState),
   };
 }
 
@@ -417,6 +436,54 @@ async function testCloseDoesNotRemoveTabMovedToAnotherGroup() {
   assert.deepEqual(Array.from(result.closedTabIds), []);
 }
 
+async function testTopDocumentSelectorSkipsFrameTreeAndDocumentLookups() {
+  const harness = createHarness({
+    tabs: { 30: { groupId: -1, url: 'https://example.com', status: 'complete' } },
+  });
+  const result = await harness.api.resolveActionTarget(30, {
+    frames: [],
+    target: { kind: 'css', selector: '#save' },
+  });
+  assert.equal(result.success, true);
+  assert.equal(harness.controller.commandMethods.includes('Page.getFrameTree'), false);
+  assert.equal(harness.controller.commandMethods.includes('DOM.getDocument'), false);
+}
+
+
+async function testPointerRenderingDoesNotDelayFocusedClick() {
+  const harness = createHarness({
+    tabs: { 31: { active: true, windowId: 1, groupId: -1, url: 'https://example.com', status: 'complete' } },
+  });
+  const result = await harness.api.clickSelector(31, '#save');
+  assert.equal(result.success, true);
+  assert.deepEqual(
+    harness.controller.commandMethods.filter((method) => method === 'Input.dispatchMouseEvent'),
+    ['Input.dispatchMouseEvent', 'Input.dispatchMouseEvent', 'Input.dispatchMouseEvent'],
+  );
+  await flush();
+  assert.equal(harness.controller.scriptCalls.length, 1);
+}
+
+
+async function testReconnectBackoffResetsOnlyAfterHostAcknowledges() {
+  const harness = createHarness({
+    reconnectState: { attempt: 4, delay: 16000 },
+  });
+  await flush();
+  assert.deepEqual(harness.reconnectState(), { attempt: 4, delay: 16000 });
+  assert.deepEqual(harness.controller.nativeMessages[0], {
+    action: 'hostHandshake',
+    protocolVersion: 1,
+  });
+  harness.controller.emitNativeMessage({
+    action: 'hostAcknowledged',
+    protocolVersion: 1,
+  });
+  await flush();
+  assert.deepEqual(harness.reconnectState(), { attempt: 0, delay: 1000 });
+}
+
+
 const tests = [
   testCompactObserveUsesBrowserAccessibility,
   testAcquireWaitsForDetach,
@@ -427,7 +494,10 @@ const tests = [
   testConcurrentCloseCannotResurrectSession,
   testCurrentGroupReassignsOwnership,
   testIdleDebuggerDoesNotHideCurrentGroup,
+  testTopDocumentSelectorSkipsFrameTreeAndDocumentLookups,
   testCloseDoesNotRemoveTabMovedToAnotherGroup,
+  testPointerRenderingDoesNotDelayFocusedClick,
+  testReconnectBackoffResetsOnlyAfterHostAcknowledges,
 ];
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

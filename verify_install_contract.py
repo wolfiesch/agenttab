@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline contract test for extension identity and install/deploy scripts."""
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -111,6 +112,8 @@ def expect_source_archive_omits_scratch_files(repo_root, dist, version):
 
         expected_tracked_public_files = [
             "bridge_policy.example.json",
+            "bridge_policy_bundle.example.json",
+            "bridge_policy_bundle.lock.example",
             "bridge_tokens.txt.example",
             "com.automation.bridge.json.template",
         ]
@@ -363,7 +366,51 @@ def expect_browser_manifest_contract(tmp):
 
 
 
+def expect_policy_bundle_examples():
+    # The tracked org-bundle examples must parse and must be obviously inert:
+    # a placeholder digest can never verify, so copying the pair verbatim fails
+    # closed instead of silently pinning something real.
+    bundle_path = SCRIPT_DIR / "bridge_policy_bundle.example.json"
+    lock_path = SCRIPT_DIR / "bridge_policy_bundle.lock.example"
+    try:
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        expect(False, f"example policy bundle should parse as JSON: {exc}")
+        return
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        expect(False, f"example bundle lockfile should parse as JSON: {exc}")
+        return
+    expect(isinstance(bundle.get("default"), dict) and isinstance(bundle.get("clients"), dict),
+           "example policy bundle should carry the default and clients layers a host merges")
+    expect("policyBundle" not in bundle,
+           "a bundle must not name another bundle; policyBundle belongs in the local policy file")
+    digest = lock.get("sha256")
+    expect(isinstance(digest, str) and len(digest) == 64 and set(digest) <= set("0123456789abcdef"),
+           f"example lockfile digest should be 64 lowercase hex characters, got {digest!r}")
+    expect(isinstance(digest, str) and set(digest) == {"0"},
+           f"example lockfile digest must be an obvious placeholder, got {digest!r}")
+    actual = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+    expect(digest != actual,
+           "example lockfile must not pin the example bundle; a real digest comes from "
+           "'chrome-bridge policy bundle lock'")
+    note = " ".join(str(v) for v in (lock.get("_comment"), bundle.get("_comment")) if v)
+    expect("policy bundle lock" in note,
+           "the examples should say a real digest must come from the lock command")
+
+
 def main():
+    wake_source = (SCRIPT_DIR / "wake.js").read_text()
+    reload_script = SCRIPT_DIR / "scripts" / "reload_unpacked_extension.sh"
+    reload_source = reload_script.read_text()
+    expect("window.history.replaceState" in wake_source and "chrome.runtime.reload()" in wake_source,
+           "wake page must remove its reload trigger before reloading the extension")
+    expect("wake.html?reload=1" in reload_source and 'open -g -a "$CHROME_APP"' in reload_source,
+           "reload helper must open the one-shot wake page without focusing Chrome")
+    if os.name == "posix":
+        expect(mode(reload_script) & 0o111, "reload helper must be executable")
+
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         key = tmp / "extension_key.pem"
@@ -449,6 +496,15 @@ def main():
             expect(launcher.exists(), "setup state-dir launcher should exist")
             expect('BRIDGE_PORT="${BRIDGE_PORT:-19223}"' in launcher.read_text(),
                    "setup state-dir launcher should use host port 19223")
+            native_host = Path(setup_info["nativeHost"])
+            expect(native_host == state_dir / "bridge.py",
+                   "setup state-dir should install the Python runtime into durable state")
+            expect(native_host.exists() and os.access(native_host, os.X_OK),
+                   "setup state-dir native host should exist and be executable")
+            expect(native_host.read_bytes() == (SCRIPT_DIR / "bridge.py").read_bytes(),
+                   "installed Python native host should match repository source")
+            expect(str(native_host) in launcher.read_text(),
+                   "setup state-dir launcher should execute the durable native host")
             expect((state_dir / "extension_id.txt").exists(),
                    "setup state-dir should write extension_id.txt")
             expect(setup_info.get("extensionIdFile") == str(state_dir / "extension_id.txt"),
@@ -490,6 +546,13 @@ def main():
             expect(launcher.exists(), "setup-rs state-dir launcher should exist")
             expect('BRIDGE_PORT="${BRIDGE_PORT:-19223}"' in launcher.read_text(),
                    "setup-rs state-dir launcher should use host port 19223")
+            native_host = Path(setup_info["nativeHost"])
+            expect(native_host == rust_state_dir / "bridge-host",
+                   "setup-rs state-dir should install the Rust runtime into durable state")
+            expect(native_host.exists() and os.access(native_host, os.X_OK),
+                   "setup-rs state-dir native host should exist and be executable")
+            expect(str(native_host) in launcher.read_text(),
+                   "setup-rs state-dir launcher should execute the durable native host")
             expect((rust_state_dir / "extension_id.txt").exists(),
                    "setup-rs state-dir should write extension_id.txt")
             expect(setup_info.get("extensionIdFile") == str(rust_state_dir / "extension_id.txt"),
@@ -568,6 +631,7 @@ def main():
         expect_windows_installer_contract()
         expect_edge_setup_contract()
         expect_browser_manifest_contract(tmp)
+        expect_policy_bundle_examples()
     if failures:
         print(f"\n{len(failures)} install contract failure(s).")
         return 1

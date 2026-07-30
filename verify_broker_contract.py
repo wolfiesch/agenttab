@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import importlib.util
 import json
 import os
 import socket
@@ -112,6 +113,22 @@ def read_line(sock):
     return json.loads(buffer.split(b"\n", 1)[0].decode("utf-8"))
 
 
+def test_default_timeout_contract():
+    saved = os.environ.pop("BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS", None)
+    try:
+        spec = importlib.util.spec_from_file_location("broker_contract_module", BROKER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.refresh_config()
+        expect(
+            module.BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS == 3.0,
+            "default backend timeout must fail fast within the 15s client deadline",
+        )
+    finally:
+        if saved is not None:
+            os.environ["BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS"] = saved
+
+
 def test_delayed_backend_then_proxy_persistent_socket():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -154,6 +171,7 @@ def test_backend_unavailable_error():
 
 def main():
     for test in [
+        test_default_timeout_contract,
         test_delayed_backend_then_proxy_persistent_socket,
         test_backend_unavailable_error,
     ]:

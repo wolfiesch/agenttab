@@ -133,6 +133,10 @@ def assert_reported_paths(setup_json, bridge_port):
         "tokenFile",
         "tokensFile",
         "launcher",
+        # setup.sh and setup-rs.sh install the host outside the checkout and
+        # report the installed copy here, in this position, so the strict
+        # key-order check below has to include it.
+        "nativeHost",
         "extensionIdFile",
         "hostPort",
     ]

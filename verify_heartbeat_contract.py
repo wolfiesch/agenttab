@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import sys
+import struct
 import tempfile
 import threading
 import time
@@ -90,6 +91,28 @@ def delayed_fake_server(port):
     conn.sendall(json.dumps({"success": True, "result": "pong"}).encode() + b"\n")
     conn.close()
     server.close()
+
+handshake = json.dumps({
+    "action": "hostHandshake",
+    "protocolVersion": 1,
+}).encode("utf-8")
+handshake_env = os.environ.copy()
+handshake_env["BRIDGE_PORT"] = str(unused_port())
+handshake_env["BRIDGE_LOG_FILE"] = os.devnull
+host = subprocess.run(
+    [sys.executable, os.path.join(SCRIPT_DIR, "bridge.py")],
+    input=struct.pack("@I", len(handshake)) + handshake,
+    capture_output=True,
+    env=handshake_env,
+    timeout=5,
+)
+try:
+    response_length = struct.unpack("@I", host.stdout[:4])[0]
+    response = json.loads(host.stdout[4:4 + response_length].decode("utf-8"))
+    if response != {"action": "hostAcknowledged", "protocolVersion": 1}:
+        fail(f"native host handshake response mismatch: {response}")
+except Exception as exc:
+    fail(f"native host handshake did not produce a framed acknowledgement: {exc!r}")
 
 port = unused_port()
 threading.Thread(target=delayed_fake_server, args=(port,), daemon=True).start()

@@ -23,6 +23,10 @@ QUIET_MODE = False
 
 
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-live-upload.txt"
+# A DLP-blocked upload must never read this file, so its content is a sentinel
+# the check greps for in the client's output.
+DLP_FIXTURE = "/tmp/chrome-bridge-live-dlp-upload.txt"
+DLP_FIXTURE_SENTINEL = "dlp-fixture-content-must-not-be-read"
 SHOT_PATH = "/tmp/chrome-bridge-live.png"
 PDF_PATH = "/tmp/chrome-bridge-live.pdf"
 HTML_PATH = "/tmp/chrome-bridge-live.html"
@@ -32,6 +36,15 @@ DOWNLOAD_NAME = "chrome-bridge-smoke-download.json"
 STRUCTURED_SCHEMA_PATH = "/tmp/chrome-bridge-structured-schema.json"
 STRUCTURED_DATA_PATH = "/tmp/chrome-bridge-structured.json"
 WORKFLOW_PATH = "/tmp/chrome-bridge-workflow.json"
+RICH_TEXT_PATH = "/tmp/chrome-bridge-rich-text.json"
+INVALID_RICH_TEXT_PATH = "/tmp/chrome-bridge-rich-text-invalid.json"
+# T4-4 fixtures: a schema the fixture page satisfies, an authored workflow whose
+# postcondition needs one bounded retry, one whose postcondition can never hold,
+# and a version-1 file that must keep replaying under the version-2 reader.
+EXPECT_SCHEMA_PATH = "/tmp/chrome-bridge-expect-schema.json"
+EXPECT_WORKFLOW_PATH = "/tmp/chrome-bridge-expect-workflow.json"
+EXPECT_FAIL_WORKFLOW_PATH = "/tmp/chrome-bridge-expect-fail-workflow.json"
+LEGACY_WORKFLOW_PATH = "/tmp/chrome-bridge-workflow-v1.json"
 # CLI-owned local state written during the ST3/ST4 checks; removed on cleanup.
 ACTION_CACHE_PATH = os.path.join(SCRIPT_DIR, "bridge_action_cache.json")
 WORKFLOW_STASH_PATH = os.path.join(SCRIPT_DIR, "bridge_workflow_last.json")
@@ -61,6 +74,10 @@ STRUCTURED_SCHEMA = {
     "required": ["orderNumber", "customerName", "totalAmount", "missingField"],
 }
 LAST_SUMMARY = {}
+# T4-3 fixture credential. The page holds it so the setter script that simulates
+# the human never has to carry it, leaving the constant below as the only copy
+# the check compares against.
+CREDENTIAL_FIXTURE_SECRET = "matrix-credential-secret-9182"
 PAGE = b"""<!doctype html>
 <html>
 <head>
@@ -85,9 +102,21 @@ PAGE = b"""<!doctype html>
   <button id="mapped">Mapped error</button>
   <button id="mapped-cross">Cross map</button>
   <button id="early">Early frame</button>
+  <!-- T4-4 fixture: #delayed appears 600ms after this button is clicked, so a
+       postcondition with a short timeout fails on the first attempt and passes
+       after one bounded retry. -->
+  <button id="delay">Delay</button>
   <select id="kind" name="kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>
   <input id="file" type="file">
+  <form id="cred-form" onsubmit="event.preventDefault(); document.querySelector('#status').textContent = 'cred-submitted'; return false;">
+    <label for="secret">Account password</label>
+    <input id="secret" name="secret" type="password" value="">
+  </form>
   <div id="status">ready</div>
+  <div id="editor" contenteditable="true" aria-label="Rich editor"></div>
+  <div id="editor-fallback" contenteditable="true" aria-label="Basic rich editor"></div>
+  <div id="editor-cancelled" contenteditable="true" aria-label="Cancelled rich editor"></div>
+  <div id="editor-async-handled" contenteditable="true" aria-label="Async handled rich editor"></div>
   <div id="from" draggable="true">from</div>
   <div id="to">to</div>
   <div id="panel"><div id="spacer">scroll panel</div></div>
@@ -95,6 +124,9 @@ PAGE = b"""<!doctype html>
   <iframe id="frame" srcdoc="&lt;input id=&quot;frame-input&quot; aria-label=&quot;Frame input&quot;&gt;&lt;button id=&quot;frame-button&quot;&gt;Frame click&lt;/button&gt;&lt;select id=&quot;frame-select&quot;&gt;&lt;option value=&quot;one&quot;&gt;One&lt;/option&gt;&lt;option value=&quot;two&quot;&gt;Two&lt;/option&gt;&lt;/select&gt;&lt;input id=&quot;frame-file&quot; type=&quot;file&quot;&gt;&lt;script&gt;document.getElementById(&quot;frame-input&quot;).addEventListener(&quot;input&quot;, function () { parent.postMessage({type: &quot;frame-value&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-button&quot;).addEventListener(&quot;click&quot;, function () { parent.postMessage({type: &quot;frame-click&quot;}, &quot;*&quot;); }); document.getElementById(&quot;frame-select&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-select&quot;, value: this.value}, &quot;*&quot;); }); document.getElementById(&quot;frame-file&quot;).addEventListener(&quot;change&quot;, function () { parent.postMessage({type: &quot;frame-file&quot;, count: this.files.length}, &quot;*&quot;); });&lt;/script&gt;"></iframe>
   <script>
     window.__shadowClicks = 0;
+    // T4-3: the page owns the fake credential so the script that simulates the
+    // human typing never has to carry the literal.
+    window.__credentialFixtureSecret = 'matrix-credential-secret-9182';
     window.__frameValue = '';
     window.__frameClicks = 0;
     window.__frameSelect = '';
@@ -104,6 +136,16 @@ PAGE = b"""<!doctype html>
     shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button><label>Shadow input<input id="shadow-input"></label><select id="shadow-kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>';
     shadowRoot.querySelector('#shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
     window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; if (event.data && event.data.type === 'frame-select') window.__frameSelect = event.data.value; if (event.data && event.data.type === 'frame-file') window.__frameFileCount = event.data.count; });
+    document.querySelector('#editor').addEventListener('paste', event => {
+      event.preventDefault();
+      event.currentTarget.innerHTML = event.clipboardData.getData('text/html');
+      window.__richPasteHandled = true;
+    });
+    document.querySelector('#editor-cancelled').addEventListener('paste', event => event.preventDefault());
+    document.querySelector('#editor-async-handled').addEventListener('paste', event => {
+      event.preventDefault();
+      setTimeout(() => { document.querySelector('#editor-async-handled').innerHTML = '<p>asynchronous editor insertion</p>'; }, 40);
+    });
     document.querySelector('#btn').addEventListener('click', () => {
       document.querySelector('#status').textContent = 'clicked:' + document.querySelector('#q').value;
     });
@@ -112,6 +154,7 @@ PAGE = b"""<!doctype html>
     document.querySelector('#alert').addEventListener('click', () => alert('hello dialog'));
     document.querySelector('#to').addEventListener('dragover', event => event.preventDefault());
     document.querySelector('#to').addEventListener('drop', event => { event.preventDefault(); window.__dragDropped = true; document.querySelector('#status').textContent = 'dropped'; });
+    document.querySelector('#delay').addEventListener('click', () => { setTimeout(() => { if (!document.querySelector('#delayed')) { const el = document.createElement('div'); el.id = 'delayed'; el.textContent = 'delayed element'; document.body.appendChild(el); } }, 600); });
   </script>
   <section id="structured">
     <h2>Order summary</h2>
@@ -195,6 +238,11 @@ EARLY_MAPPED_SCRIPT = (
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/cross-origin-redirect"):
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{self.server.server_address[1]}/")
+            self.end_headers()
+            return
         if self.path.startswith("/data.json"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -288,7 +336,7 @@ def restore_policy(backup, policy_path, backup_mode=None):
 
 
 def run_bridge(*args, timeout=20):
-    if args and args[0] in {"waitForLoad", "waitForSelector"} and isinstance(args[-1], int) and args[-1] > 1000:
+    if args and args[0] in {"waitForLoad", "waitForSelector", "expect"} and isinstance(args[-1], int) and args[-1] > 1000:
         timeout = max(timeout, int(args[-1] / 1000) + 15)
     proc = subprocess.run([*bridge_command(), *map(str, args)], text=True, capture_output=True, timeout=timeout)
     parsed = None
@@ -351,7 +399,9 @@ def main(quiet=False):
     Path(UPLOAD_FIXTURE).write_text("upload fixture\n", encoding="utf-8")
     # A stale selector cache would let the self-heal check pass on a mapping
     # this run never created.
-    for path in [SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, WORKFLOW_PATH, ACTION_CACHE_PATH, WORKFLOW_STASH_PATH]:
+    for path in [SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, WORKFLOW_PATH, ACTION_CACHE_PATH, WORKFLOW_STASH_PATH,
+                 EXPECT_SCHEMA_PATH, EXPECT_WORKFLOW_PATH, EXPECT_FAIL_WORKFLOW_PATH, LEGACY_WORKFLOW_PATH,
+                 RICH_TEXT_PATH, INVALID_RICH_TEXT_PATH]:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
     # A stale frame directory would make the frame-count assertions meaningless.
@@ -363,6 +413,7 @@ def main(quiet=False):
     policy_installed = False
     server = None
     tab_id = None
+    composite_tab_id = None
     monitoring_started = False
     interception_started = False
     screencast_started = False
@@ -379,9 +430,10 @@ def main(quiet=False):
         policy = {
             "default": {
                 "allowedActions": [
-                    "ping", "navigate", "waitForLoad", "waitForSelector", "click", "fill",
-                    "select", "uploadFile", "screenshot", "extractText", "extractStructured",
-                    "scanPromptInjection", "getHTML", "type", "drag",
+                    "ping", "navigate", "navigateAndSnapshot", "waitForLoad", "waitForSelector",
+                    "expect", "click", "fill", "insertRichText", "select", "uploadFile",
+                    "screenshot", "observe", "extractText", "extractStructured", "scanPromptInjection",
+                    "getHTML", "type", "drag",
                     "scroll", "press", "hover", "startMonitoring", "consoleMessages",
                     "setViewport", "setUserAgent", "setNetworkConditions", "clearNetworkConditions",
                     "setCpuThrottling", "setColorScheme", "networkRequests", "executeScriptCDP",
@@ -393,7 +445,7 @@ def main(quiet=False):
                     "clearStorage", "searchHistory", "searchBookmarks", "searchTabs",
                     "startScreencast", "screencastFrames", "stopScreencast",
                     "startWorkflowRecording", "stopWorkflowRecording", "replayWorkflow",
-                    "resolveCachedSelector", "cacheSelectors"
+                    "resolveCachedSelector", "cacheSelectors", "credentialHandoff"
                 ],
                 "allowedOrigins": ["*"],
                 "deniedActions": [],
@@ -434,6 +486,75 @@ def main(quiet=False):
         call = run_bridge("waitForLoad", tab_id, 20000)
         record(summary, "waitForLoad", call)
         require(call["exit"] == 0, "waitForLoad failed", call)
+        call = run_bridge(
+            "navigateAndSnapshot", BASE_URL,
+            "--wait", "selector", "--selector", "#q", "--timeout", "20000",
+            "--role", "heading", "--limit", "10",
+        )
+        composite = result(call) or {}
+        composite_tab_id = composite.get("tabId")
+        composite_nodes = composite.get("snapshot", [])
+        record(summary, "navigateAndSnapshot", call, {
+            "tabId": composite_tab_id,
+            "nodes": len(composite_nodes) if isinstance(composite_nodes, list) else None,
+        })
+        require(
+            call["exit"] == 0
+            and composite_tab_id is not None
+            and isinstance(composite_nodes, list)
+            and any(node.get("name") == "Chrome Bridge Live Test"
+                    for node in composite_nodes if isinstance(node, dict)),
+            "navigateAndSnapshot did not return the loaded fixture snapshot",
+            call,
+        )
+        run_bridge("closeTab", composite_tab_id)
+        composite_tab_id = None
+        call = run_bridge(
+            "navigateAndSnapshot", BASE_URL + "cross-origin-redirect",
+            "--wait", "load", "--timeout", "5000",
+        )
+        redirected = result(call) or {}
+        redirected_tab_id = redirected.get("tabId")
+        redirected_error = redirected.get("err") or ""
+        record(summary, "navigateAndSnapshotRejectsCrossOriginRedirect", call, {
+            "tabId": redirected_tab_id,
+            "snapshotReturned": "snapshot" in redirected,
+            "urlReturned": redirected.get("url") is not None,
+        })
+        require(
+            call["exit"] != 0
+            and redirected_tab_id is not None
+            and "cross-origin redirect" in redirected_error
+            and "snapshot" not in redirected
+            and redirected.get("url") is None
+            and f"tabId {redirected_tab_id}" in redirected_error,
+            "navigateAndSnapshot exposed a cross-origin redirect snapshot",
+            call,
+        )
+        run_bridge("closeTab", redirected_tab_id)
+
+        call = run_bridge(
+            "navigateAndSnapshot", BASE_URL,
+            "--wait", "selector", "--selector", "#definitely-absent", "--timeout", "250",
+        )
+        wait_failure = result(call) or {}
+        failed_tab_id = wait_failure.get("tabId")
+        wait_failure_error = wait_failure.get("err") or ""
+        record(summary, "navigateAndSnapshotWaitFailureContext", call, {
+            "tabId": failed_tab_id,
+            "windowId": wait_failure.get("windowId"),
+            "hasError": bool(wait_failure_error),
+        })
+        require(
+            call["exit"] != 0
+            and failed_tab_id is not None
+            and wait_failure.get("windowId") is not None
+            and f"tabId {failed_tab_id}" in wait_failure_error,
+            "navigateAndSnapshot wait failure omitted cleanup context",
+            call,
+        )
+        run_bridge("closeTab", failed_tab_id)
+
 
         # 4. Wait For Selector
         call = run_bridge("waitForSelector", tab_id, "#q", 20000)
@@ -443,6 +564,57 @@ def main(quiet=False):
         call = run_bridge("fill", tab_id, "#q", "hello")
         record(summary, "fill", call)
         require(call["exit"] == 0, "fill failed")
+        Path(RICH_TEXT_PATH).write_text(json.dumps([
+            {"tag": "h2", "children": [
+                {"tag": "strong", "children": [{"text": "Rich title"}]},
+            ]},
+            {"tag": "p", "children": [
+                {"text": "Rich bridge body"},
+            ]},
+        ]), encoding="utf-8")
+        call = run_bridge("insertRichText", tab_id, "#editor", RICH_TEXT_PATH)
+        record(summary, "insertRichText", call, {"method": (result(call) or {}).get("method")})
+        require(call["exit"] == 0 and (result(call) or {}).get("method") == "paste",
+                "insertRichText did not use the editor paste path", call)
+        call = run_bridge("expect", tab_id, "text", "Rich bridge body", "--timeout", "2000")
+        require(call["exit"] == 0 and (result(call) or {}).get("passed") is True,
+                "insertRichText did not produce observable editor content", call)
+        call = run_bridge("insertRichText", tab_id, "#editor-fallback", RICH_TEXT_PATH)
+        record(summary, "insertRichTextFallback", call, {"method": (result(call) or {}).get("method")})
+        require(call["exit"] == 0 and (result(call) or {}).get("method") == "dom",
+                "insertRichText did not use the basic contenteditable fallback", call)
+        call = run_bridge("expect", tab_id, "selector", "#editor-fallback h2", "--timeout", "2000")
+        require(call["exit"] == 0 and (result(call) or {}).get("passed") is True,
+                "insertRichText fallback did not produce observable rich content", call)
+        call = run_bridge("insertRichText", tab_id, "#editor-cancelled", RICH_TEXT_PATH)
+        record(summary, "insertRichTextRespectsCancellation", call)
+        require(call["exit"] != 0 and "cancelled" in ((result(call) or {}).get("err") or ""),
+                "insertRichText bypassed a cancelled paste event", call)
+        call = run_bridge("insertRichText", tab_id, "#editor-async-handled", RICH_TEXT_PATH)
+        record(summary, "insertRichTextAsyncHandled", call, {
+            "method": (result(call) or {}).get("method"),
+        })
+        require(call["exit"] == 0 and (result(call) or {}).get("method") == "paste",
+                "insertRichTextAsyncHandled did not wait for the editor-owned insertion", call)
+        call = run_bridge(
+            "batch",
+            json.dumps([{"action": "observe", "payload": {"diff": True}}]),
+            tab_id,
+            timeout=10,
+        )
+        record(summary, "batchRejectsSnapshotDiff", call)
+        require(call["exit"] != 0 and "diff=true" in (
+                    (result(call) or {}).get("err") or (result(call) or {}).get("error") or ""),
+                "batch accepted a state-mutating observe diff step", call)
+
+        Path(INVALID_RICH_TEXT_PATH).write_text(json.dumps([
+            {"tag": "a", "href": "javascript:alert(1)", "children": [
+                {"text": "unsafe"},
+            ]},
+        ]), encoding="utf-8")
+        call = run_bridge("insertRichText", tab_id, "#editor", INVALID_RICH_TEXT_PATH)
+        record(summary, "insertRichTextRejectsUnsafeUrl", call)
+        require(call["exit"] != 0, "insertRichText accepted an unsafe URL", call)
 
         # 6. Select
         call = run_bridge("select", tab_id, "#kind", "beta")
@@ -480,6 +652,31 @@ def main(quiet=False):
         status = (result(call) or {}).get("val")
         record(summary, "executeScriptCDP_verify_click", call, {"status": status})
         require(call["exit"] == 0 and status == "clicked:hello", "click did not update status")
+        # 6. Typed batch: waits interleaved with mutations and observations
+        batch_steps = json.dumps([
+            {"action": "fill", "payload": {"selector": "#q", "text": "batched"}},
+            {"action": "waitForSelector", "timeoutMs": 5000, "payload": {"selector": "#btn"}},
+            {"action": "click", "payload": {"selector": "#btn"}},
+            {"action": "waitForText", "timeoutMs": 5000, "payload": {"text": "clicked:batched"}},
+            {"action": "expect", "payload": {"mode": "text", "text": "clicked:batched", "timeoutMs": 5000}},
+            {"action": "observe", "payload": {"compact": True, "roles": ["button"], "limit": 5}},
+        ])
+        call = run_bridge("batch", batch_steps, tab_id, timeout=40)
+        batch_out = result(call)
+        record(summary, "batchWithObservations", call, {
+            "stepCount": len(batch_out) if isinstance(batch_out, list) else None,
+            "expectPassed": batch_out[4].get("passed") if isinstance(batch_out, list) and len(batch_out) > 4 else None,
+            "observed": len(batch_out[5]) if isinstance(batch_out, list) and len(batch_out) > 5 and isinstance(batch_out[5], list) else None,
+        })
+        require(
+            call["exit"] == 0
+            and isinstance(batch_out, list)
+            and len(batch_out) == 6
+            and batch_out[4].get("passed") is True
+            and isinstance(batch_out[5], list),
+            "batch with interleaved actions, waits, expectation, and observation failed",
+            call
+        )
 
         # 12. Drag
         call = run_bridge("drag", tab_id, "#from", "#to")
@@ -1006,21 +1203,6 @@ def main(quiet=False):
         record(summary, "windowControlClose", call, {"closed": (result(call) or {}).get("closed")})
         require(call["exit"] == 0 and (result(call) or {}).get("closed") is True, "windowControl close failed", call)
 
-        # 35. Batch: waits interleaved with mutations, then continue-on-error
-        batch_steps = json.dumps([
-            {"action": "fill", "payload": {"selector": "#q", "text": "batched"}},
-            {"action": "waitForSelector", "timeoutMs": 5000, "payload": {"selector": "#btn"}},
-            {"action": "click", "payload": {"selector": "#btn"}},
-            {"action": "waitForText", "timeoutMs": 5000, "payload": {"text": "clicked:batched"}}
-        ])
-        call = run_bridge("batch", batch_steps, tab_id, timeout=40)
-        batch_out = result(call)
-        record(summary, "batchWithWaits", call, {"stepCount": len(batch_out) if isinstance(batch_out, list) else None})
-        require(
-            call["exit"] == 0 and isinstance(batch_out, list) and len(batch_out) == 4,
-            "batch with interleaved waits failed",
-            call
-        )
 
         failing_steps = json.dumps([
             {"action": "waitForSelector", "timeoutMs": 1000, "payload": {"selector": "#definitely-absent"}},
@@ -1296,7 +1478,7 @@ def main(quiet=False):
         })
         require(
             call["exit"] == 0
-            and workflow.get("version") == 1
+            and workflow.get("version") == 2
             and fill_step is not None and click_step is not None
             and fill_step["payload"].get("text") == "<redacted>"
             and fill_step.get("requiresValue") is True
@@ -1415,11 +1597,285 @@ def main(quiet=False):
             call
         )
 
+        # 47. T4-4: `expect` is a deterministic assertion. It answers pass/fail
+        # and returns NO page content, so a failing assertion cannot become a
+        # back-door read of the element, the text, or the extracted values.
+        call = run_bridge("expect", tab_id, "selector", "text=Click me")
+        passing = result(call) or {}
+        record(summary, "expectSelectorPasses", call, {
+            "passed": passing.get("passed"),
+            "attempts": passing.get("attempts"),
+        })
+        require(
+            call["exit"] == 0 and passing.get("passed") is True and passing.get("mode") == "selector"
+            and isinstance(passing.get("attempts"), int) and passing.get("attempts") >= 1
+            and isinstance(passing.get("elapsedMs"), int),
+            "expect did not pass for a semantic selector that resolves",
+            call
+        )
+
+        # 47b. A failed assertion exits non-zero, names a reason, and leaks nothing.
+        call = run_bridge("expect", tab_id, "selector", "#definitely-absent", "--timeout", 600)
+        failing = result(call) or {}
+        leaked = [key for key in ("text", "data", "html", "url", "val", "snapshot", "matches")
+                  if key in failing]
+        record(summary, "expectSelectorFails", call, {
+            "exit": call["exit"],
+            "passed": failing.get("passed"),
+            "hasReason": bool(failing.get("reason")),
+            "contentKeys": leaked,
+        })
+        require(
+            call["exit"] != 0
+            and failing.get("success") is True
+            and failing.get("passed") is False
+            and isinstance(failing.get("reason"), str) and failing["reason"]
+            and not leaked
+            and "Ada Lovelace" not in call["stdout"]
+            and "Chrome Bridge Live Test" not in call["stdout"],
+            "a failing expect did not report passed=false with a reason and no page content",
+            call
+        )
+
+        # 47c. `negate` asserts absence, and inverts a condition that does hold.
+        call = run_bridge("expect", tab_id, "selector", "#definitely-absent", "--negate", "--timeout", 600)
+        negated = result(call) or {}
+        record(summary, "expectNegateAbsence", call, {"passed": negated.get("passed")})
+        require(
+            call["exit"] == 0 and negated.get("passed") is True and negated.get("negate") is True,
+            "negate did not pass for an element that is absent",
+            call
+        )
+        call = run_bridge("expect", tab_id, "text", "Chrome Bridge Live Test", "--negate", "--timeout", 600)
+        negated_present = result(call) or {}
+        record(summary, "expectNegateRejectsPresent", call, {"passed": negated_present.get("passed")})
+        require(
+            call["exit"] != 0 and negated_present.get("passed") is False,
+            "negate passed for text that is present on the page",
+            call
+        )
+
+        # 47d. schema mode reuses extractStructured and reports only whether the
+        # required fields were found; the extracted values never come back.
+        Path(EXPECT_SCHEMA_PATH).write_text(json.dumps({
+            "type": "object",
+            "properties": {
+                "orderNumber": {"type": "string"},
+                "customerName": {"type": "string"},
+            },
+            "required": ["orderNumber", "customerName"],
+        }), encoding="utf-8")
+        call = run_bridge("expect", tab_id, "schema", EXPECT_SCHEMA_PATH, "--timeout", 8000)
+        schema_pass = result(call) or {}
+        record(summary, "expectSchemaPasses", call, {"passed": schema_pass.get("passed")})
+        require(
+            call["exit"] == 0 and schema_pass.get("passed") is True and schema_pass.get("mode") == "schema"
+            and "data" not in schema_pass and "A-10427" not in call["stdout"],
+            "schema-mode expect did not pass without returning extracted values",
+            call
+        )
+        # The shared fixture schema deliberately requires a field the page lacks.
+        call = run_bridge("expect", tab_id, "schema", STRUCTURED_SCHEMA_PATH, "--timeout", 3000)
+        schema_fail = result(call) or {}
+        record(summary, "expectSchemaFails", call, {"passed": schema_fail.get("passed")})
+        require(
+            call["exit"] != 0 and schema_fail.get("passed") is False
+            and "A-10427" not in call["stdout"],
+            "schema-mode expect passed despite a missingRequired field, or leaked extracted values",
+            call
+        )
+
+        # 47e. Workflow postcondition with bounded retry: #delayed appears 600ms
+        # after the click, and the step's expect only allows 250ms, so the first
+        # attempt MUST fail and the retry MUST pass. That ordering is the whole
+        # point: it proves the retry ran rather than the assertion being trivially
+        # satisfied on attempt one.
+        Path(EXPECT_WORKFLOW_PATH).write_text(json.dumps({
+            "version": 2,
+            "name": "matrix-expect-retry",
+            "steps": [{
+                "action": "click",
+                "payload": {"selector": "#delay"},
+                "expect": {"mode": "selector", "selector": "#delayed", "timeoutMs": 250},
+                "retry": {"max": 2, "delayMs": 800},
+            }],
+        }), encoding="utf-8")
+        run_bridge("executeScriptCDP", tab_id, "document.querySelector('#delayed')?.remove(); 'cleared'")
+        call = run_bridge("workflow", "replay", EXPECT_WORKFLOW_PATH, "--tab", tab_id, timeout=60)
+        retried = result(call) or {}
+        retried_step = (retried.get("steps") or [{}])[0]
+        record(summary, "workflowExpectRetryPasses", call, {
+            "attempts": retried_step.get("attempts"),
+            "retried": retried_step.get("retried"),
+            "expectPassed": retried_step.get("expectPassed"),
+            "retriedSteps": retried.get("retriedSteps"),
+        })
+        require(
+            call["exit"] == 0
+            and retried.get("failedSteps") == 0
+            and retried.get("retriedSteps") == 1
+            and retried_step.get("expectPassed") is True
+            and retried_step.get("retried") is True
+            and retried_step.get("attempts") == 2,
+            "a workflow postcondition did not fail once and then pass after a bounded retry",
+            call
+        )
+
+        # 47f. A postcondition that can never hold fails the step with evidence
+        # instead of reporting a hopeful success.
+        Path(EXPECT_FAIL_WORKFLOW_PATH).write_text(json.dumps({
+            "version": 2,
+            "name": "matrix-expect-fails",
+            "steps": [{
+                "action": "click",
+                "payload": {"selector": "#delay"},
+                "expect": {"mode": "selector", "selector": "#never-appears", "timeoutMs": 250},
+                "retry": {"max": 1, "delayMs": 0},
+            }],
+        }), encoding="utf-8")
+        call = run_bridge("workflow", "replay", EXPECT_FAIL_WORKFLOW_PATH, "--tab", tab_id, timeout=60)
+        unmet = result(call) or {}
+        unmet_step = (unmet.get("steps") or [{}])[0]
+        record(summary, "workflowExpectFails", call, {
+            "err": unmet_step.get("err"),
+            "expectMode": (unmet_step.get("expect") or {}).get("mode"),
+            "attempts": unmet_step.get("attempts"),
+            "expectFailedSteps": unmet.get("expectFailedSteps"),
+        })
+        require(
+            call["exit"] != 0
+            and unmet.get("failedSteps") == 1
+            and unmet.get("expectFailedSteps") == 1
+            and unmet_step.get("err") == "expect failed"
+            and unmet_step.get("expectPassed") is False
+            and unmet_step.get("attempts") == 2
+            and (unmet_step.get("expect") or {}).get("mode") == "selector"
+            and bool((unmet_step.get("expect") or {}).get("reason")),
+            "an unmet workflow postcondition did not fail the step with expect evidence",
+            call
+        )
+
+        # 47g. A version-1 workflow file has no expect/retry clauses and must keep
+        # replaying unchanged under the version-2 reader.
+        Path(LEGACY_WORKFLOW_PATH).write_text(json.dumps({
+            "version": 1,
+            "name": "matrix-legacy-v1",
+            "steps": [{"action": "fill", "payload": {"selector": "#q", "text": "legacy"}}],
+        }), encoding="utf-8")
+        call = run_bridge("workflow", "replay", LEGACY_WORKFLOW_PATH, "--tab", tab_id, timeout=60)
+        legacy = result(call) or {}
+        legacy_step = (legacy.get("steps") or [{}])[0]
+        record(summary, "workflowVersion1StillReplays", call, {
+            "workflowVersion": legacy.get("workflowVersion"),
+            "failedSteps": legacy.get("failedSteps"),
+        })
+        require(
+            call["exit"] == 0
+            and legacy.get("failedSteps") == 0
+            and legacy.get("workflowVersion") == 1
+            and legacy_step.get("success") is True
+            and legacy_step.get("attempts") == 1
+            and legacy_step.get("retried") is False
+            and "expectPassed" not in legacy_step,
+            "a version-1 workflow file no longer replays unchanged",
+            call
+        )
+
         if QUIET_MODE:
             state = run_bridge("getCurrentState", tab_id)
             active = ((result(state) or {}).get("tab") or {}).get("active")
             record(summary, "quietFinalInactive", state, {"active": active})
             require(state["exit"] == 0 and active is False, "quiet run ended with active tab")
+
+        # 48. T4-3 credential handoff. Runs LAST on purpose: a credential handoff
+        # foregrounds the tab and window by contract, which would break the quiet
+        # inactivity assertions above. A background thread plays the human by
+        # writing the page-owned fake secret into the password field; the check
+        # then proves the response carries no value-derived datum at all - not the
+        # value, not a hash, not a character count - and that the secret never
+        # surfaces in the client's output.
+        cred_call = {}
+
+        def drive_credential_handoff():
+            cred_call.update(run_bridge(
+                "credentialHandoff", tab_id, "#secret", "type the fixture password",
+                "--mode", "filled", "--timeout", 20000, timeout=60
+            ))
+
+        cred_thread = threading.Thread(target=drive_credential_handoff)
+        cred_thread.start()
+        # Let the host register the blackout and the extension focus the field
+        # before the simulated human types.
+        time.sleep(2)
+        typed = run_bridge(
+            "executeScriptCDP", tab_id,
+            "(() => { const el = document.querySelector('#secret');"
+            " el.value = window.__credentialFixtureSecret;"
+            " el.dispatchEvent(new Event('input', {bubbles: true}));"
+            " return 'typed'; })()"
+        )
+        require((result(typed) or {}).get("val") == "typed", "could not simulate credential entry", typed)
+        cred_thread.join(60)
+        require(not cred_thread.is_alive(), "credentialHandoff never returned")
+        handed = result(cred_call) or {}
+        leaked = (
+            CREDENTIAL_FIXTURE_SECRET in (cred_call.get("stdout") or "")
+            or CREDENTIAL_FIXTURE_SECRET in (cred_call.get("stderr") or "")
+        )
+        record(summary, "credentialHandoff", cred_call, {
+            "filled": handed.get("filled"),
+            "mode": handed.get("mode"),
+            "secretLeaked": leaked,
+        })
+        # A character count is as forbidden as the value: it narrows a
+        # brute-force search, so no length-shaped field may appear at all.
+        length_leak = [k for k in handed if "length" in k.lower()]
+        require(
+            cred_call.get("exit") == 0
+            and handed.get("filled") is True
+            and handed.get("mode") == "filled"
+            and not leaked
+            and "value" not in handed
+            and not length_leak
+            and str(len(CREDENTIAL_FIXTURE_SECRET)) not in (cred_call.get("stdout") or ""),
+            "credentialHandoff leaked a value-derived datum",
+            cred_call
+        )
+
+        # 49. T4-10 DLP. Runs after everything else because it rewrites the live
+        # policy: a `block` on the `upload` channel must refuse uploadFile
+        # host-side, before any file byte is read on the request's behalf. The
+        # fixture holds a sentinel string, and the proof is that the sentinel
+        # appears NOWHERE in the client's output.
+        Path(DLP_FIXTURE).write_text(DLP_FIXTURE_SENTINEL + "\n", encoding="utf-8")
+        dlp_policy = json.loads(json.dumps(policy))
+        dlp_policy["default"]["dlp"] = {"upload": "block"}
+        policy_path.write_text(json.dumps(dlp_policy, separators=(",", ":")), encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(policy_path, 0o600)
+        time.sleep(1.1)  # let the host pick up the new policy mtime
+        call = run_bridge("uploadFile", tab_id, "#file", DLP_FIXTURE)
+        blocked_output = (call.get("stdout") or "") + (call.get("stderr") or "")
+        sentinel_leaked = DLP_FIXTURE_SENTINEL in blocked_output
+        record(summary, "dlpBlockedUpload", call, {
+            "sentinelLeaked": sentinel_leaked,
+            "dlpBlocked": "dlp blocked" in blocked_output,
+        })
+        require(
+            call["exit"] != 0
+            and "dlp blocked" in blocked_output
+            and not sentinel_leaked,
+            "a dlp-blocked upload was not refused with 'dlp blocked' and no fixture content",
+            call
+        )
+        # An unconfigured channel is untouched by the same policy.
+        call = run_bridge("getCurrentState", tab_id)
+        record(summary, "dlpUnrelatedActionUnaffected", call)
+        require(call["exit"] == 0, "dlp block on upload must not affect other channels", call)
+        # Back to the matrix policy so the teardown restore is not the only path.
+        policy_path.write_text(json.dumps(policy, separators=(",", ":")), encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(policy_path, 0o600)
 
 
         # Compact JSON output on success
@@ -1440,6 +1896,9 @@ def main(quiet=False):
             with contextlib.suppress(Exception):
                 run_bridge("closeTab", tab_id)
 
+        if composite_tab_id is not None:
+            with contextlib.suppress(Exception):
+                run_bridge("closeTab", composite_tab_id)
         if policy_installed and policy_path is not None:
             restore_policy(policy_backup, policy_path, backup_mode)
         if server is not None:
@@ -1448,8 +1907,10 @@ def main(quiet=False):
         with contextlib.suppress(Exception):
             shutil.rmtree(SCREENCAST_DIR)
 
-        for path in [UPLOAD_FIXTURE, SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, STRUCTURED_SCHEMA_PATH,
-                     STRUCTURED_DATA_PATH, WORKFLOW_PATH, ACTION_CACHE_PATH, WORKFLOW_STASH_PATH]:
+        for path in [UPLOAD_FIXTURE, DLP_FIXTURE, SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, STRUCTURED_SCHEMA_PATH,
+                     STRUCTURED_DATA_PATH, WORKFLOW_PATH, ACTION_CACHE_PATH, WORKFLOW_STASH_PATH,
+                     EXPECT_SCHEMA_PATH, EXPECT_WORKFLOW_PATH, EXPECT_FAIL_WORKFLOW_PATH, LEGACY_WORKFLOW_PATH,
+                     RICH_TEXT_PATH, INVALID_RICH_TEXT_PATH]:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
 

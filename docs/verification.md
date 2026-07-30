@@ -28,9 +28,11 @@ diff -q wake.html extension/wake.html
 diff -q wake.js extension/wake.js
 ```
 
-Manual live gates after reloading the unpacked extension (opens real Chrome tabs):
+Live gates after deploying and reloading the unpacked extension (opens real Chrome tabs):
 
 ```bash
+./scripts/reload_unpacked_extension.sh
+chrome-bridge ready 10000 250
 python3 test_client.py ping
 python3 scripts/background_reliability.py --duration-seconds 60 --output /tmp/background-reliability.json
 PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
@@ -68,7 +70,8 @@ The default sample policy is intentionally fail-closed and denies loopback URLs.
 
 - the full handoff blackout set - one-shot observations including `observe`, the collector reads `consoleMessages`/`networkRequests`/`interceptedRequests`/`screencastFrames`, and the collector starts `startMonitoring`/`startInterception`/`startScreencast` - each denied with `handoff in progress` and never forwarded, plus a `batch` and a `replayWorkflow` that wrap a blacked-out step and are denied as a whole;
 - `replayWorkflow` step-level enforcement before any forward: a denied nested action fails as `workflow step <n>: <reason>` with a `policyDenial.batchStep` index, a reserved action is not dispatchable as a step, a confirmation-gated nested action fails as `workflow step <n> requires confirmation` and mints no token, an all-allowed workflow forwards, and `--tab` retargeting is origin-checked against the live origin of the tab actually targeted;
-- secret masking armed on the **first** request: a policy denial that quotes a `secretMaskFile` value in its target writes `<masked:...>` to the audit log, never the raw value, with no prior reload or successful forward to prime it.
+- secret masking armed on the **first** request: a policy denial that quotes a `secretMaskFile` value in its target writes `<masked:...>` to the audit log, never the raw value, with no prior reload or successful forward to prime it;
+- audit export as a mirror rather than a second source: a `jsonl` sink whose lines equal the local audit events field for field (including a denial with decision `deny`), a `secretMaskFile` value that reaches the sink only as `<masked:...>`, an unwritable destination that produces exactly one `audit_export_unavailable` event and still lets the request succeed, a captured CEF line asserted against the documented header and extension mapping, a captured RFC 5424 UDP datagram asserted against the documented framing and its deny-versus-allow severity split, and single-generation rotation that drops no events. The export cases block on a polling barrier over the sink rather than a sleep, so they cannot race host startup.
 
 ## Release packaging
 

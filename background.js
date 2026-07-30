@@ -1,4 +1,5 @@
 let nativePort = null;
+let nativePortAcknowledged = false;
 const HEARTBEAT_ALARM = "chromeBridgeHeartbeat";
 const HEARTBEAT_MINUTES = 0.5;
 const RECONNECT_ALARM = "chromeBridgeReconnect";
@@ -267,16 +268,26 @@ function sendHeartbeat() {
   } catch (error) {
     console.warn("Heartbeat failed:", error);
     nativePort = null;
+    nativePortAcknowledged = false;
     // Don't wait for the next heartbeat alarm; schedule a backed-off reconnect now.
     scheduleReconnect();
   }
 }
+function acknowledgeNativeHost() {
+  if (nativePortAcknowledged) return;
+  nativePortAcknowledged = true;
+  resetBackoff();
+}
+
 function connectToHost() {
   if (nativePort) return;
   const hostName = "com.automation.bridge";
   console.log("Connecting to native host:", hostName);
+  let port;
   try {
-    nativePort = chrome.runtime.connectNative(hostName);
+    port = chrome.runtime.connectNative(hostName);
+    nativePort = port;
+    nativePortAcknowledged = false;
   } catch (error) {
     console.error("Failed to connect native host:", error);
     nativePort = null;
@@ -284,19 +295,29 @@ function connectToHost() {
     return;
   }
 
-  nativePort.onMessage.addListener((message) => {
-    console.log("Received message from native host:", message);
-    handleMessageFromHost(message);
+  port.onMessage.addListener((message) => {
+    if (nativePort !== port) return;
+    acknowledgeNativeHost();
+    console.debug("Received native host message:", message?.action || message?.id || "response");
+    if (message?.action !== "hostAcknowledged") handleMessageFromHost(message);
   });
 
-  nativePort.onDisconnect.addListener(() => {
-    console.warn("Disconnected from native host:", chrome.runtime.lastError);
+  port.onDisconnect.addListener(() => {
+    if (nativePort !== port) return;
+    console.warn("Disconnected from native host:", chrome.runtime.lastError?.message || "unknown error");
     nativePort = null;
+    nativePortAcknowledged = false;
     scheduleReconnect();
   });
 
-  // Connection established: reset backoff and clear any pending reconnect alarm.
-  resetBackoff();
+  try {
+    port.postMessage({ action: "hostHandshake", protocolVersion: 1 });
+  } catch (error) {
+    console.warn("Native host handshake failed:", error);
+    nativePort = null;
+    nativePortAcknowledged = false;
+    scheduleReconnect();
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -342,17 +363,49 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 scheduleHeartbeat();
 connectToHost();
 
+// --- DLP channel refusal (host policy key `dlp`) ----------------------------
+// The host stamps the resolved non-`allow` channel modes onto every forwarded
+// request as `dlp` and refuses a blocked channel before forwarding, so this is a
+// SECOND, independent gate rather than the only one. It matters because it sits
+// ahead of every handler: `uploadFile`, `githubAttachUploadedFiles`, and
+// `githubAttachPrBody` hand local paths to CDP `DOM.setFileInputFiles`, which is
+// where the browser process opens the file, and `downloadUrl` calls
+// `chrome.downloads.download`. Refusing here means a blocked upload never
+// reaches that call, so no file byte is ever read on behalf of the request. The
+// map is threaded explicitly (never stored in worker state) so a concurrent
+// request cannot be judged against another request's modes.
+//
+// `clipboard` is a declared channel with no action here: no bridge action reads
+// or writes the clipboard, and a page-driven copy never crosses the bridge.
+// Mirrors bridge.py DLP_ACTION_CHANNELS / host-rs dlp_channel_for_action.
+const DLP_ACTION_CHANNELS = {
+  uploadFile: "upload",
+  githubAttachUploadedFiles: "upload",
+  githubAttachPrBody: "upload",
+  downloadUrl: "download",
+  startScreencast: "screenShare",
+  screencastFrames: "screenShare"
+};
+
+function dlpRefusal(action, dlp) {
+  if (!dlp || typeof dlp !== "object") return null;
+  const channel = DLP_ACTION_CHANNELS[action];
+  if (!channel) return null;
+  if (dlp[channel] !== "block") return null;
+  return `dlp blocked: ${channel}`;
+}
+
 async function handleMessageFromHost(message) {
-  const { id, action, payload } = message;
+  const { id, action, payload, dlp } = message;
   try {
-    const result = await dispatchAction(action, payload);
+    const result = await dispatchAction(action, payload, dlp);
     sendResponseToHost({ id, success: true, result });
   } catch (error) {
     sendResponseToHost({ id, success: false, error: error.message });
   }
 }
 
-async function runBatch(steps, defaultTabId, stopOnError) {
+async function runBatch(steps, defaultTabId, stopOnError, dlp) {
   if (!Array.isArray(steps)) {
     throw new Error("batch requires a steps array");
   }
@@ -378,7 +431,10 @@ async function runBatch(steps, defaultTabId, stopOnError) {
       stepPayload.timeoutMs = step.timeoutMs;
     }
     try {
-      const stepResult = await dispatchAction(step.action, stepPayload);
+      if (step.action === "observe" && stepPayload.diff === true) {
+        throw new Error("observe cannot use diff=true inside a batch");
+      }
+      const stepResult = await dispatchAction(step.action, stepPayload, dlp);
       if (stepResult && typeof stepResult === "object" && stepResult.success === false) {
         throw new Error(stepResult.error || stepResult.err || "step reported success=false");
       }
@@ -392,11 +448,15 @@ async function runBatch(steps, defaultTabId, stopOnError) {
   return results;
 }
 
-async function dispatchAction(action, payload) {
+async function dispatchAction(action, payload, dlp) {
+    // DLP channel refusal, ahead of every handler and inside every composite:
+    // a blocked upload is rejected before any code path can open a file.
+    const dlpBlocked = dlpRefusal(action, dlp);
+    if (dlpBlocked) throw new Error(dlpBlocked);
     let result;
     switch (action) {
       case "batch":
-        result = await runBatch(payload.steps, payload.tabId, payload.stopOnError);
+        result = await runBatch(payload.steps, payload.tabId, payload.stopOnError, dlp);
         break;
       case "ping":
         result = "pong";
@@ -412,6 +472,9 @@ async function dispatchAction(action, payload) {
         break;
       case "navigateTaskSession":
         result = await navigateTaskSession(payload.sessionId, payload.url, payload.active, payload.reuse);
+        break;
+      case "navigateAndSnapshot":
+        result = await navigateAndSnapshot(payload);
         break;
       case "getTaskSessions":
         result = await getTaskSessions(payload.sessionId);
@@ -512,6 +575,9 @@ async function dispatchAction(action, payload) {
       case "select":
         result = await selectOption(payload.tabId, payload.selector, payload.value);
         break;
+      case "insertRichText":
+        result = await insertRichText(payload.tabId, payload.selector, payload.nodes, payload.clear);
+        break;
       case "githubAttachUploadedFiles":
         result = await githubAttachUploadedFiles(payload.tabId, payload.inputSelector, payload.formSelector, payload.timeoutMs);
         break;
@@ -597,6 +663,9 @@ async function dispatchAction(action, payload) {
       case "waitForHandoff":
         result = await waitForHandoff(payload);
         break;
+      case "credentialHandoff":
+        result = await credentialHandoff(payload);
+        break;
       case "setCookie":
         result = await setCookie(payload);
         break;
@@ -628,13 +697,16 @@ async function dispatchAction(action, payload) {
         result = stopWorkflowRecording(payload);
         break;
       case "replayWorkflow":
-        result = await replayWorkflow(payload);
+        result = await replayWorkflow(payload, dlp);
         break;
       case "resolveCachedSelector":
         result = await resolveCachedSelector(payload);
         break;
       case "cacheSelectors":
         result = cacheSelectors(payload);
+        break;
+      case "expect":
+        result = await expectAssertion(payload);
         break;
       case "__tabOrigin":
         result = await tabOrigin(payload.tabId);
@@ -657,8 +729,21 @@ function sendResponseToHost(response) {
   }
 }
 
+async function createNavigationTab(url, active = false) {
+  const properties = { url, active: active === true };
+  try {
+    const targetWindow = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    if (Number.isInteger(targetWindow?.id) && targetWindow.id >= 0) {
+      properties.windowId = targetWindow.id;
+    }
+  } catch (_error) {
+    // Let Chrome choose a window when no normal window is available.
+  }
+  return chrome.tabs.create(properties);
+}
+
 async function navigateToUrl(url, active = false) {
-  const tab = await chrome.tabs.create({ url, active: active === true });
+  const tab = await createNavigationTab(url, active);
   return { tabId: tab.id };
 }
 
@@ -1066,19 +1151,117 @@ async function navigateTaskSession(sessionId, url, active = false, reuse = true)
           await chrome.windows.update(tab.windowId, { focused: true });
         }
       } catch (error) {
-        tab = await chrome.tabs.create({ url, active: active === true });
+        tab = await createNavigationTab(url, active);
         session.tabIds = session.tabIds.filter((tabId) => tabId !== reusedTabId);
         session.tabIds.push(tab.id);
         await groupTaskTab(session, tab.id);
       }
     } else {
-      tab = await chrome.tabs.create({ url, active: active === true });
+      tab = await createNavigationTab(url, active);
       session.tabIds.push(tab.id);
       await groupTaskTab(session, tab.id);
     }
     session.updatedAt = Date.now();
     return { value: { sessionId, tabId: tab.id, windowId: tab.windowId, active: tab.active }, changed: true };
   });
+}
+
+async function navigateAndSnapshot(payload) {
+  if (!payload || typeof payload.url !== "string" || !payload.url.trim()) {
+    return { success: false, err: "navigateAndSnapshot requires a url" };
+  }
+  const waitMode = payload.waitMode || "load";
+  if (!["load", "url", "selector"].includes(waitMode)) {
+    return { success: false, err: `Unknown navigateAndSnapshot wait mode: ${waitMode}` };
+  }
+  if (waitMode === "selector" && (typeof payload.selector !== "string" || !payload.selector)) {
+    return { success: false, err: "navigateAndSnapshot selector wait requires a selector" };
+  }
+  if (waitMode === "url" && (typeof payload.urlSubstring !== "string" || !payload.urlSubstring)) {
+    return { success: false, err: "navigateAndSnapshot URL wait requires urlSubstring" };
+  }
+  const navigation = payload.sessionId
+    ? await navigateTaskSession(payload.sessionId, payload.url, payload.active, payload.reuse)
+    : await navigateToUrl(payload.url, payload.active);
+  const tabId = navigation.tabId;
+  let wait;
+  if (waitMode === "selector") {
+    wait = await waitForSelector(tabId, payload.selector, payload.timeoutMs);
+  } else if (waitMode === "url") {
+    wait = await waitForUrl(tabId, payload.urlSubstring, payload.timeoutMs);
+  } else {
+    wait = await waitForLoad(tabId, payload.timeoutMs);
+  }
+  const tab = await chrome.tabs.get(tabId);
+  const recoveryContext = `(tabId ${tabId}, windowId ${tab.windowId})`;
+  let requestedOrigin;
+  let settledOrigin;
+  try {
+    requestedOrigin = new URL(payload.url).origin;
+    settledOrigin = new URL(tab.url).origin;
+  } catch (_error) {
+    return {
+      success: false,
+      err: `navigateAndSnapshot could not validate the settled tab origin ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: null,
+      wait
+    };
+  }
+  const sameOrigin = settledOrigin === requestedOrigin;
+  if (!wait || wait.success === false) {
+    return {
+      success: false,
+      err: `${wait?.err || wait?.error || "navigateAndSnapshot readiness wait failed"} ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: sameOrigin ? tab.url : null,
+      wait
+    };
+  }
+  if (!sameOrigin) {
+    return {
+      success: false,
+      err: `navigateAndSnapshot refused a snapshot after a cross-origin redirect ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: null,
+      wait
+    };
+  }
+  let snapshot;
+  try {
+    snapshot = await observeTab(tabId, {
+      compact: payload.compact !== false,
+      roles: payload.roles,
+      name: payload.name,
+      limit: payload.limit,
+      diff: payload.diff === true
+    });
+  } catch (error) {
+    return {
+      success: false,
+      err: `${error?.message || "navigateAndSnapshot observation failed"} ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: tab.url || null,
+      wait
+    };
+  }
+  return {
+    success: true,
+    tabId,
+    windowId: tab.windowId,
+    sessionId: payload.sessionId || null,
+    url: tab.url || null,
+    wait,
+    snapshot
+  };
 }
 
 async function closeTaskSession(sessionId) {
@@ -1864,6 +2047,20 @@ async function describeTopFrameElement(target, rootNodeId, selector) {
 
 async function resolveActionTarget(tabId, locator, attachedTarget) {
   const run = async (target) => {
+    if (locator.frames.length === 0) {
+      const staged = await stageLocatorRefs(target, [locator], null);
+      if (staged.success === false) return staged;
+      const lookup = await evaluateInContext(target, actionTargetExpression(locator, 'center'), null);
+      const value = lookup.val || lookup;
+      if (!lookup.success || value.success === false) return value;
+      return {
+        ...value,
+        frameId: null,
+        contextId: null,
+        locator
+      };
+    }
+
     const pageTree = await debuggerCommand(target, 'Page.getFrameTree', {});
     const topFrameId = pageTree.frameTree.frame.id;
     const doc = await debuggerCommand(target, 'DOM.getDocument', { depth: 1, pierce: false });
@@ -1962,6 +2159,144 @@ async function waitForText(tabId, text, timeoutMs) {
     await sleep(250);
   }
   return { success: false, err: "Timed out waiting for text", text, timeoutMs };
+}
+
+// --- T4-4: deterministic postconditions ------------------------------------
+//
+// `expect` is an ASSERTION, not a read. It answers one closed question - does
+// this condition hold - with a boolean, an attempt count, and a short reason
+// when it does not. It never returns the matched element, the matched text, the
+// tab URL, or any extracted value, so a caller cannot smuggle a page read
+// through a postcondition. No model is involved at any point: every mode is a
+// deterministic check against the same locator, page-text, tab-url, and
+// structured-extraction paths the mutating actions already use, which is why a
+// semantic selector or a `ref=` handle behaves here exactly as it does for a
+// click.
+const EXPECT_MODES = ["selector", "text", "url", "schema"];
+const EXPECT_DEFAULT_TIMEOUT_MS = 5000;
+// A postcondition must not be able to pin the bridge on one request; a caller
+// that needs a longer wait should compose several assertions.
+const EXPECT_MAX_TIMEOUT_MS = 60000;
+const EXPECT_POLL_MS = 250;
+
+// Reject an unusable assertion up front instead of polling to the deadline and
+// reporting a failure the caller would read as "the page is wrong".
+function normalizeExpectSpec(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const mode = String(source.mode || "");
+  if (!EXPECT_MODES.includes(mode)) {
+    return { err: `expect requires mode to be one of ${EXPECT_MODES.join(", ")}` };
+  }
+  if (mode === "selector" && !source.selector) return { err: "expect mode 'selector' requires selector" };
+  if (mode === "text" && !source.text) return { err: "expect mode 'text' requires text" };
+  if (mode === "url" && !source.urlSubstring) return { err: "expect mode 'url' requires urlSubstring" };
+  if (mode === "schema" && (!source.schema || typeof source.schema !== "object")) {
+    return { err: "expect mode 'schema' requires a schema object" };
+  }
+  const timeout = Number(source.timeoutMs);
+  return {
+    spec: {
+      mode,
+      selector: source.selector,
+      text: source.text,
+      urlSubstring: source.urlSubstring,
+      schema: source.schema,
+      maxChars: source.maxChars,
+      negate: source.negate === true,
+      timeoutMs: Number.isFinite(timeout) && timeout > 0
+        ? Math.min(timeout, EXPECT_MAX_TIMEOUT_MS)
+        : EXPECT_DEFAULT_TIMEOUT_MS
+    }
+  };
+}
+
+// One evaluation. Returns {held} plus a `reason` describing only WHY the
+// condition did not hold, or {fatal} for a caller error that polling cannot fix.
+async function expectConditionHolds(tabId, spec) {
+  if (spec.mode === "selector") {
+    let locator;
+    try {
+      locator = parseActionLocator(spec.selector, tabId);
+    } catch (error) {
+      return { fatal: locatorError(error) };
+    }
+    const found = await resolveActionTarget(tabId, locator);
+    return { held: found.success !== false, reason: "selector did not resolve" };
+  }
+  if (spec.mode === "text") {
+    return {
+      held: await pageContainsText(tabId, spec.text),
+      reason: "page text did not contain the expected string"
+    };
+  }
+  if (spec.mode === "url") {
+    let url = "";
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      url = tab.url || "";
+    } catch (error) {
+      return { fatal: { success: false, err: `No such tab ${tabId}` } };
+    }
+    return { held: url.includes(spec.urlSubstring), reason: "tab URL did not contain the expected substring" };
+  }
+  // schema: reuse extractStructured so there is exactly one extraction
+  // implementation. Only the SHAPE of its errors is inspected; the extracted
+  // values are discarded here and never travel back to the caller.
+  const extracted = await extractStructured(tabId, spec.schema, spec.selector, spec.maxChars);
+  if (extracted.success === false) return { fatal: extracted };
+  const missing = (extracted.errors || []).filter((item) => item && item.code === "missingRequired");
+  return {
+    held: missing.length === 0,
+    reason: `structured extraction reported ${missing.length} missingRequired error(s)`
+  };
+}
+
+// Polls until the condition holds or the deadline passes. `negate: true` inverts
+// the outcome, which is how absence is asserted: the poll then runs until the
+// condition stops holding.
+async function evaluateExpectation(tabId, raw) {
+  if (typeof tabId !== "number") return { success: false, err: "expect requires a numeric tabId" };
+  const normalized = normalizeExpectSpec(raw);
+  if (normalized.err) return { success: false, err: normalized.err };
+  const spec = normalized.spec;
+  const started = Date.now();
+  const deadline = started + spec.timeoutMs;
+  let attempts = 0;
+  let reason = null;
+  for (;;) {
+    attempts += 1;
+    const outcome = await expectConditionHolds(tabId, spec);
+    if (outcome.fatal) return outcome.fatal;
+    if (spec.negate ? !outcome.held : outcome.held) {
+      return {
+        success: true,
+        mode: spec.mode,
+        negate: spec.negate,
+        passed: true,
+        attempts,
+        elapsedMs: Date.now() - started
+      };
+    }
+    reason = spec.negate
+      ? "condition still held and negate expected it not to"
+      : (outcome.reason || "condition did not hold");
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(EXPECT_POLL_MS, remaining));
+  }
+  return {
+    success: true,
+    mode: spec.mode,
+    negate: spec.negate,
+    passed: false,
+    attempts,
+    elapsedMs: Date.now() - started,
+    reason: reason || "condition did not hold"
+  };
+}
+
+async function expectAssertion(payload) {
+  return evaluateExpectation(payload?.tabId, payload);
 }
 
 async function getCurrentState(tabId) {
@@ -2697,8 +3032,7 @@ async function clickSelector(tabId, selector) {
       return { success: true, tagName: value.tagName, text: value.text };
     }
     const { x, y } = lookup;
-    const pointerShown = await showAgentPointer(tabId, x, y, true);
-    if (pointerShown) await sleep(160);
+    void showAgentPointer(tabId, x, y, true);
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
@@ -2739,8 +3073,7 @@ async function hoverSelector(tabId, selector) {
   return withDebugger(tabId, async (target) => {
     const lookup = await getElementCenter(target, selector);
     if (lookup.success === false) return lookup;
-    const pointerShown = await showAgentPointer(tabId, lookup.x, lookup.y, false);
-    if (pointerShown) await sleep(100);
+    void showAgentPointer(tabId, lookup.x, lookup.y, false);
     await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: lookup.x, y: lookup.y, button: 'none' });
     return { success: true, tagName: lookup.tagName, text: lookup.text };
   });
@@ -2874,6 +3207,240 @@ async function selectOption(tabId, selector, value) {
     if (resolved.success === false) return resolved;
     const result = await evaluateInContext(target, domSelectExpression(locator, value), resolved.contextId);
     return result.val || result;
+  });
+}
+
+const ALLOWED_RICH_TAGS = new Set([
+  "p", "br", "strong", "em", "code", "pre", "ul", "ol", "li", "a",
+  "h1", "h2", "h3", "blockquote"
+]);
+const RICH_TEXT_MAX_DEPTH = 10;
+const RICH_TEXT_MAX_NODES = 500;
+const RICH_TEXT_MAX_CHARS = 20000;
+
+function validateRichNodes(nodes) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    return { success: false, err: "insertRichText requires a non-empty nodes array" };
+  }
+  let count = 0;
+  let textLength = 0;
+
+  const visit = (node, path, depth) => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) {
+      throw new Error(`insertRichText rejected node ${path}: expected an object`);
+    }
+    if (depth > RICH_TEXT_MAX_DEPTH) {
+      throw new Error(`insertRichText rejected node ${path}: maximum depth is ${RICH_TEXT_MAX_DEPTH}`);
+    }
+    count += 1;
+    if (count > RICH_TEXT_MAX_NODES) {
+      throw new Error(`insertRichText rejected node ${path}: maximum node count is ${RICH_TEXT_MAX_NODES}`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(node, "text")) {
+      const keys = Object.keys(node);
+      if (keys.length !== 1 || typeof node.text !== "string") {
+        throw new Error(`insertRichText rejected node ${path}: text nodes may contain only a string text field`);
+      }
+      textLength += node.text.length;
+      if (textLength > RICH_TEXT_MAX_CHARS) {
+        throw new Error(`insertRichText rejected node ${path}: maximum text length is ${RICH_TEXT_MAX_CHARS}`);
+      }
+      return { text: node.text };
+    }
+
+    const tag = typeof node.tag === "string" ? node.tag.toLowerCase() : "";
+    if (!ALLOWED_RICH_TAGS.has(tag)) {
+      throw new Error(`insertRichText rejected node ${path}: unsupported tag ${tag || "<missing>"}`);
+    }
+    const allowedKeys = new Set(tag === "a" ? ["tag", "href", "children"] : ["tag", "children"]);
+    const unexpected = Object.keys(node).find((key) => !allowedKeys.has(key));
+    if (unexpected) {
+      throw new Error(`insertRichText rejected node ${path}: unsupported field ${unexpected}`);
+    }
+    if (node.children !== undefined && !Array.isArray(node.children)) {
+      throw new Error(`insertRichText rejected node ${path}: children must be an array`);
+    }
+    if (tag === "br" && Array.isArray(node.children) && node.children.length) {
+      throw new Error(`insertRichText rejected node ${path}: br cannot have children`);
+    }
+    const normalized = {
+      tag,
+      children: (node.children || []).map((child, index) => visit(child, `${path}.children[${index}]`, depth + 1))
+    };
+    if (tag === "a" && node.href !== undefined) {
+      if (typeof node.href !== "string" || !node.href) {
+        throw new Error(`insertRichText rejected node ${path}: href must be a non-empty string`);
+      }
+      let parsed;
+      try {
+        parsed = new URL(node.href);
+      } catch (_error) {
+        throw new Error(`insertRichText rejected node ${path}: href must be an absolute URL`);
+      }
+      if (!["https:", "http:", "mailto:"].includes(parsed.protocol)) {
+        throw new Error(`insertRichText rejected node ${path}: unsupported href protocol`);
+      }
+      normalized.href = node.href;
+    }
+    return normalized;
+  };
+
+  try {
+    const normalized = nodes.map((node, index) => visit(node, `[${index}]`, 1));
+    return { success: true, nodes: normalized, count, textLength };
+  } catch (error) {
+    return { success: false, err: error.message };
+  }
+}
+
+function richTextInsertExpression(locator, nodes, clear, phase = "dispatch", beforeFingerprint = null) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
+    if (!el.isContentEditable) {
+      return { success: false, err: 'insertRichText requires a contenteditable target' };
+    }
+    const fingerprint = (value) => {
+      let first = 2166136261;
+      let second = 5381;
+      for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index);
+        first = Math.imul(first ^ code, 16777619);
+        second = Math.imul(second, 33) ^ code;
+      }
+      return [value.length, first >>> 0, second >>> 0];
+    };
+    const currentFingerprint = fingerprint(el.innerHTML);
+    if (${JSON.stringify(phase)} === 'checkPaste') {
+      const previous = ${JSON.stringify(beforeFingerprint)};
+      const changed = !Array.isArray(previous)
+        || previous.length !== currentFingerprint.length
+        || previous.some((value, index) => value !== currentFingerprint[index]);
+      if (changed) {
+        return { success: true, tagName: el.tagName, contentEditable: true, method: 'paste' };
+      }
+      return { success: false, pendingPaste: true };
+    }
+    const build = (node) => {
+      if (Object.prototype.hasOwnProperty.call(node, 'text')) {
+        return document.createTextNode(node.text);
+      }
+      const child = document.createElement(node.tag);
+      if (node.tag === 'a' && node.href) child.setAttribute('href', node.href);
+      for (const nested of node.children || []) child.appendChild(build(nested));
+      return child;
+    };
+    const container = document.createElement('div');
+    for (const node of ${JSON.stringify(nodes)}) container.appendChild(build(node));
+    const html = container.innerHTML;
+    const plainText = container.innerText || container.textContent || '';
+    el.focus();
+    const selection = document.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    if (!${JSON.stringify(clear === true)}) range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const beforeHtml = el.innerHTML;
+    try {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData('text/html', html);
+      clipboardData.setData('text/plain', plainText);
+      const paste = new ClipboardEvent('paste', {
+        clipboardData,
+        bubbles: true,
+        cancelable: true,
+        composed: true
+      });
+      const propagated = el.dispatchEvent(paste);
+      if (el.innerHTML !== beforeHtml) {
+        return { success: true, tagName: el.tagName, contentEditable: true, method: 'paste' };
+      }
+      if (!propagated) {
+        return { success: false, pendingPaste: true, beforeFingerprint: fingerprint(beforeHtml) };
+      }
+    } catch (_error) {
+      // Fall through for environments without constructible clipboard events.
+    }
+    const before = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      inputType: 'insertFromPaste',
+      data: null
+    });
+    if (!el.dispatchEvent(before)) {
+      return { success: false, err: 'insertRichText was cancelled by the page' };
+    }
+    const fragment = document.createDocumentFragment();
+    while (container.firstChild) fragment.appendChild(container.firstChild);
+    range.deleteContents();
+    range.insertNode(fragment);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    el.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      composed: true,
+      inputType: 'insertFromPaste',
+      data: null
+    }));
+    return { success: true, tagName: el.tagName, contentEditable: true, method: 'dom' };
+  })()`;
+}
+
+async function insertRichText(tabId, selector, nodes, clear = false) {
+  const validated = validateRichNodes(nodes);
+  if (validated.success === false) return validated;
+  return withDebugger(tabId, async (target) => {
+    let locator;
+    try {
+      locator = parseActionLocator(selector, tabId);
+    } catch (error) {
+      return locatorError(error);
+    }
+    const resolved = await resolveActionTarget(tabId, locator, target);
+    if (resolved.success === false) return resolved;
+    let inserted = await evaluateInContext(
+      target,
+      richTextInsertExpression(locator, validated.nodes, clear === true),
+      resolved.contextId
+    );
+    let value = inserted.val || inserted;
+    if (inserted.success && value.pendingPaste === true) {
+      const beforeFingerprint = value.beforeFingerprint;
+      for (const delayMs of [50, 100, 200, 400, 500]) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        inserted = await evaluateInContext(
+          target,
+          richTextInsertExpression(
+            locator,
+            validated.nodes,
+            clear === true,
+            "checkPaste",
+            beforeFingerprint
+          ),
+          resolved.contextId
+        );
+        value = inserted.val || inserted;
+        if (!inserted.success || value.pendingPaste !== true) break;
+      }
+      if (inserted.success && value.pendingPaste === true) {
+        return { success: false, err: "insertRichText paste was cancelled without inserting content" };
+      }
+    }
+    if (!inserted.success || value.success === false) return value;
+    return {
+      success: true,
+      tagName: value.tagName,
+      contentEditable: value.contentEditable === true,
+      method: value.method,
+      insertedNodes: validated.count,
+      textLength: validated.textLength
+    };
   });
 }
 
@@ -4455,6 +5022,249 @@ async function waitForHandoff(payload) {
   }
 }
 
+// Credential handoff: a narrowing of waitForHandoff to one field. The human
+// types the secret straight into the page, so the value never enters the
+// bridge. Everything injected below reports presence, emptiness and a character
+// count only -- never the field value, never a hash of it -- and the native host
+// holds the same in-flight handoff blackout for the tab across the whole window,
+// so no observation action can read the field either.
+//
+// The locator is resolved once through the shared locator machinery (so semantic
+// selectors and ref=eN work, both of which need the debugger), then the resolved
+// element is tagged with a one-shot random marker attribute. The wait itself
+// polls that marker through chrome.scripting, so the debugger is not held for
+// the minutes a human may take and concurrent bridge work is not locked out.
+const CREDENTIAL_PROBE_INTERVAL_MS = 250;
+const CREDENTIAL_STABLE_POLLS = 3;
+const CREDENTIAL_DEFAULT_MESSAGE = "Enter your credential, then continue.";
+const CREDENTIAL_MARKER_ATTR = "data-chrome-bridge-credential";
+
+function credentialMarkerToken() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID().replace(/-/g, "");
+  }
+  return `cred${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+}
+
+function credentialArmExpression(locator, token) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
+    const armed = self.__chromeBridgeCredentialArmed;
+    if (armed && armed.form && armed.handler) {
+      armed.form.removeEventListener('submit', armed.handler, true);
+    }
+    self.__chromeBridgeCredentialSubmitted = false;
+    el.setAttribute(${JSON.stringify(CREDENTIAL_MARKER_ATTR)}, ${JSON.stringify(token)});
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    try { el.focus({ preventScroll: true }); } catch (_e) { el.focus(); }
+    const form = typeof el.closest === 'function' ? el.closest('form') : null;
+    if (form) {
+      const handler = () => { self.__chromeBridgeCredentialSubmitted = true; };
+      form.addEventListener('submit', handler, true);
+      self.__chromeBridgeCredentialArmed = { form, handler };
+    } else {
+      self.__chromeBridgeCredentialArmed = null;
+    }
+    // The raw value never leaves the page, and neither does its length: a
+    // character count narrows a brute-force space, so only emptiness crosses
+    // this frame boundary.
+    const raw = 'value' in el ? el.value : el.textContent;
+    return { success: true, present: true, empty: !(typeof raw === 'string' && raw.length > 0), hasForm: !!form };
+  })()`;
+}
+
+// Injected by chrome.scripting: self-contained, no closure over the worker.
+function credentialFieldProbe(attr, token) {
+  const selector = '[' + attr + '="' + token + '"]';
+  const find = (root) => {
+    if (!root || typeof root.querySelector !== 'function') return null;
+    const hit = root.querySelector(selector);
+    if (hit) return hit;
+    for (const el of root.querySelectorAll('*')) {
+      if (!el.shadowRoot) continue;
+      const nested = find(el.shadowRoot);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  const submitted = self.__chromeBridgeCredentialSubmitted === true;
+  const el = find(document);
+  if (!el) return { present: false, empty: true, submitted };
+  const raw = 'value' in el ? el.value : el.textContent;
+  return {
+    present: true,
+    empty: !(typeof raw === 'string' && raw.length > 0),
+    submitted,
+    focused: document.activeElement === el
+  };
+}
+
+function credentialFieldDisarm(attr, token) {
+  const armed = self.__chromeBridgeCredentialArmed;
+  if (armed && armed.form && armed.handler) {
+    armed.form.removeEventListener('submit', armed.handler, true);
+  }
+  self.__chromeBridgeCredentialArmed = null;
+  self.__chromeBridgeCredentialSubmitted = false;
+  const selector = '[' + attr + '="' + token + '"]';
+  const strip = (root) => {
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    for (const el of root.querySelectorAll(selector)) el.removeAttribute(attr);
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) strip(el.shadowRoot);
+    }
+  };
+  strip(document);
+  return true;
+}
+
+async function credentialProbe(tabId, token) {
+  const absent = { present: false, empty: true, submitted: false };
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: credentialFieldProbe,
+      args: [CREDENTIAL_MARKER_ATTR, token]
+    });
+    const value = results[0]?.result;
+    return value && typeof value === "object" ? value : absent;
+  } catch (_error) {
+    // A navigation mid-poll tears the frame out; the caller decides what that
+    // means for the requested mode.
+    return absent;
+  }
+}
+
+async function credentialDisarm(tabId, token) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: credentialFieldDisarm,
+      args: [CREDENTIAL_MARKER_ATTR, token]
+    });
+  } catch (_error) {
+    // Best-effort: a replaced document took the marker and listener with it.
+  }
+}
+
+async function credentialHandoff(payload) {
+  payload = payload || {};
+  const selector = payload.selector;
+  if (typeof selector !== "string" || !selector.trim()) {
+    return { success: false, err: "selector is required" };
+  }
+  const mode = payload.mode === undefined || payload.mode === null ? "filled" : payload.mode;
+  if (mode !== "filled" && mode !== "submitted") {
+    return { success: false, err: "credentialHandoff mode must be 'filled' or 'submitted'" };
+  }
+  const timeoutMs = payload.timeoutMs || 120000;
+  let tabId = payload.tabId;
+  if (tabId === undefined || tabId === null) {
+    const active = await chrome.tabs.query({ active: true, currentWindow: true });
+    tabId = active[0] && active[0].id;
+  }
+  if (tabId === undefined || tabId === null) {
+    return { success: false, err: "No target tab for handoff" };
+  }
+  let locator;
+  try {
+    locator = parseActionLocator(selector, tabId);
+  } catch (error) {
+    return locatorError(error);
+  }
+  if (locator.frames.length) {
+    return { success: false, err: "credentialHandoff does not support frame-scoped selectors" };
+  }
+  // Buffers go first: nothing may still be capturing the tab by the time it is
+  // focused, so no collector window can span the credential entry.
+  const scrubbed = await scrubCapturesForHandoff(tabId);
+  const tab = await chrome.tabs.update(tabId, { active: true });
+  if (tab.windowId) await chrome.windows.update(tab.windowId, { focused: true });
+  const taskSession = await findTaskSessionForTab(tabId);
+  const previousState = taskSession?.session?.state || "working";
+  if (taskSession) await updateTaskSessionState(taskSession.sessionId, "needs_user");
+  const startedAt = Date.now();
+  const token = credentialMarkerToken();
+  await showHandoffOverlay(tabId, payload.message || CREDENTIAL_DEFAULT_MESSAGE);
+  try {
+    const armed = await withDebugger(tabId, async (target) => {
+      const staged = await stageLocatorRefs(target, [locator], null);
+      if (staged.success === false) return staged;
+      const lookup = await evaluateInContext(target, credentialArmExpression(locator, token), null);
+      const value = lookup.val || lookup;
+      if (!lookup.success || value.success === false) return value;
+      return value;
+    });
+    if (armed.success === false) return { ...armed, scrubbedCaptures: scrubbed };
+    const startUrl = (await chrome.tabs.get(tabId)).url || "";
+    // Only emptiness is ever observed. `filled` resolves on a run of
+    // consecutive non-empty probes, which debounces a partially typed value
+    // without measuring it. A field a password manager has already filled is
+    // non-empty from the first probe and resolves after the same debounce.
+    let sawFilled = false;
+    let stableFilled = 0;
+    const done = () => ({
+      success: true,
+      tabId,
+      selector,
+      mode,
+      filled: true,
+      elapsedMs: Date.now() - startedAt,
+      scrubbedCaptures: scrubbed
+    });
+    const deadline = deadlineFrom(timeoutMs);
+    while (Date.now() <= deadline) {
+      await sleep(CREDENTIAL_PROBE_INTERVAL_MS);
+      const navigated = ((await chrome.tabs.get(tabId)).url || "") !== startUrl;
+      const state = await credentialProbe(tabId, token);
+      if (state.submitted === true && mode === "submitted") return done();
+      if (state.present !== true) {
+        // The document was replaced under the marker. In submitted mode that is
+        // the completion signal; in filled mode a credential already observed as
+        // entered still counts.
+        if (mode === "submitted" && navigated) return done();
+        if (mode === "filled" && sawFilled) return done();
+        continue;
+      }
+      const filled = state.empty === false;
+      if (filled) {
+        sawFilled = true;
+        stableFilled += 1;
+      } else {
+        stableFilled = 0;
+      }
+      if (mode === "submitted") {
+        if (navigated) return done();
+        continue;
+      }
+      if (filled && stableFilled >= CREDENTIAL_STABLE_POLLS) return done();
+    }
+    return {
+      success: false,
+      err: `credential handoff timeout after ${timeoutMs}ms`,
+      tabId,
+      selector,
+      mode,
+      scrubbedCaptures: scrubbed
+    };
+  } finally {
+    await credentialDisarm(tabId, token);
+    await hideHandoffOverlay(tabId);
+    if (taskSession) {
+      try {
+        await updateTaskSessionState(taskSession.sessionId, previousState);
+      } catch (_error) {
+        // The task can be closed while the user is completing a handoff.
+      }
+    }
+  }
+}
+
 // Cookie and web-storage write ops. Responses echo identifiers only (cookie
 // name/domain, storage scope/key) and never the stored value, so raw output can
 // be pasted without leaking credentials.
@@ -4762,7 +5572,15 @@ async function searchTabs(payload) {
 // policy grants to perform. Recordings live solely in service-worker memory: a
 // worker restart drops them, which is why `stopWorkflowRecording` returns the
 // serialized workflow for the caller to persist.
-const WORKFLOW_VERSION = 1;
+// Version 2 adds the optional per-step `expect` and `retry` clauses (T4-4).
+// Both are additive, so a version-1 file has neither and replays byte-for-byte
+// under the version-2 reader; replay therefore accepts both versions.
+const WORKFLOW_VERSION = 2;
+const WORKFLOW_REPLAYABLE_VERSIONS = [1, 2];
+// Bounded retry: a postcondition that keeps failing must end the step, not turn
+// a workflow into an unbounded poll of a page that is never going to settle.
+const WORKFLOW_MAX_RETRIES = 5;
+const WORKFLOW_MAX_RETRY_DELAY_MS = 10000;
 const WORKFLOW_STEP_LIMIT = 500;
 // A recorded human pause can be minutes long; replay waits at most this per
 // step so a workflow never stalls the bridge on a gap nobody meant to keep.
@@ -4779,8 +5597,8 @@ let workflowReplayDepth = 0;
 // actions (observe, extractText, consoleMessages, ...), host-side verbs, and
 // the recording/replay control actions themselves are deliberately absent.
 const RECORDABLE_ACTIONS = new Set([
-  "navigate", "navigateTaskSession", "activateTab", "closeTab", "reload", "goBack", "goForward",
-  "windowControl", "click", "clickAt", "type", "fill", "select", "hover", "scroll", "press", "drag",
+  "navigate", "navigateTaskSession", "navigateAndSnapshot", "activateTab", "closeTab", "reload", "goBack", "goForward",
+  "windowControl", "click", "clickAt", "type", "fill", "select", "insertRichText", "hover", "scroll", "press", "drag",
   "uploadFile", "githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody",
   "executeScript", "executeScriptCDP", "handleDialog", "downloadUrl",
   "setViewport", "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
@@ -4794,6 +5612,7 @@ const RECORDABLE_ACTIONS = new Set([
 const WORKFLOW_SENSITIVE_FIELDS = {
   type: ["text"],
   fill: ["text"],
+  insertRichText: ["nodes"],
   setCookie: ["value"],
   setStorageItem: ["value"],
   handleDialog: ["promptText"]
@@ -4813,9 +5632,12 @@ function workflowBindingKey(stepIndex, field) {
 }
 
 function isWorkflowSensitiveField(action, key, value) {
-  if (typeof value !== "string" || !value.length) return false;
-  if (WORKFLOW_SECRET_KEY_PATTERN.test(key)) return true;
-  return (WORKFLOW_SENSITIVE_FIELDS[action] || []).includes(key);
+  if (WORKFLOW_SECRET_KEY_PATTERN.test(key)) {
+    return typeof value === "string" && value.length > 0;
+  }
+  if (!(WORKFLOW_SENSITIVE_FIELDS[action] || []).includes(key)) return false;
+  if (typeof value === "string") return value.length > 0;
+  return value !== null && value !== undefined;
 }
 
 // Returns the payload as recorded plus the binding keys replay will demand.
@@ -5250,11 +6072,45 @@ function workflowStepBindingKeys(step, index) {
   return keys;
 }
 
-function applyWorkflowBindings(stepPayload, index, bindings) {
+function normalizedWorkflowBinding(action, field, value, key) {
+  if (action === "insertRichText" && field === "nodes") {
+    let parsed = value;
+    if (typeof value === "string") {
+      try {
+        parsed = JSON.parse(value);
+      } catch (_error) {
+        throw new Error(`binding ${key} must be a JSON array`);
+      }
+    }
+    if (!Array.isArray(parsed)) throw new Error(`binding ${key} must be a JSON array`);
+    return parsed;
+  }
+  if (typeof value !== "string") throw new Error(`binding ${key} must be a string`);
+  return value;
+}
+
+function applyWorkflowBindings(action, stepPayload, index, bindings) {
   for (const [field, value] of Object.entries(stepPayload)) {
     if (value !== REDACTED_VALUE) continue;
-    stepPayload[field] = bindings[workflowBindingKey(index, field)];
+    stepPayload[field] = normalizedWorkflowBinding(
+      action,
+      field,
+      bindings[workflowBindingKey(index, field)],
+      workflowBindingKey(index, field)
+    );
   }
+}
+
+// Bounded retry budget for one step. A missing, malformed, or out-of-range
+// clause clamps into 0..WORKFLOW_MAX_RETRIES and 0..WORKFLOW_MAX_RETRY_DELAY_MS
+// rather than being rejected, so an over-eager authored workflow degrades into
+// a bounded one instead of refusing to run.
+function workflowStepRetry(step) {
+  const raw = step && typeof step.retry === "object" && step.retry ? step.retry : {};
+  return {
+    max: Math.min(WORKFLOW_MAX_RETRIES, Math.max(0, Math.floor(Number(raw.max) || 0))),
+    delayMs: Math.min(WORKFLOW_MAX_RETRY_DELAY_MS, Math.max(0, Math.floor(Number(raw.delayMs) || 0)))
+  };
 }
 
 // Replays a semantic selector through the cache. Returns the selector to use
@@ -5275,13 +6131,16 @@ async function selectorForReplay(action, stepPayload) {
   };
 }
 
-async function replayWorkflow(payload) {
+async function replayWorkflow(payload, dlp) {
   const workflow = payload?.workflow;
   if (!workflow || typeof workflow !== "object") {
     return { success: false, err: "replayWorkflow requires a workflow object" };
   }
-  if (workflow.version !== undefined && Number(workflow.version) !== WORKFLOW_VERSION) {
-    return { success: false, err: `Unsupported workflow version ${workflow.version}; expected ${WORKFLOW_VERSION}` };
+  if (workflow.version !== undefined && !WORKFLOW_REPLAYABLE_VERSIONS.includes(Number(workflow.version))) {
+    return {
+      success: false,
+      err: `Unsupported workflow version ${workflow.version}; expected ${WORKFLOW_REPLAYABLE_VERSIONS.join(" or ")}`
+    };
   }
   const steps = Array.isArray(workflow.steps) ? workflow.steps : null;
   if (!steps) return { success: false, err: "workflow.steps must be an array" };
@@ -5289,16 +6148,27 @@ async function replayWorkflow(payload) {
     return { success: false, err: `Workflow has ${steps.length} steps; the limit is ${WORKFLOW_STEP_LIMIT}` };
   }
   const bindings = payload.bindings && typeof payload.bindings === "object" ? payload.bindings : {};
+  const normalizedBindings = { ...bindings };
   const defaultTabId = typeof payload.tabId === "number" ? payload.tabId : undefined;
   if (Array.isArray(payload.cache)) mergeSelectorCache(payload.cache);
 
   // Refuse the WHOLE workflow before running any step when a redacted value has
-  // no binding: a half-run workflow that stops at the password field has
+  // no valid binding: a half-run workflow that stops at the password field has
   // already mutated the page.
   const missingBindings = [];
+  const invalidBindings = [];
   steps.forEach((step, index) => {
     for (const key of workflowStepBindingKeys(step, index)) {
-      if (typeof bindings[key] !== "string") missingBindings.push(key);
+      if (!Object.prototype.hasOwnProperty.call(bindings, key)) {
+        missingBindings.push(key);
+        continue;
+      }
+      const field = key.slice(key.indexOf(".") + 1);
+      try {
+        normalizedBindings[key] = normalizedWorkflowBinding(step?.action, field, bindings[key], key);
+      } catch (error) {
+        invalidBindings.push({ key, error: error.message });
+      }
     }
   });
   if (missingBindings.length) {
@@ -5309,6 +6179,14 @@ async function replayWorkflow(payload) {
       missingBindings
     };
   }
+  if (invalidBindings.length) {
+    return {
+      success: false,
+      error: "invalidBindings",
+      err: invalidBindings.map((entry) => entry.error).join(", "),
+      invalidBindings
+    };
+  }
 
   const requiredOrigins = Array.isArray(workflow.policy?.requiredOrigins)
     ? workflow.policy.requiredOrigins.map(String).filter(Boolean)
@@ -5317,6 +6195,8 @@ async function replayWorkflow(payload) {
   const results = [];
   let selfHealedSteps = 0;
   let failed = 0;
+  let retriedSteps = 0;
+  let expectFailedSteps = 0;
 
   workflowReplayDepth += 1;
   try {
@@ -5337,7 +6217,7 @@ async function replayWorkflow(payload) {
       if (defaultTabId !== undefined && (stepPayload.tabId !== undefined || CACHEABLE_SELECTOR_ACTIONS.has(step.action))) {
         stepPayload.tabId = defaultTabId;
       }
-      applyWorkflowBindings(stepPayload, index, bindings);
+      applyWorkflowBindings(step.action, stepPayload, index, normalizedBindings);
 
       // Origin gate: a recorded workflow reproduces mutating actions, so it may
       // only run where it was recorded.
@@ -5352,36 +6232,79 @@ async function replayWorkflow(payload) {
         }
       }
 
-      const healing = await selectorForReplay(step.action, stepPayload);
-      const originalSelector = stepPayload.selector;
-      if (healing.selector !== undefined) stepPayload.selector = healing.selector;
-      try {
-        let result = await dispatchAction(step.action, stepPayload);
-        let selfHealed = healing.selfHealed === true;
-        const cachedMiss = result && typeof result === "object" && !Array.isArray(result) && result.success === false;
-        // A cached CSS path that resolves but no longer behaves gets one
-        // re-resolution through the original semantic selector.
-        if (cachedMiss && healing.cached && originalSelector !== stepPayload.selector) {
-          const refreshed = await resolveCachedSelector({ tabId: stepPayload.tabId, selector: originalSelector, refresh: true });
-          if (refreshed.success !== false) {
-            stepPayload.selector = refreshed.resolvedSelector || originalSelector;
-            result = await dispatchAction(step.action, stepPayload);
-            selfHealed = true;
+      // T4-4: an authored `expect` clause turns the step into a postcondition.
+      // A bounded `retry` re-runs the whole step - dispatch plus assertion - so
+      // a page that needed one more beat can settle, and a page that is simply
+      // wrong fails the step with evidence instead of a hopeful success.
+      const retry = workflowStepRetry(step);
+      const expectSpec = step.expect && typeof step.expect === "object" ? step.expect : null;
+      let attempts = 0;
+      let outcome = null;
+      while (outcome === null) {
+        attempts += 1;
+        const healing = await selectorForReplay(step.action, stepPayload);
+        const originalSelector = stepPayload.selector;
+        if (healing.selector !== undefined) stepPayload.selector = healing.selector;
+        try {
+          let result = await dispatchAction(step.action, stepPayload, dlp);
+          let selfHealed = healing.selfHealed === true;
+          const cachedMiss = result && typeof result === "object" && !Array.isArray(result) && result.success === false;
+          // A cached CSS path that resolves but no longer behaves gets one
+          // re-resolution through the original semantic selector.
+          if (cachedMiss && healing.cached && originalSelector !== stepPayload.selector) {
+            const refreshed = await resolveCachedSelector({ tabId: stepPayload.tabId, selector: originalSelector, refresh: true });
+            if (refreshed.success !== false) {
+              stepPayload.selector = refreshed.resolvedSelector || originalSelector;
+              result = await dispatchAction(step.action, stepPayload, dlp);
+              selfHealed = true;
+            }
           }
+          if (result && typeof result === "object" && !Array.isArray(result) && result.success === false) {
+            outcome = { failure: { success: false, selfHealed, err: result.err || result.error || "step reported success=false" } };
+          } else if (!expectSpec) {
+            outcome = { success: { selfHealed, resultSummary: summarizeRecordedResult(result) } };
+          } else {
+            const assertion = await evaluateExpectation(
+              typeof stepPayload.tabId === "number" ? stepPayload.tabId : defaultTabId,
+              expectSpec
+            );
+            if (assertion.success === false) {
+              // An unusable assertion is a workflow authoring error; retrying it
+              // would only burn the retry budget on the same rejection.
+              outcome = { failure: { success: false, selfHealed, err: assertion.err || "expect is not a valid assertion" } };
+            } else if (assertion.passed) {
+              outcome = { success: { selfHealed, resultSummary: summarizeRecordedResult(result), expectPassed: true } };
+            } else if (attempts <= retry.max) {
+              if (retry.delayMs > 0) await sleep(retry.delayMs);
+            } else {
+              outcome = {
+                failure: {
+                  success: false,
+                  selfHealed,
+                  err: "expect failed",
+                  expectPassed: false,
+                  expect: { mode: assertion.mode, reason: assertion.reason || "condition did not hold" }
+                }
+              };
+            }
+          }
+        } catch (error) {
+          outcome = { failure: { success: false, selfHealed: healing.selfHealed === true, err: error.message } };
         }
-        if (result && typeof result === "object" && !Array.isArray(result) && result.success === false) {
-          failed += 1;
-          results.push({ ...entry, success: false, selfHealed, err: result.err || result.error || "step reported success=false" });
-          if (halt) break;
-          continue;
-        }
-        if (selfHealed) selfHealedSteps += 1;
-        results.push({ ...entry, success: true, selfHealed, resultSummary: summarizeRecordedResult(result) });
-      } catch (error) {
-        failed += 1;
-        results.push({ ...entry, success: false, selfHealed: healing.selfHealed === true, err: error.message });
-        if (halt) break;
       }
+      // Per-step evidence: how many times the step ran and whether the
+      // postcondition held. `attempts` is 1 for a step with no expect clause.
+      const stepEntry = { ...entry, attempts, retried: attempts > 1 };
+      if (attempts > 1) retriedSteps += 1;
+      if (outcome.failure) {
+        failed += 1;
+        if (outcome.failure.expectPassed === false) expectFailedSteps += 1;
+        results.push({ ...stepEntry, ...outcome.failure });
+        if (halt) break;
+        continue;
+      }
+      if (outcome.success.selfHealed) selfHealedSteps += 1;
+      results.push({ ...stepEntry, success: true, ...outcome.success });
     }
   } finally {
     workflowReplayDepth -= 1;
@@ -5390,12 +6313,16 @@ async function replayWorkflow(payload) {
   return {
     success: failed === 0,
     name: workflow.name || null,
+    // The reader version, so an accepted version-1 file is still identifiable.
     version: WORKFLOW_VERSION,
+    workflowVersion: workflow.version === undefined ? null : Number(workflow.version),
     tabId: defaultTabId ?? null,
     stepCount: steps.length,
     ranSteps: results.length,
     failedSteps: failed,
     selfHealedSteps,
+    retriedSteps,
+    expectFailedSteps,
     steps: results,
     cache: selectorCacheEntries()
   };

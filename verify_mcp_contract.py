@@ -43,6 +43,7 @@ from chrome_bridge_mcp.transport import BridgeError  # noqa: E402
 received = []
 received_raw = []
 received_lock = threading.Lock()
+accepted_connections = 0
 
 
 # The active result function; swap it to change mock behavior without rebinding.
@@ -50,6 +51,7 @@ _result_fn = None
 
 
 def serve():
+    global accepted_connections
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", PORT))
@@ -58,33 +60,38 @@ def serve():
     while not stop_event.is_set():
         try:
             conn, _ = srv.accept()
+            accepted_connections += 1
         except socket.timeout:
             continue
         except OSError:
             break
         with conn:
             buf = b""
-            while b"\n" not in buf:
-                chunk = conn.recv(65536)
-                if not chunk:
+            while not stop_event.is_set():
+                while b"\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if b"\n" not in buf:
                     break
-                buf += chunk
-            if not buf.strip():
-                continue
-            req = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
-            if req.get("token") != "mcp-token":
-                conn.sendall((json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode())
-                continue
-            action, payload = req.get("action"), req.get("payload")
-            with received_lock:
-                received.append((action, payload))
-                received_raw.append(req)
-            try:
-                result = _result_fn(action, payload)
-                resp = {"success": True, "result": result}
-            except Exception as exc:  # noqa: BLE001
-                resp = {"success": False, "error": str(exc)}
-            conn.sendall((json.dumps(resp) + "\n").encode())
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                req = json.loads(line.decode("utf-8"))
+                if req.get("token") != "mcp-token":
+                    conn.sendall((json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode())
+                    continue
+                action, payload = req.get("action"), req.get("payload")
+                with received_lock:
+                    received.append((action, payload))
+                    received_raw.append(req)
+                try:
+                    result = _result_fn(action, payload)
+                    resp = {"success": True, "result": result}
+                except Exception as exc:  # noqa: BLE001
+                    resp = {"success": False, "error": str(exc)}
+                conn.sendall((json.dumps(resp) + "\n").encode())
     srv.close()
 
 
@@ -132,6 +139,8 @@ TABS = [
 
 
 def default_result(action, payload):
+    if action == "ping":
+        return "pong"
     if action == "getTabs":
         return TABS
     if action == "navigate":
@@ -164,6 +173,10 @@ def main():
     t.start()
     time.sleep(0.2)
 
+    ready = json.loads(server.browser_ready(timeout_ms=500, poll_interval_ms=50))
+    expect(ready["ready"] is True and ready["extension"] == "connected",
+           "browser_ready should report the live mock extension")
+
     # 1. list_tabs -> getTabs, no payload tabId.
     server.browser_list_tabs()
     expect(last_request()[0] == "getTabs", "list_tabs should call getTabs")
@@ -172,6 +185,34 @@ def main():
     server.browser_navigate("https://x.test")
     action, payload = last_request()
     expect(action == "navigate" and payload == {"url": "https://x.test"}, "navigate payload mismatch")
+    server.browser_navigate_and_snapshot(
+        "https://x.test",
+        session_id="session-1",
+        wait_mode="selector",
+        selector="#ready",
+        timeout_ms=2000,
+        roles=["button"],
+        diff=True,
+    )
+    expect(last_request() == ("navigateAndSnapshot", {
+        "url": "https://x.test",
+        "reuse": True,
+        "active": False,
+        "waitMode": "selector",
+        "timeoutMs": 2000,
+        "compact": True,
+        "limit": 50,
+        "diff": True,
+        "sessionId": "session-1",
+        "selector": "#ready",
+        "roles": ["button"],
+    }), "navigate_and_snapshot payload mismatch")
+    try:
+        server.browser_navigate_and_snapshot("https://x.test", wait_mode="url")
+        expect(False, "navigate_and_snapshot accepted URL wait without url_substring")
+    except ValueError:
+        pass
+
 
     server.browser_task_session_create("research")
     expect(last_request() == ("createTaskSession", {"name": "research"}), "task session create mismatch")
@@ -222,6 +263,19 @@ def main():
     expect(last_request() == ("type", {"tabId": 11, "selector": "#q", "text": "hello"}), "type payload mismatch")
     server.browser_fill("#q", "hi", tab_id=11)
     expect(last_request() == ("fill", {"tabId": 11, "selector": "#q", "text": "hi"}), "fill payload mismatch")
+    rich_nodes = [
+        {"type": "heading", "attrs": {"level": 2}, "children": [
+            {"type": "text", "text": "Title", "marks": ["bold"]},
+        ]},
+        {"type": "paragraph", "children": [
+            {"type": "text", "text": "Body"},
+        ]},
+    ]
+    server.browser_insert_rich_text("#editor", rich_nodes, tab_id=11)
+    expect(last_request() == ("insertRichText", {
+        "tabId": 11, "selector": "#editor", "nodes": rich_nodes, "clear": True,
+    }), "insert_rich_text payload mismatch")
+
 
     # 7. wait_for modes map to the right actions.
     server.browser_wait_for("load", tab_id=11)
@@ -233,6 +287,21 @@ def main():
     server.browser_wait_for("url", tab_id=11, url_substring="x.test")
     expect(last_request() == ("waitForUrl", {"tabId": 11, "substring": "x.test", "timeoutMs": 10000}), "wait_for url mismatch")
 
+    # 7a. expect modes map to the one `expect` action, with only assertion fields.
+    server.browser_expect("selector", tab_id=11, selector="#done")
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "selector", "timeoutMs": 5000, "selector": "#done"}),
+           "expect selector payload mismatch")
+    server.browser_expect("text", tab_id=11, text="Done", negate=True, timeout_ms=1500)
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "text", "timeoutMs": 1500, "negate": True, "text": "Done"}),
+           "expect text/negate payload mismatch")
+    server.browser_expect("url", tab_id=11, url_substring="x.test")
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "url", "timeoutMs": 5000, "urlSubstring": "x.test"}),
+           "expect url payload mismatch")
+    server.browser_expect("schema", tab_id=11, schema={"type": "object"}, selector="#s")
+    expect(last_request() == ("expect", {"tabId": 11, "mode": "schema", "timeoutMs": 5000,
+                                         "schema": {"type": "object"}, "selector": "#s"}),
+           "expect schema payload mismatch")
+
     # 8. tab_control ops.
     for op, act in [("activate", "activateTab"), ("close", "closeTab"), ("reload", "reload"), ("back", "goBack"), ("forward", "goForward")]:
         server.browser_tab_control(op, tab_id=11)
@@ -241,6 +310,51 @@ def main():
     # 9. browser_action passthrough.
     server.browser_action("performanceMetrics", {"tabId": 11})
     expect(last_request() == ("performanceMetrics", {"tabId": 11}), "browser_action passthrough mismatch")
+
+    # 9a. typed batch keeps every primitive on one explicit tab.
+    batch_steps = [
+        {"action": "fill", "payload": {"selector": "ref=e8", "text": "Draft"}},
+        {
+            "action": "waitForText",
+            "payload": {"text": "Saved"},
+            "timeoutMs": 5000,
+        },
+    ]
+    server.browser_batch(11, batch_steps)
+    expect(last_request() == ("batch", {
+        "tabId": 11,
+        "steps": batch_steps,
+        "stopOnError": True,
+    }), "browser_batch payload mismatch")
+    read_batch_steps = [
+        {"action": "expect", "payload": {"mode": "selector", "selector": "#saved"}},
+        {"action": "observe", "payload": {"compact": True}},
+        {"action": "extractStructured", "payload": {"schema": {"type": "object"}}},
+    ]
+    server.browser_batch(11, read_batch_steps)
+    expect(last_request() == ("batch", {
+        "tabId": 11,
+        "steps": read_batch_steps,
+        "stopOnError": True,
+    }), "browser_batch should accept typed observation steps")
+    server.browser_batch(11, [
+        {"action": "extractText", "payload": {"maxChars": 999999}},
+    ])
+    expect(last_request() == ("batch", {
+        "tabId": 11,
+        "steps": [{"action": "extractText", "payload": {"maxChars": 20000}}],
+        "stopOnError": True,
+    }), "browser_batch should clamp extractText output per step")
+    for unsafe_steps, message in [
+        ([{"action": "executeScript", "payload": {"code": "1"}}], "sensitive action"),
+        ([{"action": "click", "payload": {"tabId": 12, "selector": "#save"}}], "cross-tab action"),
+        ([{"action": "observe", "payload": {"diff": True}}], "snapshot-diff state mutation"),
+    ]:
+        try:
+            server.browser_batch(11, unsafe_steps)
+            expect(False, f"browser_batch accepted {message}")
+        except ValueError:
+            pass
 
     # 9a. browser_confirm_action forwards the same action with top-level confirmation token.
     server.browser_confirm_action("executeScript", "confirm-token", {"tabId": 11, "code": "1"})
@@ -325,10 +439,16 @@ def main():
     expect("browser_get_cookies" not in default_names, "cookies must be hidden by default")
     expect("browser_action" not in default_names, "browser_action must be hidden by default (sensitive)")
     expect("browser_click" in default_names, "mutating non-sensitive tool should be present by default")
+    expect("browser_batch" in default_names, "typed batch should be present by default")
     expect("browser_policy_check" in default_names, "policy_check must be present by default (read-only, non-sensitive)")
     expect("browser_confirm_action" in default_names, "confirm_action must be present by default (mutating, non-sensitive)")
     expect("browser_confirm" in default_names, "token-only confirm must be present by default")
     expect("browser_github_attach_pr_body" in default_names, "GitHub PR-body helper must be present by default")
+    expect("browser_ready" in default_names, "readiness tool must be present by default")
+    expect("browser_navigate_and_snapshot" in default_names,
+           "navigate-and-snapshot tool must be present by default")
+    expect("browser_insert_rich_text" in default_names,
+           "rich-text insertion tool must be present by default")
 
     # 17. allow_sensitive exposes sensitive tools.
     sens_names = _tool_names(server.build_server(allow_sensitive=True))
@@ -338,15 +458,22 @@ def main():
     ro_names = _tool_names(server.build_server(readonly=True, allow_sensitive=True))
     expect("browser_click" not in ro_names and "browser_navigate" not in ro_names, "readonly must hide mutating tools")
     expect("browser_action" not in ro_names, "readonly must hide browser_action (mutating)")
+    expect("browser_batch" not in ro_names, "readonly must hide typed batch")
     expect("browser_confirm_action" not in ro_names, "readonly must hide browser_confirm_action (mutating)")
     expect("browser_confirm" not in ro_names, "readonly must hide token-only confirm (mutating)")
     expect("browser_snapshot" in ro_names and "browser_list_tabs" in ro_names, "readonly must keep read-only tools")
     expect("browser_policy_check" in ro_names, "readonly must keep policy_check (read-only)")
+    expect("browser_ready" in ro_names, "readonly must keep readiness")
+    expect("browser_navigate_and_snapshot" not in ro_names,
+           "readonly must hide navigate-and-snapshot")
+    expect("browser_insert_rich_text" not in ro_names,
+           "readonly must hide rich-text insertion")
 
     # 19. Annotations + resources are registered.
     srv = server.build_server(allow_sensitive=True)
     tools = {t.name: t for t in srv._tool_manager.list_tools()}
     expect(tools["browser_click"].annotations.destructiveHint is True, "mutating tool should be destructiveHint=True")
+    expect(tools["browser_batch"].annotations.destructiveHint is True, "typed batch should be destructiveHint=True")
     expect(tools["browser_confirm_action"].annotations.destructiveHint is True, "confirm_action should be destructiveHint=True")
     expect(tools["browser_confirm"].annotations.destructiveHint is True, "token-only confirm should be destructiveHint=True")
     expect(tools["browser_snapshot"].annotations.readOnlyHint is True, "read-only tool should be readOnlyHint=True")
@@ -409,6 +536,15 @@ def main():
            "wait_for_handoff should be present in a normal build")
     expect("browser_wait_for_handoff" not in _tool_names(server.build_server(readonly=True)),
            "wait_for_handoff must be hidden under readonly")
+
+    # 19f-2. expect is a read-only assertion, so it survives a readonly build and
+    #        carries the read-only annotation.
+    expect("browser_expect" in _tool_names(server.build_server(readonly=True)),
+           "expect is read-only and must survive a readonly build")
+    expect(tools["browser_expect"].annotations.readOnlyHint is True,
+           "expect should be annotated readOnlyHint=True")
+    expect(tools["browser_expect"].annotations.destructiveHint is False,
+           "expect must not be annotated destructive")
 
     # 19g. search_tabs is sensitive: its snippets carry content from every open
     #      tab of the real profile, so it is gated like history and bookmarks.
@@ -489,6 +625,12 @@ def main():
         shutil.rmtree(shots, ignore_errors=True)
         _result_fn = default_result
 
+    # Normal traffic reuses one connection. Asserted BEFORE the unauthorized
+    # case below, because an `unauthorized` reply deliberately discards the
+    # cached socket (both native hosts hang up after that reply), so measuring
+    # reuse across it would be measuring the reconnect, not connection reuse.
+    expect(accepted_connections == 1, "MCP calls should reuse one serialized TCP connection")
+
     # 20. unauthorized maps to an actionable message.
     def unauth(action, payload):
         raise _Unauthorized()
@@ -509,36 +651,29 @@ def main():
         expect(False, "bridge failure should raise BridgeError")
     except BridgeError as exc:
         expect("boom" in str(exc), "BridgeError should carry the bridge error message")
+    # Exactly one reconnect, caused by the unauthorized reply discarding the
+    # socket. This mock keeps its connection open, unlike the real hosts, so the
+    # reconnect is driven purely by the transport invalidating its own cache.
+    expect(accepted_connections == 2,
+           f"unauthorized should force exactly one reconnect, saw {accepted_connections}")
+    transport._connection.close()
     stop_event.set()
     t.join(timeout=5)
 
-    # 21. The MCP transport retries exactly once when connection setup failed
-    # before the host could receive the action. It must not replay ambiguous
-    # timeout/empty-response failures after a possible mutation.
-    saved_send = transport._client.send_command_data
-    os.environ["BRIDGE_MCP_RECONNECT_DELAY_MS"] = "0"
+    # 21. Call dispatch never retries an ambiguous transport result. Connection
+    # setup retries live inside PersistentBridgeConnection before send.
+    saved_connection = transport._connection
     wire_calls = []
 
-    def connect_then_succeed(*args, **kwargs):
-        wire_calls.append((args, kwargs))
-        if len(wire_calls) == 1:
-            return 111, None, "browser unavailable"
-        return 0, {"success": True, "result": "pong"}, ""
+    class FakeConnection:
+        def __init__(self, result):
+            self.result = result
 
-    transport._client.send_command_data = connect_then_succeed
-    try:
-        expect(transport.call("ping") == "pong", "safe MCP reconnect should return second response")
-        expect(len(wire_calls) == 2, "safe MCP reconnect should make exactly two attempts")
-    finally:
-        transport._client.send_command_data = saved_send
+        def request(self, *args, **kwargs):
+            wire_calls.append((args, kwargs))
+            return self.result
 
-    wire_calls.clear()
-
-    def ambiguous_timeout(*args, **kwargs):
-        wire_calls.append((args, kwargs))
-        return 124, None, "timed out"
-
-    transport._client.send_command_data = ambiguous_timeout
+    transport._connection = FakeConnection((124, None, "timed out"))
     try:
         try:
             transport.call("click", {"tabId": 1, "selector": "#save"})
@@ -547,7 +682,7 @@ def main():
             pass
         expect(len(wire_calls) == 1, "ambiguous MCP failure must not replay a mutating action")
     finally:
-        transport._client.send_command_data = saved_send
+        transport._connection = saved_connection
 
     # 22. A packaged-style import with only mcp/ on PYTHONPATH must still load
     # repo sibling helpers. This reproduces the former MCP startup crash.
@@ -587,16 +722,20 @@ def main():
                 break
             with conn:
                 buf = b""
-                while b"\n" not in buf:
-                    chunk = conn.recv(65536)
-                    if not chunk:
+                while not recorder_stop.is_set():
+                    while b"\n" not in buf:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    if b"\n" not in buf:
                         break
-                    buf += chunk
-                if not buf.strip():
-                    continue
-                req = json.loads(buf.split(b"\n", 1)[0].decode("utf-8"))
-                recorded_tokens.append(req.get("token"))
-                conn.sendall((json.dumps({"success": True, "result": "pong"}) + "\n").encode())
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    req = json.loads(line.decode("utf-8"))
+                    recorded_tokens.append(req.get("token"))
+                    conn.sendall((json.dumps({"success": True, "result": "pong"}) + "\n").encode())
         srv.close()
 
     recorder = threading.Thread(target=record_tokens, daemon=True)
@@ -612,6 +751,7 @@ def main():
         expect(recorded_tokens[-1] == "mcp-token",
                "omitting the token override should restore the ambient bridge token")
     finally:
+        transport._connection.close()
         os.environ["BRIDGE_PORT"] = saved_port
         recorder_stop.set()
         recorder.join(timeout=5)
@@ -655,6 +795,70 @@ def main():
                "stdio requests carry no HTTP request and must use the ambient token")
     finally:
         request_ctx.reset(ctx_token)
+
+    # 25. An ``unauthorized`` reply must invalidate the cached socket. Both
+    # native hosts close the TCP connection right after that reply, so a
+    # transport that kept it marked reusable would write the next legitimate
+    # request into a dead connection and fail with an ambiguous-delivery error.
+    reject_port = PORT + 2
+    reject_conns = []
+    reject_stop = threading.Event()
+    # Bind before starting the thread so the listener is provably ready and no
+    # assertion depends on a startup sleep.
+    reject_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    reject_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    reject_srv.bind(("127.0.0.1", reject_port))
+    reject_srv.listen(4)
+    reject_srv.settimeout(0.5)
+
+    def serve_unauthorized_then_ok():
+        while not reject_stop.is_set():
+            try:
+                conn, _ = reject_srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            reject_conns.append(1)
+            first = len(reject_conns) == 1
+            with conn:
+                buf = b""
+                while not reject_stop.is_set() and b"\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if b"\n" not in buf:
+                    continue
+                if first:
+                    # Mirror the hosts: reply unauthorized, then hang up.
+                    conn.sendall((json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode())
+                    continue
+                conn.sendall((json.dumps({"success": True, "result": "pong"}) + "\n").encode())
+        reject_srv.close()
+
+    rejecter = threading.Thread(target=serve_unauthorized_then_ok, daemon=True)
+    rejecter.start()
+    saved_port = os.environ["BRIDGE_PORT"]
+    os.environ["BRIDGE_PORT"] = str(reject_port)
+    transport._connection.close()
+    try:
+        try:
+            transport.call("ping", token="bad-token")
+            expect(False, "an unauthorized reply should raise BridgeError")
+        except transport.BridgeError as exc:
+            expect("unauthorized" in str(exc), f"unexpected unauthorized error text: {exc}")
+        expect(transport._connection._socket is None,
+               "an unauthorized reply must discard the cached persistent socket")
+        expect(transport.call("ping") == "pong",
+               "the request after an unauthorized reply must succeed on a fresh connection")
+        expect(len(reject_conns) == 2,
+               f"transport should have opened a second connection, saw {len(reject_conns)}")
+    finally:
+        transport._connection.close()
+        os.environ["BRIDGE_PORT"] = saved_port
+        reject_stop.set()
+        rejecter.join(timeout=5)
 
     if failures:
         print(f"\n{len(failures)} contract failure(s).")
