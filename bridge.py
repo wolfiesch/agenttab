@@ -374,6 +374,36 @@ def handoff_blackout(action, payload):
                 return True
     return False
 
+
+COMPOSITE_HANDOFF_ERROR = 'handoff not allowed in a composite'
+
+
+def composite_handoff_reason(action, payload):
+    # A handoff nested inside a composite can never be given a meaningful
+    # blackout. runBatch and replayWorkflow dispatch every remaining step inside
+    # the extension, so the steps AFTER the handoff never pass back through this
+    # host: a batch of [credentialHandoff, screenshot] would capture the tab
+    # while the human is still typing, with no gate in between. Registering the
+    # handoff for the composite would not help, because the blackout is enforced
+    # per request and there is only one request. The safe rule is that a handoff
+    # is a TOP-LEVEL action only, so the whole composite is refused before
+    # anything is forwarded. Nested composites are walked with the same step
+    # extractors used everywhere else, so tabId defaulting/retargeting applies.
+    # Returns the byte-stable denial reason, or None when no step is a handoff.
+    if action not in ('batch', 'replayWorkflow'):
+        return None
+    if action == 'batch':
+        prefix, steps = 'batch step', _step_payloads(payload)
+    else:
+        prefix, steps = 'workflow step', _workflow_step_payloads(payload)
+    for i, (s_action, s_payload) in enumerate(steps):
+        if s_action in HANDOFF_ACTIONS:
+            return f"{prefix} {i}: {COMPOSITE_HANDOFF_ERROR}"
+        nested = composite_handoff_reason(s_action, s_payload)
+        if nested:
+            return f"{prefix} {i}: {nested}"
+    return None
+
 # --- Host-enforced guardrails: policy, audit, redaction ---------------------
 # Policy is enforced in the host request path so every local client (Python or
 # Rust host, raw TCP/CLI, MCP) is governed by the same rules before any action
@@ -725,8 +755,10 @@ _policy_sig = object()
 # Precedence for a VERIFIED bundle:
 #   built-in default -> bundle default/clients -> local bridge_policy.json
 # so a local operator can always tighten on top of the org baseline. The one
-# thing a bundle can never do is loosen: composed ``deniedActions`` and
-# ``deniedOrigins`` are the UNION of the bundle's entries and the local ones.
+# thing a local layer can never do is LOOSEN it. What "tighten" means is not
+# the same for every key -- a longer allow list is looser while a longer deny
+# list is tighter -- so composition is per key and monotonic, driven by
+# POLICY_BUNDLE_COMPOSITION below rather than by a plain local override.
 
 POLICY_BUNDLE_DECISION = 'policy_bundle_rejected'
 POLICY_BUNDLE_MISCONFIGURED = 'policy bundle misconfigured'
@@ -735,9 +767,83 @@ POLICY_BUNDLE_MALFORMED = 'policy bundle malformed'
 POLICY_BUNDLE_LOCK_UNREADABLE = 'policy bundle lockfile unreadable'
 POLICY_BUNDLE_LOCK_MALFORMED = 'policy bundle lockfile malformed'
 POLICY_BUNDLE_MISMATCH = 'policy bundle digest mismatch'
+# A composition conflict is a policy MISCONFIGURATION, not a tampered bundle,
+# but it fails closed on the same path and with the same audit decision: two
+# different nontrivial globs on one allow-list key have no intersection that is
+# representable as a pattern list. See _bundle_intersect_lists.
+POLICY_BUNDLE_CONFLICT = 'policy bundle composition conflict'
 
-# Deny lists never shrink when a bundle is composed with the local policy.
-POLICY_BUNDLE_DENY_KEYS = ('deniedActions', 'deniedOrigins')
+# How one policy key composes when a VERIFIED bundle is layered under the local
+# policy file. Every rule is monotonic: the composed value is at most as
+# permissive as the bundle's. Keys absent from this table keep plain
+# local-over-bundle precedence because they carry neither allow/deny authority
+# nor authority over what leaves the host (``traceDir``, ``auditExport``, and
+# the local root keys). Kept as a flat table, like ESCALATING_PAYLOAD_FLAGS, so
+# the Rust host's copy can be compared against it by eye.
+#
+#   allow     Explicit INTERSECTION of two allow-list PATTERN lists. Every entry
+#             is classified by _bundle_pattern_kind as the bare wildcard ``*``,
+#             an exact literal (no ``*``, ``?`` or ``[``), or a nontrivial glob,
+#             and only those three cases are composed:
+#               * on the BUNDLE side the bundle does not constrain the list, so
+#                 the local list stands; on the LOCAL side it can never widen a
+#                 constrained bundle list.
+#               A literal survives when the OTHER side's patterns permit it as a
+#                 NAME -- the one direction in which matching a pattern against
+#                 a string is sound.
+#               Two IDENTICAL nontrivial globs compose to that glob. A BUNDLE
+#                 glob the local list does not restate is dropped, which only
+#                 ever tightens.
+#             A LOCAL nontrivial glob with no identical counterpart, against a
+#             bundle list carrying a nontrivial glob of its own, has no
+#             representable intersection. Rather than guess, or silently keep
+#             the broader side and drop the local narrowing, composition fails
+#             closed: the bundle is REJECTED exactly like a bad digest, with
+#             POLICY_BUNDLE_CONFLICT naming the key and both patterns. An EMPTY
+#             allow list denies everything, so it is the tight end of this rule,
+#             never "unconstrained".
+#   egress    The same intersection, except that for ``egressAllowlist`` EMPTY
+#             means unconstrained: an empty bundle list leaves the local list
+#             alone, and an empty local list keeps the bundle's list rather
+#             than silently lifting the constraint.
+#   deny      UNION. More entries is tighter for these keys -- more denied
+#             patterns, more confirmation-gated actions, more response-masking
+#             regexes -- so an org baseline can add entries and a local layer
+#             can add more, and a local ``[]`` can never erase the bundle's.
+#   dlp       Per-channel STRICTEST mode by POLICY_BUNDLE_DLP_ORDER.
+#   siteMode  Per-pattern STRICTEST mode by POLICY_BUNDLE_SITE_MODE_ORDER.
+#   onlyTrue  Boolean whose ``true`` is the tight value: bundle true wins.
+#   paths     UNION of the bundle's and the local layer's file paths, bundle
+#             first, deduplicated, empties dropped. A single surviving path
+#             composes to that bare string, so a plain string ``secretMaskFile``
+#             keeps working unchanged; two distinct paths compose to a LIST and
+#             the loader reads every entry. A local layer can add its own
+#             secrets, never drop the org's.
+POLICY_BUNDLE_COMPOSITION = (
+    ('allowedActions', 'allow'),
+    ('allowedOrigins', 'allow'),
+    ('egressAllowlist', 'egress'),
+    ('deniedActions', 'deny'),
+    ('deniedOrigins', 'deny'),
+    ('requireConfirmation', 'deny'),
+    ('redactPatterns', 'deny'),
+    ('dlp', 'dlp'),
+    ('siteModes', 'siteMode'),
+    ('redact', 'onlyTrue'),
+    ('audit', 'onlyTrue'),
+    ('secretMaskFile', 'paths'),
+)
+
+# Strictest-first mode orders, with the rank an UNRECOGNISED value composes at.
+# Each unknown rank mirrors what that key's enforcement path already does with a
+# typo, so composition never makes a typo mean something it does not mean at
+# request time: resolve_dlp_mode fails an unknown channel mode closed to
+# ``block`` (rank 0), while resolve_site_mode ignores an unknown site mode,
+# which is identical in effect to ``auto`` (rank 1).
+POLICY_BUNDLE_DLP_ORDER = ('block', 'audit', 'allow')
+POLICY_BUNDLE_DLP_UNKNOWN_RANK = 0
+POLICY_BUNDLE_SITE_MODE_ORDER = ('manual', 'auto', 'skip')
+POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK = 1
 
 # policyInfo and the CLI report a truncated digest: enough to compare two
 # installs by eye, never enough to reconstruct any bundle content.
@@ -825,26 +931,198 @@ def verify_policy_bundle(path, lockfile):
     return doc, actual, expected, None
 
 
-def _merge_bundle_layer(bundle_layer, local_layer, local_default):
-    # Local layer keys override the bundle's, EXCEPT deny lists, which become
-    # the union of the bundle's entries and the local floor (this layer's own
-    # list when it defines one, else the local default layer's list). That is
-    # the no-loosening rule: an org baseline can add denials, never drop them.
-    bundle_layer = bundle_layer if isinstance(bundle_layer, dict) else {}
-    local_layer = local_layer if isinstance(local_layer, dict) else {}
-    merged = {**bundle_layer, **local_layer}
-    for key in POLICY_BUNDLE_DENY_KEYS:
-        floor = local_layer.get(key)
-        if not isinstance(floor, list):
-            floor = local_default.get(key) if isinstance(local_default, dict) else None
+def _bundle_path_list(value):
+    # The usable file paths in a ``paths`` value: a bare string is one path, a
+    # list is its string entries, in order, deduplicated with empties dropped.
+    raw = value if isinstance(value, list) else [value]
+    paths = []
+    for path in raw:
+        if isinstance(path, str) and path and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _bundle_value_usable(rule, value):
+    # Whether ``value`` has the shape ``rule`` can compose. A wrong-shaped local
+    # entry is treated as absent so it can never dilute the bundle by accident.
+    if rule in ('allow', 'egress', 'deny'):
+        return isinstance(value, list)
+    if rule in ('dlp', 'siteMode'):
+        return isinstance(value, dict)
+    if rule == 'onlyTrue':
+        return isinstance(value, bool)
+    if rule == 'paths':
+        return _bundle_path_list(value) != []
+    return False
+
+
+def _bundle_local_value(key, rule, local_layer, local_default):
+    # The local value this key composes against: the layer's own entry when it
+    # has the shape the rule expects, else the local ``default`` layer's entry.
+    # That fallback mirrors how a client layer inherits the default layer at
+    # enforcement time, so a client-scoped bundle key is composed against the
+    # local floor that would actually apply to that client.
+    for holder in (local_layer, local_default):
+        if not isinstance(holder, dict):
+            continue
+        value = holder.get(key)
+        if _bundle_value_usable(rule, value):
+            return value
+    return None
+
+
+# The glob metacharacters fnmatch honours. A pattern free of all three matches
+# exactly one name, which is what makes an exact-literal intersection decidable.
+_BUNDLE_GLOB_METACHARS = '*?['
+BUNDLE_PATTERN_WILDCARD = 'wildcard'
+BUNDLE_PATTERN_LITERAL = 'literal'
+BUNDLE_PATTERN_GLOB = 'glob'
+
+
+class _BundleCompositionConflict(Exception):
+    # Raised when composing one key would require intersecting two different
+    # nontrivial globs. Carries the audit/log reason; load_policy turns it into
+    # the same fail-closed rejection a bad digest gets.
+    pass
+
+
+def _bundle_pattern_kind(pattern):
+    # The one classification shared by the ``allow`` and ``egress`` rules, so
+    # the two can never drift: the bare wildcard, an exact literal, or a
+    # nontrivial glob.
+    if pattern == '*':
+        return BUNDLE_PATTERN_WILDCARD
+    if any(c in pattern for c in _BUNDLE_GLOB_METACHARS):
+        return BUNDLE_PATTERN_GLOB
+    return BUNDLE_PATTERN_LITERAL
+
+
+def _bundle_conflict_reason(key, bundle_pattern, local_pattern):
+    return (f'{POLICY_BUNDLE_CONFLICT}: {key} bundle pattern "{bundle_pattern}" '
+            f'and local pattern "{local_pattern}" are different globs with no '
+            f'representable intersection')
+
+
+def _bundle_intersect_lists(key, bundle_list, local_list):
+    # Explicit intersection of two allow-list PATTERN lists, bundle order first,
+    # deduplicated. Testing one side's pattern STRING against the other side's
+    # patterns would not be an intersection at all (fnmatch("foo*", "foo?") is
+    # true both ways), so each entry is classified first:
+    #   wildcard  the bare ``*``; survives only when the other side is also
+    #             unconstrained, so a local ``*`` never widens the bundle.
+    #   literal   survives when the other side permits it as a NAME.
+    #   glob      survives when the other side is unconstrained or restates the
+    #             identical glob. A BUNDLE glob the local list does not restate
+    #             is dropped (a tightening). A LOCAL glob the bundle does not
+    #             restate, against a bundle list that has a glob of its own, is
+    #             a narrowing that cannot be represented: raise rather than
+    #             silently drop it or keep the broader side.
+    bundle = [v for v in bundle_list if isinstance(v, str)]
+    local = [v for v in local_list if isinstance(v, str)]
+    out = []
+    for source, constraint, local_side in ((bundle, local, False), (local, bundle, True)):
+        unconstrained = any(p == '*' for p in constraint)
+        constraint_globs = [p for p in constraint
+                            if _bundle_pattern_kind(p) == BUNDLE_PATTERN_GLOB]
+        for pattern in source:
+            kind = _bundle_pattern_kind(pattern)
+            if kind == BUNDLE_PATTERN_WILDCARD:
+                keep = unconstrained
+            elif kind == BUNDLE_PATTERN_LITERAL:
+                keep = action_matches(constraint, pattern)
+            elif unconstrained or pattern in constraint:
+                keep = True
+            elif local_side and constraint_globs:
+                raise _BundleCompositionConflict(
+                    _bundle_conflict_reason(key, constraint_globs[0], pattern))
+            else:
+                keep = False
+            if keep and pattern not in out:
+                out.append(pattern)
+    return out
+
+
+def _bundle_mode_rank(order, unknown_rank, mode):
+    return order.index(mode) if mode in order else unknown_rank
+
+
+def _bundle_strictest_mode(order, unknown_rank, bundle_mode, local_mode):
+    # The stricter of the two raw values by ``order`` (tightest first); the
+    # bundle wins a tie, so an equal local restatement is a no-op.
+    bundle_rank = _bundle_mode_rank(order, unknown_rank, bundle_mode)
+    local_rank = _bundle_mode_rank(order, unknown_rank, local_mode)
+    return bundle_mode if bundle_rank <= local_rank else local_mode
+
+
+def _compose_bundle_key(key, rule, bundle_value, local_value):
+    # The composed value for one key, or None when the bundle does not
+    # constrain that key and the plain local-over-bundle result already stands.
+    # Raises _BundleCompositionConflict when the two sides cannot be intersected
+    # (see _bundle_intersect_lists); ``key`` is carried only to name it.
+    if rule == 'deny':
         union = []
-        for values in (bundle_layer.get(key), floor):
+        for values in (bundle_value, local_value):
             if isinstance(values, list):
                 for value in values:
                     if value not in union:
                         union.append(value)
-        if union:
-            merged[key] = union
+        return union or None
+    if rule in ('allow', 'egress'):
+        if not isinstance(bundle_value, list):
+            return None
+        if rule == 'egress' and not bundle_value:
+            return None
+        if rule == 'allow' and any(v == '*' for v in bundle_value):
+            return None
+        if not isinstance(local_value, list):
+            return list(bundle_value)
+        if rule == 'egress' and not local_value:
+            return list(bundle_value)
+        return _bundle_intersect_lists(key, bundle_value, local_value)
+    if rule in ('dlp', 'siteMode'):
+        if not isinstance(bundle_value, dict):
+            return None
+        if rule == 'dlp':
+            order, unknown = POLICY_BUNDLE_DLP_ORDER, POLICY_BUNDLE_DLP_UNKNOWN_RANK
+        else:
+            order, unknown = (POLICY_BUNDLE_SITE_MODE_ORDER,
+                              POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK)
+        composed = dict(local_value) if isinstance(local_value, dict) else {}
+        for name, mode in bundle_value.items():
+            if name in composed:
+                composed[name] = _bundle_strictest_mode(order, unknown, mode, composed[name])
+            else:
+                composed[name] = mode
+        return composed
+    if rule == 'onlyTrue':
+        return True if bundle_value is True else None
+    if rule == 'paths':
+        # Union of both sides' paths, bundle first: a local layer can add its
+        # own secret dictionary but can never displace the bundle's. One path
+        # stays a bare string so an unbundled policy is untouched.
+        union = _bundle_path_list(bundle_value)
+        for path in _bundle_path_list(local_value):
+            if path not in union:
+                union.append(path)
+        if not union:
+            return None
+        return union[0] if len(union) == 1 else union
+    return None
+
+
+def _merge_bundle_layer(bundle_layer, local_layer, local_default):
+    # Local layer keys override the bundle's, EXCEPT the keys named in
+    # POLICY_BUNDLE_COMPOSITION, which compose monotonically so the local layer
+    # can only tighten the org baseline. See that table for the per-key rule.
+    bundle_layer = bundle_layer if isinstance(bundle_layer, dict) else {}
+    local_layer = local_layer if isinstance(local_layer, dict) else {}
+    merged = {**bundle_layer, **local_layer}
+    for key, rule in POLICY_BUNDLE_COMPOSITION:
+        composed = _compose_bundle_key(
+            key, rule, bundle_layer.get(key),
+            _bundle_local_value(key, rule, local_layer, local_default))
+        if composed is not None:
+            merged[key] = composed
     return merged
 
 
@@ -926,6 +1204,16 @@ def load_policy():
         return local
     path, lockfile = config
     doc, actual, expected, reason = verify_policy_bundle(path, lockfile)
+    composed = None
+    if reason is None:
+        # A verified bundle can still be MISCONFIGURED against the local layer.
+        # That rejection reuses this same path -- one log line, one audit event,
+        # the built-in default served -- so it is reported once per change by the
+        # mtime-based reload check rather than on every request.
+        try:
+            composed = compose_bundle_policy(doc, local)
+        except _BundleCompositionConflict as conflict:
+            reason = str(conflict)
     if reason is not None:
         _set_policy_bundle_state(path, lockfile, False, actual)
         logging.error(
@@ -935,7 +1223,7 @@ def load_policy():
         _audit_policy_bundle_rejected(path, reason, expected, actual)
         return DEFAULT_POLICY
     _set_policy_bundle_state(path, lockfile, True, actual)
-    return compose_bundle_policy(doc, local)
+    return composed
 
 
 def _policy_source_signature():
@@ -968,6 +1256,8 @@ def current_policy():
     if reloaded:
         # Load every configured secretMaskFile at policy load time so masking
         # (including audit masking) is armed before the first response arrives.
+        # A composed value can be a LIST of paths (see the ``paths`` rule in
+        # POLICY_BUNDLE_COMPOSITION); load_secret_masks primes every entry.
         for layer_name in ("default", *(policy.get("clients") or {})):
             load_secret_masks(policy_for_client(policy, layer_name).get('secretMaskFile'))
         # Resolve the audit export sinks in the same pass, so a malformed
@@ -982,7 +1272,11 @@ _POLICY_LIST_KEYS = (
 )
 _POLICY_BOOL_KEYS = ('redact', 'audit')
 # String-valued policy keys merged like bools: a later layer replaces the value.
-_POLICY_STR_KEYS = ('secretMaskFile', 'traceDir')
+_POLICY_STR_KEYS = ('traceDir',)
+# File-path policy keys merged like strings, except that the value may also be a
+# LIST of paths: bundle composition can compose the org's path with the local
+# one (see the ``paths`` rule in POLICY_BUNDLE_COMPOSITION).
+_POLICY_PATH_KEYS = ('secretMaskFile',)
 # Map-valued policy keys merged PER KEY: a later layer overrides only the keys it
 # names and inherits the rest, so a client layer can set one site's mode (or
 # tighten one DLP channel) without restating (or silently dropping) the default
@@ -1007,6 +1301,12 @@ def policy_for_client(policy, name):
         for key in _POLICY_STR_KEYS:
             if isinstance(layer.get(key), str):
                 merged[key] = layer[key]
+        for key in _POLICY_PATH_KEYS:
+            value = layer.get(key)
+            if isinstance(value, str):
+                merged[key] = value
+            elif isinstance(value, list):
+                merged[key] = list(value)
         for key in _POLICY_MAP_KEYS:
             if isinstance(layer.get(key), dict):
                 merged[key] = {**(merged.get(key) or {}), **layer[key]}
@@ -1708,12 +2008,35 @@ _secret_mask_warned = set()  # paths already warned about (warn once)
 _secret_mask_known = {}    # value -> name, union of everything ever loaded
 
 
-def load_secret_masks(path):
-    # Parse ``name=value`` lines from the policy's secretMaskFile. Blank lines
-    # and ``#`` comments are ignored; a missing/unreadable file disables masking
-    # for that path after one warning. Cached by mtime like the policy itself,
-    # so edits apply without a host restart. Entries are ordered longest value
-    # first so an overlapping shorter secret cannot pre-empt a longer one.
+def load_secret_masks(paths):
+    # Entries for the policy's secretMaskFile, which is either a single path or
+    # a LIST of paths (bundle composition unions the org's path with the local
+    # one; see the ``paths`` rule in POLICY_BUNDLE_COMPOSITION). The result is
+    # the union of every path's entries, still ordered longest value first so an
+    # overlapping shorter secret cannot pre-empt a longer one. Each path is
+    # loaded and cached independently, so one missing file never disables the
+    # others.
+    if isinstance(paths, str):
+        return _load_secret_mask_path(paths)
+    if not isinstance(paths, list):
+        return []
+    entries = []
+    seen = set()
+    for path in paths:
+        for name, value in _load_secret_mask_path(path):
+            if value in seen:
+                continue
+            seen.add(value)
+            entries.append((name, value))
+    entries.sort(key=lambda e: len(e[1]), reverse=True)
+    return entries
+
+
+def _load_secret_mask_path(path):
+    # Parse ``name=value`` lines from one secretMaskFile path. Blank lines and
+    # ``#`` comments are ignored; a missing/unreadable file disables masking for
+    # that path after one warning. Cached by mtime like the policy itself, so
+    # edits apply without a host restart.
     if not isinstance(path, str) or not path:
         return []
     with _secret_mask_lock:
@@ -1793,10 +2116,12 @@ def write_audit_event(event):
     # known secretMaskFile value (a denial reason can quote a target). A write
     # failure is logged but never blocks browser automation.
     #
-    # The local log is the source of truth. The optional ``auditExport`` sink is
-    # a MIRROR of the line that was just committed here: it runs after the local
-    # append has returned, on the already-masked event, behind its own lock, so
-    # export can never precede, replace, or delay the local write.
+    # The local log is the source of truth and this append is synchronous. The
+    # optional ``auditExport`` sink is a MIRROR of the line just committed here:
+    # the already-masked event is handed to a bounded queue drained by one
+    # background worker (see queue_audit_export), so export can never precede,
+    # replace, or delay the local write, and a slow or dead collector can never
+    # add latency to the request thread.
     try:
         event = mask_secrets_value(event, _known_secret_masks())
         line = json.dumps(event) + "\n"
@@ -1806,7 +2131,7 @@ def write_audit_event(event):
     except Exception as e:
         logging.error(f"Could not write audit event to {AUDIT_LOG_FILE}: {e}")
         return
-    forward_audit_export(event)
+    queue_audit_export(event)
 
 
 def _audit(audit_enabled, client, action, targets, decision, reason, request_id):
@@ -1841,6 +2166,10 @@ def _audit(audit_enabled, client, action, targets, decision, reason, request_id)
 # write, disables that sink for the life of the process after exactly one log
 # line and exactly one ``audit_export_unavailable`` audit event. Automation is
 # never blocked and never retried against a dead sink.
+#
+# Off the request path: the local append stays synchronous, then the masked
+# event is queued for one background daemon worker (see queue_audit_export), so
+# DNS, a slow TCP collector, or an NFS write costs the request thread nothing.
 
 AUDIT_EXPORT_FORMATS = ('jsonl', 'syslog', 'cef')
 
@@ -2005,11 +2334,29 @@ def normalize_audit_export(config):
 # Serializes every export write (and therefore every rotation) under the
 # thread-per-connection model, exactly like _audit_write_lock does locally.
 # Separate from _audit_write_lock on purpose: a slow sink must never delay the
-# local append.
+# local append. Held only by the export worker thread now, never by a request
+# thread, so rotation and retention pruning also run off the request path.
 _audit_export_lock = threading.Lock()
 _audit_export_state_lock = threading.Lock()
 _audit_export_layers = {}    # policy layer name -> normalized config or None
 _audit_export_disabled = set()  # sink keys already disabled for this process
+
+# Bounded hand-off from the request thread to the single export worker. One
+# FIFO queue drained by one worker, so events reach the sink in exactly the
+# order they were appended locally. Each queue entry is an immutable
+# ``(event, config)`` snapshot: the sink is resolved ONCE, on the request
+# thread, and the worker forwards to exactly that sink. A policy reload while
+# events are queued therefore can neither reroute an already-authorized event
+# to a destination configured later nor drop it. When the queue is full the
+# NEWEST event is dropped (the same choice the OTLP exporter makes) and
+# counted: the local audit log still holds every event, so a drop costs
+# completeness of the mirror, never of the record. The queue and its thread are
+# created on the first event that actually has a sink, so a host with no
+# auditExport starts no thread.
+AUDIT_EXPORT_QUEUE_MAX = 1024
+_audit_export_queue = None
+_audit_export_queue_lock = threading.Lock()
+_audit_export_dropped = 0
 
 
 def prime_audit_export(policy):
@@ -2125,12 +2472,60 @@ def audit_export_emit(config, line):
         f.write(data)
 
 
-def forward_audit_export(event):
-    # Mirror one already-written, already-masked audit event to the configured
-    # sink. Called only AFTER the local append succeeded.
+def queue_audit_export(event):
+    # Hand one already-written, already-masked audit event to the export worker.
+    # Runs on the REQUEST thread, so it must never do I/O: the only work here is
+    # resolving the sink and a non-blocking put. The resolved config travels
+    # WITH the event, so the worker never re-resolves the sink and a policy
+    # reload cannot reroute a queued event. The nested
+    # ``audit_export_unavailable`` write below re-enters this function from the
+    # worker, but the sink is already marked disabled by then, so it returns at
+    # the disabled check and nothing recurses.
+    global _audit_export_queue, _audit_export_dropped
     config = audit_export_sink(event.get('client'))
     if config is None:
         return
+    with _audit_export_state_lock:
+        if config['key'] in _audit_export_disabled:
+            return
+    with _audit_export_queue_lock:
+        if _audit_export_queue is None:
+            _audit_export_queue = queue.Queue(maxsize=AUDIT_EXPORT_QUEUE_MAX)
+            threading.Thread(target=_audit_export_loop, daemon=True).start()
+        pending = _audit_export_queue
+    try:
+        # dict(config) freezes the snapshot: prime_audit_export replaces layer
+        # entries wholesale, but copying costs nothing and keeps the queued
+        # config provably immune to any future in-place edit.
+        pending.put_nowait((event, dict(config)))
+    except queue.Full:
+        with _audit_export_queue_lock:
+            _audit_export_dropped += 1
+            dropped = _audit_export_dropped
+        if dropped == 1:
+            logging.error(
+                f"auditExport queue full ({AUDIT_EXPORT_QUEUE_MAX} events); dropping the "
+                "newest events (further drops silent). The local audit log still holds "
+                "every event.")
+
+
+def _audit_export_loop():
+    # One worker draining one FIFO queue: sink order equals local append order.
+    while True:
+        event, config = _audit_export_queue.get()
+        try:
+            forward_audit_export(event, config)
+        except Exception as e:
+            logging.error(f"auditExport worker error: {e}")
+
+
+def forward_audit_export(event, config):
+    # Mirror one already-written, already-masked audit event to the sink that
+    # was in force when the event was produced. ``config`` is the snapshot the
+    # request thread enqueued, never a freshly resolved sink: an event is
+    # delivered to the destination that authorized it, or not at all. Runs on
+    # the export worker thread, only AFTER the local append succeeded, so every
+    # blocking step below is off the request path.
     key = config['key']
     with _audit_export_state_lock:
         if key in _audit_export_disabled:
@@ -2890,6 +3285,12 @@ def handle_socket_client(client_socket):
                     verdict["allowed"] = False
                     verdict["reason"] = HANDOFF_BLACKOUT_ERROR
                     verdict["blackout"] = True
+                # A handoff nested in a composite is refused outright, so the
+                # dry run must report the same verdict the real request meets.
+                nested_handoff = composite_handoff_reason(action, cmd.get("payload") or {})
+                if nested_handoff:
+                    verdict["allowed"] = False
+                    verdict["reason"] = nested_handoff
                 # Host-answered actions resolve without Chrome, so they would
                 # never forward even when fully allowed.
                 host_side = action in ('lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo', 'confirm')
@@ -3047,6 +3448,18 @@ def handle_socket_client(client_socket):
                     "error": HANDOFF_BLACKOUT_ERROR,
                     "blackout": True,
                 }, "handoff_blackout", HANDOFF_BLACKOUT_ERROR)
+                continue
+
+            # A handoff nested in a composite is refused outright (see
+            # composite_handoff_reason): the composite's later steps run inside
+            # the extension, so no blackout could cover them. Denied here, before
+            # policy evaluation, so nothing is forwarded.
+            nested_handoff = composite_handoff_reason(action, payload)
+            if nested_handoff:
+                _audit(audit_enabled, name, action, [], "deny", nested_handoff, None)
+                respond({"success": False, "error": f"policy denied: {nested_handoff}",
+                         "policyDenial": policy_denial(nested_handoff, action, [], name, policy, payload)},
+                        "deny", nested_handoff)
                 continue
 
             # Host-enforced policy, phase 1: action-level and payload-target

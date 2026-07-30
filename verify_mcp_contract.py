@@ -548,6 +548,12 @@ def main():
         shutil.rmtree(shots, ignore_errors=True)
         _result_fn = default_result
 
+    # Normal traffic reuses one connection. Asserted BEFORE the unauthorized
+    # case below, because an `unauthorized` reply deliberately discards the
+    # cached socket (both native hosts hang up after that reply), so measuring
+    # reuse across it would be measuring the reconnect, not connection reuse.
+    expect(accepted_connections == 1, "MCP calls should reuse one serialized TCP connection")
+
     # 20. unauthorized maps to an actionable message.
     def unauth(action, payload):
         raise _Unauthorized()
@@ -568,7 +574,11 @@ def main():
         expect(False, "bridge failure should raise BridgeError")
     except BridgeError as exc:
         expect("boom" in str(exc), "BridgeError should carry the bridge error message")
-    expect(accepted_connections == 1, "MCP calls should reuse one serialized TCP connection")
+    # Exactly one reconnect, caused by the unauthorized reply discarding the
+    # socket. This mock keeps its connection open, unlike the real hosts, so the
+    # reconnect is driven purely by the transport invalidating its own cache.
+    expect(accepted_connections == 2,
+           f"unauthorized should force exactly one reconnect, saw {accepted_connections}")
     transport._connection.close()
     stop_event.set()
     t.join(timeout=5)
@@ -708,6 +718,70 @@ def main():
                "stdio requests carry no HTTP request and must use the ambient token")
     finally:
         request_ctx.reset(ctx_token)
+
+    # 25. An ``unauthorized`` reply must invalidate the cached socket. Both
+    # native hosts close the TCP connection right after that reply, so a
+    # transport that kept it marked reusable would write the next legitimate
+    # request into a dead connection and fail with an ambiguous-delivery error.
+    reject_port = PORT + 2
+    reject_conns = []
+    reject_stop = threading.Event()
+    # Bind before starting the thread so the listener is provably ready and no
+    # assertion depends on a startup sleep.
+    reject_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    reject_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    reject_srv.bind(("127.0.0.1", reject_port))
+    reject_srv.listen(4)
+    reject_srv.settimeout(0.5)
+
+    def serve_unauthorized_then_ok():
+        while not reject_stop.is_set():
+            try:
+                conn, _ = reject_srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            reject_conns.append(1)
+            first = len(reject_conns) == 1
+            with conn:
+                buf = b""
+                while not reject_stop.is_set() and b"\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if b"\n" not in buf:
+                    continue
+                if first:
+                    # Mirror the hosts: reply unauthorized, then hang up.
+                    conn.sendall((json.dumps({"success": False, "error": "unauthorized"}) + "\n").encode())
+                    continue
+                conn.sendall((json.dumps({"success": True, "result": "pong"}) + "\n").encode())
+        reject_srv.close()
+
+    rejecter = threading.Thread(target=serve_unauthorized_then_ok, daemon=True)
+    rejecter.start()
+    saved_port = os.environ["BRIDGE_PORT"]
+    os.environ["BRIDGE_PORT"] = str(reject_port)
+    transport._connection.close()
+    try:
+        try:
+            transport.call("ping", token="bad-token")
+            expect(False, "an unauthorized reply should raise BridgeError")
+        except transport.BridgeError as exc:
+            expect("unauthorized" in str(exc), f"unexpected unauthorized error text: {exc}")
+        expect(transport._connection._socket is None,
+               "an unauthorized reply must discard the cached persistent socket")
+        expect(transport.call("ping") == "pong",
+               "the request after an unauthorized reply must succeed on a fresh connection")
+        expect(len(reject_conns) == 2,
+               f"transport should have opened a second connection, saw {len(reject_conns)}")
+    finally:
+        transport._connection.close()
+        os.environ["BRIDGE_PORT"] = saved_port
+        reject_stop.set()
+        rejecter.join(timeout=5)
 
     if failures:
         print(f"\n{len(failures)} contract failure(s).")

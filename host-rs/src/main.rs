@@ -579,6 +579,40 @@ fn handoff_blackout(handoffs: &Handoffs, action: &str, payload: Option<&Value>) 
     }
 }
 
+const COMPOSITE_HANDOFF_ERROR: &str = "handoff not allowed in a composite";
+
+/// A handoff nested inside a composite can never be given a meaningful
+/// blackout. runBatch and replayWorkflow dispatch every remaining step inside
+/// the extension, so the steps AFTER the handoff never pass back through this
+/// host: a batch of [credentialHandoff, screenshot] would capture the tab while
+/// the human is still typing, with no gate in between. Registering the handoff
+/// for the composite would not help, because the blackout is enforced per
+/// request and there is only one request. The safe rule is that a handoff is a
+/// TOP-LEVEL action only, so the whole composite is refused before anything is
+/// forwarded. Nested composites are walked with the same step extractors used
+/// everywhere else, so tabId defaulting/retargeting applies.
+/// Returns the byte-stable denial reason, or None when no step is a handoff.
+/// Mirrors bridge.py::composite_handoff_reason.
+fn composite_handoff_reason(action: &str, payload: Option<&Value>) -> Option<String> {
+    if action != "batch" && action != "replayWorkflow" {
+        return None;
+    }
+    let (prefix, steps) = if action == "batch" {
+        ("batch step", step_payloads(payload))
+    } else {
+        ("workflow step", workflow_step_payloads(payload))
+    };
+    for (i, (s_action, s_payload)) in steps.iter().enumerate() {
+        if HANDOFF_ACTIONS.contains(&s_action.as_str()) {
+            return Some(format!("{} {}: {}", prefix, i, COMPOSITE_HANDOFF_ERROR));
+        }
+        if let Some(nested) = composite_handoff_reason(s_action, Some(s_payload)) {
+            return Some(format!("{} {}: {}", prefix, i, nested));
+        }
+    }
+    None
+}
+
 // --- Host-enforced guardrails: policy, audit, redaction --------------------
 // Mirrors bridge.py so the Rust native host governs every local client path
 // (raw TCP/CLI, MCP) with the same policy/audit/redaction behavior.
@@ -978,8 +1012,11 @@ fn default_policy() -> Value {
 //
 // Precedence for a VERIFIED bundle:
 //   built-in default -> bundle default/clients -> local bridge_policy.json
-// so a local operator can always tighten. A bundle can never loosen: composed
-// `deniedActions`/`deniedOrigins` are the UNION of bundle and local entries.
+// so a local operator can always tighten. A local layer can never LOOSEN the
+// bundle. What "tighten" means is not the same for every key -- a longer allow
+// list is looser while a longer deny list is tighter -- so composition is per
+// key and monotonic, driven by POLICY_BUNDLE_COMPOSITION below rather than by
+// a plain local override.
 
 const POLICY_BUNDLE_DECISION: &str = "policy_bundle_rejected";
 const POLICY_BUNDLE_MISCONFIGURED: &str = "policy bundle misconfigured";
@@ -988,9 +1025,84 @@ const POLICY_BUNDLE_MALFORMED: &str = "policy bundle malformed";
 const POLICY_BUNDLE_LOCK_UNREADABLE: &str = "policy bundle lockfile unreadable";
 const POLICY_BUNDLE_LOCK_MALFORMED: &str = "policy bundle lockfile malformed";
 const POLICY_BUNDLE_MISMATCH: &str = "policy bundle digest mismatch";
+/// A composition conflict is a policy MISCONFIGURATION, not a tampered bundle,
+/// but it fails closed on the same path and with the same audit decision: two
+/// different nontrivial globs on one allow-list key have no intersection that
+/// is representable as a pattern list. See bundle_intersect_lists.
+const POLICY_BUNDLE_CONFLICT: &str = "policy bundle composition conflict";
 
-/// Deny lists never shrink when a bundle is composed with the local policy.
-const POLICY_BUNDLE_DENY_KEYS: [&str; 2] = ["deniedActions", "deniedOrigins"];
+/// How one policy key composes when a VERIFIED bundle is layered under the
+/// local policy file. Every rule is monotonic: the composed value is at most as
+/// permissive as the bundle's. Keys absent from this table keep plain
+/// local-over-bundle precedence because they carry neither allow/deny authority
+/// nor authority over what leaves the host (`traceDir`, `auditExport`, and the
+/// local root keys). Kept as a flat table, mirroring bridge.py's
+/// POLICY_BUNDLE_COMPOSITION field for field so the two hosts can be compared
+/// by eye.
+///
+///   allow     Explicit INTERSECTION of two allow-list PATTERN lists. Every
+///             entry is classified by bundle_pattern_kind as the bare wildcard
+///             `*`, an exact literal (no `*`, `?` or `[`), or a nontrivial
+///             glob, and only those three cases are composed:
+///               * on the BUNDLE side the bundle does not constrain the list,
+///                 so the local list stands; on the LOCAL side it can never
+///                 widen a constrained bundle list.
+///               A literal survives when the OTHER side's patterns permit it as
+///                 a NAME -- the one direction in which matching a pattern
+///                 against a string is sound.
+///               Two IDENTICAL nontrivial globs compose to that glob. A BUNDLE
+///                 glob the local list does not restate is dropped, which only
+///                 ever tightens.
+///             A LOCAL nontrivial glob with no identical counterpart, against a
+///             bundle list carrying a nontrivial glob of its own, has no
+///             representable intersection. Rather than guess, or silently keep
+///             the broader side and drop the local narrowing, composition fails
+///             closed: the bundle is REJECTED exactly like a bad digest, with
+///             POLICY_BUNDLE_CONFLICT naming the key and both patterns. An
+///             EMPTY allow list denies everything, so it is the tight end of
+///             this rule, never "unconstrained".
+///   egress    The same intersection, except that for `egressAllowlist` EMPTY
+///             means unconstrained: an empty bundle list leaves the local list
+///             alone, and an empty local list keeps the bundle's list rather
+///             than silently lifting the constraint.
+///   deny      UNION. More entries is tighter for these keys -- more denied
+///             patterns, more confirmation-gated actions, more response-masking
+///             regexes -- so an org baseline can add entries and a local layer
+///             can add more, and a local `[]` can never erase the bundle's.
+///   dlp       Per-channel STRICTEST mode by POLICY_BUNDLE_DLP_ORDER.
+///   siteMode  Per-pattern STRICTEST mode by POLICY_BUNDLE_SITE_MODE_ORDER.
+///   onlyTrue  Boolean whose `true` is the tight value: bundle true wins.
+///   paths     UNION of the bundle's and the local layer's file paths, bundle
+///             first, deduplicated, empties dropped. A single surviving path
+///             composes to that bare string, so a plain string `secretMaskFile`
+///             keeps working unchanged; two distinct paths compose to a LIST
+///             and the loader reads every entry. A local layer can add its own
+///             secrets, never drop the org's.
+const POLICY_BUNDLE_COMPOSITION: [(&str, &str); 12] = [
+    ("allowedActions", "allow"),
+    ("allowedOrigins", "allow"),
+    ("egressAllowlist", "egress"),
+    ("deniedActions", "deny"),
+    ("deniedOrigins", "deny"),
+    ("requireConfirmation", "deny"),
+    ("redactPatterns", "deny"),
+    ("dlp", "dlp"),
+    ("siteModes", "siteMode"),
+    ("redact", "onlyTrue"),
+    ("audit", "onlyTrue"),
+    ("secretMaskFile", "paths"),
+];
+
+/// Strictest-first mode orders, with the rank an UNRECOGNISED value composes
+/// at. Each unknown rank mirrors what that key's enforcement path already does
+/// with a typo, so composition never makes a typo mean something it does not
+/// mean at request time: resolve_dlp_mode fails an unknown channel mode closed
+/// to `block` (rank 0), while resolve_site_mode ignores an unknown site mode,
+/// which is identical in effect to `auto` (rank 1).
+const POLICY_BUNDLE_DLP_ORDER: [&str; 3] = ["block", "audit", "allow"];
+const POLICY_BUNDLE_DLP_UNKNOWN_RANK: usize = 0;
+const POLICY_BUNDLE_SITE_MODE_ORDER: [&str; 3] = ["manual", "auto", "skip"];
+const POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK: usize = 1;
 
 /// policyInfo and the CLI report a truncated digest: enough to compare two
 /// installs by eye, never enough to reconstruct any bundle content.
@@ -1126,15 +1238,301 @@ fn verify_policy_bundle(
     }
 }
 
-/// Local layer keys override the bundle's, EXCEPT deny lists, which become the
-/// union of the bundle's entries and the local floor (this layer's own list
-/// when it defines one, else the local default layer's list). That is the
-/// no-loosening rule: an org baseline can add denials, never drop them.
+/// The usable file paths in a `paths` value: a bare string is one path, an array
+/// is its string entries, in order, deduplicated with empties dropped.
+fn bundle_path_list(value: Option<&Value>) -> Vec<String> {
+    let raw: Vec<&Value> = match value {
+        Some(Value::Array(arr)) => arr.iter().collect(),
+        Some(v) => vec![v],
+        None => Vec::new(),
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for entry in raw {
+        if let Some(path) = entry.as_str() {
+            if !path.is_empty() && !paths.iter().any(|p| p == path) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// Whether `value` has the shape `rule` can compose. A wrong-shaped local entry
+/// is treated as absent so it can never dilute the bundle by accident.
+fn bundle_value_usable(rule: &str, value: &Value) -> bool {
+    match rule {
+        "allow" | "egress" | "deny" => value.is_array(),
+        "dlp" | "siteMode" => value.is_object(),
+        "onlyTrue" => value.is_boolean(),
+        "paths" => !bundle_path_list(Some(value)).is_empty(),
+        _ => false,
+    }
+}
+
+/// The local value this key composes against: the layer's own entry when it has
+/// the shape the rule expects, else the local `default` layer's entry. That
+/// fallback mirrors how a client layer inherits the default layer at
+/// enforcement time, so a client-scoped bundle key is composed against the
+/// local floor that would actually apply to that client.
+fn bundle_local_value(
+    key: &str,
+    rule: &str,
+    local_map: &serde_json::Map<String, Value>,
+    local_default: &Value,
+) -> Option<Value> {
+    if let Some(v) = local_map.get(key) {
+        if bundle_value_usable(rule, v) {
+            return Some(v.clone());
+        }
+    }
+    if let Some(v) = local_default.get(key) {
+        if bundle_value_usable(rule, v) {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+/// The glob metacharacters the matcher honours. A pattern free of all three
+/// matches exactly one name, which is what makes an exact-literal intersection
+/// decidable. Mirrors bridge.py's _BUNDLE_GLOB_METACHARS.
+const BUNDLE_GLOB_METACHARS: [char; 3] = ['*', '?', '['];
+
+#[derive(PartialEq, Eq)]
+enum BundlePatternKind {
+    Wildcard,
+    Literal,
+    Glob,
+}
+
+/// The one classification shared by the `allow` and `egress` rules, so the two
+/// can never drift: the bare wildcard, an exact literal, or a nontrivial glob.
+/// Mirrors bridge.py's _bundle_pattern_kind.
+fn bundle_pattern_kind(pattern: &str) -> BundlePatternKind {
+    if pattern == "*" {
+        return BundlePatternKind::Wildcard;
+    }
+    if pattern.chars().any(|c| BUNDLE_GLOB_METACHARS.contains(&c)) {
+        return BundlePatternKind::Glob;
+    }
+    BundlePatternKind::Literal
+}
+
+fn bundle_conflict_reason(key: &str, bundle_pattern: &str, local_pattern: &str) -> String {
+    format!(
+        "{}: {} bundle pattern \"{}\" and local pattern \"{}\" are different \
+         globs with no representable intersection",
+        POLICY_BUNDLE_CONFLICT, key, bundle_pattern, local_pattern)
+}
+
+/// The string entries of one pattern list, in order. A non-string entry is
+/// skipped, exactly as the gates skip it at request time.
+fn bundle_pattern_strings(list: &Value) -> Vec<&str> {
+    match list.as_array() {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Whether any pattern in `constraint` permits `name`, using the same glob the
+/// gates use. This is the only sound direction: `name` is a NAME, not a pattern.
+fn bundle_permits_name(constraint: &[&str], name: &str) -> bool {
+    constraint
+        .iter()
+        .copied()
+        .any(|p| glob::Pattern::new(p).map(|g| g.matches(name)).unwrap_or(false))
+}
+
+/// Explicit intersection of two allow-list PATTERN lists, bundle order first,
+/// deduplicated. Testing one side's pattern STRING against the other side's
+/// patterns would not be an intersection at all (matching "foo*" against "foo?"
+/// succeeds both ways), so each entry is classified first:
+///   wildcard  the bare `*`; survives only when the other side is also
+///             unconstrained, so a local `*` never widens the bundle.
+///   literal   survives when the other side permits it as a NAME.
+///   glob      survives when the other side is unconstrained or restates the
+///             identical glob. A BUNDLE glob the local list does not restate is
+///             dropped (a tightening). A LOCAL glob the bundle does not restate,
+///             against a bundle list that has a glob of its own, is a narrowing
+///             that cannot be represented: Err rather than silently drop it or
+///             keep the broader side. Mirrors bridge.py's
+///             _bundle_intersect_lists.
+fn bundle_intersect_lists(
+    key: &str,
+    bundle_list: &Value,
+    local_list: &Value,
+) -> Result<Value, String> {
+    let bundle = bundle_pattern_strings(bundle_list);
+    let local = bundle_pattern_strings(local_list);
+    let mut out: Vec<&str> = Vec::new();
+    for (source, constraint, local_side) in
+        [(&bundle, &local, false), (&local, &bundle, true)]
+    {
+        let unconstrained = constraint.iter().any(|p| *p == "*");
+        let constraint_globs: Vec<&str> = constraint
+            .iter()
+            .copied()
+            .filter(|p| bundle_pattern_kind(p) == BundlePatternKind::Glob)
+            .collect();
+        for pattern in source.iter().copied() {
+            let keep = match bundle_pattern_kind(pattern) {
+                BundlePatternKind::Wildcard => unconstrained,
+                BundlePatternKind::Literal => bundle_permits_name(constraint.as_slice(), pattern),
+                BundlePatternKind::Glob => {
+                    if unconstrained || constraint.contains(&pattern) {
+                        true
+                    } else {
+                        if local_side {
+                            if let Some(other) = constraint_globs.first() {
+                                return Err(bundle_conflict_reason(key, other, pattern));
+                            }
+                        }
+                        false
+                    }
+                }
+            };
+            if keep && !out.contains(&pattern) {
+                out.push(pattern);
+            }
+        }
+    }
+    Ok(Value::Array(out.into_iter().map(|s| Value::String(s.to_string())).collect()))
+}
+
+fn bundle_mode_rank(order: &[&str; 3], unknown_rank: usize, mode: &Value) -> usize {
+    match mode.as_str() {
+        Some(s) => order.iter().position(|m| *m == s).unwrap_or(unknown_rank),
+        None => unknown_rank,
+    }
+}
+
+/// The stricter of the two raw values by `order` (tightest first); the bundle
+/// wins a tie, so an equal local restatement is a no-op.
+fn bundle_strictest_mode(
+    order: &[&str; 3],
+    unknown_rank: usize,
+    bundle_mode: &Value,
+    local_mode: &Value,
+) -> Value {
+    if bundle_mode_rank(order, unknown_rank, bundle_mode)
+        <= bundle_mode_rank(order, unknown_rank, local_mode)
+    {
+        bundle_mode.clone()
+    } else {
+        local_mode.clone()
+    }
+}
+
+/// The composed value for one key, or None when the bundle does not constrain
+/// that key and the plain local-over-bundle result already stands. Err when the
+/// two sides cannot be intersected (see bundle_intersect_lists); `key` is
+/// carried only to name it.
+fn compose_bundle_key(
+    key: &str,
+    rule: &str,
+    bundle_value: Option<&Value>,
+    local_value: Option<&Value>,
+) -> Result<Option<Value>, String> {
+    match rule {
+        "deny" => {
+            let mut union: Vec<Value> = Vec::new();
+            for values in [bundle_value, local_value].into_iter().flatten() {
+                if let Some(arr) = values.as_array() {
+                    for value in arr {
+                        if !union.contains(value) {
+                            union.push(value.clone());
+                        }
+                    }
+                }
+            }
+            if union.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(Value::Array(union)))
+            }
+        }
+        "allow" | "egress" => {
+            let bundle_arr = match bundle_value.and_then(|v| v.as_array()) {
+                Some(a) => a,
+                None => return Ok(None),
+            };
+            let bundle = match bundle_value {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+            if rule == "egress" && bundle_arr.is_empty() {
+                return Ok(None);
+            }
+            if rule == "allow" && bundle_arr.iter().any(|v| v.as_str() == Some("*")) {
+                return Ok(None);
+            }
+            let local = match local_value.filter(|v| v.is_array()) {
+                Some(v) => v,
+                None => return Ok(Some(bundle.clone())),
+            };
+            if rule == "egress" && local.as_array().is_some_and(|a| a.is_empty()) {
+                return Ok(Some(bundle.clone()));
+            }
+            Ok(Some(bundle_intersect_lists(key, bundle, local)?))
+        }
+        "dlp" | "siteMode" => {
+            let bundle_map = match bundle_value.and_then(|v| v.as_object()) {
+                Some(m) => m,
+                None => return Ok(None),
+            };
+            let (order, unknown) = if rule == "dlp" {
+                (&POLICY_BUNDLE_DLP_ORDER, POLICY_BUNDLE_DLP_UNKNOWN_RANK)
+            } else {
+                (&POLICY_BUNDLE_SITE_MODE_ORDER, POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK)
+            };
+            let mut composed = local_value
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            for (name, mode) in bundle_map.iter() {
+                let value = match composed.get(name) {
+                    Some(local_mode) => bundle_strictest_mode(order, unknown, mode, local_mode),
+                    None => mode.clone(),
+                };
+                composed.insert(name.clone(), value);
+            }
+            Ok(Some(Value::Object(composed)))
+        }
+        "onlyTrue" => {
+            if bundle_value == Some(&Value::Bool(true)) {
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(None)
+            }
+        }
+        "paths" => {
+            // Union of both sides' paths, bundle first: a local layer can add
+            // its own secret dictionary but can never displace the bundle's.
+            // One path stays a bare string so an unbundled policy is untouched.
+            let mut union = bundle_path_list(bundle_value);
+            for path in bundle_path_list(local_value) {
+                if !union.contains(&path) {
+                    union.push(path);
+                }
+            }
+            match union.len() {
+                0 => Ok(None),
+                1 => Ok(Some(Value::String(union.remove(0)))),
+                _ => Ok(Some(Value::Array(union.into_iter().map(Value::String).collect()))),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Local layer keys override the bundle's, EXCEPT the keys named in
+/// POLICY_BUNDLE_COMPOSITION, which compose monotonically so the local layer
+/// can only tighten the org baseline. See that table for the per-key rule.
 fn merge_bundle_layer(
     bundle_layer: Option<&Value>,
     local_layer: Option<&Value>,
     local_default: &Value,
-) -> Value {
+) -> Result<Value, String> {
     let empty = serde_json::Map::new();
     let bundle_map = bundle_layer.and_then(|v| v.as_object()).unwrap_or(&empty);
     let local_map = local_layer.and_then(|v| v.as_object()).unwrap_or(&empty);
@@ -1142,32 +1540,21 @@ fn merge_bundle_layer(
     for (k, v) in local_map.iter() {
         merged.insert(k.clone(), v.clone());
     }
-    for key in POLICY_BUNDLE_DENY_KEYS.iter() {
-        let floor = match local_map.get(*key) {
-            Some(v) if v.is_array() => Some(v.clone()),
-            _ => local_default.get(*key).filter(|v| v.is_array()).cloned(),
-        };
-        let mut union: Vec<Value> = Vec::new();
-        for values in [bundle_map.get(*key).cloned(), floor].iter().flatten() {
-            if let Some(arr) = values.as_array() {
-                for value in arr {
-                    if !union.contains(value) {
-                        union.push(value.clone());
-                    }
-                }
-            }
-        }
-        if !union.is_empty() {
-            merged.insert((*key).to_string(), Value::Array(union));
+    for (key, rule) in POLICY_BUNDLE_COMPOSITION.iter() {
+        let local_value = bundle_local_value(key, rule, local_map, local_default);
+        if let Some(composed) =
+            compose_bundle_key(key, rule, bundle_map.get(*key), local_value.as_ref())?
+        {
+            merged.insert((*key).to_string(), composed);
         }
     }
-    Value::Object(merged)
+    Ok(Value::Object(merged))
 }
 
 /// A verified bundle supplies the baseline "default"/"clients" layers; the
 /// local policy document is layered on top. Local root keys (including the
 /// policyBundle stanza itself) are preserved.
-fn compose_bundle_policy(bundle: &Value, local: &Value) -> Value {
+fn compose_bundle_policy(bundle: &Value, local: &Value) -> Result<Value, String> {
     let empty = serde_json::Map::new();
     let local_map = local.as_object().unwrap_or(&empty);
     let local_default = local
@@ -1183,7 +1570,7 @@ fn compose_bundle_policy(bundle: &Value, local: &Value) -> Value {
     }
     composed.insert(
         "default".to_string(),
-        merge_bundle_layer(bundle.get("default"), local.get("default"), &local_default),
+        merge_bundle_layer(bundle.get("default"), local.get("default"), &local_default)?,
     );
     let bundle_clients = bundle.get("clients").and_then(|v| v.as_object()).unwrap_or(&empty);
     let local_clients = local.get("clients").and_then(|v| v.as_object()).unwrap_or(&empty);
@@ -1197,11 +1584,12 @@ fn compose_bundle_policy(bundle: &Value, local: &Value) -> Value {
     for name in names {
         clients.insert(
             name.clone(),
-            merge_bundle_layer(bundle_clients.get(&name), local_clients.get(&name), &local_default),
+            merge_bundle_layer(
+                bundle_clients.get(&name), local_clients.get(&name), &local_default)?,
         );
     }
     composed.insert("clients".to_string(), Value::Object(clients));
-    Value::Object(composed)
+    Ok(Value::Object(composed))
 }
 
 /// policyInfo view: path, verification result, truncated digest. Metadata only
@@ -1276,6 +1664,21 @@ fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
     };
     let (path, lockfile) = config;
     let (doc, actual, expected, reason) = verify_policy_bundle(&path, &lockfile);
+    let mut reason: Option<String> = reason.map(|r| r.to_string());
+    let mut composed: Option<Value> = None;
+    if reason.is_none() {
+        // A verified bundle can still be MISCONFIGURED against the local layer.
+        // That rejection reuses this same path -- one log line, one audit event,
+        // the built-in default served -- so it is reported once per change by the
+        // mtime-based reload check rather than on every request.
+        match doc {
+            Some(bundle) => match compose_bundle_policy(&bundle, &local) {
+                Ok(value) => composed = Some(value),
+                Err(conflict) => reason = Some(conflict),
+            },
+            None => composed = Some(default_policy()),
+        }
+    }
     if let Some(reason) = reason {
         set_policy_bundle_state(PolicyBundleState {
             path: Some(path.clone()),
@@ -1291,7 +1694,7 @@ fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
             actual.clone().unwrap_or_else(|| "none".to_string()),
         ));
         audit_policy_bundle_rejected(
-            host_dir, logger, &path, reason, expected.as_deref(), actual.as_deref());
+            host_dir, logger, &path, &reason, expected.as_deref(), actual.as_deref());
         return default_policy();
     }
     set_policy_bundle_state(PolicyBundleState {
@@ -1300,10 +1703,7 @@ fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
         verified: true,
         digest: actual,
     });
-    match doc {
-        Some(bundle) => compose_bundle_policy(&bundle, &local),
-        None => default_policy(),
-    }
+    composed.unwrap_or_else(default_policy)
 }
 
 /// Every file the effective policy derives from, using the bundle paths the
@@ -1382,7 +1782,11 @@ const POLICY_LIST_KEYS: [&str; 7] = [
 ];
 const POLICY_BOOL_KEYS: [&str; 2] = ["redact", "audit"];
 /// String-valued policy keys merged like bools: a later layer replaces the value.
-const POLICY_STR_KEYS: [&str; 2] = ["secretMaskFile", "traceDir"];
+const POLICY_STR_KEYS: [&str; 1] = ["traceDir"];
+/// File-path policy keys merged like strings, except that the value may also be
+/// a LIST of paths: bundle composition can compose the org's path with the local
+/// one (see the `paths` rule in POLICY_BUNDLE_COMPOSITION). Mirrors bridge.py.
+const POLICY_PATH_KEYS: [&str; 1] = ["secretMaskFile"];
 /// Map-valued policy keys merged PER KEY: a later layer overrides only the
 /// origin patterns it names and inherits the rest. Mirrors bridge.py.
 const POLICY_MAP_KEYS: [&str; 3] = ["siteModes", "dlp", "auditExport"];
@@ -1416,6 +1820,13 @@ fn policy_for_client(policy: &Value, name: &str) -> Value {
         for key in POLICY_STR_KEYS.iter() {
             if let Some(Value::String(s)) = layer.get(*key) {
                 merged[*key] = Value::String(s.clone());
+            }
+        }
+        for key in POLICY_PATH_KEYS.iter() {
+            if let Some(v) = layer.get(*key) {
+                if v.is_string() || v.is_array() {
+                    merged[*key] = v.clone();
+                }
             }
         }
         for key in POLICY_MAP_KEYS.iter() {
@@ -2218,20 +2629,42 @@ struct SecretMaskState {
 
 static SECRET_MASKS: Mutex<Option<SecretMaskState>> = Mutex::new(None);
 
-/// Parse `name=value` lines from the policy's secretMaskFile. Blank lines and
-/// `#` comments are ignored; a missing/unreadable file disables masking for that
-/// path after one warning. Cached by mtime like the policy itself, so edits
-/// apply without a host restart. Entries are ordered longest value first so an
-/// overlapping shorter secret cannot pre-empt a longer one.
+/// Entries for the policy's secretMaskFile, which is either a single path or a
+/// LIST of paths (bundle composition unions the org's path with the local one;
+/// see the `paths` rule in POLICY_BUNDLE_COMPOSITION). The result is the union of
+/// every path's entries, still ordered longest value first so an overlapping
+/// shorter secret cannot pre-empt a longer one. Each path is loaded and cached
+/// independently, so one missing file never disables the others.
 fn load_secret_masks(
-    path: Option<&str>,
+    paths: Option<&Value>,
     host_dir: &Path,
     logger: &Arc<Logger>,
 ) -> Vec<(String, String)> {
-    let path = match path {
-        Some(p) if !p.is_empty() => p,
-        _ => return Vec::new(),
-    };
+    let paths = bundle_path_list(paths);
+    if paths.len() == 1 {
+        return load_secret_mask_path(&paths[0], host_dir, logger);
+    }
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for path in paths.iter() {
+        for entry in load_secret_mask_path(path, host_dir, logger) {
+            if !entries.iter().any(|e| e.1 == entry.1) {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    entries
+}
+
+/// Parse `name=value` lines from one secretMaskFile path. Blank lines and `#`
+/// comments are ignored; a missing/unreadable file disables masking for that
+/// path after one warning. Cached by mtime like the policy itself, so edits
+/// apply without a host restart.
+fn load_secret_mask_path(
+    path: &str,
+    host_dir: &Path,
+    logger: &Arc<Logger>,
+) -> Vec<(String, String)> {
     let mtime = file_mtime(Path::new(path));
     if let Ok(mut guard) = SECRET_MASKS.lock() {
         let state = guard.get_or_insert_with(SecretMaskState::default);
@@ -2309,7 +2742,9 @@ fn known_secret_masks() -> Vec<(String, String)> {
 }
 
 /// Load every configured secretMaskFile at policy load time so masking
-/// (including audit masking) is armed before the first response arrives.
+/// (including audit masking) is armed before the first response arrives. A
+/// composed value can be a LIST of paths (see the `paths` rule in
+/// POLICY_BUNDLE_COMPOSITION); load_secret_masks primes every entry.
 fn prime_secret_masks(policy: &Value, host_dir: &Path, logger: &Arc<Logger>) {
     let mut names: Vec<String> = vec!["default".to_string()];
     if let Some(Value::Object(clients)) = policy.get("clients") {
@@ -2317,7 +2752,7 @@ fn prime_secret_masks(policy: &Value, host_dir: &Path, logger: &Arc<Logger>) {
     }
     for name in names {
         let cp = policy_for_client(policy, &name);
-        load_secret_masks(cp.get("secretMaskFile").and_then(|v| v.as_str()), host_dir, logger);
+        load_secret_masks(cp.get("secretMaskFile"), host_dir, logger);
     }
 }
 
@@ -2357,10 +2792,12 @@ static AUDIT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// and never any known secretMaskFile value (a denial reason can quote a
 /// target). A write failure is logged but never blocks browser automation.
 ///
-/// The local log is the source of truth. The optional `auditExport` sink is a
-/// MIRROR of the line just committed here: it runs after the local append has
-/// returned, on the already-masked event, behind its own lock, so export can
-/// never precede, replace, or delay the local write.
+/// The local log is the source of truth and this append is synchronous. The
+/// optional `auditExport` sink is a MIRROR of the line just committed here: the
+/// already-masked event is handed to a bounded channel drained by one
+/// background worker (see queue_audit_export), so export can never precede,
+/// replace, or delay the local write, and a slow or dead collector can never
+/// add latency to the request thread.
 fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
     let path = audit_log_path(host_dir);
     let event = mask_secrets_value(event.clone(), &known_secret_masks());
@@ -2377,7 +2814,7 @@ fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
         log_error(logger, &format!("Could not write audit event to {}: {}", path.display(), e));
         return;
     }
-    forward_audit_export(host_dir, logger, &event);
+    queue_audit_export(host_dir, logger, event);
 }
 
 /// Emit an audit event when audit is enabled for the client.
@@ -2474,8 +2911,31 @@ struct AuditExportState {
 /// Serializes every export write (and therefore every rotation) under the
 /// thread-per-connection model, exactly like AUDIT_WRITE_LOCK does locally.
 /// Separate from it on purpose: a slow sink must never delay the local append.
+/// Held only by the export worker thread now, never by a request thread, so
+/// rotation and retention pruning also run off the request path.
 static AUDIT_EXPORT_LOCK: Mutex<()> = Mutex::new(());
 static AUDIT_EXPORT_STATE: Mutex<Option<AuditExportState>> = Mutex::new(None);
+
+/// Bounded hand-off from the request thread to the single export worker. One
+/// FIFO channel drained by one worker, so events reach the sink in exactly the
+/// order they were appended locally. Each queue entry is an immutable
+/// `(event, config)` snapshot: the sink is resolved ONCE, on the request
+/// thread, and the worker forwards to exactly that sink. A policy reload while
+/// events are queued therefore can neither reroute an already-authorized event
+/// to a destination configured later nor drop it. When the channel is full the
+/// NEWEST event is dropped (the same choice the OTLP exporter makes) and
+/// counted: the local audit log still holds every event, so a drop costs
+/// completeness of the mirror, never of the record. The channel and its thread
+/// are created on the first event that actually has a sink, so a host with no
+/// auditExport starts no thread.
+const AUDIT_EXPORT_QUEUE_MAX: usize = 1024;
+
+/// One queued export: the event plus the sink snapshot that authorized it.
+type QueuedAuditExport = (Value, AuditExportConfig);
+
+static AUDIT_EXPORT_SENDER: Mutex<Option<std::sync::mpsc::SyncSender<QueuedAuditExport>>> =
+    Mutex::new(None);
+static AUDIT_EXPORT_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Deny and blackout outcomes ride at the higher severity in both formats.
 fn audit_export_alerting(decision: Option<&Value>) -> bool {
@@ -2838,13 +3298,67 @@ fn audit_export_emit(config: &AuditExportConfig, line: &str) -> io::Result<()> {
     file.write_all(&data)
 }
 
-/// Mirror one already-written, already-masked audit event to the configured
-/// sink. Called only AFTER the local append succeeded.
-fn forward_audit_export(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
+/// Hand one already-written, already-masked audit event to the export worker.
+/// Runs on the REQUEST thread, so it must never do I/O: the only work here is
+/// resolving the sink and a non-blocking send. The resolved config travels WITH
+/// the event, so the worker never re-resolves the sink and a policy reload
+/// cannot reroute a queued event. The nested `audit_export_unavailable` write
+/// re-enters this function from the worker, but the sink is already marked
+/// disabled by then, so it returns at the disabled check and nothing recurses.
+fn queue_audit_export(host_dir: &Path, logger: &Arc<Logger>, event: Value) {
     let config = match audit_export_sink(event.get("client").and_then(|v| v.as_str())) {
         Some(c) => c,
         None => return,
     };
+    if audit_export_disabled(&config.key) {
+        return;
+    }
+    let mut guard = match AUDIT_EXPORT_SENDER.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guard.is_none() {
+        // One worker draining one FIFO channel: sink order equals local append
+        // order.
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<QueuedAuditExport>(AUDIT_EXPORT_QUEUE_MAX);
+        let worker_logger = Arc::clone(logger);
+        let worker_dir = host_dir.to_path_buf();
+        std::thread::spawn(move || {
+            for (queued, queued_config) in rx {
+                forward_audit_export(&worker_dir, &worker_logger, &queued, &queued_config);
+            }
+        });
+        *guard = Some(tx);
+    }
+    if let Some(tx) = guard.as_ref() {
+        if tx.try_send((event, config)).is_err()
+            && AUDIT_EXPORT_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
+        {
+            log_error(
+                logger,
+                &format!(
+                    "auditExport queue full ({} events); dropping the newest events \
+                     (further drops silent). The local audit log still holds every event.",
+                    AUDIT_EXPORT_QUEUE_MAX
+                ),
+            );
+        }
+    }
+}
+
+/// Mirror one already-written, already-masked audit event to the sink that was
+/// in force when the event was produced. `config` is the snapshot the request
+/// thread enqueued, never a freshly resolved sink: an event is delivered to the
+/// destination that authorized it, or not at all. Runs on the export worker
+/// thread, only AFTER the local append succeeded, so every blocking step below
+/// is off the request path.
+fn forward_audit_export(
+    host_dir: &Path,
+    logger: &Arc<Logger>,
+    event: &Value,
+    config: &AuditExportConfig,
+) {
     if audit_export_disabled(&config.key) {
         return;
     }
@@ -2856,7 +3370,7 @@ fn forward_audit_export(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
                 if audit_export_disabled(&config.key) {
                     return;
                 }
-                if let Err(e) = audit_export_emit(&config, &line) {
+                if let Err(e) = audit_export_emit(config, &line) {
                     failure = Some(e.to_string());
                 }
             }
@@ -3919,6 +4433,12 @@ fn handle_socket_client(
                 verdict["reason"] = Value::String(HANDOFF_BLACKOUT_ERROR.to_string());
                 verdict["blackout"] = Value::Bool(true);
             }
+            // A handoff nested in a composite is refused outright, so the dry
+            // run must report the same verdict the real request meets.
+            if let Some(reason) = composite_handoff_reason(&action, payload.as_ref()) {
+                verdict["allowed"] = Value::Bool(false);
+                verdict["reason"] = Value::String(reason);
+            }
             // Host-answered actions resolve without Chrome, so they would never
             // forward even when fully allowed.
             let host_side = matches!(
@@ -4134,6 +4654,25 @@ fn handle_socket_client(
             continue;
         }
 
+        // A handoff nested in a composite is refused outright (see
+        // composite_handoff_reason): the composite's later steps run inside the
+        // extension, so no blackout could cover them. Denied here, before policy
+        // evaluation, so nothing is forwarded.
+        if let Some(reason) = composite_handoff_reason(&action, payload.as_ref()) {
+            let cp = policy_for_client(&policy_value, &client_name);
+            let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
+            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some(&reason), None);
+            let resp = json!({
+                "success": false,
+                "error": format!("policy denied: {}", reason),
+                "policyDenial": policy_denial(&reason, &action, &[], &client_name, host_dir, &policy_value, payload.as_ref()),
+            });
+            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
+                          &resp, "deny", Some(&reason), None, trace_started);
+            let _ = write_line(&mut stream, &resp);
+            continue;
+        }
+
         let empty_origins = std::collections::BTreeMap::new();
 
         // Phase 1: action-level and payload-target checks needing no extension
@@ -4279,7 +4818,7 @@ fn handle_socket_client(
         let client_policy = policy_for_client(&policy_value, &client_name);
         let redact_patterns = client_policy.get("redactPatterns").cloned();
         let secrets = load_secret_masks(
-            client_policy.get("secretMaskFile").and_then(|v| v.as_str()),
+            client_policy.get("secretMaskFile"),
             host_dir,
             logger,
         );

@@ -85,6 +85,7 @@ The server reads two env flags to scope the exposed surface:
 Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately. An MCP annotation is **static per tool**, so it cannot describe a call whose tier depends on its arguments: those annotations stay deliberately conservative and the authoritative tier is the `effectiveTier` the host computes per call. Two tools where the difference matters:
 
 - `browser_batch` is annotated mutating, but host-side a batch is `read_only` only when **every** step is; one mutating step makes the whole batch mutating, and under a `manual` origin that is what decides whether the batch needs a confirmation token. Ask `browser_policy_check(action="batch", payload=...)` for the tier of a specific batch.
+- `browser_batch` and `browser_replay_workflow` cannot carry a handoff. A composite whose steps include `waitForHandoff` or `credentialHandoff` is denied host-side as `batch step <n>: handoff not allowed in a composite` before anything is forwarded, because the composite's later steps run inside the extension and could observe the tab while the human is still typing. Call `browser_wait_for_handoff` / `browser_credential_handoff` on their own, then send the rest of the sequence.
 - `browser_screencast_save` is annotated mutating because it always sends `consume: true`. The underlying `screencastFrames` action is nominally read-only and escalates to `mutating` precisely because of that flag, which drains the tab's frame buffer irrecoverably.
 
 The full escalation table (`screencastFrames.consume`, `cacheSelectors.op`, `resolveCachedSelector.cache`) is in docs/security.md.
@@ -131,7 +132,7 @@ One HTTP endpoint can serve several agents, each with its own bridge identity. E
 
 Precedence: a valid `Bearer` value wins; otherwise `X-Bridge-Token` is used; if neither header is present the request falls back to the server's ambient `bridge_token.txt` identity, so existing single-identity HTTP setups keep working unchanged. This is always on - no feature flag - and stdio is unaffected (there is no HTTP request behind a stdio tool call, so the ambient token is always used).
 
-The header token is passed straight to the native host as that request's token. The host resolves it to a client name from `bridge_tokens.txt`, so per-request identity drives policy scoping, audit attribution, and cooperative leasing. An unknown token is rejected by the host with its usual `unauthorized` error; token values are never logged by the MCP server or included in its error text.
+The header token is passed straight to the native host as that request's token. The host resolves it to a client name from `bridge_tokens.txt`, so per-request identity drives policy scoping, audit attribution, and cooperative leasing. An unknown token is rejected by the host with its usual `unauthorized` error; token values are never logged by the MCP server or included in its error text. Both hosts close the TCP connection after that reply, so the shared persistent transport discards its socket and the next request opens a fresh one - a rejected request cannot disrupt the authenticated callers sharing the process, and nothing is replayed because it never reached the extension.
 
 Two agents against one endpoint:
 

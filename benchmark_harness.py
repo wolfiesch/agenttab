@@ -465,20 +465,36 @@ class BridgeClient:
     def request(self, action, payload):
         cmd = json.dumps({"action": action, "payload": payload, "token": self._token}) + "\n"
         self.requests += 1
-        # One transparent reconnect: the host may have idled the socket shut.
+        encoded = cmd.encode("utf-8")
+        # One transparent reconnect, but only for failures that happened before
+        # any byte reached the host: the host may have idled the socket shut.
+        # Once ``sendall`` returns, delivery is ambiguous, so a read failure is
+        # surfaced instead of replaying a possibly-executed action. This matches
+        # the MCP transport, which never replays a timeout or empty response.
         for attempt in range(2):
+            sent = False
             try:
                 if self._sock is None:
                     self._connect()
-                self._sock.sendall(cmd.encode("utf-8"))
-                self.bytes_sent += len(cmd)
+                self._sock.sendall(encoded)
+                sent = True
+                self.bytes_sent += len(encoded)
                 line = self._recv_line()
                 return json.loads(line.decode("utf-8"))
             except (OSError, ConnectionError) as exc:
                 self.close()
+                if sent:
+                    raise RuntimeError(
+                        f"bridge request failed after the command was sent: {exc}. "
+                        "Not retried because the action may already have run."
+                    )
                 if attempt == 1:
                     raise RuntimeError(f"bridge request failed: {exc}")
                 self.reconnects += 1
+            except ValueError as exc:
+                # Malformed response line: the action already reached the host.
+                self.close()
+                raise RuntimeError(f"bridge returned an unparsable response: {exc}")
         raise RuntimeError("bridge request failed")
 
     def close(self):
@@ -867,13 +883,23 @@ def _run_task_batch_workflow(base_url, timeout_ms):
 
 
 def _workflow_summary(mode, cold, warmups, measured):
-    durations = [run["durationMs"] for run in measured]
-    requests = [run["transport"]["requests"] for run in measured]
+    # A run that failed after its command bytes reached the host has no timing:
+    # it is reported but excluded from the medians rather than counted as 0 ms.
+    completed = [run for run in measured if run.get("durationMs") is not None]
+    failed = [run for run in measured if run.get("durationMs") is None]
+    durations = [run["durationMs"] for run in completed]
+    requests = [
+        run["transport"]["requests"] for run in completed
+        if isinstance(run.get("transport"), dict)
+    ]
     return {
         "mode": mode,
         "cold": cold,
         "discardedWarmups": warmups,
         "warm": measured,
+        "warmMeasuredRuns": len(completed),
+        "warmFailedRuns": len(failed),
+        "warmFailures": [run.get("error") for run in failed],
         "warmMedianMs": calculate_median(durations),
         "warmMedianRequests": calculate_median(requests),
         "coldDefinition": "first workflow after benchmark process start",
@@ -881,14 +907,24 @@ def _workflow_summary(mode, cold, warmups, measured):
     }
 
 
+def _attempt_workflow(runner, base_url, timeout_ms):
+    # Post-send transport failures are no longer retried, so a measured
+    # iteration can legitimately produce no timing. Surface it as a failed run
+    # instead of aborting the whole benchmark or contributing a bogus duration.
+    try:
+        return runner(base_url, timeout_ms)
+    except Exception as exc:
+        return {"success": False, "error": sanitize_error(str(exc))}
+
+
 def run_complex_workflow(args, base_url):
     runner = _run_primitive_workflow if args.workflow_mode == "primitive" else _run_task_batch_workflow
     timeout_ms = int(args.timeout_seconds * 1000)
     if args.iterations <= 0:
         return _workflow_summary(args.workflow_mode, None, [], [])
-    cold = runner(base_url, timeout_ms)
-    discarded = [runner(base_url, timeout_ms) for _ in range(args.warmups)]
-    measured = [runner(base_url, timeout_ms) for _ in range(args.iterations)]
+    cold = _attempt_workflow(runner, base_url, timeout_ms)
+    discarded = [_attempt_workflow(runner, base_url, timeout_ms) for _ in range(args.warmups)]
+    measured = [_attempt_workflow(runner, base_url, timeout_ms) for _ in range(args.iterations)]
     return _workflow_summary(args.workflow_mode, cold, discarded, measured)
 
 

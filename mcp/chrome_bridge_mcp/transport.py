@@ -165,6 +165,13 @@ class PersistentBridgeConnection:
                 f"Error communicating over the persistent bridge connection: {exc}. "
                 "The action was not replayed because delivery is ambiguous."
             )
+        # Both native hosts close the TCP connection immediately after an
+        # ``unauthorized`` reply, so the cached socket is already dead. Discard
+        # it here or the next legitimate request writes into a closed
+        # connection and fails with an ambiguous-delivery error. Nothing is
+        # replayed: the rejected request never reached the extension.
+        if response.get("success") is not True and response.get("error") == "unauthorized":
+            self.close()
         exit_code = 0 if response.get("success") is True else 1
         result = response.get("result")
         if isinstance(result, dict) and result.get("success") is False:

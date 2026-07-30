@@ -123,6 +123,7 @@ LEGACY_FILE = "/tmp/chrome-bridge-guard-legacy.txt"
 POLICY_FILE = "/tmp/chrome-bridge-guard-policy.json"
 AUDIT_FILE = "/tmp/chrome-bridge-guard-audit.jsonl"
 SECRETS_FILE = "/tmp/chrome-bridge-guard-secrets.txt"
+SECRETS_FILE_B = "/tmp/chrome-bridge-guard-secrets-b.txt"
 TRACE_DIR = "/tmp/chrome-bridge-guard-traces"
 OTEL_FILE = "/tmp/chrome-bridge-guard-otel.jsonl"
 SCHEDULE_FILE = "/tmp/chrome-bridge-guard-schedules.json"
@@ -133,6 +134,10 @@ BUNDLE_LOCK_FILE = "/tmp/chrome-bridge-guard-bundle.lock"
 EXPORT_FILE = "/tmp/chrome-bridge-guard-export.jsonl"
 EXPORT_CEF_FILE = "/tmp/chrome-bridge-guard-export.cef"
 EXPORT_DEAD_DIR = "/tmp/chrome-bridge-guard-export-missing"
+# A FIFO export destination: both hosts open a file sink with a blocking
+# open(2), so a reader-less FIFO holds the export worker deterministically.
+EXPORT_FIFO = "/tmp/chrome-bridge-guard-export.fifo"
+EXPORT_SWITCH_FILE = "/tmp/chrome-bridge-guard-export-switched.jsonl"
 
 
 def write_policy(policy):
@@ -270,13 +275,134 @@ def wait_until_exported(count, path=EXPORT_FILE, timeout=10.0):
     return False
 
 
-def wait_until_datagrams(received, count, timeout=10.0):
+def wait_until_audited(decision, count, timeout=10.0):
+    # Barrier for audit events a BACKGROUND thread writes. audit_export_unavailable
+    # is discovered by the export worker, not by the request thread, so the
+    # request that triggered it has already returned by the time the event lands:
+    # polling the audit log is the only race-free way to observe it, exactly like
+    # wait_until_exported for the sink. Returns the matching events once at least
+    # ``count`` are present, else whatever is present at the deadline, so a case
+    # can assert "exactly one" over a bounded window without a fixed sleep.
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        with forwarded_lock:
-            if len(received) >= count:
-                return True
+    while True:
+        events = [e for e in audit_events() if e.get("decision") == decision]
+        if len(events) >= count or time.time() >= deadline:
+            return events
         time.sleep(0.02)
+
+
+def wait_until(predicate, timeout=10.0):
+    # Generic polling barrier for a condition a BACKGROUND thread satisfies.
+    # Prefer this over a count-based barrier whenever a case cares about a
+    # SPECIFIC event: a count can be satisfied by unrelated earlier events, so
+    # "at least N lines arrived" is not evidence that the line under test did.
+    deadline = time.time() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+def wait_until_datagram_matching(received, predicate, timeout=10.0):
+    # Poll for a datagram the case actually asserts on, not for a datagram
+    # COUNT. The export worker emits every audit event, so a count barrier for
+    # "the denial arrived" is satisfied by the earlier allow events and the
+    # assertion then races the datagram it is about.
+    def seen():
+        with forwarded_lock:
+            return any(predicate(line) for line in received)
+
+    return wait_until(seen, timeout)
+
+
+def wait_until_export_matching(fragment, path=EXPORT_FILE, timeout=10.0):
+    # Same discipline for a file sink: poll for the specific bytes under test.
+    return wait_until(lambda: fragment in export_text(path), timeout)
+
+
+def make_blocking_fifo(path):
+    # A FIFO with no reader is the one export destination that blocks the worker
+    # DETERMINISTICALLY and indefinitely: both hosts open a file sink with a
+    # plain blocking open(2), which on a FIFO does not return until a reader
+    # arrives. That turns "events are still queued" from a timing hope into a
+    # structural fact, with no sleep and no timeout involved -- the worker cannot
+    # advance past the first event until the case opens the read end.
+    remove_paths(path)
+    os.mkfifo(path, 0o600)
+
+
+class FifoReader:
+    """Opens a FIFO's read end (releasing the export worker) and drains it."""
+
+    def __init__(self, path):
+        self.path = path
+        self.chunks = []
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.fd = None
+        self.thread = None
+
+    def release(self):
+        # Opening the read end is what unblocks the worker's pending open(2).
+        self.fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        self.thread = threading.Thread(target=self._drain, daemon=True)
+        self.thread.start()
+
+    def _drain(self):
+        while not self.stop.is_set():
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                time.sleep(0.02)
+                continue
+            except OSError:
+                return
+            if not data:
+                time.sleep(0.02)
+                continue
+            with self.lock:
+                self.chunks.append(data.decode("utf-8", "replace"))
+
+    def text(self):
+        with self.lock:
+            return "".join(self.chunks)
+
+    def close(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=2)
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
+def reload_policy_barrier(client, policy, label):
+    # Install ``policy`` and block until the host has actually reloaded it,
+    # observed on the REQUEST thread rather than after a sleep. Policy reload is
+    # mtime-keyed and happens on the next request, so the barrier is: make the
+    # new policy deny getTabs, then poll getTabs until it is denied. The mtime is
+    # advanced explicitly so a rewrite is unambiguously a change. The barrier is
+    # deliberately request-side: the export worker may be blocked, so nothing
+    # observable on the SINK can prove the reload happened.
+    policy = dict(policy)
+    default = dict(policy["default"])
+    default["deniedActions"] = sorted(set(default.get("deniedActions") or []) | {"getTabs"})
+    policy["default"] = default
+    write_policy(policy)
+    stamp = time.time() + 1
+    os.utime(POLICY_FILE, (stamp, stamp))
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        r = client.req("getTabs")
+        if r and r.get("success") is False:
+            return True
+        time.sleep(0.02)
+    expect(False, f"{label}: the host never reloaded the switched policy")
     return False
 
 
@@ -2168,6 +2294,59 @@ def run_against(label, cmd, env):
         observer.close()
         watcher.close()
 
+    # (f) A handoff nested in a composite is refused outright. runBatch and
+    # replayWorkflow dispatch their later steps inside the extension, so those
+    # steps never pass back through the host and no blackout could cover them:
+    # a batch of [credentialHandoff, screenshot] would capture the tab while the
+    # human is still typing. The host denies the whole composite before
+    # forwarding, names the offending step, and leaves top-level handoffs alone.
+    write_policy(PERMISSIVE)
+    with Host(label, cmd, env, result_fn=handoff_result):
+        c = Client("tok-alpha")
+        r = c.req("batch", {"tabId": 7, "steps": [
+            {"action": "getCurrentState"},
+            {"action": "credentialHandoff", "payload": {"selector": "#password"}},
+            {"action": "screenshot"},
+        ]})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: batch step 1: handoff not allowed in a composite",
+               f"{label}: batch wrapping credentialHandoff should be denied, got {r}")
+        expect(((r or {}).get("policyDenial") or {}).get("batchStep") == 1,
+               f"{label}: composite handoff denial should report the batch step index, got {r}")
+        r = c.req("replayWorkflow", {"tabId": 7, "workflow": {"version": 1, "steps": [
+            {"action": "waitForHandoff", "payload": {"message": "log in"}},
+            {"action": "getHTML"},
+        ]}})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: workflow step 0: handoff not allowed in a composite",
+               f"{label}: replayWorkflow wrapping waitForHandoff should be denied, got {r}")
+        expect(((r or {}).get("policyDenial") or {}).get("batchStep") == 0,
+               f"{label}: composite handoff denial should report the workflow step index, got {r}")
+        # Nesting does not help: the step extractor reaches the inner composite.
+        r = c.req("batch", {"tabId": 7, "steps": [
+            {"action": "batch", "payload": {"steps": [{"action": "waitForHandoff"}]}},
+        ]})
+        expect(r and r.get("success") is False
+               and "handoff not allowed in a composite" in (r.get("error") or ""),
+               f"{label}: a nested composite handoff should be denied, got {r}")
+        expect(not any(a in forwarded_actions() for a in
+                       ("batch", "replayWorkflow", "credentialHandoff", "waitForHandoff")),
+               f"{label}: a composite carrying a handoff must not forward, got {forwarded_actions()}")
+        # A TOP-LEVEL handoff is unaffected and still opens the blackout.
+        watcher = Client("tok-alpha")
+        t = threading.Thread(target=lambda: watcher.req(
+            "credentialHandoff", {"selector": "#password", "tabId": 7}))
+        t.start()
+        expect(wait_until_forwarded("credentialHandoff"),
+               f"{label}: a top-level credentialHandoff should still forward")
+        r = c.req("screenshot", {"tabId": 7})
+        expect(r and r.get("success") is False and r.get("error") == "handoff in progress"
+               and r.get("blackout") is True,
+               f"{label}: a top-level credentialHandoff should still black out the tab, got {r}")
+        t.join(timeout=15)
+        c.close()
+        watcher.close()
+
     # --- Opt-in OpenTelemetry spans (BRIDGE_OTEL_ENABLED) ---------------------
     # (a) Disabled is inert. An endpoint and a file sink are BOTH configured and
     # BRIDGE_OTEL_ENABLED is left unset: no span file may appear (so no export
@@ -2400,11 +2579,461 @@ def run_against(label, cmd, env):
                f"{label}: the rejection must be audited once per change, not per request, "
                f"got {bundle_rejections()}")
         c.close()
+
+    # (f) Monotonic composition: a VERIFIED bundle is a floor, so the local layer
+    # can only tighten it. One case per rule kind in POLICY_BUNDLE_COMPOSITION,
+    # each asserting both directions -- the local layer cannot LOOSEN the bundle,
+    # and a local layer that is genuinely stricter still wins.
+    bundle_baseline = {"deniedActions": [], "allowedOrigins": ["*"],
+                       "deniedOrigins": [], "requireConfirmation": [],
+                       "redact": True, "audit": True}
+
+    # (f1) allowedActions ('allow'): explicit INTERSECTION, so a local "*"
+    # collapses to the bundle's list instead of widening it.
+    write_bundle({"default": dict(bundle_baseline,
+                                  allowedActions=["ping", "policyInfo", "getTabs"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"allowedActions": ["*"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: an action both layers permit should proceed, got {r}")
+        r = c.req("getCookies", {"domain": "x.test"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action getCookies not allowed",
+               f"{label}: a local allowedActions '*' must not widen the bundle, got {r}")
+        expect("getCookies" not in forwarded_actions(),
+               f"{label}: an action outside the composed allow list must not forward, "
+               f"got {forwarded_actions()}")
+        c.close()
+    # Mirror: a local list NARROWER than the bundle's wins.
+    write_policy(bundle_local_policy(default={"allowedActions": ["ping", "policyInfo"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action getTabs not allowed",
+               f"{label}: a narrower local allowedActions should tighten the bundle, got {r}")
+        r = c.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: an action both layers still permit should proceed, got {r}")
+        c.close()
+
+    # (f2) allowedOrigins ('allow'): the same intersection on the origin list.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  allowedOrigins=["*://github.com"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"allowedOrigins": ["*"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: an origin both layers permit should proceed, got {r}")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: target not allowed",
+               f"{label}: a local allowedOrigins '*' must not widen the bundle, got {r}")
+        c.close()
+    # Mirror: the local layer drops one of the bundle's two origins.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  allowedOrigins=["*://github.com", "*://mail.google.com"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"allowedOrigins": ["*://github.com"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: the origin the local layer kept should proceed, got {r}")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: target not allowed",
+               f"{label}: a narrower local allowedOrigins should tighten the bundle, got {r}")
+        c.close()
+
+    # (f3) dlp ('dlp'): per-channel STRICTEST mode, block > audit > allow.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  dlp={"upload": "block"})})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"dlp": {"upload": "allow"}}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("uploadFile", {"tabId": 7, "selector": "#f",
+                                 "files": ["/tmp/dlp-fixture.txt"]})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: a local dlp 'allow' must not relax the bundle's block, got {r}")
+        denial = (r or {}).get("policyDenial") or {}
+        expect(denial.get("kind") == "dlp" and denial.get("dlpChannel") == "upload",
+               f"{label}: the composed dlp denial should name the channel, got {denial}")
+        expect("uploadFile" not in forwarded_actions(),
+               f"{label}: a composed dlp block must not forward, got {forwarded_actions()}")
+        c.close()
+    # Mirror: the local layer is the stricter of the two.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  dlp={"upload": "audit"})})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"dlp": {"upload": "block"}}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("uploadFile", {"tabId": 7, "selector": "#f",
+                                 "files": ["/tmp/dlp-fixture.txt"]})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: dlp blocked",
+               f"{label}: a local dlp block should tighten the bundle's audit, got {r}")
+        c.close()
+
+    # (f4) siteModes ('siteMode'): per-pattern STRICTEST mode, manual > auto > skip.
+    set_tab_origins({None: "https://github.com", 7: "https://mail.google.com"})
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  siteModes={"*://mail.google.com": "manual"})})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(
+        default={"siteModes": {"*://mail.google.com": "skip"}}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True
+               and r.get("error") == "confirmation required",
+               f"{label}: a local siteMode 'skip' must not lift the bundle's manual, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: a manual-gated navigate must not forward, got {forwarded_actions()}")
+        c.close()
+    # Mirror: the local layer tightens the bundle's auto to manual.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  siteModes={"*://mail.google.com": "auto"})})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(
+        default={"siteModes": {"*://mail.google.com": "manual"}}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://mail.google.com/mail"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: a local siteMode 'manual' should tighten the bundle's auto, got {r}")
+        c.close()
+    set_tab_origins({None: "https://github.com"})
+
+    # (f5) secretMaskFile ('paths'): dropping the path is a loosening, so a
+    # local null and a local omission both keep the bundle's masks armed.
+    with open(SECRETS_FILE, "w") as f:
+        f.write("apiKey=b0nd-bundle-secret\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  secretMaskFile=SECRETS_FILE)})
+    write_bundle_lock(bundle_digest())
+    masked_result = lambda a, p: {"outer": "carrying b0nd-bundle-secret here"}
+    for local_layer, note in ((None, "omits secretMaskFile"),
+                              ({"secretMaskFile": None}, "nulls secretMaskFile")):
+        write_policy(bundle_local_policy()
+                     if local_layer is None else bundle_local_policy(default=local_layer))
+        with Host(label, cmd, env, result_fn=masked_result):
+            c = Client("tok-alpha")
+            r = c.req("getTabs")
+            rendered = json.dumps(r)
+            expect("b0nd-bundle-secret" not in rendered,
+                   f"{label}: a local layer that {note} must not disarm the bundle's "
+                   f"secretMaskFile, got {r}")
+            expect("<masked:apiKey>" in rendered,
+                   f"{label}: the bundle's mask should still replace the value, got {r}")
+            c.close()
+    remove_paths(SECRETS_FILE)
+
+    # (f6) requireConfirmation ('deny'): UNION, so a bundle entry the local list
+    # omits still gates.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  requireConfirmation=["executeScript"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"requireConfirmation": ["navigate"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("executeScript", {"tabId": 7, "code": "1"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True
+               and r.get("error") == "confirmation required",
+               f"{label}: a bundle requireConfirmation entry must gate even when the "
+               f"local list omits it, got {r}")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: the local layer's own confirmation entry should also gate, got {r}")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: the union must not gate an action neither layer named, got {r}")
+        c.close()
+
+    # (f7) egressAllowlist ('egress'): EMPTY means unconstrained, so an empty
+    # local list must keep the bundle's constraint rather than lift it.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  egressAllowlist=["*://github.com"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"egressAllowlist": []}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://evil.test/x"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: egress not allowed",
+               f"{label}: an empty local egressAllowlist must not lift the bundle's "
+               f"constraint, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: a composed egress denial must not forward, got {forwarded_actions()}")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is True,
+               f"{label}: a destination inside the bundle's egressAllowlist should "
+               f"proceed, got {r}")
+        c.close()
+
+    # (f8) redact ('onlyTrue'): true is the tight value, so a local false loses.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"], redact=True)})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"redact": False}))
+    bundle_cookie_result = lambda a, p: {"cookies": [{"name": "sid",
+                                                      "value": "secret-cookie",
+                                                      "domain": "x.test"}]}
+    with Host(label, cmd, env, result_fn=bundle_cookie_result):
+        c = Client("tok-alpha")
+        r = c.req("getCookies", {"domain": "x.test"})
+        cookies = ((r or {}).get("result") or {}).get("cookies") or []
+        expect(cookies and cookies[0].get("value") == "<redacted>",
+               f"{label}: a local redact false must not disable the bundle's redaction, "
+               f"got {cookies}")
+        c.close()
+
+    # (k) redactPatterns ('deny'): UNION. redactPatterns is the mask applied to
+    # page-derived content before it reaches the client, so it carries authority
+    # over data egress and a local empty list must not erase the bundle's.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  redactPatterns=[r"\d{3}-\d{2}-\d{4}"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"redactPatterns": []}))
+    bundle_html_result = lambda a, p: {"success": True,
+                                       "html": "<p>SSN 123-45-6789 Bearer abc123</p>"}
+    with Host(label, cmd, env, result_fn=bundle_html_result):
+        c = Client("tok-alpha")
+        r = c.req("getHTML", {"tabId": 7})
+        rendered = json.dumps(r)
+        expect("123-45-6789" not in rendered and "<redacted>" in rendered,
+               f"{label}: a local empty redactPatterns must not erase the bundle's "
+               f"regexes, got {r}")
+        c.close()
+    # Mirror: a regex the local layer ADDS on top of the bundle's also applies.
+    write_policy(bundle_local_policy(
+        default={"redactPatterns": ["(?i)bearer [a-z0-9]+"]}))
+    with Host(label, cmd, env, result_fn=bundle_html_result):
+        c = Client("tok-alpha")
+        r = c.req("getHTML", {"tabId": 7})
+        rendered = json.dumps(r)
+        expect("123-45-6789" not in rendered and "abc123" not in rendered,
+               f"{label}: the composed redactPatterns should be the union of both "
+               f"layers, got {r}")
+        c.close()
+
+    # (l) secretMaskFile ('paths'): UNION of paths, so a local layer naming its
+    # OWN dictionary adds to the org's instead of replacing it. A response
+    # carrying both raw values must come back with both masked, which is only
+    # possible if neither file was dropped.
+    with open(SECRETS_FILE, "w") as f:
+        f.write("orgKey=org-0nly-s3cret\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    with open(SECRETS_FILE_B, "w") as f:
+        f.write("localKey=l0cal-only-s3cret\n")
+    os.chmod(SECRETS_FILE_B, 0o600)
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  secretMaskFile=SECRETS_FILE)})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"secretMaskFile": SECRETS_FILE_B}))
+    both_secrets_result = lambda a, p: {
+        "outer": "org org-0nly-s3cret and local l0cal-only-s3cret"}
+    with Host(label, cmd, env, result_fn=both_secrets_result):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        rendered = json.dumps(r)
+        expect("org-0nly-s3cret" not in rendered,
+               f"{label}: a local secretMaskFile must not drop the bundle's secret "
+               f"dictionary, got {r}")
+        expect("l0cal-only-s3cret" not in rendered,
+               f"{label}: the local layer's own secretMaskFile should mask too, got {r}")
+        expect("<masked:orgKey>" in rendered and "<masked:localKey>" in rendered,
+               f"{label}: both composed dictionaries should mask by name, got {r}")
+        c.close()
+    remove_paths(SECRETS_FILE, SECRETS_FILE_B)
+
+    # (f10) The allow-list intersection is EXPLICIT, and one that is not
+    # representable as a pattern list is REJECTED rather than silently merged.
+    # Bundle ["foo*"] under local ["foo?"] used to compose to ["foo*", "foo?"] --
+    # fnmatch("foo*", "foo?") is true in both directions -- so the local
+    # narrowing to four-character names vanished without a word.
+    write_bundle({"default": dict(bundle_baseline,
+                                  allowedActions=["ping", "policyInfo", "getTabs", "foo*"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(default={"allowedActions": ["foo?"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action getTabs not allowed",
+               f"{label}: a bundle with an unrepresentable allow-list intersection must "
+               f"be refused, so an action it allowed should now deny, got {r}")
+        r = c.req("ping")
+        expect(r and r.get("success") is True,
+               f"{label}: the built-in fail-closed default should still allow ping after "
+               f"a composition conflict, got {r}")
+        rejections = bundle_rejections()
+        expect(len(rejections) == 1,
+               f"{label}: a composition conflict should audit exactly once, got {rejections}")
+        reason = (rejections[0] if rejections else {}).get("reason") or ""
+        expect(reason.startswith("policy bundle composition conflict:")
+               and "allowedActions" in reason
+               and '"foo*"' in reason and '"foo?"' in reason,
+               f"{label}: the conflict should name the key and both patterns, got {reason}")
+        r = c.req("policyInfo")
+        reported = ((r or {}).get("result") or {}).get("policyBundle") or {}
+        expect(reported.get("verified") is False,
+               f"{label}: a conflicting bundle should report as unverified, got {reported}")
+        expect(len(bundle_rejections()) == 1,
+               f"{label}: a composition conflict must be audited once per change, not per "
+               f"request, got {bundle_rejections()}")
+        c.close()
+
+    # (f11) Exact-literal narrowing still composes: a literal is tested as a NAME
+    # against the other side's patterns, which is the one sound direction.
+    write_bundle({"default": dict(bundle_baseline,
+                                  allowedActions=["ping", "policyInfo", "get*"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(
+        default={"allowedActions": ["ping", "policyInfo", "getTabs"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: a local literal inside the bundle's glob should survive the "
+               f"intersection, got {r}")
+        r = c.req("getCookies", {"domain": "x.test"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action getCookies not allowed",
+               f"{label}: another action inside the bundle's glob but outside the local "
+               f"literals must deny, got {r}")
+        expect(not bundle_rejections(),
+               f"{label}: literal narrowing is representable and must not reject the "
+               f"bundle, got {bundle_rejections()}")
+        c.close()
+
+    # (f12) Two IDENTICAL nontrivial globs compose to that glob, and it still
+    # names everything it named.
+    write_policy(bundle_local_policy(
+        default={"allowedActions": ["ping", "policyInfo", "get*"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: an identical glob on both sides should still allow getTabs, got {r}")
+        r = c.req("getCookies", {"domain": "x.test"})
+        expect(r and r.get("success") is True,
+               f"{label}: an identical glob on both sides should still allow every name it "
+               f"covers, got {r}")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action navigate not allowed",
+               f"{label}: the composed glob must not reach outside itself, got {r}")
+        expect(not bundle_rejections(),
+               f"{label}: identical globs are representable and must not reject the bundle, "
+               f"got {bundle_rejections()}")
+        c.close()
+
+    # (f13) A local "*" still cannot widen a constrained bundle list, including
+    # one whose entries are globs rather than literals.
+    write_policy(bundle_local_policy(default={"allowedActions": ["*"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: a local '*' should leave the bundle's glob in force, got {r}")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action navigate not allowed",
+               f"{label}: a local allowedActions '*' must not widen a bundle glob list, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: an action outside the composed allow list must not forward, "
+               f"got {forwarded_actions()}")
+        expect(not bundle_rejections(),
+               f"{label}: a local '*' is representable and must not reject the bundle, "
+               f"got {bundle_rejections()}")
+        c.close()
+
+    # (f14) The same conflict on egressAllowlist is rejected the same way, so the
+    # two rules share one classification and cannot drift.
+    write_bundle({"default": dict(bundle_baseline, allowedActions=["*"],
+                                  egressAllowlist=["*://github.com"])})
+    write_bundle_lock(bundle_digest())
+    write_policy(bundle_local_policy(
+        default={"egressAllowlist": ["*://*.github.com"]}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("navigate", {"url": "https://github.com/x"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action navigate not allowed",
+               f"{label}: an egressAllowlist composition conflict must refuse the bundle, "
+               f"so an action it allowed should now deny, got {r}")
+        expect("navigate" not in forwarded_actions(),
+               f"{label}: a refused bundle must not forward the action it would have "
+               f"allowed, got {forwarded_actions()}")
+        rejections = bundle_rejections()
+        expect(len(rejections) == 1,
+               f"{label}: an egress composition conflict should audit exactly once, "
+               f"got {rejections}")
+        reason = (rejections[0] if rejections else {}).get("reason") or ""
+        expect(reason.startswith("policy bundle composition conflict:")
+               and "egressAllowlist" in reason
+               and '"*://github.com"' in reason and '"*://*.github.com"' in reason,
+               f"{label}: the egress conflict should name the key and both patterns, "
+               f"got {reason}")
+        c.close()
+
     for path in (BUNDLE_FILE, BUNDLE_LOCK_FILE):
         try:
             os.remove(path)
         except FileNotFoundError:
             pass
+
+    # (f9) Composition is INERT without a verified bundle: with no policyBundle
+    # configured the local layer behaves exactly as it did before the table
+    # existed, so nothing composes against a phantom baseline.
+    write_policy(permissive_with(allowedActions=["ping", "policyInfo", "getTabs"]))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: without a bundle a locally allowed action should succeed, got {r}")
+        r = c.req("getCookies", {"domain": "x.test"})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action getCookies not allowed",
+               f"{label}: without a bundle a locally denied action should still fail, got {r}")
+        r = c.req("policyInfo")
+        reported = ((r or {}).get("result") or {}).get("policyBundle")
+        expect(reported is None,
+               f"{label}: policyInfo must report no bundle when none is configured, "
+               f"got {reported}")
+        c.close()
+
+    # (m) The masking rules are inert without a bundle too: a plain STRING
+    # secretMaskFile and a local redactPatterns list behave exactly as they did
+    # before either key entered the composition table.
+    with open(SECRETS_FILE, "w") as f:
+        f.write("apiKey=n0-bundle-s3cret\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    write_policy(permissive_with(secretMaskFile=SECRETS_FILE,
+                                 redactPatterns=[r"\d{3}-\d{2}-\d{4}"]))
+    unbundled_result = lambda a, p: {
+        "success": True, "html": "<p>SSN 123-45-6789 key n0-bundle-s3cret</p>"}
+    with Host(label, cmd, env, result_fn=unbundled_result):
+        c = Client("tok-alpha")
+        r = c.req("getHTML", {"tabId": 7})
+        rendered = json.dumps(r)
+        expect("123-45-6789" not in rendered and "<redacted>" in rendered,
+               f"{label}: without a bundle a local redactPatterns list should apply "
+               f"as before, got {r}")
+        expect("n0-bundle-s3cret" not in rendered and "<masked:apiKey>" in rendered,
+               f"{label}: without a bundle a plain string secretMaskFile should apply "
+               f"as before, got {r}")
+        c.close()
+    remove_paths(SECRETS_FILE)
 
     # --- Audit export forwarder (policy auditExport) ------------------------
     # Export is an ADDITIONAL sink for events the local audit log already holds,
@@ -2474,8 +3103,11 @@ def run_against(label, cmd, env):
             r = c.req("getTabs")
             expect(r and r.get("success") is True,
                    f"{label}: a dead export sink must not block automation, got {r}")
-        unavailable = [e for e in audit_events()
-                       if e.get("decision") == "audit_export_unavailable"]
+        # Poll for the sink-failure event itself: the worker discovers the
+        # failure off the request path, so an unpolled read of the audit log
+        # races it. wait_until_audited keys on the DECISION, not on a count of
+        # audit lines, which the three getTabs events would already satisfy.
+        unavailable = wait_until_audited("audit_export_unavailable", 1)
         expect(len(unavailable) == 1
                and unavailable[0].get("action") == "auditExport"
                and unavailable[0].get("targets") == [dead_sink],
@@ -2494,8 +3126,9 @@ def run_against(label, cmd, env):
     with Host(label, cmd, env):
         c = Client("tok-alpha")
         c.req("screenshot", {"tabId": 7})
-        expect(wait_until_exported(1, EXPORT_CEF_FILE),
-               f"{label}: no CEF line reached the sink")
+        expect(wait_until_export_matching("|deny|screenshot|", EXPORT_CEF_FILE),
+               f"{label}: the denial never reached the CEF sink, got "
+               f"{export_lines(EXPORT_CEF_FILE)}")
         cef_lines = export_lines(EXPORT_CEF_FILE)
         denials = [line for line in cef_lines if "|deny|screenshot|" in line]
         expect(denials, f"{label}: the CEF sink should carry the denial, got {cef_lines}")
@@ -2544,8 +3177,17 @@ def run_against(label, cmd, env):
         c = Client("tok-alpha")
         c.req("getTabs")
         c.req("screenshot", {"tabId": 7})
-        expect(wait_until_datagrams(datagrams, 2),
-               f"{label}: the syslog collector never received both events, got {datagrams}")
+        # Poll for the DENIAL datagram and for a non-deny datagram, not for a
+        # datagram count: a count of 2 is satisfied by the two earlier getTabs
+        # events, so the deny assertions below would race the datagram they are
+        # about. This is the barrier weakness that hid the reroute bug.
+        expect(wait_until_datagram_matching(
+                   datagrams, lambda line: 'decision="deny"' in line),
+               f"{label}: the syslog collector never received the denial, got {datagrams}")
+        expect(wait_until_datagram_matching(
+                   datagrams, lambda line: 'decision="deny"' not in line),
+               f"{label}: the syslog collector never received a non-deny event, "
+               f"got {datagrams}")
         with forwarded_lock:
             lines = list(datagrams)
         denials = [line for line in lines if 'decision="deny"' in line]
@@ -2581,14 +3223,33 @@ def run_against(label, cmd, env):
         c = Client("tok-alpha")
         for _ in range(8):
             c.req("getTabs")
-        expect(wait_until_exported(1),
-               f"{label}: the rotating sink never received a line")
+        # Wait on an ordered SENTINEL, not on file existence. Rotation renames
+        # the live file, so "both files exist" only narrows the window: the
+        # worker can rotate again between the predicate and the assertion. The
+        # export queue is ordered and drained by a single worker, so a distinct
+        # final action that has reached the live file proves every earlier event
+        # already drained AND that this case has no further write pending, which
+        # is the only state in which both generations are stable to inspect.
+        c.req("policyInfo")
+
+        def sentinel_landed():
+            lines = export_lines()
+            if not lines:
+                return False
+            try:
+                return json.loads(lines[-1]).get("action") == "policyInfo"
+            except ValueError:
+                return False
+
+        expect(wait_until(sentinel_landed),
+               f"{label}: the export sentinel never reached the live sink, got {export_lines()}")
         expect(os.path.exists(EXPORT_FILE + ".1"),
-               f"{label}: exceeding rotateBytes should produce exactly one rotated generation")
+               f"{label}: exceeding rotateBytes should produce a rotated generation")
         expect(not os.path.exists(EXPORT_FILE + ".2"),
                f"{label}: rotation must stay single-generation, found a .2")
-        expect(os.path.getsize(EXPORT_FILE) <= 400,
-               f"{label}: the live sink must stay within rotateBytes, got {os.path.getsize(EXPORT_FILE)}")
+        live_size = os.path.getsize(EXPORT_FILE)
+        expect(live_size <= 400,
+               f"{label}: the live sink must stay within rotateBytes, got {live_size}")
         live = export_lines()
         rotated = export_lines(EXPORT_FILE + ".1")
         expect(live and rotated,
@@ -2603,16 +3264,234 @@ def run_against(label, cmd, env):
                 parsed.append(None)
         expect(all(isinstance(e, dict) and e.get("action") for e in parsed),
                f"{label}: rotation must not tear a line, got {parsed}")
-        # Oldest is discarded, newest is kept: the most recent audit event is the
-        # last line of the live generation.
-        audit_tail = audit_events()[-1]
-        expect(parsed and live and json.loads(live[-1]).get("action") == audit_tail.get("action")
-               and json.loads(live[-1]).get("decision") == audit_tail.get("decision"),
-               f"{label}: the live generation should end with the newest event, got {live[-1] if live else None}")
+        # Oldest is discarded, newest is kept: the sentinel is the newest event
+        # and it is the last line of the live generation.
+        expect(parsed and live and json.loads(live[-1]).get("action") == "policyInfo",
+               f"{label}: the live generation should end with the sentinel, got {live[-1] if live else None}")
         expect(len(live) + len(rotated) <= len(audit_events()),
                f"{label}: a bounded sink can hold at most the full audit stream")
         c.close()
     remove_paths(EXPORT_FILE, EXPORT_FILE + ".1")
+
+    # (g) Export runs OFF the request thread: the local append stays synchronous
+    # and the already-masked event is then drained by one background worker. The
+    # mirror contract is unchanged, but every sink assertion is now a poll --
+    # wait_until_exported -- because the line is not there when the reply is.
+    remove_paths(EXPORT_FILE, EXPORT_FILE + ".1")
+    write_policy(permissive_with(
+        deniedActions=["screenshot"],
+        requireConfirmation=["executeScript"],
+        auditExport={"format": "jsonl", "destination": EXPORT_FILE}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: an allowed action must not wait on the export worker, got {r}")
+        r = c.req("screenshot", {"tabId": 7})
+        expect(r and r.get("success") is False
+               and r.get("error") == "policy denied: action screenshot denied",
+               f"{label}: the denial must still be enforced with async export on, got {r}")
+        r = c.req("executeScript", {"tabId": 7, "code": "1"})
+        expect(r and r.get("success") is False and r.get("confirmationRequired") is True,
+               f"{label}: the confirmation gate must survive async export, got {r}")
+        local = audit_events()
+        expect(wait_until_exported(len(local)),
+               f"{label}: the export worker never drained the queue, got {export_lines()}")
+        exported = [json.loads(line) for line in export_lines()]
+        expect(exported == local,
+               f"{label}: async export must mirror the local audit events field for field, "
+               f"got {exported} vs {local}")
+        expect(any(e.get("decision") == "confirmation_required" for e in exported),
+               f"{label}: the confirmation_required event must reach the sink, got {exported}")
+        c.close()
+
+    # (h) One worker draining one FIFO queue, so sink order equals local append
+    # order. Alternating allow/deny decisions make the assertion sensitive to
+    # ORDER rather than to the multiset of events.
+    remove_paths(EXPORT_FILE, EXPORT_FILE + ".1")
+    write_policy(permissive_with(
+        deniedActions=["screenshot"],
+        auditExport={"format": "jsonl", "destination": EXPORT_FILE}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for _ in range(3):
+            r = c.req("getTabs")
+            expect(r and r.get("success") is True,
+                   f"{label}: the allowed leg of the ordering drive should succeed, got {r}")
+            r = c.req("screenshot", {"tabId": 7})
+            expect(r and r.get("success") is False,
+                   f"{label}: the denied leg of the ordering drive should fail, got {r}")
+        local = audit_events()
+        expect(wait_until_exported(len(local)),
+               f"{label}: the export worker never drained all six events, got {export_lines()}")
+        exported = [json.loads(line) for line in export_lines()]
+        local_order = [(e.get("action"), e.get("decision")) for e in local]
+        export_order = [(e.get("action"), e.get("decision")) for e in exported]
+        expect(export_order == local_order,
+               f"{label}: the exported order must equal the local audit order, "
+               f"got {export_order} vs {local_order}")
+        expect(len({d for _a, d in local_order}) > 1,
+               f"{label}: the ordering drive should mix decisions, got {local_order}")
+        c.close()
+
+    # (i) Fail-closed behavior survives the move to a worker thread: the failure
+    # is now detected off the request path, so it is polled for, and it still
+    # disables the sink after exactly ONE audit_export_unavailable event while
+    # every request keeps succeeding.
+    remove_paths(EXPORT_FILE)
+    shutil.rmtree(EXPORT_DEAD_DIR, ignore_errors=True)
+    async_dead_sink = os.path.join(EXPORT_DEAD_DIR, "async-sink.jsonl")
+    write_policy(permissive_with(
+        auditExport={"format": "jsonl", "destination": async_dead_sink}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        r = c.req("getTabs")
+        expect(r and r.get("success") is True,
+               f"{label}: a dead async sink must not block the first request, got {r}")
+        unavailable = wait_until_audited("audit_export_unavailable", 1)
+        expect(len(unavailable) == 1
+               and unavailable[0].get("action") == "auditExport"
+               and unavailable[0].get("targets") == [async_dead_sink],
+               f"{label}: the worker should audit one audit_export_unavailable naming the "
+               f"sink, got {unavailable}")
+        # Keep driving traffic through the now-disabled sink and give the worker a
+        # bounded window to report a second failure. It must never come.
+        for _ in range(3):
+            r = c.req("getTabs")
+            expect(r and r.get("success") is True,
+                   f"{label}: a dead async sink must not block automation, got {r}")
+        again = wait_until_audited("audit_export_unavailable", 2, timeout=2.0)
+        expect(len(again) == 1,
+               f"{label}: a dead sink must audit audit_export_unavailable exactly once for "
+               f"the life of the process, got {again}")
+        expect(not os.path.exists(async_dead_sink),
+               f"{label}: the worker must not create a sink under a missing directory")
+        c.close()
+    shutil.rmtree(EXPORT_DEAD_DIR, ignore_errors=True)
+
+    # (j) Masking happens BEFORE the event is queued, so the worker only ever
+    # holds already-masked bytes and a secretMaskFile value cannot reach the sink
+    # even though a different thread writes it.
+    remove_paths(EXPORT_FILE)
+    with open(SECRETS_FILE, "w") as f:
+        f.write("siteKey=s3cr3t-async-sink\n")
+    os.chmod(SECRETS_FILE, 0o600)
+    write_policy(permissive_with(
+        allowedOrigins=["https://github.com"],
+        secretMaskFile=SECRETS_FILE,
+        auditExport={"format": "jsonl", "destination": EXPORT_FILE}))
+    with Host(label, cmd, env):
+        c = Client("tok-alpha")
+        for n in range(3):
+            r = c.req("navigate", {"url": f"https://s3cr3t-async-sink.invalid/{n}"})
+            expect(r and r.get("success") is False
+                   and r.get("error") == "policy denied: target not allowed",
+                   f"{label}: navigate to an unlisted origin should be denied, got {r}")
+        local = audit_events()
+        expect(wait_until_exported(len(local)),
+               f"{label}: the worker never drained the masked denials, got {export_lines()}")
+        raw = export_text()
+        expect("s3cr3t-async-sink" not in raw,
+               f"{label}: a known secret must never reach the sink's raw bytes, got {raw}")
+        expect(raw.count("<masked:siteKey>") >= 3,
+               f"{label}: every masked denial should carry the placeholder, got {raw}")
+        c.close()
+    remove_paths(SECRETS_FILE, EXPORT_FILE)
+
+    # (k) The sink is resolved ONCE, on the request thread, and the resolved
+    # config is enqueued WITH the event, so a policy reload while events are
+    # queued can never reroute an already-authorized event into a destination
+    # configured later. Determinism comes from the FIFO destination: both hosts
+    # open a file sink with a plain blocking open(2), which on a reader-less FIFO
+    # never returns, so the worker is provably parked on the first event and the
+    # rest provably sit in the queue. No sleep, no timeout, no scheduling luck --
+    # the worker cannot advance until this case opens the read end.
+    if hasattr(os, "mkfifo"):
+        remove_paths(EXPORT_SWITCH_FILE)
+        make_blocking_fifo(EXPORT_FIFO)
+        write_policy(permissive_with(
+            allowedOrigins=["https://github.com"],
+            auditExport={"format": "jsonl", "destination": EXPORT_FIFO}))
+        reader = FifoReader(EXPORT_FIFO)
+        with Host(label, cmd, env):
+            c = Client("tok-alpha")
+            for n in range(3):
+                r = c.req("navigate", {"url": f"https://sink-a-only.invalid/{n}"})
+                expect(r and r.get("success") is False,
+                       f"{label}: navigate to an unlisted origin should be denied, got {r}")
+            # The local append is synchronous, so once the log holds them they are
+            # already queued against sink A.
+            expect(wait_until(lambda: sum(
+                       1 for e in audit_events() if "sink-a-only" in json.dumps(e)) >= 3),
+                   f"{label}: the sink-A events never reached the local audit log, "
+                   f"got {audit_events()}")
+            # Now switch the destination while those events are stuck in the queue.
+            reload_policy_barrier(c, permissive_with(
+                allowedOrigins=["https://github.com"],
+                auditExport={"format": "jsonl",
+                             "destination": EXPORT_SWITCH_FILE}), label)
+            expect(not os.path.exists(EXPORT_SWITCH_FILE),
+                   f"{label}: the parked worker cannot have drained anything yet, got "
+                   f"{export_text(EXPORT_SWITCH_FILE)}")
+            for n in range(2):
+                c.req("navigate", {"url": f"https://sink-b-only.invalid/{n}"})
+            # Release the worker: opening the read end completes its pending open.
+            reader.release()
+            expect(wait_until_export_matching("sink-b-only", EXPORT_SWITCH_FILE),
+                   f"{label}: events produced under the new policy never reached the new "
+                   f"sink, got {export_text(EXPORT_SWITCH_FILE)}")
+            # Delivered to the destination that authorized them...
+            expect(wait_until(lambda: sum(
+                       1 for line in reader.text().splitlines()
+                       if "sink-a-only" in line) >= 3),
+                   f"{label}: a queued event must still reach the sink that authorized it, "
+                   f"got {reader.text()!r}")
+            # ...and never to the one configured afterwards.
+            switched = export_text(EXPORT_SWITCH_FILE)
+            expect("sink-a-only" not in switched,
+                   f"{label}: an event authorized for one destination must never land in a "
+                   f"destination configured later, got {switched}")
+            c.close()
+        reader.close()
+        remove_paths(EXPORT_SWITCH_FILE, EXPORT_FIFO)
+
+    # (l) A reload that removes auditExport ENTIRELY must not resurrect or
+    # misroute already-queued events either: they still belong to the sink that
+    # was in force when they were produced, so they are delivered there and the
+    # disappearance of the policy key cannot silently discard them. Same FIFO
+    # barrier, so the events are provably still queued when the sink vanishes.
+    if hasattr(os, "mkfifo"):
+        remove_paths(EXPORT_SWITCH_FILE)
+        make_blocking_fifo(EXPORT_FIFO)
+        write_policy(permissive_with(
+            allowedOrigins=["https://github.com"],
+            auditExport={"format": "jsonl", "destination": EXPORT_FIFO}))
+        reader = FifoReader(EXPORT_FIFO)
+        with Host(label, cmd, env):
+            c = Client("tok-alpha")
+            for n in range(3):
+                r = c.req("navigate", {"url": f"https://sink-gone.invalid/{n}"})
+                expect(r and r.get("success") is False,
+                       f"{label}: navigate to an unlisted origin should be denied, got {r}")
+            expect(wait_until(lambda: sum(
+                       1 for e in audit_events() if "sink-gone" in json.dumps(e)) >= 3),
+                   f"{label}: the queued events never reached the local audit log, "
+                   f"got {audit_events()}")
+            # Drop auditExport from policy while the worker is still parked.
+            reload_policy_barrier(
+                c, permissive_with(allowedOrigins=["https://github.com"]), label)
+            reader.release()
+            expect(wait_until(lambda: sum(
+                       1 for line in reader.text().splitlines()
+                       if "sink-gone" in line) >= 3),
+                   f"{label}: removing the sink from policy must not discard events already "
+                   f"queued against it, got {reader.text()!r}")
+            local = audit_events()
+            expect(sum(1 for e in local if "sink-gone" in json.dumps(e)) >= 3,
+                   f"{label}: the local audit log stays the complete record, got {local}")
+            c.close()
+        reader.close()
+        remove_paths(EXPORT_FIFO)
 
 
 
