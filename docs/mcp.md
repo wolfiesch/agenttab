@@ -4,7 +4,7 @@
 
 `mcp/` exposes the bridge to MCP clients (Claude Desktop, Cursor, Cline) so an agent drives your real, logged-in Chrome profile through the standard Model Context Protocol. It is a pure client of the token-gated `127.0.0.1:9223` TCP API; the extension, wire protocol, and host are unchanged.
 
-The server reuses `test_client.py`'s transport verbatim, so the MCP tools and the CLI stay in lockstep.
+The server uses one serialized persistent TCP connection with the same newline-framed request contract as `test_client.py`. It reconnects only before sending; a timeout or disconnect after a send is never replayed.
 
 ### Tools
 
@@ -12,6 +12,7 @@ The MCP server ships a grouped tool set. Legacy tab-scoped tools take an optiona
 
 Read-only:
 
+- `browser_ready` - one bounded readiness operation for the TCP endpoint, native backend, and extension. It replaces repeated `ping`/tab-list/policy probes and reports `ready`, `endpointStatus`, `backend`, `extension`, `attempts`, `elapsedMs`, and a short failure reason without page content
 - `browser_list_tabs`
 - `browser_task_session_list`
 - `browser_snapshot` (compact by default; filter by roles/name/limit or request full details). Every node carries a stable `ref` such as `e12` that any selector argument accepts as `ref=e12`; `diff=True` returns `added`/`removed`/`changed` against the previous snapshot of that tab with `baseEpoch`/`epoch`, and returns the full snapshot with `diffBase: true` when there is no baseline yet
@@ -39,11 +40,13 @@ Sensitive:
 Mutating:
 
 - `browser_navigate`
+- `browser_navigate_and_snapshot` - create or reuse a task-session tab, wait for `load`, URL, or a selector, and return the tab id plus a compact accessibility snapshot in one request. URL waits require `url_substring`. The snapshot is withheld after a cross-origin redirect; the MCP failure message includes cleanup tab/window ids but omits the settled page URL, so observe the destination separately through the normal live-origin gate. Prefer this tool over separate navigate, wait, and snapshot calls when the page has a deterministic same-origin readiness condition
 - `browser_task_session_create`, `browser_task_session_navigate`, `browser_task_session_state`, `browser_task_session_close`
 - `browser_click`, `browser_type`, `browser_fill`, `browser_hover` - selectors accept `ref=e12` from `browser_snapshot` alongside CSS and the `text=`/`aria=`/`label=`/`role=` prefixes. Refs are invalidated by navigation and by an extension service-worker restart; a stale ref fails with `error: staleRef` instead of matching a different element, so re-snapshot
 - `browser_click_at` - click raw viewport coordinates; no element is resolved, so nothing identifies the target in the audit log. Prefer `browser_click`; the sample policy confirmation-gates `clickAt`
 - `browser_scroll`, `browser_press`, `browser_drag`
 - `browser_select`
+- `browser_insert_rich_text` - insert a constrained node tree into a contenteditable editor without arbitrary JavaScript. Text nodes contain only `text`; element nodes use an allowlisted `tag` (`p`, `br`, `strong`, `em`, `code`, `pre`, `ul`, `ol`, `li`, `a`, `h1` through `h3`, or `blockquote`) plus optional `children`. Only links accept another field, an absolute HTTP(S) or `mailto` `href`. Unknown fields, unsafe URLs, excessive depth, node count, and text length are rejected before the editor is changed
 - `browser_upload_file` (validates local paths before contacting Chrome)
 - `browser_github_attach_pr_body` (opens only the GitHub PR-body editor, attaches files, waits for CDN URLs, and saves)
 - `browser_tab_control` (`op`: `activate|close|reload|back|forward`), `browser_lease`, `browser_release`
@@ -84,7 +87,7 @@ The server reads two env flags to scope the exposed surface:
 
 Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately. An MCP annotation is **static per tool**, so it cannot describe a call whose tier depends on its arguments: those annotations stay deliberately conservative and the authoritative tier is the `effectiveTier` the host computes per call. Two tools where the difference matters:
 
-- `browser_batch` is annotated mutating, but host-side a batch is `read_only` only when **every** step is; one mutating step makes the whole batch mutating, and under a `manual` origin that is what decides whether the batch needs a confirmation token. Ask `browser_policy_check(action="batch", payload=...)` for the tier of a specific batch.
+- `browser_batch` is annotated mutating, but host-side a batch is `read_only` only when **every** step is; one mutating step makes the whole batch mutating, and under a `manual` origin that is what decides whether the batch needs a confirmation token. Typed batch steps include interaction/wait primitives plus `expect`, `observe`, `extractStructured`, `extractText`, and `getCurrentState`, so a deterministic action, assertion, and compact observation can stay in one outer call. Each `extractText` step is clamped to 20,000 characters, and `observe` with `diff: true` is rejected so a batch cannot consume the standalone diff baseline. Ask `browser_policy_check(action="batch", payload={...})` for the computed tier before a sensitive sequence.
 - `browser_batch` and `browser_replay_workflow` cannot carry a handoff. A composite whose steps include `waitForHandoff` or `credentialHandoff` is denied host-side as `batch step <n>: handoff not allowed in a composite` before anything is forwarded, because the composite's later steps run inside the extension and could observe the tab while the human is still typing. Call `browser_wait_for_handoff` / `browser_credential_handoff` on their own, then send the rest of the sequence.
 - `browser_screencast_save` is annotated mutating because it always sends `consume: true`. The underlying `screencastFrames` action is nominally read-only and escalates to `mutating` precisely because of that flag, which drains the tab's frame buffer irrecoverably.
 
@@ -92,9 +95,18 @@ The full escalation table (`screencastFrames.consume`, `cacheSelectors.op`, `res
 
 MCP deliberately exposes **no policy-mutation and no scheduling tool**. Reading a verdict (`browser_policy_check`, `browser_plan_preview`) is safe; rewriting the file that produces verdicts is not something an agent should do through the same channel it is being governed by. Change per-site permission modes with `chrome-bridge policy site-mode <originPattern> manual|auto|skip [client]` / `chrome-bridge policy clear-site-mode <originPattern> [client]`, and register scheduled-workflow metadata with `chrome-bridge schedule workflow ... --at|--interval` (which starts nothing - see docs/security.md). Both edit local files under the human's control; the host stays the enforcement boundary either way. If you need the raw escape hatch for a host action, `browser_action` still forwards one action and is still fully policy-gated.
 
-The same applies to the egress allowlist. `egressAllowlist` bounds where an agent may make the browser send a new outbound request (`navigate`, `navigateTaskSession`, `downloadUrl`, `setCookie`, and those actions nested in a `batch`/`replayWorkflow` step), and it is **CLI-managed only**: grant with `chrome-bridge policy allow-egress <pattern> [client]`, remove with `chrome-bridge policy clear-egress <pattern> [client]`. There is no MCP tool that edits it. What MCP does report is the resulting denial: `browser_policy_check` (and `browser_plan_preview`, per step) answers `allowed: false` with `reason: "egress not allowed"`, and a live call fails with `policy denied: egress not allowed` plus a `policyDenial` whose `kind` is `egress` and whose `targets` name the refused destination. Egress never loosens site policy, and it deliberately does not cover traffic the host cannot see - click-driven in-page navigation, script-issued requests, or a page's own resource loads. See docs/security.md.
+The same applies to the egress allowlist. `egressAllowlist` bounds where an agent may make the browser send a new outbound request (`navigate`, `navigateTaskSession`, `navigateAndSnapshot`, `downloadUrl`, `setCookie`, and those actions nested in a `batch`/`replayWorkflow` step), and it is **CLI-managed only**: grant with `chrome-bridge policy allow-egress <pattern> [client]`, remove with `chrome-bridge policy clear-egress <pattern> [client]`. There is no MCP tool that edits it. What MCP does report is the resulting denial: `browser_policy_check` (and `browser_plan_preview`, per step) answers `allowed: false` with `reason: "egress not allowed"`, and a live call fails with `policy denied: egress not allowed` plus a `policyDenial` whose `kind` is `egress` and whose `targets` name the destination.
 
 The same applies to the DLP channel modes. `dlp` attaches `allow`/`audit`/`block` to a channel and is **CLI-managed only**: `chrome-bridge policy dlp <clipboard|upload|download|screenShare> allow|audit|block [client]`. There is no MCP tool that edits it. What MCP reports is the resolved mode: every `browser_policy_check` verdict (and every `browser_plan_preview` step) carries `dlp`, the mode for that action's channel, or `null` when the action belongs to no channel. A `block` answers `allowed: false` with `reason: "dlp blocked"`, and a live call fails with `policy denied: dlp blocked` plus a `policyDenial` whose `kind` is `dlp` and whose `dlpChannel` names the channel. The host enforces `upload` (`browser_upload_file`, `browser_github_attach_pr_body`), `download` (`downloadUrl` through `browser_action`), and `screenShare` (`browser_start_screencast`, `browser_screencast_save`), and it refuses before forwarding, so a blocked upload never reaches CDP `DOM.setFileInputFiles` and no file is opened. `clipboard` is declared but has **no chokepoint**: no bridge action reads or writes the clipboard and a page-driven copy never crosses the bridge, so a clipboard mode enforces nothing. See docs/security.md.
+
+### Efficient agent workflow
+
+1. Call `browser_ready` once when bridge state is unknown. Retry typed MCP tools after it succeeds; do not fall back to repeated CLI probes.
+2. Create one task session per workstream. Retain returned tab ids and pass them explicitly instead of repeatedly listing or activating tabs.
+3. Prefer `browser_navigate_and_snapshot` for a new page. Use compact snapshots and `ref=eN` selectors; re-snapshot only after navigation, an extension restart, or a stale-ref failure.
+4. Use `browser_batch` for known same-tab sequences. Put deterministic `expect` and compact observation/extraction steps in the same batch when their results are needed only at the end.
+5. Use `browser_insert_rich_text` for supported contenteditable editors. Keep `executeScript` and `executeScriptCDP` for unsupported page behavior; their confirmation boundary is unchanged.
+6. Activate a tab only for native UI visibility or human handoff. Background navigation, CDP input, snapshots, and screenshots do not need activation.
 
 ### Register
 

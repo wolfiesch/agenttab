@@ -28,9 +28,11 @@ diff -q wake.html extension/wake.html
 diff -q wake.js extension/wake.js
 ```
 
-Manual live gates after reloading the unpacked extension (opens real Chrome tabs):
+Live gates after deploying and reloading the unpacked extension (opens real Chrome tabs):
 
 ```bash
+./scripts/reload_unpacked_extension.sh
+chrome-bridge ready 10000 250
 python3 test_client.py ping
 python3 scripts/background_reliability.py --duration-seconds 60 --output /tmp/background-reliability.json
 PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py

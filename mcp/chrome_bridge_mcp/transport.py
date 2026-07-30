@@ -67,12 +67,16 @@ class PersistentBridgeConnection:
             except OSError:
                 pass
 
-    def _connect(self, endpoint, response_timeout):
-        retry_seconds = _client.env_float("BRIDGE_CONNECT_TIMEOUT_SECONDS", 45.0)
+    def _connect(self, endpoint, response_timeout, connect_timeout_seconds=None):
+        retry_seconds = (
+            _client.env_float("BRIDGE_CONNECT_TIMEOUT_SECONDS", 45.0)
+            if connect_timeout_seconds is None
+            else max(0.0, float(connect_timeout_seconds))
+        )
         deadline = time.monotonic() + retry_seconds
         while True:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(15)
+            sock.settimeout(min(15.0, max(0.1, response_timeout)))
             try:
                 sock.connect(endpoint)
                 sock.settimeout(response_timeout)
@@ -89,7 +93,7 @@ class PersistentBridgeConnection:
                         "Error: browser unavailable. Chrome may be closed, the extension may be "
                         "disabled, or the native connection may be disconnected.",
                     )
-                time.sleep(0.5)
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
             except OSError as exc:
                 sock.close()
                 return 1, None, f"Error connecting to bridge: {exc}"
@@ -112,6 +116,8 @@ class PersistentBridgeConnection:
         dry_run=False,
         token=None,
         traceparent=None,
+        connect_timeout_seconds=None,
+        response_timeout_seconds_override=None,
     ):
         payload = dict(payload or {})
         if read_timeout_ms is None:
@@ -121,7 +127,11 @@ class PersistentBridgeConnection:
         resolved_token = token or _client.load_token()
         if not resolved_token:
             return 2, None, "Error: could not read bridge token."
-        response_timeout = _client.response_timeout_seconds(read_timeout_ms)
+        response_timeout = (
+            _client.response_timeout_seconds(read_timeout_ms)
+            if response_timeout_seconds_override is None
+            else max(0.1, float(response_timeout_seconds_override))
+        )
         endpoint = ("127.0.0.1", int(os.environ.get("BRIDGE_PORT", "9223")))
         max_idle = _client.env_float("BRIDGE_MCP_CONNECTION_MAX_IDLE_SECONDS", 240.0)
         if (
@@ -133,7 +143,11 @@ class PersistentBridgeConnection:
         ):
             self.close()
         if self._socket is None:
-            error = self._connect(endpoint, response_timeout)
+            error = self._connect(
+                endpoint,
+                response_timeout,
+                connect_timeout_seconds=connect_timeout_seconds,
+            )
             if error is not None:
                 return error
         else:
@@ -165,18 +179,108 @@ class PersistentBridgeConnection:
                 f"Error communicating over the persistent bridge connection: {exc}. "
                 "The action was not replayed because delivery is ambiguous."
             )
-        # Both native hosts close the TCP connection immediately after an
-        # ``unauthorized`` reply, so the cached socket is already dead. Discard
-        # it here or the next legitimate request writes into a closed
-        # connection and fails with an ambiguous-delivery error. Nothing is
-        # replayed: the rejected request never reached the extension.
-        if response.get("success") is not True and response.get("error") == "unauthorized":
+        # The hosts close after ``unauthorized`` and the broker closes after
+        # ``browser_unavailable``. Discard either socket now; the next safe
+        # readiness probe must open a new connection rather than write into a
+        # peer-closed stream. Nothing is replayed: neither response reached the
+        # extension.
+        if (
+            response.get("success") is not True
+            and (
+                response.get("error") == "unauthorized"
+                or response.get("status") == "browser_unavailable"
+            )
+        ):
             self.close()
         exit_code = 0 if response.get("success") is True else 1
         result = response.get("result")
         if isinstance(result, dict) and result.get("success") is False:
             exit_code = 1
         return exit_code, response, ""
+
+
+
+
+def readiness(timeout_ms=5000, poll_interval_ms=250, token=None, traceparent=None):
+    """Wait once for endpoint, backend, and extension readiness.
+
+    Only pre-send connection failures and the broker's explicit
+    ``browser_unavailable`` response are retried. A timeout, malformed response,
+    unauthorized reply, or any other post-send failure is returned immediately.
+    """
+    timeout_ms = max(0, min(30000, int(timeout_ms)))
+    poll_interval_ms = max(50, min(1000, int(poll_interval_ms)))
+    started = time.monotonic()
+    deadline = started + timeout_ms / 1000.0
+    attempts = 0
+    endpoint_port = int(os.environ.get("BRIDGE_PORT", "9223"))
+    endpoint_status = "refused"
+    extension_status = "unavailable"
+    reason = "browser unavailable"
+    ready = False
+
+    while True:
+        attempts += 1
+        remaining = max(0.1, deadline - time.monotonic())
+        with _call_lock:
+            exit_code, response, stderr = _connection.request(
+                "ping",
+                {},
+                traceparent=traceparent,
+                token=token,
+                connect_timeout_seconds=min(0.25, remaining),
+                response_timeout_seconds_override=remaining,
+            )
+        if response is not None:
+            endpoint_status = "reachable"
+            if response.get("success") is True and response.get("result") == "pong":
+                extension_status = "connected"
+                reason = None
+                ready = True
+                break
+            reason = response.get("error") or stderr or "bridge reported failure"
+            if response.get("error") == "unauthorized":
+                extension_status = "unavailable"
+                ready = False
+                break
+            if response.get("status") == "browser_unavailable":
+                extension_status = "unavailable"
+            else:
+                extension_status = "stalled"
+                ready = False
+                break
+        elif exit_code == 124:
+            endpoint_status = "reachable"
+            extension_status = "stalled"
+            reason = stderr or "bridge response timed out"
+            ready = False
+            break
+        else:
+            endpoint_status = "refused"
+            extension_status = "unavailable"
+            reason = stderr or "browser unavailable"
+
+        if time.monotonic() >= deadline:
+            ready = False
+            break
+        time.sleep(min(poll_interval_ms / 1000.0, max(0.0, deadline - time.monotonic())))
+
+    if ready:
+        backend = "reachable"
+    elif endpoint_status == "reachable" and extension_status == "unavailable":
+        backend = "unavailable"
+    else:
+        backend = "unknown"
+    return {
+        "ready": ready,
+        "endpoint": f"127.0.0.1:{endpoint_port}",
+        "endpointStatus": endpoint_status,
+        "backend": backend,
+        "extension": extension_status,
+        "attempts": attempts,
+        "elapsedMs": round((time.monotonic() - started) * 1000),
+        "reason": reason,
+    }
 
 
 _connection = PersistentBridgeConnection()

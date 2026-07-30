@@ -1721,6 +1721,7 @@ def run_against(label, cmd, env):
         c = Client("tok-alpha")
         for action, payload in (
                 ("navigate", {"url": "https://evil.test/x"}),
+                ("navigateAndSnapshot", {"url": "https://evil.test/x"}),
                 ("navigateTaskSession", {"sessionId": "s1", "url": "https://evil.test/x"}),
                 ("downloadUrl", {"url": "https://evil.test/f.zip"}),
                 ("setCookie", {"url": "https://evil.test", "name": "s", "value": "1"})):
@@ -1736,6 +1737,7 @@ def run_against(label, cmd, env):
                    f"{label}: {action} must not forward outside the egressAllowlist, got {forwarded_actions()}")
         for action, payload in (
                 ("navigate", {"url": "https://github.com/x"}),
+                ("navigateAndSnapshot", {"url": "https://github.com/x"}),
                 ("downloadUrl", {"url": "https://raw.github.com/f.zip"}),
                 ("setCookie", {"url": "https://github.com", "name": "s", "value": "1"})):
             r = c.req(action, payload)
@@ -3520,26 +3522,29 @@ def check_example_policy_is_conservative():
 
 
 def check_classification_parity():
-    """Static guard: the 5 emulate actions must be classified mutating in BOTH
-    hosts, and Python's MUTATING_ACTIONS must match the Rust mutating_actions()
-    string list. Behavioral tests don't exercise classification directly, so this
-    catches host-to-host drift (e.g. an action added to Rust but not Python)."""
+    """Static guard: state-changing actions must be mutating in both hosts.
+
+    Python's MUTATING_ACTIONS must match the Rust mutating_actions() string
+    list so policy tiering cannot drift between host implementations.
+    """
     sys.path.insert(0, SCRIPT_DIR)
     import re
     import bridge
-    emulate = {"setCpuThrottling", "setNetworkConditions",
-               "clearNetworkConditions", "setColorScheme", "setUserAgent"}
-    missing = emulate - bridge.MUTATING_ACTIONS
+    expected_mutating = {
+        "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
+        "setColorScheme", "setUserAgent", "navigateAndSnapshot", "insertRichText",
+    }
+    missing = expected_mutating - bridge.MUTATING_ACTIONS
     expect(not missing,
-           f"python: emulate actions missing from MUTATING_ACTIONS: {sorted(missing)}")
+           f"python: actions missing from MUTATING_ACTIONS: {sorted(missing)}")
 
     rs = open(os.path.join(SCRIPT_DIR, "host-rs", "src", "main.rs")).read()
     m = re.search(r"fn mutating_actions\(\)[^{]*\{\s*&\[(.*?)\]", rs, re.S)
     expect(m is not None, "rust: could not locate mutating_actions() list")
     if m:
         rust_mut = set(re.findall(r'"([^"]+)"', m.group(1)))
-        expect(not (emulate - rust_mut),
-               f"rust: emulate actions missing from mutating_actions(): {sorted(emulate - rust_mut)}")
+        expect(not (expected_mutating - rust_mut),
+               f"rust: actions missing from mutating_actions(): {sorted(expected_mutating - rust_mut)}")
         expect(bridge.MUTATING_ACTIONS == rust_mut,
                "python/rust MUTATING parity drift: "
                f"py-only={sorted(bridge.MUTATING_ACTIONS - rust_mut)} "

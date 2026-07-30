@@ -431,6 +431,9 @@ async function runBatch(steps, defaultTabId, stopOnError, dlp) {
       stepPayload.timeoutMs = step.timeoutMs;
     }
     try {
+      if (step.action === "observe" && stepPayload.diff === true) {
+        throw new Error("observe cannot use diff=true inside a batch");
+      }
       const stepResult = await dispatchAction(step.action, stepPayload, dlp);
       if (stepResult && typeof stepResult === "object" && stepResult.success === false) {
         throw new Error(stepResult.error || stepResult.err || "step reported success=false");
@@ -469,6 +472,9 @@ async function dispatchAction(action, payload, dlp) {
         break;
       case "navigateTaskSession":
         result = await navigateTaskSession(payload.sessionId, payload.url, payload.active, payload.reuse);
+        break;
+      case "navigateAndSnapshot":
+        result = await navigateAndSnapshot(payload);
         break;
       case "getTaskSessions":
         result = await getTaskSessions(payload.sessionId);
@@ -568,6 +574,9 @@ async function dispatchAction(action, payload, dlp) {
         break;
       case "select":
         result = await selectOption(payload.tabId, payload.selector, payload.value);
+        break;
+      case "insertRichText":
+        result = await insertRichText(payload.tabId, payload.selector, payload.nodes, payload.clear);
         break;
       case "githubAttachUploadedFiles":
         result = await githubAttachUploadedFiles(payload.tabId, payload.inputSelector, payload.formSelector, payload.timeoutMs);
@@ -720,8 +729,21 @@ function sendResponseToHost(response) {
   }
 }
 
+async function createNavigationTab(url, active = false) {
+  const properties = { url, active: active === true };
+  try {
+    const targetWindow = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    if (Number.isInteger(targetWindow?.id) && targetWindow.id >= 0) {
+      properties.windowId = targetWindow.id;
+    }
+  } catch (_error) {
+    // Let Chrome choose a window when no normal window is available.
+  }
+  return chrome.tabs.create(properties);
+}
+
 async function navigateToUrl(url, active = false) {
-  const tab = await chrome.tabs.create({ url, active: active === true });
+  const tab = await createNavigationTab(url, active);
   return { tabId: tab.id };
 }
 
@@ -1129,19 +1151,117 @@ async function navigateTaskSession(sessionId, url, active = false, reuse = true)
           await chrome.windows.update(tab.windowId, { focused: true });
         }
       } catch (error) {
-        tab = await chrome.tabs.create({ url, active: active === true });
+        tab = await createNavigationTab(url, active);
         session.tabIds = session.tabIds.filter((tabId) => tabId !== reusedTabId);
         session.tabIds.push(tab.id);
         await groupTaskTab(session, tab.id);
       }
     } else {
-      tab = await chrome.tabs.create({ url, active: active === true });
+      tab = await createNavigationTab(url, active);
       session.tabIds.push(tab.id);
       await groupTaskTab(session, tab.id);
     }
     session.updatedAt = Date.now();
     return { value: { sessionId, tabId: tab.id, windowId: tab.windowId, active: tab.active }, changed: true };
   });
+}
+
+async function navigateAndSnapshot(payload) {
+  if (!payload || typeof payload.url !== "string" || !payload.url.trim()) {
+    return { success: false, err: "navigateAndSnapshot requires a url" };
+  }
+  const waitMode = payload.waitMode || "load";
+  if (!["load", "url", "selector"].includes(waitMode)) {
+    return { success: false, err: `Unknown navigateAndSnapshot wait mode: ${waitMode}` };
+  }
+  if (waitMode === "selector" && (typeof payload.selector !== "string" || !payload.selector)) {
+    return { success: false, err: "navigateAndSnapshot selector wait requires a selector" };
+  }
+  if (waitMode === "url" && (typeof payload.urlSubstring !== "string" || !payload.urlSubstring)) {
+    return { success: false, err: "navigateAndSnapshot URL wait requires urlSubstring" };
+  }
+  const navigation = payload.sessionId
+    ? await navigateTaskSession(payload.sessionId, payload.url, payload.active, payload.reuse)
+    : await navigateToUrl(payload.url, payload.active);
+  const tabId = navigation.tabId;
+  let wait;
+  if (waitMode === "selector") {
+    wait = await waitForSelector(tabId, payload.selector, payload.timeoutMs);
+  } else if (waitMode === "url") {
+    wait = await waitForUrl(tabId, payload.urlSubstring, payload.timeoutMs);
+  } else {
+    wait = await waitForLoad(tabId, payload.timeoutMs);
+  }
+  const tab = await chrome.tabs.get(tabId);
+  const recoveryContext = `(tabId ${tabId}, windowId ${tab.windowId})`;
+  let requestedOrigin;
+  let settledOrigin;
+  try {
+    requestedOrigin = new URL(payload.url).origin;
+    settledOrigin = new URL(tab.url).origin;
+  } catch (_error) {
+    return {
+      success: false,
+      err: `navigateAndSnapshot could not validate the settled tab origin ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: null,
+      wait
+    };
+  }
+  const sameOrigin = settledOrigin === requestedOrigin;
+  if (!wait || wait.success === false) {
+    return {
+      success: false,
+      err: `${wait?.err || wait?.error || "navigateAndSnapshot readiness wait failed"} ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: sameOrigin ? tab.url : null,
+      wait
+    };
+  }
+  if (!sameOrigin) {
+    return {
+      success: false,
+      err: `navigateAndSnapshot refused a snapshot after a cross-origin redirect ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: null,
+      wait
+    };
+  }
+  let snapshot;
+  try {
+    snapshot = await observeTab(tabId, {
+      compact: payload.compact !== false,
+      roles: payload.roles,
+      name: payload.name,
+      limit: payload.limit,
+      diff: payload.diff === true
+    });
+  } catch (error) {
+    return {
+      success: false,
+      err: `${error?.message || "navigateAndSnapshot observation failed"} ${recoveryContext}`,
+      tabId,
+      windowId: tab.windowId,
+      sessionId: payload.sessionId || null,
+      url: tab.url || null,
+      wait
+    };
+  }
+  return {
+    success: true,
+    tabId,
+    windowId: tab.windowId,
+    sessionId: payload.sessionId || null,
+    url: tab.url || null,
+    wait,
+    snapshot
+  };
 }
 
 async function closeTaskSession(sessionId) {
@@ -3087,6 +3207,240 @@ async function selectOption(tabId, selector, value) {
     if (resolved.success === false) return resolved;
     const result = await evaluateInContext(target, domSelectExpression(locator, value), resolved.contextId);
     return result.val || result;
+  });
+}
+
+const ALLOWED_RICH_TAGS = new Set([
+  "p", "br", "strong", "em", "code", "pre", "ul", "ol", "li", "a",
+  "h1", "h2", "h3", "blockquote"
+]);
+const RICH_TEXT_MAX_DEPTH = 10;
+const RICH_TEXT_MAX_NODES = 500;
+const RICH_TEXT_MAX_CHARS = 20000;
+
+function validateRichNodes(nodes) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    return { success: false, err: "insertRichText requires a non-empty nodes array" };
+  }
+  let count = 0;
+  let textLength = 0;
+
+  const visit = (node, path, depth) => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) {
+      throw new Error(`insertRichText rejected node ${path}: expected an object`);
+    }
+    if (depth > RICH_TEXT_MAX_DEPTH) {
+      throw new Error(`insertRichText rejected node ${path}: maximum depth is ${RICH_TEXT_MAX_DEPTH}`);
+    }
+    count += 1;
+    if (count > RICH_TEXT_MAX_NODES) {
+      throw new Error(`insertRichText rejected node ${path}: maximum node count is ${RICH_TEXT_MAX_NODES}`);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(node, "text")) {
+      const keys = Object.keys(node);
+      if (keys.length !== 1 || typeof node.text !== "string") {
+        throw new Error(`insertRichText rejected node ${path}: text nodes may contain only a string text field`);
+      }
+      textLength += node.text.length;
+      if (textLength > RICH_TEXT_MAX_CHARS) {
+        throw new Error(`insertRichText rejected node ${path}: maximum text length is ${RICH_TEXT_MAX_CHARS}`);
+      }
+      return { text: node.text };
+    }
+
+    const tag = typeof node.tag === "string" ? node.tag.toLowerCase() : "";
+    if (!ALLOWED_RICH_TAGS.has(tag)) {
+      throw new Error(`insertRichText rejected node ${path}: unsupported tag ${tag || "<missing>"}`);
+    }
+    const allowedKeys = new Set(tag === "a" ? ["tag", "href", "children"] : ["tag", "children"]);
+    const unexpected = Object.keys(node).find((key) => !allowedKeys.has(key));
+    if (unexpected) {
+      throw new Error(`insertRichText rejected node ${path}: unsupported field ${unexpected}`);
+    }
+    if (node.children !== undefined && !Array.isArray(node.children)) {
+      throw new Error(`insertRichText rejected node ${path}: children must be an array`);
+    }
+    if (tag === "br" && Array.isArray(node.children) && node.children.length) {
+      throw new Error(`insertRichText rejected node ${path}: br cannot have children`);
+    }
+    const normalized = {
+      tag,
+      children: (node.children || []).map((child, index) => visit(child, `${path}.children[${index}]`, depth + 1))
+    };
+    if (tag === "a" && node.href !== undefined) {
+      if (typeof node.href !== "string" || !node.href) {
+        throw new Error(`insertRichText rejected node ${path}: href must be a non-empty string`);
+      }
+      let parsed;
+      try {
+        parsed = new URL(node.href);
+      } catch (_error) {
+        throw new Error(`insertRichText rejected node ${path}: href must be an absolute URL`);
+      }
+      if (!["https:", "http:", "mailto:"].includes(parsed.protocol)) {
+        throw new Error(`insertRichText rejected node ${path}: unsupported href protocol`);
+      }
+      normalized.href = node.href;
+    }
+    return normalized;
+  };
+
+  try {
+    const normalized = nodes.map((node, index) => visit(node, `[${index}]`, 1));
+    return { success: true, nodes: normalized, count, textLength };
+  } catch (error) {
+    return { success: false, err: error.message };
+  }
+}
+
+function richTextInsertExpression(locator, nodes, clear, phase = "dispatch", beforeFingerprint = null) {
+  return `(() => {
+    ${locatorResolverSource()}
+    const resolved = resolveLocator(${JSON.stringify(locator)});
+    if (!resolved.success) return resolved;
+    const el = resolved.el;
+    if (!el.isContentEditable) {
+      return { success: false, err: 'insertRichText requires a contenteditable target' };
+    }
+    const fingerprint = (value) => {
+      let first = 2166136261;
+      let second = 5381;
+      for (let index = 0; index < value.length; index += 1) {
+        const code = value.charCodeAt(index);
+        first = Math.imul(first ^ code, 16777619);
+        second = Math.imul(second, 33) ^ code;
+      }
+      return [value.length, first >>> 0, second >>> 0];
+    };
+    const currentFingerprint = fingerprint(el.innerHTML);
+    if (${JSON.stringify(phase)} === 'checkPaste') {
+      const previous = ${JSON.stringify(beforeFingerprint)};
+      const changed = !Array.isArray(previous)
+        || previous.length !== currentFingerprint.length
+        || previous.some((value, index) => value !== currentFingerprint[index]);
+      if (changed) {
+        return { success: true, tagName: el.tagName, contentEditable: true, method: 'paste' };
+      }
+      return { success: false, pendingPaste: true };
+    }
+    const build = (node) => {
+      if (Object.prototype.hasOwnProperty.call(node, 'text')) {
+        return document.createTextNode(node.text);
+      }
+      const child = document.createElement(node.tag);
+      if (node.tag === 'a' && node.href) child.setAttribute('href', node.href);
+      for (const nested of node.children || []) child.appendChild(build(nested));
+      return child;
+    };
+    const container = document.createElement('div');
+    for (const node of ${JSON.stringify(nodes)}) container.appendChild(build(node));
+    const html = container.innerHTML;
+    const plainText = container.innerText || container.textContent || '';
+    el.focus();
+    const selection = document.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    if (!${JSON.stringify(clear === true)}) range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const beforeHtml = el.innerHTML;
+    try {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData('text/html', html);
+      clipboardData.setData('text/plain', plainText);
+      const paste = new ClipboardEvent('paste', {
+        clipboardData,
+        bubbles: true,
+        cancelable: true,
+        composed: true
+      });
+      const propagated = el.dispatchEvent(paste);
+      if (el.innerHTML !== beforeHtml) {
+        return { success: true, tagName: el.tagName, contentEditable: true, method: 'paste' };
+      }
+      if (!propagated) {
+        return { success: false, pendingPaste: true, beforeFingerprint: fingerprint(beforeHtml) };
+      }
+    } catch (_error) {
+      // Fall through for environments without constructible clipboard events.
+    }
+    const before = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      inputType: 'insertFromPaste',
+      data: null
+    });
+    if (!el.dispatchEvent(before)) {
+      return { success: false, err: 'insertRichText was cancelled by the page' };
+    }
+    const fragment = document.createDocumentFragment();
+    while (container.firstChild) fragment.appendChild(container.firstChild);
+    range.deleteContents();
+    range.insertNode(fragment);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    el.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      composed: true,
+      inputType: 'insertFromPaste',
+      data: null
+    }));
+    return { success: true, tagName: el.tagName, contentEditable: true, method: 'dom' };
+  })()`;
+}
+
+async function insertRichText(tabId, selector, nodes, clear = false) {
+  const validated = validateRichNodes(nodes);
+  if (validated.success === false) return validated;
+  return withDebugger(tabId, async (target) => {
+    let locator;
+    try {
+      locator = parseActionLocator(selector, tabId);
+    } catch (error) {
+      return locatorError(error);
+    }
+    const resolved = await resolveActionTarget(tabId, locator, target);
+    if (resolved.success === false) return resolved;
+    let inserted = await evaluateInContext(
+      target,
+      richTextInsertExpression(locator, validated.nodes, clear === true),
+      resolved.contextId
+    );
+    let value = inserted.val || inserted;
+    if (inserted.success && value.pendingPaste === true) {
+      const beforeFingerprint = value.beforeFingerprint;
+      for (const delayMs of [50, 100, 200, 400, 500]) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        inserted = await evaluateInContext(
+          target,
+          richTextInsertExpression(
+            locator,
+            validated.nodes,
+            clear === true,
+            "checkPaste",
+            beforeFingerprint
+          ),
+          resolved.contextId
+        );
+        value = inserted.val || inserted;
+        if (!inserted.success || value.pendingPaste !== true) break;
+      }
+      if (inserted.success && value.pendingPaste === true) {
+        return { success: false, err: "insertRichText paste was cancelled without inserting content" };
+      }
+    }
+    if (!inserted.success || value.success === false) return value;
+    return {
+      success: true,
+      tagName: value.tagName,
+      contentEditable: value.contentEditable === true,
+      method: value.method,
+      insertedNodes: validated.count,
+      textLength: validated.textLength
+    };
   });
 }
 
@@ -5243,8 +5597,8 @@ let workflowReplayDepth = 0;
 // actions (observe, extractText, consoleMessages, ...), host-side verbs, and
 // the recording/replay control actions themselves are deliberately absent.
 const RECORDABLE_ACTIONS = new Set([
-  "navigate", "navigateTaskSession", "activateTab", "closeTab", "reload", "goBack", "goForward",
-  "windowControl", "click", "clickAt", "type", "fill", "select", "hover", "scroll", "press", "drag",
+  "navigate", "navigateTaskSession", "navigateAndSnapshot", "activateTab", "closeTab", "reload", "goBack", "goForward",
+  "windowControl", "click", "clickAt", "type", "fill", "select", "insertRichText", "hover", "scroll", "press", "drag",
   "uploadFile", "githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody",
   "executeScript", "executeScriptCDP", "handleDialog", "downloadUrl",
   "setViewport", "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
@@ -5258,6 +5612,7 @@ const RECORDABLE_ACTIONS = new Set([
 const WORKFLOW_SENSITIVE_FIELDS = {
   type: ["text"],
   fill: ["text"],
+  insertRichText: ["nodes"],
   setCookie: ["value"],
   setStorageItem: ["value"],
   handleDialog: ["promptText"]
@@ -5277,9 +5632,12 @@ function workflowBindingKey(stepIndex, field) {
 }
 
 function isWorkflowSensitiveField(action, key, value) {
-  if (typeof value !== "string" || !value.length) return false;
-  if (WORKFLOW_SECRET_KEY_PATTERN.test(key)) return true;
-  return (WORKFLOW_SENSITIVE_FIELDS[action] || []).includes(key);
+  if (WORKFLOW_SECRET_KEY_PATTERN.test(key)) {
+    return typeof value === "string" && value.length > 0;
+  }
+  if (!(WORKFLOW_SENSITIVE_FIELDS[action] || []).includes(key)) return false;
+  if (typeof value === "string") return value.length > 0;
+  return value !== null && value !== undefined;
 }
 
 // Returns the payload as recorded plus the binding keys replay will demand.
@@ -5714,10 +6072,32 @@ function workflowStepBindingKeys(step, index) {
   return keys;
 }
 
-function applyWorkflowBindings(stepPayload, index, bindings) {
+function normalizedWorkflowBinding(action, field, value, key) {
+  if (action === "insertRichText" && field === "nodes") {
+    let parsed = value;
+    if (typeof value === "string") {
+      try {
+        parsed = JSON.parse(value);
+      } catch (_error) {
+        throw new Error(`binding ${key} must be a JSON array`);
+      }
+    }
+    if (!Array.isArray(parsed)) throw new Error(`binding ${key} must be a JSON array`);
+    return parsed;
+  }
+  if (typeof value !== "string") throw new Error(`binding ${key} must be a string`);
+  return value;
+}
+
+function applyWorkflowBindings(action, stepPayload, index, bindings) {
   for (const [field, value] of Object.entries(stepPayload)) {
     if (value !== REDACTED_VALUE) continue;
-    stepPayload[field] = bindings[workflowBindingKey(index, field)];
+    stepPayload[field] = normalizedWorkflowBinding(
+      action,
+      field,
+      bindings[workflowBindingKey(index, field)],
+      workflowBindingKey(index, field)
+    );
   }
 }
 
@@ -5768,16 +6148,27 @@ async function replayWorkflow(payload, dlp) {
     return { success: false, err: `Workflow has ${steps.length} steps; the limit is ${WORKFLOW_STEP_LIMIT}` };
   }
   const bindings = payload.bindings && typeof payload.bindings === "object" ? payload.bindings : {};
+  const normalizedBindings = { ...bindings };
   const defaultTabId = typeof payload.tabId === "number" ? payload.tabId : undefined;
   if (Array.isArray(payload.cache)) mergeSelectorCache(payload.cache);
 
   // Refuse the WHOLE workflow before running any step when a redacted value has
-  // no binding: a half-run workflow that stops at the password field has
+  // no valid binding: a half-run workflow that stops at the password field has
   // already mutated the page.
   const missingBindings = [];
+  const invalidBindings = [];
   steps.forEach((step, index) => {
     for (const key of workflowStepBindingKeys(step, index)) {
-      if (typeof bindings[key] !== "string") missingBindings.push(key);
+      if (!Object.prototype.hasOwnProperty.call(bindings, key)) {
+        missingBindings.push(key);
+        continue;
+      }
+      const field = key.slice(key.indexOf(".") + 1);
+      try {
+        normalizedBindings[key] = normalizedWorkflowBinding(step?.action, field, bindings[key], key);
+      } catch (error) {
+        invalidBindings.push({ key, error: error.message });
+      }
     }
   });
   if (missingBindings.length) {
@@ -5786,6 +6177,14 @@ async function replayWorkflow(payload, dlp) {
       error: "missingBindings",
       err: `Workflow needs values for redacted fields: ${missingBindings.join(", ")}`,
       missingBindings
+    };
+  }
+  if (invalidBindings.length) {
+    return {
+      success: false,
+      error: "invalidBindings",
+      err: invalidBindings.map((entry) => entry.error).join(", "),
+      invalidBindings
     };
   }
 
@@ -5818,7 +6217,7 @@ async function replayWorkflow(payload, dlp) {
       if (defaultTabId !== undefined && (stepPayload.tabId !== undefined || CACHEABLE_SELECTOR_ACTIONS.has(step.action))) {
         stepPayload.tabId = defaultTabId;
       }
-      applyWorkflowBindings(stepPayload, index, bindings);
+      applyWorkflowBindings(step.action, stepPayload, index, normalizedBindings);
 
       // Origin gate: a recorded workflow reproduces mutating actions, so it may
       // only run where it was recorded.

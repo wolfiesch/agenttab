@@ -401,6 +401,16 @@ def expect_policy_bundle_examples():
 
 
 def main():
+    wake_source = (SCRIPT_DIR / "wake.js").read_text()
+    reload_script = SCRIPT_DIR / "scripts" / "reload_unpacked_extension.sh"
+    reload_source = reload_script.read_text()
+    expect("window.history.replaceState" in wake_source and "chrome.runtime.reload()" in wake_source,
+           "wake page must remove its reload trigger before reloading the extension")
+    expect("wake.html?reload=1" in reload_source and 'open -g -a "$CHROME_APP"' in reload_source,
+           "reload helper must open the one-shot wake page without focusing Chrome")
+    if os.name == "posix":
+        expect(mode(reload_script) & 0o111, "reload helper must be executable")
+
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         key = tmp / "extension_key.pem"

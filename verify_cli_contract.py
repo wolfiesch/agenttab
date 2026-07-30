@@ -20,11 +20,18 @@ ENV["BRIDGE_TOKEN_FILE"] = TOKEN_FIXTURE
 UPLOAD_FIXTURE = "/tmp/chrome-bridge-upload.txt"
 with open(UPLOAD_FIXTURE, "w", encoding="utf-8") as f:
     f.write("chrome bridge upload fixture\n")
+RICH_TEXT_FIXTURE = "/tmp/chrome-bridge-rich-text.json"
+with open(RICH_TEXT_FIXTURE, "w", encoding="utf-8") as f:
+    f.write('[{"type":"paragraph","children":[{"type":"text","text":"Hello"}]}]\n')
+
 
 CASES = [
     (["ping"], 111),
+    (["ready", "0", "50"], 1),
     (["navigate", "https://example.com"], 111),
     (["navigate", "https://example.com", "--foreground"], 111),
+    (["navigateAndSnapshot", "https://example.com", "--wait", "selector", "--selector", "#ready"], 111),
+    (["navigateAndSnapshot", "https://example.com", "--wait", "url"], 2),
     (["getCookies", "example.com"], 111),
     (["executeScript", "1", "document.title"], 111),
     (["getTabs"], 111),
@@ -62,6 +69,7 @@ CASES = [
     (["press", "1", "Enter"], 111),
     (["drag", "1", "#from", "#to"], 111),
     (["fill", "1", "input[name=q]", "hello"], 111),
+    (["insertRichText", "1", "#editor", RICH_TEXT_FIXTURE], 111),
     (["select", "1", "select[name=kind]", "beta"], 111),
     (["uploadFile", "1", "input[type=file]", UPLOAD_FIXTURE], 111),
     (["githubAttachUploadedFiles", "1", "input[type=file]"], 111),
@@ -138,12 +146,19 @@ _spec.loader.exec_module(test_client)
 
 captured = {}
 
-def _fake_send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None):
+def _fake_send_command_data(
+        action, payload=None, read_timeout_ms=None, confirmation_token=None, **kwargs):
     captured["action"] = action
     captured["payload"] = payload
     captured["read_timeout_ms"] = read_timeout_ms
     captured["confirmation_token"] = confirmation_token
-    result = {"dataUrl": "data:image/png;base64,iVBORw0KGgo="} if action == "screenshot" else {}
+    captured["extra_kwargs"] = kwargs
+    if action == "ping":
+        result = "pong"
+    elif action == "screenshot":
+        result = {"dataUrl": "data:image/png;base64,iVBORw0KGgo="}
+    else:
+        result = {}
     # Mimic a successful response so send_command returns exit code 0.
     return 0, {"success": True, "result": result}, ""
 
@@ -201,6 +216,11 @@ try:
 finally:
     test_client.subprocess.run = _saved_subprocess_run
 
+ready = test_client.bridge_readiness(100, 50)
+check("readiness ready", ready.get("ready"), True)
+check("readiness backend", ready.get("backend"), "reachable")
+check("readiness extension", ready.get("extension"), "connected")
+
 result = dispatch(["sessionStatus", "a.com", "b.com"])
 check("sessionStatus action", result.get("action"), "sessionStatus")
 check("sessionStatus payload", result.get("payload"), {"domains": ["a.com", "b.com"]})
@@ -219,6 +239,25 @@ check("default navigate payload", result.get("payload"), {"url": "https://exampl
 
 result = dispatch(["navigate", "https://example.com", "--foreground"])
 check("foreground navigate payload", result.get("payload"), {"url": "https://example.com", "active": True})
+result = dispatch([
+    "navigateAndSnapshot", "https://example.com",
+    "--session", "session-1", "--wait", "selector", "--selector", "#ready",
+    "--timeout", "2000", "--role", "button,link", "--diff",
+])
+check("navigate-and-snapshot action", result.get("action"), "navigateAndSnapshot")
+check("navigate-and-snapshot payload", result.get("payload"), {
+    "url": "https://example.com",
+    "waitMode": "selector",
+    "compact": True,
+    "limit": 50,
+    "sessionId": "session-1",
+    "selector": "#ready",
+    "timeoutMs": 2000,
+    "roles": ["button", "link"],
+    "diff": True,
+})
+check("navigate-and-snapshot read timeout", result.get("read_timeout_ms"), 2000)
+
 
 result = dispatch(["taskSession", "create", "research"])
 check("task session create action", result.get("action"), "createTaskSession")
@@ -245,6 +284,15 @@ check("task session state payload", result.get("payload"), {"sessionId": "sessio
 result = dispatch(["taskSession", "close", "session-1"])
 check("task session close action", result.get("action"), "closeTaskSession")
 check("task session close payload", result.get("payload"), {"sessionId": "session-1"})
+
+result = dispatch(["insertRichText", "1", "#editor", RICH_TEXT_FIXTURE])
+check("insert rich text action", result.get("action"), "insertRichText")
+check("insert rich text payload", result.get("payload"), {
+    "tabId": 1,
+    "selector": "#editor",
+    "nodes": [{"type": "paragraph", "children": [{"type": "text", "text": "Hello"}]}],
+    "clear": True,
+})
 
 result = dispatch(["screenshot", "1", "/tmp/chrome-bridge-shot.png"])
 check("default screenshot payload", result.get("payload"), {"tabId": 1, "format": "png", "quiet": True})

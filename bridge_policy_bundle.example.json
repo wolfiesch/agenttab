@@ -13,10 +13,10 @@
   },
   "clients": {
     "default": {
-      "allowedActions": ["ping", "getTabs", "getCurrentState", "observe", "extractText", "extractStructured", "screenshot", "navigate", "click", "type", "fill", "waitForLoad", "waitForSelector"],
+      "allowedActions": ["ping", "getTabs", "getCurrentState", "observe", "extractText", "extractStructured", "screenshot", "navigate", "navigateAndSnapshot", "click", "type", "fill", "insertRichText", "waitForLoad", "waitForSelector"],
       "allowedOrigins": ["https://github.com"],
       "deniedOrigins": ["file://*", "chrome://*", "chrome-extension://*", "*://localhost", "*://localhost:*", "*://127.0.0.1", "*://127.0.0.1:*", "*://0.0.0.0", "*://0.0.0.0:*", "*://*.local", "*://*.local:*", "*://[[]::1[]]", "*://[[]::1[]]:*"],
-      "requireConfirmation": ["navigate", "click", "type", "fill"],
+      "requireConfirmation": ["navigate", "navigateAndSnapshot", "click", "type", "fill", "insertRichText"],
       "redact": true,
       "audit": true
     }

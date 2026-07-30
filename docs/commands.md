@@ -9,14 +9,18 @@ New checkout? `scripts/quick_install.sh` runs `./setup.sh` and prints the extens
 ### Core
 
 ```bash
+chrome-bridge ready [timeoutMs] [pollIntervalMs]
 chrome-bridge ping
 chrome-bridge navigate <url> [--foreground]
+chrome-bridge navigateAndSnapshot <url> [--session <id>] [--wait load|url|selector] [--selector <selector>] [--url-substring <text>] [--timeout <ms>] [--full] [--diff] [--role <role[,role...]>] [--name <text>] [--limit <count>] [--foreground] [--new-tab]
 chrome-bridge getTabs
 chrome-bridge getCookies <domain>
 chrome-bridge executeScript <tabId> <code>
 chrome-bridge executeScriptCDP <tabId> <code>
 chrome-bridge observe <tabId> [--compact|--full] [--diff] [--role <role[,role...]>] [--name <text>] [--limit <count>]
 ```
+
+`ready` performs one bounded readiness check and reports the local endpoint, native backend, extension state, attempts, elapsed time, and a short failure reason. `navigateAndSnapshot` combines navigation or task-session reuse, a deterministic load/URL/selector wait, and one accessibility snapshot in a single request. URL waits require `--url-substring`. The composite returns a snapshot only when the settled page keeps the requested origin; after a cross-origin redirect it returns cleanup tab/window ids, no page URL, and no snapshot so the caller can issue a separately origin-checked observation.
 
 `observe` prints a compact accessibility view by default (role, accessible name, and value). Use `--role button,link`, `--name Save`, and `--limit 20` to narrow it further. Both compact and full snapshots use Chrome's real accessibility tree, so both attach Chrome's debugger. `--full` also includes node IDs, descriptions, and detailed accessibility properties. Text extraction, HTML capture, and text waits use normal extension page access and do not attach the debugger.
 
@@ -110,7 +114,7 @@ chrome-bridge batch <stepsJson> [tabId] [--continue-on-error]
 
 `batch` runs an array of `{ "action": ..., "payload": {...} }` steps in order over one bridge request. Any action the extension dispatches is a valid step, so the wait actions (`waitForLoad`, `waitForSelector`, `waitForText`, `waitForUrl`) interleave freely with mutating steps - no special casing, they resolve through the same dispatch table as a standalone call.
 
-Per step: `delayMs` sleeps before the step runs; `payload.tabId` defaults to the batch-level `tabId`; and a step-level `timeoutMs` is passed through into the step payload when the payload does not set one itself, which is the convenient form for waits (`{"action": "waitForSelector", "timeoutMs": 15000, "payload": {"selector": "#done"}}`). A step with no `action` records `null` and is skipped.
+Per step: `delayMs` sleeps before the step runs; `payload.tabId` defaults to the batch-level `tabId`; and a step-level `timeoutMs` is passed through into the step payload when the payload does not set one itself, which is the convenient form for waits (`{"action": "waitForSelector", "timeoutMs": 15000, "payload": {"selector": "#done"}}`). A step with no `action` records `null` and is skipped. Typed MCP batches clamp each `extractText` step to 20,000 characters and reject `observe` with `diff: true`, so a batch cannot consume the snapshot baseline used by a later standalone diff.
 
 A step fails when it throws or returns `success: false`. `stopOnError` defaults to `true`: the first failure aborts the batch and the whole request fails with `batch step <index> (<action>) failed: <message>`. Pass `--continue-on-error` (wire field `stopOnError: false`) to keep going instead; each failed step is recorded in place as `{"success": false, "step": <index>, "action": ..., "err": ...}` and the batch still reports success. `batch` is confirmation-gated in the sample policy, and host-side redaction applies recursively to batch results.
 
@@ -148,11 +152,14 @@ chrome-bridge press <tabId> <keySpec>
 chrome-bridge drag <tabId> <fromSelector> <toSelector>
 chrome-bridge fill <tabId> <selector> <text>
 chrome-bridge select <tabId> <selector> <value>
+chrome-bridge insertRichText <tabId> <selector> <nodesJsonPath> [--append]
 chrome-bridge uploadFile <tabId> <selector> <path...>
 chrome-bridge githubAttachUploadedFiles <tabId> <inputSelector> [formSelector] [timeoutMs]
 chrome-bridge githubSubmitComment <tabId> [formSelector] [timeoutMs]
 chrome-bridge github-attach-pr-body <tabId> <file...> [--timeout <milliseconds>]
 ```
+
+`insertRichText` accepts a JSON array containing text nodes (`{"text":"..."}`) and allowlisted element nodes (`{"tag":"p","children":[...]}`). Supported tags are `p`, `br`, `strong`, `em`, `code`, `pre`, `ul`, `ol`, `li`, `a`, `h1` through `h3`, and `blockquote`; only `a` accepts an additional absolute HTTP(S) or `mailto` `href`. It rejects every other field, unsafe URL, arbitrary HTML, and an excessive tree before focusing or changing the editor. The default replaces the current editor contents; `--append` inserts at the end.
 
 `type` focuses and inserts text. `fill` clears first, then inserts text. `click`, `type`, `hover`, `drag`, `fill`, `select`, `uploadFile`, `scroll`, and `waitForSelector` accept plain CSS plus semantic selector prefixes: `ref=e<N>` (an element ref from `observe`), `css=<selector>`, `text=<visible-text>`, `aria=<accessible-name>`, `label=<form-label>`, and `role=<role>[name=<accessible-name>]`. For example, `chrome-bridge click 123 'ref=e12'`, `chrome-bridge click 123 'aria=Show options'`, or `chrome-bridge click 123 'role=button[name=Save]'` avoids guessing GitHub-specific CSS. A `ref=` target is resolved from the live node recorded by `observe`, not re-matched by text, and a navigation or extension service-worker restart invalidates it: the action then fails with `error: staleRef` rather than silently acting on a different element. Use `<host> >>> <shadow-selector>` to reach into an open shadow root and `frame=<iframe-selector> >> <selector>` to reach into an iframe.
 

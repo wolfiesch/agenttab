@@ -139,6 +139,8 @@ TABS = [
 
 
 def default_result(action, payload):
+    if action == "ping":
+        return "pong"
     if action == "getTabs":
         return TABS
     if action == "navigate":
@@ -171,6 +173,10 @@ def main():
     t.start()
     time.sleep(0.2)
 
+    ready = json.loads(server.browser_ready(timeout_ms=500, poll_interval_ms=50))
+    expect(ready["ready"] is True and ready["extension"] == "connected",
+           "browser_ready should report the live mock extension")
+
     # 1. list_tabs -> getTabs, no payload tabId.
     server.browser_list_tabs()
     expect(last_request()[0] == "getTabs", "list_tabs should call getTabs")
@@ -179,6 +185,34 @@ def main():
     server.browser_navigate("https://x.test")
     action, payload = last_request()
     expect(action == "navigate" and payload == {"url": "https://x.test"}, "navigate payload mismatch")
+    server.browser_navigate_and_snapshot(
+        "https://x.test",
+        session_id="session-1",
+        wait_mode="selector",
+        selector="#ready",
+        timeout_ms=2000,
+        roles=["button"],
+        diff=True,
+    )
+    expect(last_request() == ("navigateAndSnapshot", {
+        "url": "https://x.test",
+        "reuse": True,
+        "active": False,
+        "waitMode": "selector",
+        "timeoutMs": 2000,
+        "compact": True,
+        "limit": 50,
+        "diff": True,
+        "sessionId": "session-1",
+        "selector": "#ready",
+        "roles": ["button"],
+    }), "navigate_and_snapshot payload mismatch")
+    try:
+        server.browser_navigate_and_snapshot("https://x.test", wait_mode="url")
+        expect(False, "navigate_and_snapshot accepted URL wait without url_substring")
+    except ValueError:
+        pass
+
 
     server.browser_task_session_create("research")
     expect(last_request() == ("createTaskSession", {"name": "research"}), "task session create mismatch")
@@ -229,6 +263,19 @@ def main():
     expect(last_request() == ("type", {"tabId": 11, "selector": "#q", "text": "hello"}), "type payload mismatch")
     server.browser_fill("#q", "hi", tab_id=11)
     expect(last_request() == ("fill", {"tabId": 11, "selector": "#q", "text": "hi"}), "fill payload mismatch")
+    rich_nodes = [
+        {"type": "heading", "attrs": {"level": 2}, "children": [
+            {"type": "text", "text": "Title", "marks": ["bold"]},
+        ]},
+        {"type": "paragraph", "children": [
+            {"type": "text", "text": "Body"},
+        ]},
+    ]
+    server.browser_insert_rich_text("#editor", rich_nodes, tab_id=11)
+    expect(last_request() == ("insertRichText", {
+        "tabId": 11, "selector": "#editor", "nodes": rich_nodes, "clear": True,
+    }), "insert_rich_text payload mismatch")
+
 
     # 7. wait_for modes map to the right actions.
     server.browser_wait_for("load", tab_id=11)
@@ -279,9 +326,29 @@ def main():
         "steps": batch_steps,
         "stopOnError": True,
     }), "browser_batch payload mismatch")
+    read_batch_steps = [
+        {"action": "expect", "payload": {"mode": "selector", "selector": "#saved"}},
+        {"action": "observe", "payload": {"compact": True}},
+        {"action": "extractStructured", "payload": {"schema": {"type": "object"}}},
+    ]
+    server.browser_batch(11, read_batch_steps)
+    expect(last_request() == ("batch", {
+        "tabId": 11,
+        "steps": read_batch_steps,
+        "stopOnError": True,
+    }), "browser_batch should accept typed observation steps")
+    server.browser_batch(11, [
+        {"action": "extractText", "payload": {"maxChars": 999999}},
+    ])
+    expect(last_request() == ("batch", {
+        "tabId": 11,
+        "steps": [{"action": "extractText", "payload": {"maxChars": 20000}}],
+        "stopOnError": True,
+    }), "browser_batch should clamp extractText output per step")
     for unsafe_steps, message in [
         ([{"action": "executeScript", "payload": {"code": "1"}}], "sensitive action"),
         ([{"action": "click", "payload": {"tabId": 12, "selector": "#save"}}], "cross-tab action"),
+        ([{"action": "observe", "payload": {"diff": True}}], "snapshot-diff state mutation"),
     ]:
         try:
             server.browser_batch(11, unsafe_steps)
@@ -377,6 +444,11 @@ def main():
     expect("browser_confirm_action" in default_names, "confirm_action must be present by default (mutating, non-sensitive)")
     expect("browser_confirm" in default_names, "token-only confirm must be present by default")
     expect("browser_github_attach_pr_body" in default_names, "GitHub PR-body helper must be present by default")
+    expect("browser_ready" in default_names, "readiness tool must be present by default")
+    expect("browser_navigate_and_snapshot" in default_names,
+           "navigate-and-snapshot tool must be present by default")
+    expect("browser_insert_rich_text" in default_names,
+           "rich-text insertion tool must be present by default")
 
     # 17. allow_sensitive exposes sensitive tools.
     sens_names = _tool_names(server.build_server(allow_sensitive=True))
@@ -391,6 +463,11 @@ def main():
     expect("browser_confirm" not in ro_names, "readonly must hide token-only confirm (mutating)")
     expect("browser_snapshot" in ro_names and "browser_list_tabs" in ro_names, "readonly must keep read-only tools")
     expect("browser_policy_check" in ro_names, "readonly must keep policy_check (read-only)")
+    expect("browser_ready" in ro_names, "readonly must keep readiness")
+    expect("browser_navigate_and_snapshot" not in ro_names,
+           "readonly must hide navigate-and-snapshot")
+    expect("browser_insert_rich_text" not in ro_names,
+           "readonly must hide rich-text insertion")
 
     # 19. Annotations + resources are registered.
     srv = server.build_server(allow_sensitive=True)

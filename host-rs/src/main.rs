@@ -473,7 +473,7 @@ fn lease_gate(client: &str, lease: &LeaseState) -> Option<Value> {
 // denying start keeps a client from opening a fresh collector mid-handoff and
 // reading it out afterwards. The extension additionally discards the target
 // tab's buffered collector data before showing the handoff banner.
-const HANDOFF_BLACKOUT_ACTIONS: [&str; 17] = [
+const HANDOFF_BLACKOUT_ACTIONS: [&str; 18] = [
     "screenshot",
     "extractText",
     "getHTML",
@@ -486,6 +486,7 @@ const HANDOFF_BLACKOUT_ACTIONS: [&str; 17] = [
     "scanPromptInjection",
     "consoleMessages",
     "observe",
+    "navigateAndSnapshot",
     "networkRequests",
     "interceptedRequests",
     "startMonitoring",
@@ -631,7 +632,8 @@ fn sensitive_actions() -> &'static [&'static str] {
 #[allow(dead_code)]
 fn mutating_actions() -> &'static [&'static str] {
     &[
-        "navigate", "click", "clickAt", "type", "fill", "hover", "scroll", "press", "drag",
+        "navigate", "navigateAndSnapshot", "click", "clickAt", "type", "fill",
+        "insertRichText", "hover", "scroll", "press", "drag",
         "select", "uploadFile", "activateTab", "closeTab", "reload", "goBack",
         "goForward", "windowControl", "setViewport", "setGeolocation", "clearGeolocation",
         "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
@@ -775,7 +777,7 @@ fn effective_action_tier(action: &str, payload: Option<&Value>) -> &'static str 
 fn origin_exempt_action(action: &str) -> bool {
     matches!(
         action,
-        "ping" | "getTabs" | "navigate" | "downloadUrl" | "getCookies"
+        "ping" | "getTabs" | "navigate" | "navigateAndSnapshot" | "downloadUrl" | "getCookies"
             | "sessionStatus" | "createTaskSession" | "navigateTaskSession"
             | "getTaskSessions" | "updateTaskSessionState" | "closeTaskSession"
             | "batch" | "lease" | "release" | "leaseStatus"
@@ -783,7 +785,8 @@ fn origin_exempt_action(action: &str) -> bool {
     )
 }
 
-const TARGET_REQUIRED_ACTIONS: [&str; 4] = ["navigate", "navigateTaskSession", "downloadUrl", "getCookies"];
+const TARGET_REQUIRED_ACTIONS: [&str; 5] =
+    ["navigate", "navigateTaskSession", "navigateAndSnapshot", "downloadUrl", "getCookies"];
 
 /// Actions that make the browser issue a NEW outbound request to a host named in
 /// the request payload, so the host can bound the destination before forwarding.
@@ -800,7 +803,8 @@ const TARGET_REQUIRED_ACTIONS: [&str; 4] = ["navigate", "navigateTaskSession", "
 /// extension fulfills from the inline `body` and fetches nothing); and
 /// `deleteCookie` (names a url but removes state and sends nothing).
 /// Mirrors bridge.py::EGRESS_URL_ACTIONS.
-const EGRESS_URL_ACTIONS: [&str; 4] = ["navigate", "navigateTaskSession", "downloadUrl", "setCookie"];
+const EGRESS_URL_ACTIONS: [&str; 5] =
+    ["navigate", "navigateTaskSession", "navigateAndSnapshot", "downloadUrl", "setCookie"];
 
 // --- Data-loss-prevention channels (policy key `dlp`) -----------------------
 // `dlp` is a map of CHANNEL -> MODE:
@@ -1898,7 +1902,7 @@ fn targets_from_payload(action: &str, payload: Option<&Value>) -> Vec<String> {
         _ => return Vec::new(),
     };
     match action {
-        "navigate" | "navigateTaskSession" | "downloadUrl" => payload
+        "navigate" | "navigateTaskSession" | "navigateAndSnapshot" | "downloadUrl" => payload
             .get("url")
             .and_then(|u| u.as_str())
             .map(normalize_url_targets)
@@ -3418,10 +3422,10 @@ fn forward_audit_export(
 // timeout). The artifact is metadata only -- decision, timing, tab ids, and
 // content hashes -- never a payload body, a response body, or a token.
 
-const TRACE_SESSION_ACTIONS: [&str; 3] =
-    ["createTaskSession", "navigateTaskSession", "closeTaskSession"];
+const TRACE_SESSION_ACTIONS: [&str; 4] =
+    ["createTaskSession", "navigateTaskSession", "navigateAndSnapshot", "closeTaskSession"];
 /// Response keys whose array values are an observe snapshot (or its diff).
-const TRACE_SNAPSHOT_KEYS: [&str; 3] = ["nodes", "snapshot", "diff"];
+const TRACE_SNAPSHOT_KEYS: [&str; 4] = ["nodes", "snapshot", "diff", "observe"];
 const TRACE_ID_MAX: usize = 80;
 
 static TRACE_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -4220,6 +4224,9 @@ fn redact_response_patterns(
             | "extractStructured"
             | "scanPromptInjection"
             | "consoleMessages"
+            | "observe"
+            | "getCurrentState"
+            | "navigateAndSnapshot"
     ) {
         let compiled = compile_patterns(patterns);
         if compiled.is_empty() {

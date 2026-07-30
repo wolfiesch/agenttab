@@ -44,10 +44,11 @@ chrome-bridge/
 |---|---|
 | `extension/manifest.json` | Public unkeyed MV3 source manifest. `setup.sh` and `deploy.sh --with-local-key` write a keyed copy into the local extension directory for a deterministic unpacked ID. |
 | `extension/background.js` | Service worker: connects to the native host, runs browser actions, and uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep. |
-| `wake.html`, `wake.js` | Legacy explicit recovery page retained for packaging compatibility. The CLI and broker never open it during routine retries. |
+| `wake.html`, `wake.js` | One-shot extension page used for explicit recovery and background reload. A `?reload=1` request removes its trigger before calling `chrome.runtime.reload()`; the replacement worker reconnects through its normal startup path. Routine retries never open the page. |
 | `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
 | `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
 | `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
+| `scripts/reload_unpacked_extension.sh` | macOS development helper that opens the keyed extension's one-shot reload page with `open -g`, so an already-running Chrome stays in the background and no accessibility or Computer Use interaction is required. It starts Chrome if the browser is closed. |
 | `.github/workflows/ci.yml` | Pull-request and `main` push gates for syntax, offline contracts, Rust parity, benchmarks, and packaging checks. |
 | `.github/workflows/release.yml` | Tag-driven release workflow for `v*` tags after the CI command set passes. |
 | `scripts/package_release.py` | Stdlib release packager for source archives, unpacked extension bundles, and Rust host binaries. |
@@ -286,6 +287,15 @@ tail -f bridge_debug.log
 ```
 
 Run `python3 scripts/diagnose_install.py` for a read-only comparison of repository and deployed files plus broker/backend connection state. It never launches Chrome or opens a tab.
+
+After deploying service-worker changes on macOS, reload the unpacked extension without focusing Chrome:
+
+```bash
+./scripts/reload_unpacked_extension.sh
+chrome-bridge ready 10000 250
+```
+
+The helper opens a background extension tab that requests one reload. Chrome tears down the old extension page, and the replacement worker reconnects through its normal startup path. If Chrome is closed, `open` starts it. Use the `chrome://extensions/` reload button only if this bounded path fails.
 
 - `Connection refused` after retry in direct mode: Chrome is closed, no bridge extension is enabled, or the native connection is down. Routine retries never open Chrome or create a tab. Open Chrome normally, then inspect the extension service worker and `bridge_debug.log`.
 - MCP says `server not connected` while `chrome-bridge ping` works: update to a build containing the packaged-startup path fix, then restart the MCP client once so it launches the corrected server. The MCP package now adds `BRIDGE_REPO_ROOT` before importing repo-local helpers and retries one safe pre-send connection failure automatically; a separate `PYTHONPATH` entry is no longer required.

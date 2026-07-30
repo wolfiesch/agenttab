@@ -313,7 +313,7 @@ HANDOFF_BLACKOUT_ACTIONS = {
     'screenshot', 'extractText', 'getHTML', 'storageState', 'printToPDF',
     'searchTabs', 'getCurrentState', 'screencastFrames',
     'extractStructured', 'scanPromptInjection', 'consoleMessages',
-    'observe', 'networkRequests', 'interceptedRequests',
+    'observe', 'navigateAndSnapshot', 'networkRequests', 'interceptedRequests',
     'startMonitoring', 'startScreencast', 'startInterception',
 }
 HANDOFF_BLACKOUT_ERROR = 'handoff in progress'
@@ -420,7 +420,8 @@ SENSITIVE_ACTIONS = {
     'startInterception', 'downloadUrl', 'screencastFrames',
 }
 MUTATING_ACTIONS = {
-    'navigate', 'click', 'clickAt', 'type', 'fill', 'hover', 'scroll', 'press', 'drag',
+    'navigate', 'navigateAndSnapshot', 'click', 'clickAt', 'type', 'fill',
+    'insertRichText', 'hover', 'scroll', 'press', 'drag',
     'select', 'uploadFile', 'activateTab', 'closeTab', 'reload', 'goBack',
     'goForward', 'windowControl', 'setViewport', 'setGeolocation', 'clearGeolocation',
     'setCpuThrottling', 'setNetworkConditions', 'clearNetworkConditions',
@@ -553,7 +554,7 @@ def effective_action_tier(action, payload=None):
 # origin-checked against the live tab (fail-safe: a new tab action is protected
 # by default rather than silently exempt).
 ORIGIN_EXEMPT_ACTIONS = {
-    'ping', 'getTabs', 'navigate', 'downloadUrl', 'getCookies', 'sessionStatus',
+    'ping', 'getTabs', 'navigate', 'navigateAndSnapshot', 'downloadUrl', 'getCookies', 'sessionStatus',
     'createTaskSession', 'getTaskSessions', 'updateTaskSessionState', 'closeTaskSession',
     'navigateTaskSession', 'batch', 'lease', 'release', 'leaseStatus', 'policyCheck', 'policyInfo',
 }
@@ -563,7 +564,7 @@ ORIGIN_EXEMPT_ACTIONS = {
 # "unknown action" so the reserved surface is not externally reachable.
 RESERVED_ACTIONS = {'__tabOrigin'}
 
-TARGET_REQUIRED_ACTIONS = {'navigate', 'navigateTaskSession', 'downloadUrl', 'getCookies'}
+TARGET_REQUIRED_ACTIONS = {'navigate', 'navigateTaskSession', 'navigateAndSnapshot', 'downloadUrl', 'getCookies'}
 
 # Actions that make the browser issue a NEW outbound request to a host named in
 # the request payload, so the host can bound the destination before forwarding.
@@ -584,7 +585,7 @@ TARGET_REQUIRED_ACTIONS = {'navigate', 'navigateTaskSession', 'downloadUrl', 'ge
 #   - ``startInterception`` in ``fulfill`` mode: the extension fulfills from the
 #     inline ``body``, so it fetches nothing and creates no new egress.
 #   - ``deleteCookie``: names a url but removes state and sends nothing.
-EGRESS_URL_ACTIONS = {'navigate', 'navigateTaskSession', 'downloadUrl', 'setCookie'}
+EGRESS_URL_ACTIONS = {'navigate', 'navigateTaskSession', 'navigateAndSnapshot', 'downloadUrl', 'setCookie'}
 
 # --- Data-loss-prevention channels (policy key ``dlp``) ---------------------
 # ``dlp`` is a map of CHANNEL -> MODE:
@@ -1337,7 +1338,7 @@ def targets_from_payload(action, payload):
     # Ordered list of normalized policy targets derived from a request payload.
     if not isinstance(payload, dict):
         return []
-    if action in ('navigate', 'navigateTaskSession', 'downloadUrl'):
+    if action in ('navigate', 'navigateTaskSession', 'navigateAndSnapshot', 'downloadUrl'):
         url = payload.get('url')
         return normalize_url_targets(url) if isinstance(url, str) else []
     if action == 'getCookies':
@@ -2575,7 +2576,7 @@ def forward_audit_export(event, config):
 # change" without ever storing what was read, typed, or returned. No payload
 # body, no response body, no tokens.
 
-TRACE_SESSION_ACTIONS = {'createTaskSession', 'navigateTaskSession', 'closeTaskSession'}
+TRACE_SESSION_ACTIONS = {'createTaskSession', 'navigateTaskSession', 'navigateAndSnapshot', 'closeTaskSession'}
 
 # Trace file names are derived from caller-supplied ids, so everything outside
 # this set collapses to "_" and the name is capped: a traceId can never escape
@@ -2587,7 +2588,7 @@ _TRACE_ID_MAX = 80
 # Response keys whose array values are an observe snapshot (or its diff). Their
 # hash lets a reader tell "the page changed" from "the page is unchanged"
 # without the snapshot itself ever being written.
-_TRACE_SNAPSHOT_KEYS = ('nodes', 'snapshot', 'diff')
+_TRACE_SNAPSHOT_KEYS = ('nodes', 'snapshot', 'diff', 'observe')
 
 _trace_write_lock = threading.Lock()
 
@@ -3147,6 +3148,7 @@ def _redact_response_patterns(action, response, redact_enabled, patterns=None, p
     if action in (
         'getHTML', 'extractText', 'executeScript', 'executeScriptCDP',
         'searchTabs', 'extractStructured', 'scanPromptInjection', 'consoleMessages',
+        'observe', 'getCurrentState', 'navigateAndSnapshot',
     ):
         compiled = _compile_patterns(patterns)
         if not compiled:

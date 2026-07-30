@@ -18,7 +18,12 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent, ToolAnnotations
 
 from .identity import LeaseManager, provision_identity
-from .transport import BridgeError, call as _bridge_call, resolve_tab_id as _bridge_resolve_tab_id
+from .transport import (
+    BridgeError,
+    call as _bridge_call,
+    readiness as _bridge_readiness,
+    resolve_tab_id as _bridge_resolve_tab_id,
+)
 
 _PNG_PREFIX = "data:image/png;base64,"
 
@@ -125,6 +130,21 @@ def _expand_existing_files(paths):
     return expanded
 
 
+def browser_ready(timeout_ms: int = 5000, poll_interval_ms: int = 250) -> str:
+    """Wait once for the bridge endpoint, native backend, and extension.
+
+    Returns one bounded status object instead of requiring repeated ``ping``,
+    tab-list, and policy probes. A timeout after a request is sent is never
+    retried because delivery is ambiguous.
+    """
+    return _text(_bridge_readiness(
+        timeout_ms,
+        poll_interval_ms,
+        token=_http_request_token(),
+        traceparent=_request_traceparent(),
+    ))
+
+
 def browser_list_tabs() -> str:
     """List all open browser tabs (id, url, title, active, status)."""
     return _text(call("getTabs"))
@@ -133,6 +153,57 @@ def browser_list_tabs() -> str:
 def browser_navigate(url: str) -> str:
     """Open a URL in a new tab and return the new tab id."""
     return _text(call("navigate", {"url": url}))
+
+
+def browser_navigate_and_snapshot(
+    url: str,
+    session_id: Optional[str] = None,
+    reuse: bool = True,
+    foreground: bool = False,
+    wait_mode: str = "load",
+    selector: Optional[str] = None,
+    url_substring: Optional[str] = None,
+    timeout_ms: int = 10000,
+    compact: bool = True,
+    roles: Optional[list] = None,
+    name: Optional[str] = None,
+    limit: int = 50,
+    diff: bool = False,
+) -> str:
+    """Navigate, wait deterministically, and return one accessibility snapshot.
+
+    Post-navigation failures include tab and window ids in the error message so
+    callers can close a newly-created tab.
+    """
+    if wait_mode not in {"load", "url", "selector"}:
+        raise ValueError("wait_mode must be load, url, or selector")
+    if wait_mode == "selector" and not selector:
+        raise ValueError("selector is required when wait_mode is selector")
+    if wait_mode == "url" and not url_substring:
+        raise ValueError("url_substring is required when wait_mode is url")
+    payload = {
+        "url": url,
+        "reuse": reuse,
+        "active": foreground,
+        "waitMode": wait_mode,
+        "timeoutMs": timeout_ms,
+        "compact": compact,
+        "limit": limit,
+        "diff": diff,
+    }
+    if session_id:
+        payload["sessionId"] = session_id
+    if selector:
+        payload["selector"] = selector
+    if url_substring:
+        payload["urlSubstring"] = url_substring
+    if roles:
+        payload["roles"] = roles
+    if name:
+        payload["name"] = name
+    return _text(call("navigateAndSnapshot", payload))
+
+
 
 
 def browser_task_session_create(name: str) -> str:
@@ -582,6 +653,32 @@ def browser_tab_control(op: str, tab_id: Optional[int] = None) -> str:
     return _text(call(action, {"tabId": tid}))
 
 
+def browser_insert_rich_text(
+    selector: str,
+    nodes: list,
+    tab_id: Optional[int] = None,
+    clear: bool = True,
+) -> str:
+    """Insert a constrained rich-text node tree without arbitrary JavaScript.
+
+    A text node is ``{"text": "..."}``. Element nodes use ``tag`` and optional
+    ``children``; supported tags are ``p``, ``br``, ``strong``, ``em``, ``code``,
+    ``pre``, ``ul``, ``ol``, ``li``, ``a``, ``h1`` through ``h3``, and
+    ``blockquote``. Only ``a`` accepts an additional ``href`` field, restricted
+    to absolute HTTP(S) or ``mailto`` URLs. Every other field is rejected.
+    """
+    if not isinstance(selector, str) or not selector:
+        raise ValueError("selector must be a non-empty string")
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("nodes must be a non-empty list")
+    return _text(call("insertRichText", {
+        "tabId": resolve_tab_id(tab_id),
+        "selector": selector,
+        "nodes": nodes,
+        "clear": bool(clear),
+    }))
+
+
 _BATCH_PRIMITIVES = {
     "waitForLoad",
     "waitForSelector",
@@ -590,12 +687,20 @@ _BATCH_PRIMITIVES = {
     "click",
     "type",
     "fill",
+    "insertRichText",
     "select",
     "scroll",
     "press",
     "hover",
     "drag",
+    "expect",
+    "observe",
+    "extractStructured",
+    "extractText",
+    "getCurrentState",
 }
+
+_BATCH_EXTRACT_TEXT_MAX_CHARS = 20000
 
 
 def browser_batch(
@@ -632,6 +737,13 @@ def browser_batch(
         if not isinstance(payload, dict):
             raise ValueError(f"steps[{index}].payload must be an object")
         payload = dict(payload)
+        if step["action"] == "observe" and payload.get("diff") is True:
+            raise ValueError(f"steps[{index}].payload.diff cannot be true inside a batch")
+        if step["action"] == "extractText":
+            max_chars = payload.get("maxChars", _BATCH_EXTRACT_TEXT_MAX_CHARS)
+            if isinstance(max_chars, bool) or not isinstance(max_chars, int):
+                raise ValueError(f"steps[{index}].payload.maxChars must be an integer")
+            payload["maxChars"] = max(1, min(_BATCH_EXTRACT_TEXT_MAX_CHARS, max_chars))
         nested_tab_id = payload.pop("tabId", tab_id)
         if nested_tab_id != tab_id:
             raise ValueError(f"steps[{index}] cannot target a different tab")
@@ -1357,6 +1469,7 @@ def browser_replay_workflow(
 
 # (func, mutating, sensitive) for every tool in the surface.
 _TOOLS = [
+    (browser_ready, False, False),
     (browser_list_tabs, False, False),
     (browser_task_session_list, False, False),
     (browser_snapshot, False, False),
@@ -1384,6 +1497,7 @@ _TOOLS = [
     (browser_search_history, False, True),
     (browser_search_bookmarks, False, True),
     (browser_navigate, True, False),
+    (browser_navigate_and_snapshot, True, False),
     (browser_task_session_create, True, False),
     (browser_task_session_navigate, True, False),
     (browser_task_session_state, True, False),
@@ -1392,6 +1506,7 @@ _TOOLS = [
     (browser_click_at, True, False),
     (browser_type, True, False),
     (browser_fill, True, False),
+    (browser_insert_rich_text, True, False),
     (browser_hover, True, False),
     (browser_scroll, True, False),
     (browser_press, True, False),

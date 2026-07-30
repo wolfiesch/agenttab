@@ -36,6 +36,8 @@ DOWNLOAD_NAME = "chrome-bridge-smoke-download.json"
 STRUCTURED_SCHEMA_PATH = "/tmp/chrome-bridge-structured-schema.json"
 STRUCTURED_DATA_PATH = "/tmp/chrome-bridge-structured.json"
 WORKFLOW_PATH = "/tmp/chrome-bridge-workflow.json"
+RICH_TEXT_PATH = "/tmp/chrome-bridge-rich-text.json"
+INVALID_RICH_TEXT_PATH = "/tmp/chrome-bridge-rich-text-invalid.json"
 # T4-4 fixtures: a schema the fixture page satisfies, an authored workflow whose
 # postcondition needs one bounded retry, one whose postcondition can never hold,
 # and a version-1 file that must keep replaying under the version-2 reader.
@@ -111,6 +113,10 @@ PAGE = b"""<!doctype html>
     <input id="secret" name="secret" type="password" value="">
   </form>
   <div id="status">ready</div>
+  <div id="editor" contenteditable="true" aria-label="Rich editor"></div>
+  <div id="editor-fallback" contenteditable="true" aria-label="Basic rich editor"></div>
+  <div id="editor-cancelled" contenteditable="true" aria-label="Cancelled rich editor"></div>
+  <div id="editor-async-handled" contenteditable="true" aria-label="Async handled rich editor"></div>
   <div id="from" draggable="true">from</div>
   <div id="to">to</div>
   <div id="panel"><div id="spacer">scroll panel</div></div>
@@ -130,6 +136,16 @@ PAGE = b"""<!doctype html>
     shadowRoot.innerHTML = '<button id="shadow-btn">Shadow click</button><label>Shadow input<input id="shadow-input"></label><select id="shadow-kind"><option value="alpha">Alpha</option><option value="beta">Beta</option></select>';
     shadowRoot.querySelector('#shadow-btn').addEventListener('click', () => { window.__shadowClicks += 1; });
     window.addEventListener('message', event => { if (event.data && event.data.type === 'frame-value') window.__frameValue = event.data.value; if (event.data && event.data.type === 'frame-click') window.__frameClicks += 1; if (event.data && event.data.type === 'frame-select') window.__frameSelect = event.data.value; if (event.data && event.data.type === 'frame-file') window.__frameFileCount = event.data.count; });
+    document.querySelector('#editor').addEventListener('paste', event => {
+      event.preventDefault();
+      event.currentTarget.innerHTML = event.clipboardData.getData('text/html');
+      window.__richPasteHandled = true;
+    });
+    document.querySelector('#editor-cancelled').addEventListener('paste', event => event.preventDefault());
+    document.querySelector('#editor-async-handled').addEventListener('paste', event => {
+      event.preventDefault();
+      setTimeout(() => { document.querySelector('#editor-async-handled').innerHTML = '<p>asynchronous editor insertion</p>'; }, 40);
+    });
     document.querySelector('#btn').addEventListener('click', () => {
       document.querySelector('#status').textContent = 'clicked:' + document.querySelector('#q').value;
     });
@@ -222,6 +238,11 @@ EARLY_MAPPED_SCRIPT = (
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/cross-origin-redirect"):
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{self.server.server_address[1]}/")
+            self.end_headers()
+            return
         if self.path.startswith("/data.json"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -379,7 +400,8 @@ def main(quiet=False):
     # A stale selector cache would let the self-heal check pass on a mapping
     # this run never created.
     for path in [SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, WORKFLOW_PATH, ACTION_CACHE_PATH, WORKFLOW_STASH_PATH,
-                 EXPECT_SCHEMA_PATH, EXPECT_WORKFLOW_PATH, EXPECT_FAIL_WORKFLOW_PATH, LEGACY_WORKFLOW_PATH]:
+                 EXPECT_SCHEMA_PATH, EXPECT_WORKFLOW_PATH, EXPECT_FAIL_WORKFLOW_PATH, LEGACY_WORKFLOW_PATH,
+                 RICH_TEXT_PATH, INVALID_RICH_TEXT_PATH]:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
     # A stale frame directory would make the frame-count assertions meaningless.
@@ -391,6 +413,7 @@ def main(quiet=False):
     policy_installed = False
     server = None
     tab_id = None
+    composite_tab_id = None
     monitoring_started = False
     interception_started = False
     screencast_started = False
@@ -407,9 +430,10 @@ def main(quiet=False):
         policy = {
             "default": {
                 "allowedActions": [
-                    "ping", "navigate", "waitForLoad", "waitForSelector", "expect", "click", "fill",
-                    "select", "uploadFile", "screenshot", "extractText", "extractStructured",
-                    "scanPromptInjection", "getHTML", "type", "drag",
+                    "ping", "navigate", "navigateAndSnapshot", "waitForLoad", "waitForSelector",
+                    "expect", "click", "fill", "insertRichText", "select", "uploadFile",
+                    "screenshot", "observe", "extractText", "extractStructured", "scanPromptInjection",
+                    "getHTML", "type", "drag",
                     "scroll", "press", "hover", "startMonitoring", "consoleMessages",
                     "setViewport", "setUserAgent", "setNetworkConditions", "clearNetworkConditions",
                     "setCpuThrottling", "setColorScheme", "networkRequests", "executeScriptCDP",
@@ -462,6 +486,75 @@ def main(quiet=False):
         call = run_bridge("waitForLoad", tab_id, 20000)
         record(summary, "waitForLoad", call)
         require(call["exit"] == 0, "waitForLoad failed", call)
+        call = run_bridge(
+            "navigateAndSnapshot", BASE_URL,
+            "--wait", "selector", "--selector", "#q", "--timeout", "20000",
+            "--role", "heading", "--limit", "10",
+        )
+        composite = result(call) or {}
+        composite_tab_id = composite.get("tabId")
+        composite_nodes = composite.get("snapshot", [])
+        record(summary, "navigateAndSnapshot", call, {
+            "tabId": composite_tab_id,
+            "nodes": len(composite_nodes) if isinstance(composite_nodes, list) else None,
+        })
+        require(
+            call["exit"] == 0
+            and composite_tab_id is not None
+            and isinstance(composite_nodes, list)
+            and any(node.get("name") == "Chrome Bridge Live Test"
+                    for node in composite_nodes if isinstance(node, dict)),
+            "navigateAndSnapshot did not return the loaded fixture snapshot",
+            call,
+        )
+        run_bridge("closeTab", composite_tab_id)
+        composite_tab_id = None
+        call = run_bridge(
+            "navigateAndSnapshot", BASE_URL + "cross-origin-redirect",
+            "--wait", "load", "--timeout", "5000",
+        )
+        redirected = result(call) or {}
+        redirected_tab_id = redirected.get("tabId")
+        redirected_error = redirected.get("err") or ""
+        record(summary, "navigateAndSnapshotRejectsCrossOriginRedirect", call, {
+            "tabId": redirected_tab_id,
+            "snapshotReturned": "snapshot" in redirected,
+            "urlReturned": redirected.get("url") is not None,
+        })
+        require(
+            call["exit"] != 0
+            and redirected_tab_id is not None
+            and "cross-origin redirect" in redirected_error
+            and "snapshot" not in redirected
+            and redirected.get("url") is None
+            and f"tabId {redirected_tab_id}" in redirected_error,
+            "navigateAndSnapshot exposed a cross-origin redirect snapshot",
+            call,
+        )
+        run_bridge("closeTab", redirected_tab_id)
+
+        call = run_bridge(
+            "navigateAndSnapshot", BASE_URL,
+            "--wait", "selector", "--selector", "#definitely-absent", "--timeout", "250",
+        )
+        wait_failure = result(call) or {}
+        failed_tab_id = wait_failure.get("tabId")
+        wait_failure_error = wait_failure.get("err") or ""
+        record(summary, "navigateAndSnapshotWaitFailureContext", call, {
+            "tabId": failed_tab_id,
+            "windowId": wait_failure.get("windowId"),
+            "hasError": bool(wait_failure_error),
+        })
+        require(
+            call["exit"] != 0
+            and failed_tab_id is not None
+            and wait_failure.get("windowId") is not None
+            and f"tabId {failed_tab_id}" in wait_failure_error,
+            "navigateAndSnapshot wait failure omitted cleanup context",
+            call,
+        )
+        run_bridge("closeTab", failed_tab_id)
+
 
         # 4. Wait For Selector
         call = run_bridge("waitForSelector", tab_id, "#q", 20000)
@@ -471,6 +564,57 @@ def main(quiet=False):
         call = run_bridge("fill", tab_id, "#q", "hello")
         record(summary, "fill", call)
         require(call["exit"] == 0, "fill failed")
+        Path(RICH_TEXT_PATH).write_text(json.dumps([
+            {"tag": "h2", "children": [
+                {"tag": "strong", "children": [{"text": "Rich title"}]},
+            ]},
+            {"tag": "p", "children": [
+                {"text": "Rich bridge body"},
+            ]},
+        ]), encoding="utf-8")
+        call = run_bridge("insertRichText", tab_id, "#editor", RICH_TEXT_PATH)
+        record(summary, "insertRichText", call, {"method": (result(call) or {}).get("method")})
+        require(call["exit"] == 0 and (result(call) or {}).get("method") == "paste",
+                "insertRichText did not use the editor paste path", call)
+        call = run_bridge("expect", tab_id, "text", "Rich bridge body", "--timeout", "2000")
+        require(call["exit"] == 0 and (result(call) or {}).get("passed") is True,
+                "insertRichText did not produce observable editor content", call)
+        call = run_bridge("insertRichText", tab_id, "#editor-fallback", RICH_TEXT_PATH)
+        record(summary, "insertRichTextFallback", call, {"method": (result(call) or {}).get("method")})
+        require(call["exit"] == 0 and (result(call) or {}).get("method") == "dom",
+                "insertRichText did not use the basic contenteditable fallback", call)
+        call = run_bridge("expect", tab_id, "selector", "#editor-fallback h2", "--timeout", "2000")
+        require(call["exit"] == 0 and (result(call) or {}).get("passed") is True,
+                "insertRichText fallback did not produce observable rich content", call)
+        call = run_bridge("insertRichText", tab_id, "#editor-cancelled", RICH_TEXT_PATH)
+        record(summary, "insertRichTextRespectsCancellation", call)
+        require(call["exit"] != 0 and "cancelled" in ((result(call) or {}).get("err") or ""),
+                "insertRichText bypassed a cancelled paste event", call)
+        call = run_bridge("insertRichText", tab_id, "#editor-async-handled", RICH_TEXT_PATH)
+        record(summary, "insertRichTextAsyncHandled", call, {
+            "method": (result(call) or {}).get("method"),
+        })
+        require(call["exit"] == 0 and (result(call) or {}).get("method") == "paste",
+                "insertRichTextAsyncHandled did not wait for the editor-owned insertion", call)
+        call = run_bridge(
+            "batch",
+            json.dumps([{"action": "observe", "payload": {"diff": True}}]),
+            tab_id,
+            timeout=10,
+        )
+        record(summary, "batchRejectsSnapshotDiff", call)
+        require(call["exit"] != 0 and "diff=true" in (
+                    (result(call) or {}).get("err") or (result(call) or {}).get("error") or ""),
+                "batch accepted a state-mutating observe diff step", call)
+
+        Path(INVALID_RICH_TEXT_PATH).write_text(json.dumps([
+            {"tag": "a", "href": "javascript:alert(1)", "children": [
+                {"text": "unsafe"},
+            ]},
+        ]), encoding="utf-8")
+        call = run_bridge("insertRichText", tab_id, "#editor", INVALID_RICH_TEXT_PATH)
+        record(summary, "insertRichTextRejectsUnsafeUrl", call)
+        require(call["exit"] != 0, "insertRichText accepted an unsafe URL", call)
 
         # 6. Select
         call = run_bridge("select", tab_id, "#kind", "beta")
@@ -508,6 +652,31 @@ def main(quiet=False):
         status = (result(call) or {}).get("val")
         record(summary, "executeScriptCDP_verify_click", call, {"status": status})
         require(call["exit"] == 0 and status == "clicked:hello", "click did not update status")
+        # 6. Typed batch: waits interleaved with mutations and observations
+        batch_steps = json.dumps([
+            {"action": "fill", "payload": {"selector": "#q", "text": "batched"}},
+            {"action": "waitForSelector", "timeoutMs": 5000, "payload": {"selector": "#btn"}},
+            {"action": "click", "payload": {"selector": "#btn"}},
+            {"action": "waitForText", "timeoutMs": 5000, "payload": {"text": "clicked:batched"}},
+            {"action": "expect", "payload": {"mode": "text", "text": "clicked:batched", "timeoutMs": 5000}},
+            {"action": "observe", "payload": {"compact": True, "roles": ["button"], "limit": 5}},
+        ])
+        call = run_bridge("batch", batch_steps, tab_id, timeout=40)
+        batch_out = result(call)
+        record(summary, "batchWithObservations", call, {
+            "stepCount": len(batch_out) if isinstance(batch_out, list) else None,
+            "expectPassed": batch_out[4].get("passed") if isinstance(batch_out, list) and len(batch_out) > 4 else None,
+            "observed": len(batch_out[5]) if isinstance(batch_out, list) and len(batch_out) > 5 and isinstance(batch_out[5], list) else None,
+        })
+        require(
+            call["exit"] == 0
+            and isinstance(batch_out, list)
+            and len(batch_out) == 6
+            and batch_out[4].get("passed") is True
+            and isinstance(batch_out[5], list),
+            "batch with interleaved actions, waits, expectation, and observation failed",
+            call
+        )
 
         # 12. Drag
         call = run_bridge("drag", tab_id, "#from", "#to")
@@ -1034,21 +1203,6 @@ def main(quiet=False):
         record(summary, "windowControlClose", call, {"closed": (result(call) or {}).get("closed")})
         require(call["exit"] == 0 and (result(call) or {}).get("closed") is True, "windowControl close failed", call)
 
-        # 35. Batch: waits interleaved with mutations, then continue-on-error
-        batch_steps = json.dumps([
-            {"action": "fill", "payload": {"selector": "#q", "text": "batched"}},
-            {"action": "waitForSelector", "timeoutMs": 5000, "payload": {"selector": "#btn"}},
-            {"action": "click", "payload": {"selector": "#btn"}},
-            {"action": "waitForText", "timeoutMs": 5000, "payload": {"text": "clicked:batched"}}
-        ])
-        call = run_bridge("batch", batch_steps, tab_id, timeout=40)
-        batch_out = result(call)
-        record(summary, "batchWithWaits", call, {"stepCount": len(batch_out) if isinstance(batch_out, list) else None})
-        require(
-            call["exit"] == 0 and isinstance(batch_out, list) and len(batch_out) == 4,
-            "batch with interleaved waits failed",
-            call
-        )
 
         failing_steps = json.dumps([
             {"action": "waitForSelector", "timeoutMs": 1000, "payload": {"selector": "#definitely-absent"}},
@@ -1742,6 +1896,9 @@ def main(quiet=False):
             with contextlib.suppress(Exception):
                 run_bridge("closeTab", tab_id)
 
+        if composite_tab_id is not None:
+            with contextlib.suppress(Exception):
+                run_bridge("closeTab", composite_tab_id)
         if policy_installed and policy_path is not None:
             restore_policy(policy_backup, policy_path, backup_mode)
         if server is not None:
@@ -1752,7 +1909,8 @@ def main(quiet=False):
 
         for path in [UPLOAD_FIXTURE, DLP_FIXTURE, SHOT_PATH, PDF_PATH, HTML_PATH, STATE_PATH, STRUCTURED_SCHEMA_PATH,
                      STRUCTURED_DATA_PATH, WORKFLOW_PATH, ACTION_CACHE_PATH, WORKFLOW_STASH_PATH,
-                     EXPECT_SCHEMA_PATH, EXPECT_WORKFLOW_PATH, EXPECT_FAIL_WORKFLOW_PATH, LEGACY_WORKFLOW_PATH]:
+                     EXPECT_SCHEMA_PATH, EXPECT_WORKFLOW_PATH, EXPECT_FAIL_WORKFLOW_PATH, LEGACY_WORKFLOW_PATH,
+                     RICH_TEXT_PATH, INVALID_RICH_TEXT_PATH]:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
 

@@ -147,7 +147,9 @@ def response_timeout_seconds(read_timeout_ms=None):
     return timeout
 
 
-def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_token=None, dry_run=False):
+def send_command_data(
+        action, payload=None, read_timeout_ms=None, confirmation_token=None,
+        dry_run=False, connect_timeout_seconds=None, response_timeout_seconds_override=None):
     if payload is None:
         payload = {}
 
@@ -165,8 +167,16 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         return 2, None, "Error: could not read bridge token. Is bridge_token.txt present?"
 
     port = int(os.environ.get('BRIDGE_PORT', 9223))
-    retry_seconds = float(os.environ.get('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45))
-    response_timeout = response_timeout_seconds(read_timeout_ms)
+    retry_seconds = (
+        env_float('BRIDGE_CONNECT_TIMEOUT_SECONDS', 45.0)
+        if connect_timeout_seconds is None
+        else max(0.0, float(connect_timeout_seconds))
+    )
+    response_timeout = (
+        response_timeout_seconds(read_timeout_ms)
+        if response_timeout_seconds_override is None
+        else max(0.1, float(response_timeout_seconds_override))
+    )
     deadline = time.monotonic() + retry_seconds
     sock = None
 
@@ -174,7 +184,7 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
         while True:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(15)
+                sock.settimeout(min(15.0, max(0.1, response_timeout)))
                 sock.connect(('127.0.0.1', port))
                 # Use a post-connect deadline with headroom over both the broker's
                 # backend wait and any extension-side action deadline.
@@ -187,7 +197,7 @@ def send_command_data(action, payload=None, read_timeout_ms=None, confirmation_t
                     pass
                 if time.monotonic() >= deadline:
                     raise
-                time.sleep(0.5)
+                time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
         cmd = {
             "action": action,
@@ -2260,6 +2270,158 @@ def cmd_doctor():
     return subprocess.run([sys.executable, script], check=False).returncode
 
 
+def bridge_readiness(timeout_ms=5000, poll_interval_ms=250):
+    timeout_ms = max(0, min(30000, int(timeout_ms)))
+    poll_interval_ms = max(50, min(1000, int(poll_interval_ms)))
+    started = time.monotonic()
+    deadline = started + timeout_ms / 1000.0
+    attempts = 0
+    endpoint_status = "refused"
+    extension_status = "unavailable"
+    reason = "browser unavailable"
+    ready = False
+
+    while True:
+        attempts += 1
+        remaining = max(0.1, deadline - time.monotonic())
+        exit_code, response, stderr = send_command_data(
+            "ping",
+            connect_timeout_seconds=min(0.25, remaining),
+            response_timeout_seconds_override=remaining,
+        )
+        if response is not None:
+            endpoint_status = "reachable"
+            if response.get("success") is True and response.get("result") == "pong":
+                extension_status = "connected"
+                reason = None
+                ready = True
+                break
+            reason = response.get("error") or stderr or "bridge reported failure"
+            if response.get("error") == "unauthorized":
+                break
+            if response.get("status") == "browser_unavailable":
+                extension_status = "unavailable"
+            else:
+                extension_status = "stalled"
+                break
+        elif exit_code == 124:
+            endpoint_status = "reachable"
+            extension_status = "stalled"
+            reason = stderr or "bridge response timed out"
+            break
+        else:
+            endpoint_status = "refused"
+            extension_status = "unavailable"
+            reason = stderr or "browser unavailable"
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(poll_interval_ms / 1000.0, max(0.0, deadline - time.monotonic())))
+
+    if ready:
+        backend = "reachable"
+    elif endpoint_status == "reachable" and extension_status == "unavailable":
+        backend = "unavailable"
+    else:
+        backend = "unknown"
+    return {
+        "ready": ready,
+        "endpoint": f"127.0.0.1:{int(os.environ.get('BRIDGE_PORT', 9223))}",
+        "endpointStatus": endpoint_status,
+        "backend": backend,
+        "extension": extension_status,
+        "attempts": attempts,
+        "elapsedMs": round((time.monotonic() - started) * 1000),
+        "reason": reason,
+    }
+
+
+def cmd_ready(args):
+    timeout_ms = parse_int(args[2], "timeoutMs") if len(args) > 2 else 5000
+    poll_interval_ms = parse_int(args[3], "pollIntervalMs") if len(args) > 3 else 250
+    result = bridge_readiness(timeout_ms, poll_interval_ms)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ready"] else 1
+
+
+def cmd_navigate_and_snapshot(args):
+    require_args(args, 3, "Usage: chrome-bridge navigateAndSnapshot <url> [options]")
+    payload = {"url": args[2], "waitMode": "load", "compact": True, "limit": 50}
+    rest = args[3:]
+    index = 0
+    while index < len(rest):
+        flag = rest[index]
+        if flag in {"--foreground", "--new", "--full", "--diff"}:
+            if flag == "--foreground":
+                payload["active"] = True
+            elif flag == "--new":
+                payload["reuse"] = False
+            elif flag == "--full":
+                payload["compact"] = False
+            else:
+                payload["diff"] = True
+            index += 1
+            continue
+        if flag not in {
+                "--session", "--wait", "--selector", "--url-substring",
+                "--timeout", "--limit", "--role", "--name"}:
+            print(f"Unknown navigateAndSnapshot option: {flag}", file=sys.stderr)
+            return 2
+        if index + 1 >= len(rest):
+            print(f"Missing value for {flag}", file=sys.stderr)
+            return 2
+        value = rest[index + 1]
+        if flag == "--session":
+            payload["sessionId"] = value
+        elif flag == "--wait":
+            if value not in {"load", "url", "selector"}:
+                print("--wait must be load, url, or selector", file=sys.stderr)
+                return 2
+            payload["waitMode"] = value
+        elif flag == "--selector":
+            payload["selector"] = value
+        elif flag == "--url-substring":
+            payload["urlSubstring"] = value
+        elif flag == "--timeout":
+            payload["timeoutMs"] = parse_int(value, "timeoutMs")
+        elif flag == "--limit":
+            payload["limit"] = parse_int(value, "limit")
+        elif flag == "--role":
+            payload["roles"] = [part.strip() for part in value.split(",") if part.strip()]
+        else:
+            payload["name"] = value
+        index += 2
+    if payload["waitMode"] == "selector" and not payload.get("selector"):
+        print("--selector is required with --wait selector", file=sys.stderr)
+        return 2
+    if payload["waitMode"] == "url" and not payload.get("urlSubstring"):
+        print("--url-substring is required with --wait url", file=sys.stderr)
+        return 2
+    return send_command("navigateAndSnapshot", payload, payload.get("timeoutMs"))
+
+
+def cmd_insert_rich_text(args):
+    require_args(
+        args,
+        5,
+        "Usage: chrome-bridge insertRichText <tabId> <selector> <nodesJsonPath> [--append]",
+    )
+    with open(args[4], "r", encoding="utf-8") as handle:
+        nodes = json.load(handle)
+    if not isinstance(nodes, list) or not nodes:
+        print("nodesJsonPath must contain a non-empty JSON array", file=sys.stderr)
+        return 2
+    unknown = [arg for arg in args[5:] if arg != "--append"]
+    if unknown:
+        print(f"Unknown insertRichText option: {unknown[0]}", file=sys.stderr)
+        return 2
+    return send_command("insertRichText", {
+        "tabId": parse_int(args[2], "tabId"),
+        "selector": args[3],
+        "nodes": nodes,
+        "clear": "--append" not in args[5:],
+    })
+
+
 def print_usage():
     print("Usage:")
     print("  chrome-bridge <command> [arguments]")
@@ -2268,12 +2430,15 @@ def print_usage():
     print("")
     print("Common commands:")
     print("  ping                              Check bridge health")
+    print("  ready [timeoutMs] [pollMs]        Wait once for endpoint, backend, and extension readiness")
     print("  doctor                            Diagnose install drift and live bridge state")
     print("  getTabs                           List open tabs")
     print("  navigate <url> [--foreground]     Open a tab in the background by default")
+    print("  navigateAndSnapshot <url> [...]   Navigate, wait, and return one accessibility snapshot")
     print("  observe <tabId> [filters]         Concise accessibility view with ref=eN ids; --full, --diff")
     print("  click <tabId> <selector>          Click by ref, CSS, text, ARIA name, label, or role")
     print("  fill <tabId> <selector> <text>    Clear and fill a form field")
+    print("  insertRichText <tabId> <selector> <nodesJsonPath> [--append]")
     print("  screenshot <tabId> <path>         Save a background-safe screenshot")
     print("  github-attach-pr-body <tabId> <files...>")
     print("                                    Edit a GitHub PR body, attach files, and save")
@@ -2302,6 +2467,20 @@ COMMAND_HELP = {
         "chrome-bridge doctor",
         "Check the registered manifest, durable launcher and runtime, deployed extension, "
         "last successful response, and broker/native-backend connection state without exposing secrets.",
+    ),
+    "ready": (
+        "chrome-bridge ready [timeoutMs] [pollIntervalMs]",
+        "Wait once for the bridge endpoint, native backend, and extension, then print one bounded status object.",
+    ),
+    "navigateAndSnapshot": (
+        "chrome-bridge navigateAndSnapshot <url> [--session <id>] [--wait load|url|selector] "
+        "[--selector <selector>] [--url-substring <text>] [--timeout <ms>] [--foreground] "
+        "[--new] [--full] [--diff] [--limit <count>] [--role <roles>] [--name <text>]",
+        "Navigate or reuse a task-session tab, wait deterministically, and return a compact accessibility snapshot in one request.",
+    ),
+    "insertRichText": (
+        "chrome-bridge insertRichText <tabId> <selector> <nodesJsonPath> [--append]",
+        "Insert a constrained JSON rich-text node tree into a contenteditable editor without arbitrary page script execution.",
     ),
     "observe": (
         "chrome-bridge observe <tabId> [--compact|--full] [--diff] [--role <role[,role...]>] [--name <text>] [--limit <count>]",
@@ -2559,11 +2738,15 @@ def main():
         sys.exit(cmd_doctor())
     if action == "ping":
         sys.exit(send_command("ping"))
+    elif action == "ready":
+        sys.exit(cmd_ready(args))
     elif action == "navigate":
         require_args(args, 3, "Missing URL.")
         foreground = len(args) > 3 and args[3] == "--foreground"
         payload = {"url": args[2], "active": foreground}
         sys.exit(send_command("navigate", payload))
+    elif action == "navigateAndSnapshot":
+        sys.exit(cmd_navigate_and_snapshot(args))
     elif action == "getTabs":
         sys.exit(send_command("getTabs"))
     elif action == "taskSession":
@@ -2746,6 +2929,8 @@ def main():
     elif action == "fill":
         require_args(args, 5, "Usage: python3 test_client.py fill <tabId> <selector> <text>")
         sys.exit(send_command("fill", {"tabId": parse_int(args[2], "tabId"), "selector": args[3], "text": args[4]}))
+    elif action == "insertRichText":
+        sys.exit(cmd_insert_rich_text(args))
     elif action == "select":
         require_args(args, 5, "Usage: python3 test_client.py select <tabId> <selector> <value>")
         sys.exit(send_command("select", {"tabId": parse_int(args[2], "tabId"), "selector": args[3], "value": args[4]}))

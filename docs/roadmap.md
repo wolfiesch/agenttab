@@ -18,6 +18,10 @@ Progress tracker for the 2026-07 competitive audit. Tiers execute in order: quic
 | QW10 | Secret masking dictionary | Policy-referenced local secrets file; exact values masked in every response field, both hosts | done |
 | QW11 | Audit viewer CLI | `chrome-bridge audit tail/summary` over `bridge_audit.jsonl`: per-client/action/decision counts, recent denies | done |
 | QW12 | One-line install bootstrap | `scripts/quick_install.sh` wrapping setup + extension-load + MCP registration instructions | done |
+| QW13 | Navigate-and-snapshot composite | One mutating request creates/reuses a task tab, waits deterministically, and returns a compact accessibility snapshot | done |
+| QW14 | Typed observation batches | `batch` accepts `expect`, `observe`, structured/text extraction, and current-state steps alongside interactions and waits | done |
+| QW15 | Deterministic readiness | CLI/MCP `ready` reports endpoint, backend, and extension state with one bounded wait and no post-send replay | done |
+| QW16 | Constrained rich-text insertion | Allowlisted contenteditable node trees replace confirmation-gated script injection for paragraphs, headings, lists, links, and inline formatting tags | done |
 
 ## Tier 2 - High impact
 
