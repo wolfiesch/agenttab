@@ -754,6 +754,11 @@ async function getTabs() {
     windowId: tab.windowId,
     active: tab.active,
     highlighted: tab.highlighted,
+    pinned: tab.pinned === true,
+    audible: tab.audible === true,
+    discarded: tab.discarded === true,
+    groupId: typeof tab.groupId === "number" ? tab.groupId : -1,
+    lastAccessed: typeof tab.lastAccessed === "number" ? tab.lastAccessed : null,
     title: tab.title,
     url: tab.url,
     status: tab.status
