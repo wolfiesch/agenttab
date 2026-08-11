@@ -1,4 +1,4 @@
-"""FastMCP server exposing the Chrome native-messaging bridge.
+"""MCP 2.0 server exposing the Chrome native-messaging bridge.
 
 P2 contract: every tool is a plain module-level function (directly callable in
 tests and scripts) and the server is assembled on demand by ``build_server``,
@@ -8,13 +8,15 @@ and applies ``readOnly``/``destructive`` annotations. Every tab-scoped tool
 takes an optional ``tab_id``; when omitted the active tab is used.
 """
 import base64
+import contextvars
 import functools
 import glob
 import json
 import os
 from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
+from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.types import ImageContent, TextContent, ToolAnnotations
 
 from .identity import LeaseManager, provision_identity
@@ -26,6 +28,23 @@ from .transport import (
 )
 
 _PNG_PREFIX = "data:image/png;base64,"
+_request_headers = contextvars.ContextVar(
+    "chrome_bridge_mcp_request_headers",
+    default=None,
+)
+
+
+async def _capture_request_headers(
+    ctx: ServerRequestContext[Any, Any],
+    call_next: CallNext,
+) -> HandlerResult:
+    """Make transport headers available to every tool and resource handler."""
+    request = ctx.request
+    token = _request_headers.set(getattr(request, "headers", None))
+    try:
+        return await call_next(ctx)
+    finally:
+        _request_headers.reset(token)
 
 
 def _text(value: Any) -> str:
@@ -40,13 +59,7 @@ def _truthy(v):
 
 def _http_request_headers():
     """Headers of the current HTTP request, or ``None`` under stdio."""
-    try:
-        from mcp.server.lowlevel.server import request_ctx
-
-        request = request_ctx.get().request
-    except (ImportError, LookupError, AttributeError):
-        return None
-    return getattr(request, "headers", None)
+    return _request_headers.get()
 
 
 def _http_request_token():
@@ -1554,7 +1567,7 @@ def _with_lease(func, manager):
     """Wrap ``func`` so it acquires/renews the lease before its bridge action.
 
     ``functools.wraps`` keeps the name, docstring, signature, and annotations
-    intact so FastMCP introspection sees the original function via __wrapped__.
+    intact so MCPServer introspection sees the original function via __wrapped__.
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -1568,7 +1581,7 @@ def _with_lease_sync(func, manager):
     """Wrap a manual lease/release tool so the auto-lease manager's local state
     stays coherent: after the tool talks to the host directly, forget the
     cached lease so the next mutating call reacquires instead of trusting stale
-    state. ``functools.wraps`` preserves FastMCP-introspected metadata.
+    state. ``functools.wraps`` preserves MCPServer-introspected metadata.
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
@@ -1634,8 +1647,8 @@ def _with_lease_handoff(func, manager, timeout_index=5):
     return wrapper
 
 
-def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> FastMCP:
-    """Assemble a ``FastMCP`` server scoped by ``readonly``/``allow_sensitive``.
+def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> MCPServer:
+    """Assemble an ``MCPServer`` scoped by ``readonly``/``allow_sensitive``.
 
     Each flag falls back to its env var (``BRIDGE_MCP_READONLY`` /
     ``BRIDGE_MCP_ALLOW_SENSITIVE``) parsed with ``_truthy``. Mutating tools are
@@ -1648,7 +1661,8 @@ def build_server(readonly=None, allow_sensitive=None, auto_lease=False) -> FastM
     if allow_sensitive is None:
         allow_sensitive = _truthy(os.environ.get("BRIDGE_MCP_ALLOW_SENSITIVE", ""))
 
-    m = FastMCP("chrome-bridge")
+    m = MCPServer("chrome-bridge")
+    m.middleware.append(_capture_request_headers)
 
     for func, mutating, sensitive in _TOOLS:
         if readonly and mutating:
@@ -1718,12 +1732,11 @@ def main() -> None:
         host = os.environ.get("BRIDGE_MCP_HTTP_HOST", "127.0.0.1")
         port = os.environ.get("BRIDGE_MCP_HTTP_PORT", "8723")
         m = build_server(auto_lease=auto_lease)
-        try:
-            m.settings.host = host
-            m.settings.port = int(port)
-        except AttributeError:
-            pass
-        m.run(transport="streamable-http")
+        m.run(
+            transport="streamable-http",
+            host=host,
+            port=int(port),
+        )
     else:
         build_server(auto_lease=auto_lease).run()
 

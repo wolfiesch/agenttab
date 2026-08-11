@@ -123,7 +123,7 @@ def _tool_names(srv):
 def _resource_uris(srv):
     res = asyncio.run(srv.list_resources())
     tmpl = asyncio.run(srv.list_resource_templates())
-    return {str(r.uri) for r in res} | {str(t.uriTemplate) for t in tmpl}
+    return {str(r.uri) for r in res} | {str(t.uri_template) for t in tmpl}
 
 
 class _Unauthorized(Exception):
@@ -376,7 +376,7 @@ def main():
 
     # 10. screenshot returns inline image content from the data URL.
     shot = server.browser_screenshot(tab_id=11)
-    expect(getattr(shot, "type", None) == "image" and shot.data == "QUJD" and shot.mimeType == "image/png",
+    expect(getattr(shot, "type", None) == "image" and shot.data == "QUJD" and shot.mime_type == "image/png",
            "screenshot should return ImageContent decoded from dataUrl")
 
     # 11. invalid wait mode raises before any call.
@@ -472,11 +472,11 @@ def main():
     # 19. Annotations + resources are registered.
     srv = server.build_server(allow_sensitive=True)
     tools = {t.name: t for t in srv._tool_manager.list_tools()}
-    expect(tools["browser_click"].annotations.destructiveHint is True, "mutating tool should be destructiveHint=True")
-    expect(tools["browser_batch"].annotations.destructiveHint is True, "typed batch should be destructiveHint=True")
-    expect(tools["browser_confirm_action"].annotations.destructiveHint is True, "confirm_action should be destructiveHint=True")
-    expect(tools["browser_confirm"].annotations.destructiveHint is True, "token-only confirm should be destructiveHint=True")
-    expect(tools["browser_snapshot"].annotations.readOnlyHint is True, "read-only tool should be readOnlyHint=True")
+    expect(tools["browser_click"].annotations.destructive_hint is True, "mutating tool should be destructiveHint=True")
+    expect(tools["browser_batch"].annotations.destructive_hint is True, "typed batch should be destructiveHint=True")
+    expect(tools["browser_confirm_action"].annotations.destructive_hint is True, "confirm_action should be destructiveHint=True")
+    expect(tools["browser_confirm"].annotations.destructive_hint is True, "token-only confirm should be destructiveHint=True")
+    expect(tools["browser_snapshot"].annotations.read_only_hint is True, "read-only tool should be readOnlyHint=True")
     res_uris = _resource_uris(srv)
     expect("browser://tabs" in res_uris, "browser://tabs resource missing")
     expect(any(u.startswith("browser://tab/") for u in res_uris), "tab state resource template missing")
@@ -541,9 +541,9 @@ def main():
     #        carries the read-only annotation.
     expect("browser_expect" in _tool_names(server.build_server(readonly=True)),
            "expect is read-only and must survive a readonly build")
-    expect(tools["browser_expect"].annotations.readOnlyHint is True,
+    expect(tools["browser_expect"].annotations.read_only_hint is True,
            "expect should be annotated readOnlyHint=True")
-    expect(tools["browser_expect"].annotations.destructiveHint is False,
+    expect(tools["browser_expect"].annotations.destructive_hint is False,
            "expect must not be annotated destructive")
 
     # 19g. search_tabs is sensitive: its snippets carry content from every open
@@ -570,9 +570,9 @@ def main():
     for name in ("browser_screencast_save", "browser_cache_selectors"):
         expect(name in default_names, f"{name} should be present in a normal build")
         expect(name not in ro_names, f"{name} must be hidden under readonly (mutating)")
-        expect(tools[name].annotations.readOnlyHint is False,
+        expect(tools[name].annotations.read_only_hint is False,
                f"{name} must not be annotated readOnlyHint=True")
-        expect(tools[name].annotations.destructiveHint is True,
+        expect(tools[name].annotations.destructive_hint is True,
                f"{name} must be annotated destructiveHint=True")
 
     # 19i. screencast_save validates/prepares the destination BEFORE draining and
@@ -758,20 +758,11 @@ def main():
 
     # 24. Header extraction feeding that override: Bearer wins, X-Bridge-Token
     # is the fallback, and no HTTP request (the stdio path) means no override.
-    from mcp.server.lowlevel.server import request_ctx  # noqa: E402
-
     class _Headers(dict):
         # Mimic Starlette's case-insensitive Headers mapping.
         def get(self, key, default=None):
             return dict.get(self, key.lower(), default)
 
-    class _FakeRequest:
-        def __init__(self, headers):
-            self.headers = _Headers(headers)
-
-    class _FakeRequestContext:
-        def __init__(self, request):
-            self.request = request
 
     header_cases = [
         ({"authorization": "Bearer bearer-tok", "x-bridge-token": "hdr-tok"}, "bearer-tok",
@@ -783,18 +774,18 @@ def main():
         ({}, None, "no token header should fall back to the ambient identity"),
     ]
     for headers, expected, msg in header_cases:
-        ctx_token = request_ctx.set(_FakeRequestContext(_FakeRequest(headers)))
+        ctx_token = server._request_headers.set(_Headers(headers))
         try:
             expect(server._http_request_token() == expected, msg)
         finally:
-            request_ctx.reset(ctx_token)
+            server._request_headers.reset(ctx_token)
 
-    ctx_token = request_ctx.set(_FakeRequestContext(None))
+    ctx_token = server._request_headers.set(None)
     try:
         expect(server._http_request_token() is None,
                "stdio requests carry no HTTP request and must use the ambient token")
     finally:
-        request_ctx.reset(ctx_token)
+        server._request_headers.reset(ctx_token)
 
     # 25. An ``unauthorized`` reply must invalidate the cached socket. Both
     # native hosts close the TCP connection right after that reply, so a

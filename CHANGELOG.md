@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Migrated the Python MCP server to SDK 2.0 and the `2026-07-28` protocol while preserving legacy stdio compatibility, scoped tool registration, resources, annotations, per-request HTTP bridge tokens, and streamable HTTP configuration.
 - Added `navigateAndSnapshot`, a single policy-checked request that navigates or reuses a task-session tab, waits for load, URL, or selector readiness, and returns a compact accessibility snapshot; `browser_batch` now accepts common typed interactions, waits, expectations, snapshots, extractions, and current-state reads rather than five primitives; and new CLI/MCP `ready` reports bounded endpoint, native-backend, and extension status without repeated probes. Added `insertRichText`, which accepts a bounded allowlisted node tree, rejects scripts, event handlers, unsafe URLs, excessive depth/size, and arbitrary HTML, then uses an editor-handled sanitized paste path with a DOM fallback for basic contenteditable fields. All composite steps still pass through the existing host policy, origin, DLP, audit, lease, and confirmation gates.
 - Added `scripts/reload_unpacked_extension.sh` for nonintrusive macOS development reloads. It opens the keyed extension's one-shot `wake.html?reload=1` page with `open -g`, so an already-running Chrome stays in the background; the page removes the trigger before calling `chrome.runtime.reload()`, and the replacement worker reconnects on startup.
 
