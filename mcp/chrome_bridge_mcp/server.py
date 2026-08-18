@@ -252,6 +252,44 @@ def browser_task_session_create(name: str) -> str:
     return _text(call("createTaskSession", {"name": name}))
 
 
+def _task_session_open_preflight(task_name: str, navigation_payload: dict) -> None:
+    """Fail before setup unless every task-session capability is immediately usable."""
+    plan = [
+        {"action": "createTaskSession", "payload": {"name": task_name}},
+        {"action": "navigateAndSnapshot", "payload": navigation_payload},
+        {"action": "closeTaskSession", "payload": {}},
+    ]
+    preview = call("policyCheck", {"plan": plan})
+    verdicts = preview.get("plan") if isinstance(preview, dict) else None
+    if not isinstance(verdicts, list) or len(verdicts) != len(plan):
+        raise BridgeError("Task session setup policy preflight returned an invalid plan result.")
+
+    for step, verdict in zip(plan, verdicts):
+        action = step["action"]
+        if not isinstance(verdict, dict) or verdict.get("action") != action:
+            raise BridgeError("Task session setup policy preflight returned an invalid plan result.")
+        confirmation_required = verdict.get("confirmationRequired") is True
+        if verdict.get("allowed") is True and not confirmation_required:
+            continue
+        reason = verdict.get("reason")
+        if not isinstance(reason, str) or not reason:
+            reason = "confirmation required" if confirmation_required else "not allowed"
+        raise BridgeError(
+            f"Task session setup policy preflight blocked {action}: {reason}",
+            {
+                "kind": "confirmation" if confirmation_required else "action",
+                "action": action,
+                "step": verdict.get("step"),
+                "reason": reason,
+                "confirmationRequired": confirmation_required,
+                "remediation": (
+                    f"Allow {action} without confirmation for task-session setup."
+                ),
+                "cli": "chrome-bridge policy doctor",
+            },
+        )
+
+
 def browser_task_session_open(
     task_name: str,
     url: str,
@@ -270,13 +308,16 @@ def browser_task_session_open(
     """Create an owned task group, navigate it in the background, and snapshot.
 
     This is the default entry point for a new authenticated-browser workstream.
-    If navigation fails, the newly created session is closed before the error is
-    returned, so failed setup cannot leak an unowned tab or empty task group.
+    Policy preflight must permit creation, navigation, and cleanup before any
+    task session is created. If navigation fails, the newly created session is
+    closed before the error is returned, so failed setup cannot leak an unowned
+    tab or empty task group.
     """
     payload = _navigate_and_snapshot_payload(
         url, None, reuse, foreground, wait_mode, selector, url_substring,
         timeout_ms, compact, roles, snapshot_name, limit, diff,
     )
+    _task_session_open_preflight(task_name, payload)
     session = call("createTaskSession", {"name": task_name})
     session_id = session.get("sessionId") if isinstance(session, dict) else None
     if not isinstance(session_id, str) or not session_id:
@@ -289,7 +330,8 @@ def browser_task_session_open(
             call("closeTaskSession", {"sessionId": session_id})
         except BridgeError as cleanup_exc:
             raise BridgeError(
-                f"{exc} Cleanup of task session {session_id} also failed: {cleanup_exc}"
+                f"{exc} Cleanup of task session {session_id} also failed: {cleanup_exc}",
+                policy_denial=exc.policy_denial or cleanup_exc.policy_denial,
             ) from exc
         raise
     result = dict(navigation) if isinstance(navigation, dict) else {"result": navigation}
