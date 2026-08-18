@@ -26,6 +26,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
       - name: Validate the provisioned M1 browser and Python
         if: ${{ runner.name == 'wolfie-m1-chrome-bridge' }}
         shell: bash
