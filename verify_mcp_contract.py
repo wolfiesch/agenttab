@@ -89,6 +89,12 @@ def serve():
                 try:
                     result = _result_fn(action, payload)
                     resp = {"success": True, "result": result}
+                except _PolicyDenied as exc:
+                    resp = {
+                        "success": False,
+                        "error": str(exc),
+                        "policyDenial": exc.policy_denial,
+                    }
                 except Exception as exc:  # noqa: BLE001
                     resp = {"success": False, "error": str(exc)}
                 conn.sendall((json.dumps(resp) + "\n").encode())
@@ -129,6 +135,12 @@ def _resource_uris(srv):
 class _Unauthorized(Exception):
     def __str__(self):
         return "unauthorized"
+
+
+class _PolicyDenied(Exception):
+    def __init__(self, message, policy_denial):
+        super().__init__(message)
+        self.policy_denial = policy_denial
 
 
 # Default mock: active-tab tabs list, and per-action canned results.
@@ -228,6 +240,46 @@ def main():
     }), "task session state mismatch")
     server.browser_task_session_close("session-1")
     expect(last_request() == ("closeTaskSession", {"sessionId": "session-1"}), "task session close mismatch")
+
+    with received_lock:
+        received.clear()
+    opened = json.loads(server.browser_task_session_open(
+        "research", "https://x.test", wait_mode="selector", selector="#ready"
+    ))
+    with received_lock:
+        open_sequence = list(received)
+    expect([action for action, _ in open_sequence] == [
+        "createTaskSession", "navigateAndSnapshot",
+    ], f"owned navigation should create then navigate once: {open_sequence}")
+    expect(open_sequence[-1][1].get("sessionId") == "session-1"
+           and open_sequence[-1][1].get("active") is False,
+           f"owned navigation should stay backgrounded and session-scoped: {open_sequence}")
+    expect(opened.get("sessionId") == "session-1"
+           and opened.get("taskSession", {}).get("name") == "research",
+           f"owned navigation should return ownership metadata: {opened}")
+
+    def fail_owned_navigation(action, payload):
+        if action == "createTaskSession":
+            return {"sessionId": "cleanup-session", "name": "cleanup", "tabIds": []}
+        if action == "navigateAndSnapshot":
+            raise RuntimeError("navigation failed")
+        return {"success": True}
+
+    _result_fn = fail_owned_navigation
+    with received_lock:
+        received.clear()
+    try:
+        server.browser_task_session_open("cleanup", "https://x.test")
+        expect(False, "failed owned navigation should raise")
+    except BridgeError as exc:
+        expect("navigation failed" in str(exc),
+               f"owned navigation should preserve its failure: {exc}")
+    with received_lock:
+        cleanup_sequence = list(received)
+    expect([action for action, _ in cleanup_sequence] == [
+        "createTaskSession", "navigateAndSnapshot", "closeTaskSession",
+    ], f"failed owned navigation should close its new session: {cleanup_sequence}")
+    _result_fn = default_result
 
     # 3. snapshot with explicit tab_id -> observe with that tabId (no active-tab lookup).
     with received_lock:
@@ -447,6 +499,8 @@ def main():
     expect("browser_ready" in default_names, "readiness tool must be present by default")
     expect("browser_navigate_and_snapshot" in default_names,
            "navigate-and-snapshot tool must be present by default")
+    expect("browser_task_session_open" in default_names,
+           "owned navigation composite must be present by default")
     expect("browser_insert_rich_text" in default_names,
            "rich-text insertion tool must be present by default")
 
@@ -466,6 +520,8 @@ def main():
     expect("browser_ready" in ro_names, "readonly must keep readiness")
     expect("browser_navigate_and_snapshot" not in ro_names,
            "readonly must hide navigate-and-snapshot")
+    expect("browser_task_session_open" not in ro_names,
+           "readonly must hide owned navigation composite")
     expect("browser_insert_rich_text" not in ro_names,
            "readonly must hide rich-text insertion")
 
@@ -630,6 +686,29 @@ def main():
     # cached socket (both native hosts hang up after that reply), so measuring
     # reuse across it would be measuring the reconnect, not connection reuse.
     expect(accepted_connections == 1, "MCP calls should reuse one serialized TCP connection")
+
+    def denied_with_remediation(action, payload):
+        raise _PolicyDenied("policy denied: action createTaskSession not allowed", {
+            "kind": "action",
+            "action": "createTaskSession",
+            "policyFile": "/tmp/bridge_policy.json",
+            "remediation": (
+                "Add 'createTaskSession' to default.allowedActions in "
+                "/tmp/bridge_policy.json"
+            ),
+            "cli": "chrome-bridge policy doctor",
+        })
+
+    _result_fn = denied_with_remediation
+    try:
+        server.browser_task_session_create("research")
+        expect(False, "policy denial should raise")
+    except BridgeError as exc:
+        expect(exc.policy_denial and exc.policy_denial.get("action") == "createTaskSession",
+               f"BridgeError should retain structured policy denial: {exc.policy_denial}")
+        expect("default.allowedActions" in str(exc)
+               and "chrome-bridge policy doctor" in str(exc),
+               f"policy denial should surface actionable remediation: {exc}")
 
     # 20. unauthorized maps to an actionable message.
     def unauth(action, payload):

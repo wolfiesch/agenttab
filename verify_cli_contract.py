@@ -434,6 +434,15 @@ check("explicit client seeded from default (getCookies inherited)", "getCookies"
 check("explicit client did not add to default",
       "newaction" in _pol.get("default", {}).get("allowedActions", []), False)
 
+# doctor validates task-session actions as one ownership/cleanup capability and
+# catches the historical transposed wire-action name before a request is denied.
+_pol = _json.load(open(POLICY_FIXTURE))
+_pol.setdefault("clients", {})["broken"] = {
+    "allowedActions": ["createTaskSession", "taskSessionNavigate"],
+}
+with open(POLICY_FIXTURE, "w") as f:
+    _json.dump(_pol, f)
+
 # doctor splits "not allowed" (grant) from "denied" (remove deny-list).
 with open(AUDIT_FIXTURE, "w") as f:
     f.write(_json.dumps({"decision": "deny", "action": "getTabs",
@@ -454,6 +463,17 @@ with _ctx.redirect_stdout(_buf):
     rc = test_client.cmd_policy(["test_client.py", "policy", "doctor"])
 check("doctor rc", rc, 0)
 _doc = _json.loads(_buf.getvalue())
+_issues = _doc.get("configurationIssues", [])
+check("doctor catches unknown task-session action",
+      any(i.get("kind") == "unknownAction"
+          and i.get("action") == "taskSessionNavigate"
+          and i.get("replacement") == "navigateTaskSession"
+          for i in _issues), True)
+check("doctor catches incomplete task-session capability",
+      any(i.get("kind") == "incompleteCapability"
+          and i.get("section") == "clients.broken"
+          and "closeTaskSession" in i.get("missing", [])
+          for i in _issues), True)
 _by_reason = {d["reason"]: d.get("suggestion") for d in _doc.get("denials", [])}
 check("doctor not-allowed action grants",
       _by_reason.get("action getTabs not allowed"), {"cli": "policy allow-action getTabs"})
