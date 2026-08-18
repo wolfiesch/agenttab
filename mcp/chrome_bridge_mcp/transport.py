@@ -46,7 +46,24 @@ _call_lock = threading.Lock()
 
 
 class BridgeError(Exception):
-    """Raised when the bridge transport or the extension reports a failure."""
+    """Bridge failure with optional structured policy remediation."""
+
+    def __init__(self, message, policy_denial=None):
+        self.policy_denial = (
+            dict(policy_denial) if isinstance(policy_denial, dict) else None
+        )
+        details = []
+        if self.policy_denial:
+            remediation = self.policy_denial.get("remediation")
+            cli = self.policy_denial.get("cli")
+            if isinstance(remediation, str) and remediation:
+                details.append(remediation)
+            if isinstance(cli, str) and cli:
+                details.append(f"Run `{cli}` for current denial details.")
+        rendered = str(message)
+        if details:
+            rendered = f"{rendered}. {' '.join(details)}"
+        super().__init__(rendered)
 
 
 class PersistentBridgeConnection:
@@ -317,7 +334,7 @@ def call(action, payload=None, read_timeout_ms=None, confirmation_token=None, dr
             err = ("unauthorized: bridge token mismatch. Ensure the MCP server "
                    "reads the same bridge_token.txt as the running host "
                    "(check BRIDGE_TOKEN_FILE / BRIDGE_REPO_ROOT).")
-        raise BridgeError(err)
+        raise BridgeError(err, response.get("policyDenial"))
 
     # A dry run carries its verdict at the top level, not under ``result``.
     if response.get("dryRun") is True:

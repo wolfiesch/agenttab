@@ -1055,17 +1055,82 @@ def cmd_policy(args):
     return 64
 
 
+_TASK_SESSION_CAPABILITY = (
+    "createTaskSession",
+    "navigateTaskSession",
+    "getTaskSessions",
+    "updateTaskSessionState",
+    "closeTaskSession",
+    "navigateAndSnapshot",
+)
+_KNOWN_POLICY_ACTION_RENAMES = {
+    "taskSessionNavigate": "navigateTaskSession",
+}
+
+
+def _policy_configuration_issues(policy_file):
+    policy = _load_policy_file(policy_file)
+    if not isinstance(policy, dict):
+        return []
+    sections = [("default", policy.get("default"))]
+    clients = policy.get("clients")
+    if isinstance(clients, dict):
+        sections.extend(
+            (f"clients.{name}", layer) for name, layer in clients.items()
+        )
+    issues = []
+    required = set(_TASK_SESSION_CAPABILITY)
+    for section_name, layer in sections:
+        if not isinstance(layer, dict):
+            continue
+        actions = layer.get("allowedActions")
+        if not isinstance(actions, list):
+            continue
+        action_names = {action for action in actions if isinstance(action, str)}
+        for action in sorted(action_names):
+            replacement = _KNOWN_POLICY_ACTION_RENAMES.get(action)
+            if replacement:
+                issues.append({
+                    "kind": "unknownAction",
+                    "section": section_name,
+                    "action": action,
+                    "replacement": replacement,
+                })
+        present = required.intersection(action_names)
+        missing = required.difference(action_names)
+        if present and missing:
+            issues.append({
+                "kind": "incompleteCapability",
+                "section": section_name,
+                "capability": "taskSession",
+                "present": sorted(present),
+                "missing": sorted(missing),
+                "remediation": (
+                    "Grant the complete task-session capability so sessions can "
+                    "be created, navigated, inspected, and closed safely."
+                ),
+            })
+    return issues
+
+
 def _policy_doctor(audit_file, policy_file):
     # Read recent deny entries from the audit log and propose the precise grant
-    # for each distinct (action, target) so the user can self-service. Reads only
-    # paths/metadata the host already disclosed; never forwards anything.
+    # for each distinct (action, target) so the user can self-service. Also
+    # validate policy capability groups before reading runtime evidence, so a
+    # stale allowlist is visible even when no denied request has reached Chrome.
+    configuration_issues = _policy_configuration_issues(policy_file)
     denials = []
     try:
         with open(audit_file) as f:
             lines = f.readlines()
     except FileNotFoundError:
-        print(json.dumps({"policyFile": policy_file, "denials": [],
-                          "note": "No audit log yet; nothing to diagnose."}, indent=2))
+        print(json.dumps({
+            "policyFile": policy_file,
+            "auditLogFile": audit_file,
+            "configurationIssues": configuration_issues,
+            "denials": [],
+            "note": "No audit log yet; policy configuration was still validated.",
+        }, indent=2))
         return 0
     seen = set()
     for line in reversed(lines[-500:]):
@@ -1112,6 +1177,7 @@ def _policy_doctor(audit_file, policy_file):
         denials.append({"action": action, "reason": reason, "targets": targets,
                         "batchStep": batch_step, "suggestion": suggestion})
     print(json.dumps({"policyFile": policy_file, "auditLogFile": audit_file,
+                      "configurationIssues": configuration_issues,
                       "denials": denials}, indent=2))
     return 0
 

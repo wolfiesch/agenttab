@@ -8,7 +8,7 @@ The server uses one serialized persistent TCP connection with the same newline-f
 
 ### Tools
 
-The MCP server ships a grouped tool set. Legacy tab-scoped tools take an optional `tab_id`; omitting it targets the active tab. For new workflows, prefer task-session tools so a human tab change cannot redirect the agent.
+The MCP server ships a grouped tool set. Legacy tab-scoped tools take an optional `tab_id`; omitting it targets the active tab. New workstreams should start with `browser_task_session_open`, which creates an owned task group, navigates it inactive, waits, and snapshots in one call. If task-session setup is policy-denied, repair the active policy and retry; do not fall back to an unowned shared-profile tab.
 
 Read-only:
 
@@ -39,8 +39,9 @@ Sensitive:
 
 Mutating:
 
-- `browser_navigate`
-- `browser_navigate_and_snapshot` - create or reuse a task-session tab, wait for `load`, URL, or a selector, and return the tab id plus a compact accessibility snapshot in one request. URL waits require `url_substring`. The snapshot is withheld after a cross-origin redirect; the MCP failure message includes cleanup tab/window ids but omits the settled page URL, so observe the destination separately through the normal live-origin gate. Prefer this tool over separate navigate, wait, and snapshot calls when the page has a deterministic same-origin readiness condition
+- `browser_navigate` - open an inactive but unowned tab in the shared Chrome profile. This legacy path has no automatic cleanup contract; retain the tab id and close it explicitly
+- `browser_navigate_and_snapshot` - create an unowned tab or reuse an explicitly supplied task session, wait for `load`, URL, or a selector, and return the tab id plus a compact accessibility snapshot in one request. URL waits require `url_substring`. The snapshot is withheld after a cross-origin redirect; the MCP failure message includes cleanup tab/window ids but omits the settled page URL, so observe the destination separately through the normal live-origin gate. Prefer `browser_task_session_open` for a new workstream
+- `browser_task_session_open` - preflights creation, navigation, and cleanup in one host-side policy plan before creating an owned task session, then navigates it in the background, waits, and snapshots in one MCP call. A denied or confirmation-required preflight step returns actionable policy metadata without creating a session; invalid wait arguments also fail before session creation. A navigation failure closes the newly created session before returning the error
 - `browser_task_session_create`, `browser_task_session_navigate`, `browser_task_session_state`, `browser_task_session_close`
 - `browser_click`, `browser_type`, `browser_fill`, `browser_hover` - selectors accept `ref=e12` from `browser_snapshot` alongside CSS and the `text=`/`aria=`/`label=`/`role=` prefixes. Refs are invalidated by navigation and by an extension service-worker restart; a stale ref fails with `error: staleRef` instead of matching a different element, so re-snapshot
 - `browser_click_at` - click raw viewport coordinates; no element is resolved, so nothing identifies the target in the audit log. Prefer `browser_click`; the sample policy confirmation-gates `clickAt`

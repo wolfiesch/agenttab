@@ -164,30 +164,30 @@ def browser_list_tabs() -> str:
 
 
 def browser_navigate(url: str) -> str:
-    """Open a URL in a new tab and return the new tab id."""
+    """Open an inactive but unowned tab in the user's shared Chrome profile.
+
+    Prefer ``browser_task_session_open`` for new workstreams. This legacy call
+    has no ownership or automatic cleanup contract; the caller must retain the
+    returned tab id and close it explicitly.
+    """
     return _text(call("navigate", {"url": url}))
 
 
-def browser_navigate_and_snapshot(
+def _navigate_and_snapshot_payload(
     url: str,
-    session_id: Optional[str] = None,
-    reuse: bool = True,
-    foreground: bool = False,
-    wait_mode: str = "load",
-    selector: Optional[str] = None,
-    url_substring: Optional[str] = None,
-    timeout_ms: int = 10000,
-    compact: bool = True,
-    roles: Optional[list] = None,
-    name: Optional[str] = None,
-    limit: int = 50,
-    diff: bool = False,
-) -> str:
-    """Navigate, wait deterministically, and return one accessibility snapshot.
-
-    Post-navigation failures include tab and window ids in the error message so
-    callers can close a newly-created tab.
-    """
+    session_id: Optional[str],
+    reuse: bool,
+    foreground: bool,
+    wait_mode: str,
+    selector: Optional[str],
+    url_substring: Optional[str],
+    timeout_ms: int,
+    compact: bool,
+    roles: Optional[list],
+    name: Optional[str],
+    limit: int,
+    diff: bool,
+) -> dict:
     if wait_mode not in {"load", "url", "selector"}:
         raise ValueError("wait_mode must be load, url, or selector")
     if wait_mode == "selector" and not selector:
@@ -214,6 +214,34 @@ def browser_navigate_and_snapshot(
         payload["roles"] = roles
     if name:
         payload["name"] = name
+    return payload
+
+
+def browser_navigate_and_snapshot(
+    url: str,
+    session_id: Optional[str] = None,
+    reuse: bool = True,
+    foreground: bool = False,
+    wait_mode: str = "load",
+    selector: Optional[str] = None,
+    url_substring: Optional[str] = None,
+    timeout_ms: int = 10000,
+    compact: bool = True,
+    roles: Optional[list] = None,
+    name: Optional[str] = None,
+    limit: int = 50,
+    diff: bool = False,
+) -> str:
+    """Navigate, wait, and snapshot an explicit task session when provided.
+
+    Without ``session_id`` this creates an inactive but unowned tab in the
+    user's shared profile. Prefer ``browser_task_session_open`` for new
+    workstreams. Post-navigation failures include cleanup tab/window ids.
+    """
+    payload = _navigate_and_snapshot_payload(
+        url, session_id, reuse, foreground, wait_mode, selector, url_substring,
+        timeout_ms, compact, roles, name, limit, diff,
+    )
     return _text(call("navigateAndSnapshot", payload))
 
 
@@ -222,6 +250,94 @@ def browser_navigate_and_snapshot(
 def browser_task_session_create(name: str) -> str:
     """Create a durable browser task session that owns only its own tabs."""
     return _text(call("createTaskSession", {"name": name}))
+
+
+def _task_session_open_preflight(task_name: str, navigation_payload: dict) -> None:
+    """Fail unless task-session creation, navigation, and cleanup are usable."""
+    plan = [
+        {"action": "createTaskSession", "payload": {"name": task_name}},
+        {"action": "navigateAndSnapshot", "payload": navigation_payload},
+        {"action": "closeTaskSession", "payload": {}},
+    ]
+    preview = call("policyCheck", {"plan": plan})
+    verdicts = preview.get("plan") if isinstance(preview, dict) else None
+    if not isinstance(verdicts, list) or len(verdicts) != len(plan):
+        raise BridgeError("Task session setup policy preflight returned an invalid plan result.")
+
+    for step, verdict in zip(plan, verdicts):
+        action = step["action"]
+        if not isinstance(verdict, dict) or verdict.get("action") != action:
+            raise BridgeError("Task session setup policy preflight returned an invalid plan result.")
+        confirmation_required = verdict.get("confirmationRequired") is True
+        if verdict.get("allowed") is True and not confirmation_required:
+            continue
+        reason = verdict.get("reason")
+        if not isinstance(reason, str) or not reason:
+            reason = "confirmation required" if confirmation_required else "not allowed"
+        raise BridgeError(
+            f"Task session setup policy preflight blocked {action}: {reason}",
+            {
+                "kind": "confirmation" if confirmation_required else "action",
+                "action": action,
+                "step": verdict.get("step"),
+                "reason": reason,
+                "confirmationRequired": confirmation_required,
+                "remediation": (
+                    f"Allow {action} without confirmation for task-session setup."
+                ),
+                "cli": "chrome-bridge policy doctor",
+            },
+        )
+
+
+def browser_task_session_open(
+    task_name: str,
+    url: str,
+    reuse: bool = True,
+    foreground: bool = False,
+    wait_mode: str = "load",
+    selector: Optional[str] = None,
+    url_substring: Optional[str] = None,
+    timeout_ms: int = 10000,
+    compact: bool = True,
+    roles: Optional[list] = None,
+    snapshot_name: Optional[str] = None,
+    limit: int = 50,
+    diff: bool = False,
+) -> str:
+    """Create an owned task group, navigate it in the background, and snapshot.
+
+    This is the default entry point for a new authenticated-browser workstream.
+    Policy preflight must permit creation, navigation, and cleanup before any
+    task session is created. If navigation fails, the newly created session is
+    closed before the error is returned, so failed setup cannot leak an unowned
+    tab or empty task group.
+    """
+    payload = _navigate_and_snapshot_payload(
+        url, None, reuse, foreground, wait_mode, selector, url_substring,
+        timeout_ms, compact, roles, snapshot_name, limit, diff,
+    )
+    _task_session_open_preflight(task_name, payload)
+    session = call("createTaskSession", {"name": task_name})
+    session_id = session.get("sessionId") if isinstance(session, dict) else None
+    if not isinstance(session_id, str) or not session_id:
+        raise BridgeError("createTaskSession did not return a sessionId")
+    payload["sessionId"] = session_id
+    try:
+        navigation = call("navigateAndSnapshot", payload)
+    except BridgeError as exc:
+        try:
+            call("closeTaskSession", {"sessionId": session_id})
+        except BridgeError as cleanup_exc:
+            raise BridgeError(
+                f"{exc} Cleanup of task session {session_id} also failed: {cleanup_exc}",
+                policy_denial=exc.policy_denial or cleanup_exc.policy_denial,
+            ) from exc
+        raise
+    result = dict(navigation) if isinstance(navigation, dict) else {"result": navigation}
+    result["sessionId"] = session_id
+    result["taskSession"] = session
+    return _text(result)
 
 
 def browser_task_session_navigate(
@@ -1512,6 +1628,7 @@ _TOOLS = [
     (browser_navigate, True, False),
     (browser_navigate_and_snapshot, True, False),
     (browser_task_session_create, True, False),
+    (browser_task_session_open, True, False),
     (browser_task_session_navigate, True, False),
     (browser_task_session_state, True, False),
     (browser_task_session_close, True, False),
