@@ -1087,7 +1087,7 @@ def _policy_configuration_issues(policy_file):
         if not isinstance(actions, list):
             continue
         action_names = {action for action in actions if isinstance(action, str)}
-        for action in action_names:
+        for action in sorted(action_names):
             replacement = _KNOWN_POLICY_ACTION_RENAMES.get(action)
             if replacement:
                 issues.append({

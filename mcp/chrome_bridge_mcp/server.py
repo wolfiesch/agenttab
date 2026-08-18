@@ -253,7 +253,7 @@ def browser_task_session_create(name: str) -> str:
 
 
 def _task_session_open_preflight(task_name: str, navigation_payload: dict) -> None:
-    """Fail before setup unless every task-session capability is immediately usable."""
+    """Fail unless task-session creation, navigation, and cleanup are usable."""
     plan = [
         {"action": "createTaskSession", "payload": {"name": task_name}},
         {"action": "navigateAndSnapshot", "payload": navigation_payload},
