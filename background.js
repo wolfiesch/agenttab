@@ -1894,10 +1894,19 @@ function activeModalSource() {
   `;
 }
 
-function activeModalExpression() {
+function activeModalExpression(frameSelector = null) {
   return `(() => {
     ${activeModalSource()}
-    return { success: true, activeDialog };
+    const frameTarget = ${JSON.stringify(frameSelector)} === null
+      ? null
+      : document.querySelector(${JSON.stringify(frameSelector)});
+    return {
+      success: true,
+      activeDialog,
+      targetInsideActiveDialog: activeModal && frameTarget
+        ? activeModal.contains(frameTarget)
+        : null
+    };
   })()`;
 }
 
@@ -2125,10 +2134,14 @@ async function resolveActionTarget(tabId, locator, attachedTarget, mode = "cente
       };
     }
     if (mode === 'click') {
-      const modalProbe = await evaluateInContext(target, activeModalExpression(), null);
+      const modalProbe = await evaluateInContext(
+        target,
+        activeModalExpression(locator.frames[0]),
+        null
+      );
       const modalValue = modalProbe.val || modalProbe;
       if (!modalProbe.success || modalValue.success === false) return modalValue;
-      if (modalValue.activeDialog) {
+      if (modalValue.activeDialog && modalValue.targetInsideActiveDialog !== true) {
         return {
           success: false,
           error: 'activeDialog',
