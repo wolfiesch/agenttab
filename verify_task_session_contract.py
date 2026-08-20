@@ -38,6 +38,7 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
         'openerTabId: tabId',
         'Input.dispatchMouseEvent',
         'tab.openerTabId === tabId',
+        'session.tabIds = [...(session.tabIds || []), tab.id]',
     ):
         expect(needle in text, f"{path.name} missing task-session contract: {needle}")
     close_body = text.split("async function closeTaskSession", 1)[1].split("chrome.tabs.onRemoved", 1)[0]

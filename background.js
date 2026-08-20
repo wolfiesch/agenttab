@@ -1155,7 +1155,7 @@ async function adoptTaskSessionChildTab(tab) {
     if (otherOwner) return { value: null, changed: false };
     const alreadyOwned = (session.tabIds || []).includes(tab.id);
     if (!alreadyOwned) {
-      session.tabIds.push(tab.id);
+      session.tabIds = [...(session.tabIds || []), tab.id];
       session.updatedAt = Date.now();
       await groupTaskTab(session, tab.id);
     }
