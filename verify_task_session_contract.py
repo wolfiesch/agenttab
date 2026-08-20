@@ -22,10 +22,23 @@ for path in (ROOT / "background.js", ROOT / "extension" / "background.js"):
         'case "closeTaskSession"',
         'TASK_SESSIONS_KEY',
         'chrome.storage.local',
+        'chrome.tabs.onCreated.addListener',
+        'tab?.openerTabId',
+        'adoptTaskSessionChildTab',
         'chrome.tabs.onRemoved.addListener',
         'chrome.tabs.group',
         'active: active === true',
         'closedTabIds: tabIds',
+        "error: 'activeDialog'",
+        'includeActiveDialog',
+        'settleMs',
+        'openedTabs: adoptedTabs',
+        "const anchor = el.closest?.('a[href]') || null;",
+        "lookup.target === '_blank'",
+        'openerTabId: tabId',
+        'Input.dispatchMouseEvent',
+        'tab.openerTabId === tabId',
+        'session.tabIds = [...(session.tabIds || []), tab.id]',
     ):
         expect(needle in text, f"{path.name} missing task-session contract: {needle}")
     close_body = text.split("async function closeTaskSession", 1)[1].split("chrome.tabs.onRemoved", 1)[0]
@@ -61,6 +74,13 @@ bridge = (ROOT / "bridge.py").read_text(encoding="utf-8")
 expect("'navigateTaskSession'" in bridge, "host missing navigateTaskSession policy classification")
 expect("'closeTaskSession'" in bridge, "host missing closeTaskSession policy classification")
 expect("'updateTaskSessionState'" in bridge, "host missing updateTaskSessionState policy classification")
+mcp = (ROOT / "mcp" / "chrome_bridge_mcp" / "server.py").read_text(encoding="utf-8")
+expect(
+    'result["taskSession"] = call("getTaskSessions", {"sessionId": session_id})' in mcp,
+    "MCP task-session open must return fresh post-navigation ownership",
+)
+expect("include_active_dialog" in mcp, "MCP snapshot missing active-dialog context option")
+expect("settle_ms: int = 500" in mcp, "MCP click missing bounded side-effect settling")
 
 harness = (ROOT / "scripts" / "background_reliability.py").read_text(encoding="utf-8")
 for needle in ("active_tabs_changed", "frontmost_app_changed", "unexpected_tabs", "owned_tab_became_active", "owned_ready", "runError"):

@@ -162,9 +162,9 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reco
         listeners.detach?.({ tabId: target.tabId }, 'canceled_by_user');
         callback();
       },
-      sendCommand(_target, method, _params, callback) {
+      sendCommand(_target, method, params, callback) {
         controller.commandMethods.push(method);
-        callback(controller.commandResult(method));
+        callback(controller.commandResult(method, params));
       },
     },
     scripting: {
@@ -174,6 +174,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reco
       },
     },
     tabs: {
+      onCreated: { addListener(listener) { listeners.created = listener; } },
       onRemoved: { addListener(listener) { listeners.removed = listener; } },
       onUpdated: { addListener() {} },
       async get(tabId) {
@@ -449,12 +450,84 @@ async function testTopDocumentSelectorSkipsFrameTreeAndDocumentLookups() {
   assert.equal(harness.controller.commandMethods.includes('DOM.getDocument'), false);
 }
 
+async function testFramedClickInsideActiveModalIsAllowed() {
+  const harness = createHarness({
+    tabs: { 32: { active: false, windowId: 1, groupId: -1, url: 'https://example.com', status: 'complete' } },
+  });
+  const frame = {};
+  const modal = {
+    getBoundingClientRect: () => ({ width: 400, height: 300 }),
+    getAttribute: (name) => name === 'role' ? 'dialog' : name === 'aria-label' ? 'Payment' : null,
+    contains: (candidate) => candidate === frame,
+  };
+  const page = {
+    querySelectorAll: () => [modal],
+    querySelector: (selector) => selector === '#payment-frame' ? frame : null,
+  };
+  let evaluation = 0;
+  harness.controller.commandResult = (method, params) => {
+    if (method === 'Runtime.evaluate') {
+      evaluation += 1;
+      if (evaluation === 1) {
+        const value = vm.runInNewContext(params.expression, {
+          document: page,
+          getComputedStyle: () => ({
+            display: 'block',
+            visibility: 'visible',
+            pointerEvents: 'auto',
+          }),
+        });
+        return { result: { value } };
+      }
+      const values = [
+        {
+          success: true,
+          frameIndex: 0,
+          x: 5,
+          y: 7,
+          clientLeft: 0,
+          clientTop: 0,
+        },
+        { success: true, x: 10, y: 20, width: 30, height: 40 },
+      ];
+      return { result: { value: values[evaluation - 2] } };
+    }
+    if (method === 'Page.getFrameTree') {
+      return {
+        frameTree: {
+          frame: { id: 'top' },
+          childFrames: [{ frame: { id: 'child' } }],
+        },
+      };
+    }
+    if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+    if (method === 'DOM.querySelector') return { nodeId: 2 };
+    if (method === 'DOM.describeNode') return { node: { frameId: 'child' } };
+    if (method === 'Page.createIsolatedWorld') return { executionContextId: 42 };
+    return {};
+  };
+
+  const result = await harness.api.resolveActionTarget(32, {
+    frames: ['#payment-frame'],
+    target: { kind: 'css', selector: '#submit-payment' },
+    selector: '#submit-payment',
+    shadowSegments: [],
+  }, null, 'click');
+
+  assert.equal(result.success, true);
+  assert.equal(result.frameId, 'child');
+  assert.equal(result.contextId, 42);
+  assert.equal(result.x, 15);
+  assert.equal(result.y, 27);
+}
+
+
 
 async function testPointerRenderingDoesNotDelayFocusedClick() {
   const harness = createHarness({
     tabs: { 31: { active: true, windowId: 1, groupId: -1, url: 'https://example.com', status: 'complete' } },
   });
-  const result = await harness.api.clickSelector(31, '#save');
+  const result = await harness.api.clickSelector(31, '#save', 0);
   assert.equal(result.success, true);
   assert.deepEqual(
     harness.controller.commandMethods.filter((method) => method === 'Input.dispatchMouseEvent'),
@@ -496,6 +569,7 @@ const tests = [
   testIdleDebuggerDoesNotHideCurrentGroup,
   testTopDocumentSelectorSkipsFrameTreeAndDocumentLookups,
   testCloseDoesNotRemoveTabMovedToAnotherGroup,
+  testFramedClickInsideActiveModalIsAllowed,
   testPointerRenderingDoesNotDelayFocusedClick,
   testReconnectBackoffResetsOnlyAfterHostAcknowledges,
 ];

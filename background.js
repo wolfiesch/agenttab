@@ -492,7 +492,7 @@ async function dispatchAction(action, payload, dlp) {
         result = await runScriptWithDebugger(payload.tabId, payload.code);
         break;
       case "click":
-        result = await clickSelector(payload.tabId, payload.selector);
+        result = await clickSelector(payload.tabId, payload.selector, payload.settleMs);
         break;
       case "clickAt":
         result = await clickAt(payload.tabId, payload.x, payload.y);
@@ -1141,6 +1141,40 @@ async function groupTaskTab(session, tabId) {
     }
   }
 }
+
+async function adoptTaskSessionChildTab(tab) {
+  if (!Number.isInteger(tab?.id) || !Number.isInteger(tab?.openerTabId)) return null;
+  const openerOwner = await findTaskSessionForTab(tab.openerTabId);
+  if (!openerOwner) return null;
+  return mutateTaskSessions(async (sessions) => {
+    const session = sessions[openerOwner.sessionId];
+    if (!session) return { value: null, changed: false };
+    const otherOwner = Object.values(sessions).find((candidate) =>
+      candidate !== session && (candidate.tabIds || []).includes(tab.id)
+    );
+    if (otherOwner) return { value: null, changed: false };
+    const alreadyOwned = (session.tabIds || []).includes(tab.id);
+    if (!alreadyOwned) {
+      session.tabIds = [...(session.tabIds || []), tab.id];
+      session.updatedAt = Date.now();
+      await groupTaskTab(session, tab.id);
+    }
+    return {
+      value: {
+        sessionId: session.sessionId,
+        tabId: tab.id,
+        adopted: !alreadyOwned
+      },
+      changed: !alreadyOwned
+    };
+  });
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  void adoptTaskSessionChildTab(tab).catch((error) => {
+    console.warn("Could not adopt task-session child tab:", error);
+  });
+});
 
 async function navigateTaskSession(sessionId, url, active = false, reuse = true) {
   return mutateTaskSessions(async (sessions) => {
@@ -1841,12 +1875,56 @@ function locatorResolverSource() {
   `;
 }
 
+function activeModalSource() {
+  return `
+    const activeModal = [...document.querySelectorAll(
+      'dialog[open], [role="alertdialog"], [role="dialog"][aria-modal="true"]'
+    )].reverse().find((candidate) => {
+      const rect = candidate.getBoundingClientRect();
+      const style = getComputedStyle(candidate);
+      return rect.width > 0 && rect.height > 0 && style.display !== 'none' &&
+        style.visibility !== 'hidden' && style.pointerEvents !== 'none';
+    }) || null;
+    const activeDialog = activeModal ? {
+      role: activeModal.getAttribute('role') || 'dialog',
+      name: activeModal.getAttribute('aria-label') ||
+        activeModal.querySelector('[role="heading"], h1, h2, h3')?.innerText?.trim() ||
+        activeModal.innerText?.trim().split(/\\n+/)[0] || ''
+    } : null;
+  `;
+}
+
+function activeModalExpression(frameSelector = null) {
+  return `(() => {
+    ${activeModalSource()}
+    const frameTarget = ${JSON.stringify(frameSelector)} === null
+      ? null
+      : document.querySelector(${JSON.stringify(frameSelector)});
+    return {
+      success: true,
+      activeDialog,
+      targetInsideActiveDialog: activeModal && frameTarget
+        ? activeModal.contains(frameTarget)
+        : null
+    };
+  })()`;
+}
+
 function elementResolverExpression(locator, mode) {
   return `(() => {
     ${locatorResolverSource()}
     const resolved = resolveLocator(${JSON.stringify(locator)});
     if (!resolved.success) return resolved;
     const el = resolved.el;
+    ${activeModalSource()}
+    if (${JSON.stringify(mode)} === 'click' && activeModal && !activeModal.contains(el)) {
+      return {
+        success: false,
+        error: 'activeDialog',
+        err: 'Action blocked by an active modal dialog',
+        activeDialog
+      };
+    }
     el.scrollIntoView({ block: 'center', inline: 'center' });
     const rect = el.getBoundingClientRect();
     if (${JSON.stringify(mode)} === 'focus' || ${JSON.stringify(mode)} === 'clear') {
@@ -1860,13 +1938,16 @@ function elementResolverExpression(locator, mode) {
       }
       el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
     }
+    const anchor = el.closest?.('a[href]') || null;
     return {
       success: true,
       x: rect.left + rect.width / 2,
       y: rect.top + rect.height / 2,
       tagName: el.tagName,
       text: el.innerText || el.value || el.getAttribute('aria-label') || '',
-      value: 'value' in el ? el.value : el.textContent
+      value: 'value' in el ? el.value : el.textContent,
+      href: anchor?.href || null,
+      target: anchor?.target || null
     };
   })()`;
 }
@@ -1888,28 +1969,15 @@ function domClickExpression(locator) {
       return { success: false, err: 'Matched element is not clickable' };
     }
     el.scrollIntoView({ block: 'center', inline: 'center' });
-    const rect = el.getBoundingClientRect();
-    const eventInit = {
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-      button: 0,
-      buttons: 1,
-      clickCount: 1
-    };
-    el.dispatchEvent(new MouseEvent('mousedown', eventInit));
-    el.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
     el.click();
     return {
       success: true,
       tagName: el.tagName,
-      text: el.innerText || el.value || el.getAttribute('aria-label') || '',
-      value: 'value' in el ? el.value : el.textContent
+      text: el.innerText || el.value || el.getAttribute('aria-label') || ''
     };
   })()`;
 }
+
 
 function domScrollExpression(locator, deltaX, deltaY) {
   const locatorJson = locator ? JSON.stringify(locator) : "null";
@@ -2050,12 +2118,12 @@ async function describeTopFrameElement(target, rootNodeId, selector) {
 
 
 
-async function resolveActionTarget(tabId, locator, attachedTarget) {
+async function resolveActionTarget(tabId, locator, attachedTarget, mode = "center") {
   const run = async (target) => {
     if (locator.frames.length === 0) {
       const staged = await stageLocatorRefs(target, [locator], null);
       if (staged.success === false) return staged;
-      const lookup = await evaluateInContext(target, actionTargetExpression(locator, 'center'), null);
+      const lookup = await evaluateInContext(target, actionTargetExpression(locator, mode), null);
       const value = lookup.val || lookup;
       if (!lookup.success || value.success === false) return value;
       return {
@@ -2065,6 +2133,24 @@ async function resolveActionTarget(tabId, locator, attachedTarget) {
         locator
       };
     }
+    if (mode === 'click') {
+      const modalProbe = await evaluateInContext(
+        target,
+        activeModalExpression(locator.frames[0]),
+        null
+      );
+      const modalValue = modalProbe.val || modalProbe;
+      if (!modalProbe.success || modalValue.success === false) return modalValue;
+      if (modalValue.activeDialog && modalValue.targetInsideActiveDialog !== true) {
+        return {
+          success: false,
+          error: 'activeDialog',
+          err: 'Action blocked by an active modal dialog',
+          activeDialog: modalValue.activeDialog
+        };
+      }
+    }
+
 
     const pageTree = await debuggerCommand(target, 'Page.getFrameTree', {});
     const topFrameId = pageTree.frameTree.frame.id;
@@ -2105,7 +2191,7 @@ async function resolveActionTarget(tabId, locator, attachedTarget) {
     const staged = await stageLocatorRefs(target, [locator], currentContextId);
     if (staged.success === false) return staged;
 
-    const lookup = await evaluateInContext(target, actionTargetExpression(locator, 'center'), currentContextId);
+    const lookup = await evaluateInContext(target, actionTargetExpression(locator, mode), currentContextId);
     const value = lookup.val || lookup;
     if (!lookup.success || value.success === false) return value;
     return {
@@ -2960,14 +3046,14 @@ async function extractStructured(tabId, schema, selector, maxChars) {
   };
 }
 
-async function getElementCenter(target, selector) {
+async function getElementCenter(target, selector, mode = "center") {
   let locator;
   try {
     locator = parseActionLocator(selector, target.tabId);
   } catch (error) {
     return locatorError(error);
   }
-  return resolveActionTarget(target.tabId, locator, target);
+  return resolveActionTarget(target.tabId, locator, target, mode);
 }
 
 async function isTabActive(tabId) {
@@ -3026,22 +3112,85 @@ async function showAgentPointer(tabId, x, y, click = false) {
   }
 }
 
-async function clickSelector(tabId, selector) {
+async function clickSelector(tabId, selector, settleMs = 500) {
   return withDebugger(tabId, async (target) => {
-    const lookup = await getElementCenter(target, selector);
+    const beforeTab = await chrome.tabs.get(tabId);
+    const beforeTabs = new Set((await chrome.tabs.query({})).map((tab) => tab.id));
+    const beforeDialogResult = await evaluateInContext(target, activeModalExpression(), null);
+    const beforeDialog = (beforeDialogResult.val || beforeDialogResult).activeDialog || null;
+    const lookup = await getElementCenter(target, selector, "click");
     if (lookup.success === false) return lookup;
-    if (lookup.contextId !== null && lookup.contextId !== undefined || !(await isTabActive(tabId))) {
+    let result;
+    if (!(await isTabActive(tabId)) && lookup.target === '_blank' && /^https?:\/\//i.test(lookup.href || '')) {
+      await chrome.tabs.create({
+        url: lookup.href,
+        active: false,
+        windowId: beforeTab.windowId,
+        openerTabId: tabId
+      });
+      result = { success: true, tagName: lookup.tagName, text: lookup.text };
+    } else if (lookup.contextId !== null && lookup.contextId !== undefined || !(await isTabActive(tabId))) {
       const click = await evaluateInContext(target, domClickExpression(lookup.locator), lookup.contextId);
       const value = click.val || click;
       if (!click.success || value.success === false) return value;
-      return { success: true, tagName: value.tagName, text: value.text };
+      result = { success: true, tagName: value.tagName, text: value.text };
+    } else {
+      const { x, y } = lookup;
+      void showAgentPointer(tabId, x, y, true);
+      await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
+      await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+      await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
+      result = { success: true, tagName: lookup.tagName, text: lookup.text };
     }
-    const { x, y } = lookup;
-    void showAgentPointer(tabId, x, y, true);
-    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0 });
-    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
-    await debuggerCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 });
-    return { success: true, tagName: lookup.tagName, text: lookup.text };
+
+    const deadline = Date.now() + Math.max(0, Math.min(2000, Number(settleMs) || 0));
+    let effects = null;
+    do {
+      if (Date.now() < deadline) await sleep(25);
+      const openedTabs = (await chrome.tabs.query({})).filter((tab) =>
+        !beforeTabs.has(tab.id) && tab.openerTabId === tabId
+      );
+      const adoptedTabs = [];
+      for (const tab of openedTabs) {
+        const adoption = await adoptTaskSessionChildTab(tab);
+        adoptedTabs.push({
+          tabId: tab.id,
+          windowId: tab.windowId,
+          active: tab.active === true,
+          taskSessionId: adoption?.sessionId || null
+        });
+      }
+      let currentTab = null;
+      try {
+        currentTab = await chrome.tabs.get(tabId);
+      } catch (_error) {
+        // A click may intentionally close its source tab.
+      }
+      let activeDialog = null;
+      if (currentTab) {
+        try {
+          const dialogResult = await evaluateInContext(target, activeModalExpression(), null);
+          activeDialog = (dialogResult.val || dialogResult).activeDialog || null;
+        } catch (_error) {
+          // Navigation can invalidate the prior execution context.
+        }
+      }
+      const navigated = Boolean(currentTab && currentTab.url !== beforeTab.url);
+      const dialogOpened = !beforeDialog && Boolean(activeDialog);
+      const dialogClosed = Boolean(beforeDialog) && !activeDialog;
+      if (openedTabs.length || navigated || dialogOpened || dialogClosed || !currentTab) {
+        effects = {
+          openedTabs: adoptedTabs,
+          navigated,
+          sourceTabClosed: !currentTab,
+          dialogOpened,
+          dialogClosed,
+          activeDialog
+        };
+        break;
+      }
+    } while (Date.now() < deadline);
+    return { ...result, effects: effects || { observed: false } };
   });
 }
 
@@ -4046,9 +4195,21 @@ async function observeTab(tabId, options = {}) {
     const epoch = registry.epoch;
     registry.snapshot = current;
     registry.snapshotEpoch = epoch;
-    if (options.diff !== true) return results;
-    if (!baseSnapshot) return { success: true, tabId, epoch, diffBase: true, nodes: results };
-    return { success: true, tabId, baseEpoch, epoch, ...diffSnapshots(baseSnapshot, current) };
+    let response;
+    if (options.diff !== true) {
+      response = options.includeActiveDialog === true
+        ? { success: true, tabId, nodes: results }
+        : results;
+    } else if (!baseSnapshot) {
+      response = { success: true, tabId, epoch, diffBase: true, nodes: results };
+    } else {
+      response = { success: true, tabId, baseEpoch, epoch, ...diffSnapshots(baseSnapshot, current) };
+    }
+    if (options.includeActiveDialog === true) {
+      const dialogResult = await evaluateInContext(target, activeModalExpression(), null);
+      response.activeDialog = (dialogResult.val || dialogResult).activeDialog || null;
+    }
+    return response;
   });
 }
 
