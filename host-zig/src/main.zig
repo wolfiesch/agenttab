@@ -386,25 +386,30 @@ fn handleLine(fd: c_int, line: []const u8) bool {
     };
 
     // --- Await the extension response (or timeout). ---
+    // The timeout verdict, response-ownership transfer, and map removal
+    // happen under ONE mutex hold: stdinLoop delivers only to slots it can
+    // still find in the map (under the same mutex), so after remove() no
+    // late response can be inserted, misreported as a timeout, or leaked.
     var response: ?[]u8 = null;
-    if (forwarded) {
-        var abstime: c.timespec = undefined;
-        _ = c.clock_gettime(.REALTIME, &abstime);
-        abstime.sec += config.resp_timeout_s;
-
+    {
         pending_mu.lock();
-        while (!slot.done) {
-            const rc = c.pthread_cond_timedwait(&slot.cond, &pending_mu.m, &abstime);
-            if (rc == .TIMEDOUT) break;
+        defer pending_mu.unlock();
+        if (forwarded) {
+            var abstime: c.timespec = undefined;
+            _ = c.clock_gettime(.REALTIME, &abstime);
+            abstime.sec += config.resp_timeout_s;
+            while (!slot.done) {
+                const rc = c.pthread_cond_timedwait(&slot.cond, &pending_mu.m, &abstime);
+                if (rc == .TIMEDOUT) break;
+            }
         }
+        // Harvest whatever arrived, even on the TIMEDOUT return path: a
+        // signal that raced the timeout already published its response
+        // under this mutex before we reacquired it.
         response = slot.response;
         slot.response = null;
-        pending_mu.unlock();
+        _ = pending_map.remove(id_key);
     }
-
-    pending_mu.lock();
-    _ = pending_map.remove(id_key);
-    pending_mu.unlock();
     _ = c.pthread_cond_destroy(&slot.cond);
     gpa.destroy(slot);
     gpa.free(id_key);

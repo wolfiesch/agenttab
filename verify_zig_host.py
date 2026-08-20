@@ -121,6 +121,9 @@ def main():
         f.write("# named clients\nomp:zig-named-token\n")
     test_env['BRIDGE_TOKENS_FILE'] = tokens_fixture
     test_env['BRIDGE_LOG_FILE'] = "/tmp/chrome-bridge-verify-zig.log"
+    # Short timeout so the timeout/race cases (6a-6c) run in seconds. All
+    # other cases answer immediately and are unaffected.
+    test_env['BRIDGE_RESP_TIMEOUT_SECONDS'] = '1'
 
     proc = subprocess.Popen(
         [zig_bin],
@@ -152,7 +155,6 @@ def main():
 
     # Case 4: a named token (BRIDGE_TOKENS_FILE) must authenticate.
     print("[TEST] --- Case 4: named token accepted ---")
-    os.environ['BRIDGE_TOKEN_FILE'] = tokens_fixture  # not used below; keep legacy path intact
     named = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     named.connect(('127.0.0.1', PORT))
     named.sendall((json.dumps({"action": "ping", "payload": {}, "token": "zig-named-token"}) + "\n").encode('utf-8'))
@@ -212,8 +214,91 @@ def main():
         forwarded.clear()
     print("[TEST] OK: out-of-order responses routed to the correct clients.\n")
 
-    # Case 6: stdin EOF (Chrome exit) must terminate the host promptly.
-    print("[TEST] --- Case 6: clean exit on stdin EOF ---")
+    def send_and_forward(payload):
+        """Send one authenticated request; return (socket, forwarded_id)."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(('127.0.0.1', PORT))
+        with open(token_fixture) as f:
+            tok = f.read().strip()
+        s.sendall((json.dumps({"action": "ping", "payload": payload,
+                               "token": tok}) + "\n").encode('utf-8'))
+        rid = None
+        deadline = time.time() + 5
+        while time.time() < deadline and rid is None:
+            with forwarded_lock:
+                if forwarded:
+                    rid = next(iter(forwarded))
+            time.sleep(0.005)
+        assert rid is not None, "request was not forwarded"
+        with forwarded_lock:
+            forwarded.clear()
+        return s, rid
+
+    # Case 6a: a response arriving after the timeout verdict is dropped:
+    # the client gets the timeout error, the host stays healthy, and a
+    # follow-up request round-trips normally.
+    print("[TEST] --- Case 6a: late response dropped after timeout ---")
+    s, rid = send_and_forward({})
+    t0 = time.time()
+    line = recv_line(s)  # no reply sent; host must emit its timeout error
+    elapsed = time.time() - t0
+    s.close()
+    resp = json.loads(line.decode('utf-8'))
+    assert resp.get("success") is False and "timeout" in resp.get("error", ""), \
+        f"expected timeout error, got {resp!r}"
+    assert elapsed < 4, f"timeout verdict took {elapsed:.1f}s with a 1s budget"
+    respond_on_stdin(proc, rid, "way-too-late")  # must be dropped, not crash
+    time.sleep(0.1)
+    round_trip(proc, PORT, "ping", "pong", "Case 6a follow-up: host healthy")
+
+    # Case 6b: hammer the timeout boundary. Respond at ~the 1s deadline with
+    # jitter on both sides; every outcome must be EITHER this request's own
+    # payload OR the timeout error. A wrong payload, a hang, or a crash
+    # fails. This drives the verdict/transfer/deregistration critical
+    # section from both sides simultaneously.
+    print("[TEST] --- Case 6b: timeout-vs-response boundary hammer ---")
+    outcomes = {"delivered": 0, "timeout": 0}
+    for i in range(12):
+        marker = f"boundary-{i}"
+        s, rid = send_and_forward({"who": marker})
+        delay = 0.90 + (i % 5) * 0.05  # 0.90s .. 1.10s across the 1s deadline
+        responder = threading.Timer(delay, respond_on_stdin, args=(proc, rid, marker))
+        responder.start()
+        line = recv_line(s)
+        s.close()
+        responder.join()
+        resp = json.loads(line.decode('utf-8'))
+        if resp.get("success") is True:
+            assert resp.get("result") == marker, \
+                f"iteration {i}: wrong payload {resp.get('result')!r}"
+            outcomes["delivered"] += 1
+        else:
+            assert "timeout" in resp.get("error", ""), f"iteration {i}: {resp!r}"
+            outcomes["timeout"] += 1
+    print(f"[TEST] OK: 12 boundary races, all outcomes clean "
+          f"(delivered={outcomes['delivered']}, timeout={outcomes['timeout']}).")
+    assert outcomes["delivered"] > 0 and outcomes["timeout"] > 0, \
+        "hammer never straddled the boundary; widen the jitter range"
+
+    # Case 6c: late LARGE responses must not accumulate in the host (the
+    # dropped-response path must free). 500KB x 8 late replies would grow
+    # RSS by ~4MB if leaked.
+    print("[TEST] --- Case 6c: late large responses do not leak ---")
+    rss_before = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(proc.pid)]).strip())
+    for i in range(8):
+        s, rid = send_and_forward({})
+        recv_line(s)  # timeout error after 1s
+        s.close()
+        respond_on_stdin(proc, rid, "x" * 500_000)  # late; must be dropped+freed
+    time.sleep(0.3)
+    round_trip(proc, PORT, "ping", "pong", "Case 6c follow-up: host healthy")
+    rss_after = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(proc.pid)]).strip())
+    growth_mb = (rss_after - rss_before) / 1024
+    assert growth_mb < 3, f"RSS grew {growth_mb:.1f} MB across late 500KB responses"
+    print(f"[TEST] OK: RSS growth {growth_mb:.2f} MB across 8 late 500KB responses.\n")
+
+    # Case 7: stdin EOF (Chrome exit) must terminate the host promptly.
+    print("[TEST] --- Case 7: clean exit on stdin EOF ---")
     proc.stdin.close()
     try:
         proc.wait(timeout=5)

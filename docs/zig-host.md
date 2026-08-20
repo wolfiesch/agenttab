@@ -47,8 +47,22 @@ Same contract as `verify_rust_host.py` (port 9226): small round-trip, 500 KB
 framing integrity, invalid-token rejection, plus named-token acceptance
 (`BRIDGE_TOKENS_FILE`), concurrent clients answered in reverse arrival order
 with each socket asserted to receive only its own payload (the pending-map
-routing under the interleaving it exists for), and clean exit on stdin EOF.
-All six cases pass, stable across 5 consecutive runs.
+routing under the interleaving it exists for), a timeout-race suite, and
+clean exit on stdin EOF. The race suite runs the host with a 1 s response
+timeout and covers three cases: a response arriving after the timeout
+verdict is dropped while the client gets the timeout error and the host
+keeps serving; a 12-iteration hammer replies at 0.90 s to 1.10 s across the
+deadline and asserts every outcome is the request's own payload or the
+timeout error, requiring both outcomes to occur; and eight late 500 KB
+responses must not grow host RSS, pinning the dropped-response free path.
+All cases pass, stable across consecutive runs.
+
+The timeout verdict, response-ownership transfer, and pending-map removal
+execute under a single mutex hold in `handleLine`, and the stdin thread
+delivers only to slots still present in the map under that same mutex. A
+response can therefore land either before the verdict (delivered) or after
+removal (dropped and freed); no window exists where it is both counted as a
+timeout and leaked.
 
 ## Measured comparison
 
