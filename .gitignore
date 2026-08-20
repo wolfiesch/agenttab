@@ -58,6 +58,8 @@ mcp/.venv/
 
 # Build output (release archives, store upload zip)
 dist/
+host-zig/zig-out*/
+host-zig/.zig-cache/
 
 # OS noise
 .DS_Store
