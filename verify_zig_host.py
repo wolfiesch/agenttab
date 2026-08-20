@@ -172,8 +172,48 @@ def main():
     assert resp.get("success") is True and resp.get("result") == "pong"
     print("[TEST] OK: named token accepted.\n")
 
-    # Case 5: stdin EOF (Chrome exit) must terminate the host promptly.
-    print("[TEST] --- Case 5: clean exit on stdin EOF ---")
+    # Case 5: concurrent clients, responses delivered in REVERSE arrival
+    # order, each socket must receive only its own payload. This exercises
+    # the pending-map/condvar routing under the interleaving it exists for.
+    print("[TEST] --- Case 5: concurrent clients, out-of-order responses ---")
+    with open(token_fixture) as f:
+        legacy_token = f.read().strip()
+    clients = {}
+    for who in ("alpha", "beta"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(('127.0.0.1', PORT))
+        s.sendall((json.dumps({"action": "ping", "payload": {"who": who},
+                               "token": legacy_token}) + "\n").encode('utf-8'))
+        clients[who] = s
+    # Both requests must be forwarded (in-flight simultaneously) before any
+    # response is written back.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        with forwarded_lock:
+            if len(forwarded) == 2:
+                break
+        time.sleep(0.02)
+    with forwarded_lock:
+        assert len(forwarded) == 2, "both requests should be in flight concurrently"
+        arrival = list(forwarded.items())  # dict preserves arrival order
+    ids_by_who = {msg["payload"]["who"]: rid for rid, msg in arrival}
+    assert set(ids_by_who) == {"alpha", "beta"}, "forwarded payloads corrupted"
+    assert ids_by_who["alpha"] != ids_by_who["beta"], "request ids must be unique"
+    # Reply in reverse arrival order with per-request payloads.
+    for rid, msg in reversed(arrival):
+        respond_on_stdin(proc, rid, "result-for-" + msg["payload"]["who"])
+    for who, s in clients.items():
+        resp = json.loads(recv_line(s).decode('utf-8'))
+        s.close()
+        assert resp.get("success") is True, f"{who}: response not successful"
+        assert resp.get("result") == "result-for-" + who, \
+            f"{who}: received another client's payload: {resp.get('result')!r}"
+    with forwarded_lock:
+        forwarded.clear()
+    print("[TEST] OK: out-of-order responses routed to the correct clients.\n")
+
+    # Case 6: stdin EOF (Chrome exit) must terminate the host promptly.
+    print("[TEST] --- Case 6: clean exit on stdin EOF ---")
     proc.stdin.close()
     try:
         proc.wait(timeout=5)

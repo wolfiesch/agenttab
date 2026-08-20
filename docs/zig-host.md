@@ -45,7 +45,10 @@ PYTHONDONTWRITEBYTECODE=1 python3 verify_zig_host.py
 
 Same contract as `verify_rust_host.py` (port 9226): small round-trip, 500 KB
 framing integrity, invalid-token rejection, plus named-token acceptance
-(`BRIDGE_TOKENS_FILE`) and clean exit on stdin EOF. All five cases pass.
+(`BRIDGE_TOKENS_FILE`), concurrent clients answered in reverse arrival order
+with each socket asserted to receive only its own payload (the pending-map
+routing under the interleaving it exists for), and clean exit on stdin EOF.
+All six cases pass, stable across 5 consecutive runs.
 
 ## Measured comparison
 
