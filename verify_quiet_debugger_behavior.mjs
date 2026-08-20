@@ -174,6 +174,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reco
       },
     },
     tabs: {
+      onCreated: { addListener(listener) { listeners.created = listener; } },
       onRemoved: { addListener(listener) { listeners.removed = listener; } },
       onUpdated: { addListener() {} },
       async get(tabId) {
@@ -454,7 +455,7 @@ async function testPointerRenderingDoesNotDelayFocusedClick() {
   const harness = createHarness({
     tabs: { 31: { active: true, windowId: 1, groupId: -1, url: 'https://example.com', status: 'complete' } },
   });
-  const result = await harness.api.clickSelector(31, '#save');
+  const result = await harness.api.clickSelector(31, '#save', 0);
   assert.equal(result.success, true);
   assert.deepEqual(
     harness.controller.commandMethods.filter((method) => method === 'Input.dispatchMouseEvent'),
