@@ -336,7 +336,7 @@ def browser_task_session_open(
         raise
     result = dict(navigation) if isinstance(navigation, dict) else {"result": navigation}
     result["sessionId"] = session_id
-    result["taskSession"] = session
+    result["taskSession"] = call("getTaskSessions", {"sessionId": session_id})
     return _text(result)
 
 
@@ -380,6 +380,7 @@ def browser_snapshot(
     name: Optional[str] = None,
     limit: int = 50,
     diff: bool = False,
+    include_active_dialog: bool = False,
 ) -> str:
     """Filtered accessibility snapshot of what is on the page.
 
@@ -397,7 +398,9 @@ def browser_snapshot(
     Set ``diff=True`` to get only what changed since the previous snapshot of
     this tab: ``added``, ``removed`` (refs), and ``changed``, plus ``baseEpoch``
     and ``epoch``. The first diff call after a navigation has no baseline and
-    returns the full snapshot with ``diffBase: true``.
+    returns the full snapshot with ``diffBase: true``. Set
+    ``include_active_dialog=True`` to wrap the nodes with explicit active-modal
+    context, including when role filters omit the dialog.
     """
     tid = resolve_tab_id(tab_id)
     payload = {"tabId": tid, "compact": compact, "limit": limit}
@@ -407,6 +410,8 @@ def browser_snapshot(
         payload["name"] = name
     if diff:
         payload["diff"] = True
+    if include_active_dialog:
+        payload["includeActiveDialog"] = True
     return _text(call("observe", payload))
 
 
@@ -523,14 +528,27 @@ def browser_screenshot(tab_id: Optional[int] = None) -> ImageContent:
     )
 
 
-def browser_click(selector: str, tab_id: Optional[int] = None) -> str:
-    """Click a target by ref, CSS, or semantic selector (ref=e12, label=, text=, role=, frame=... >> ..., shadow >>>).
+def browser_click(
+    selector: str,
+    tab_id: Optional[int] = None,
+    settle_ms: int = 500,
+) -> str:
+    """Click a target and report immediate navigation, child-tab, and modal effects.
 
-    ``ref=e12`` reuses an element id from ``browser_snapshot``; it fails with
-    ``staleRef`` after a navigation instead of matching a different element.
+    Selectors accept ref, CSS, or semantic forms (ref=e12, label=, text=,
+    role=, frame=... >> ..., shadow >>>). ``ref=e12`` reuses an element id from
+    ``browser_snapshot``; it fails with ``staleRef`` after a navigation instead
+    of matching a different element. An active modal blocks clicks outside it.
+    ``settle_ms`` is clamped by the extension to 0-2000 milliseconds.
     """
+    if isinstance(settle_ms, bool) or not isinstance(settle_ms, int):
+        raise ValueError("settle_ms must be an integer")
     tid = resolve_tab_id(tab_id)
-    return _text(call("click", {"tabId": tid, "selector": selector}))
+    return _text(call("click", {
+        "tabId": tid,
+        "selector": selector,
+        "settleMs": settle_ms,
+    }))
 
 
 def browser_type(selector: str, text: str, tab_id: Optional[int] = None) -> str:

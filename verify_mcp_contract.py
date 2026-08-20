@@ -178,7 +178,11 @@ def default_result(action, payload):
     if action == "navigateTaskSession":
         return {"sessionId": payload.get("sessionId"), "tabId": 99, "active": payload.get("active")}
     if action == "getTaskSessions":
-        return []
+        return {
+            "sessionId": payload.get("sessionId"),
+            "name": "research",
+            "tabIds": [99],
+        } if payload.get("sessionId") else []
     if action == "observe":
         return [{"role": "button", "name": "OK"}]
     if action == "extractText":
@@ -282,14 +286,16 @@ def main():
     expect(open_sequence[0] == ("policyCheck", {"plan": expected_open_preflight}),
            f"owned navigation must preflight its complete plan first: {open_sequence}")
     expect([action for action, _ in open_sequence] == [
-        "policyCheck", "createTaskSession", "navigateAndSnapshot",
-    ], f"owned navigation should preflight, create, then navigate once: {open_sequence}")
-    expect(open_sequence[-1][1].get("sessionId") == "session-1"
-           and open_sequence[-1][1].get("active") is False,
+        "policyCheck", "createTaskSession", "navigateAndSnapshot", "getTaskSessions",
+    ], f"owned navigation should preflight, create, navigate, then refresh ownership: {open_sequence}")
+    expect(open_sequence[-2][1].get("sessionId") == "session-1"
+           and open_sequence[-2][1].get("active") is False,
            f"owned navigation should stay backgrounded and session-scoped: {open_sequence}")
+    expect(open_sequence[-1] == ("getTaskSessions", {"sessionId": "session-1"}),
+           f"owned navigation should refresh task ownership after navigation: {open_sequence}")
     expect(opened.get("sessionId") == "session-1"
-           and opened.get("taskSession", {}).get("name") == "research",
-           f"owned navigation should return ownership metadata: {opened}")
+           and opened.get("taskSession", {}).get("tabIds") == [99],
+           f"owned navigation should return fresh ownership metadata: {opened}")
 
     def fail_owned_navigation(action, payload):
         if action == "policyCheck":
@@ -391,13 +397,24 @@ def main():
         "tabId": 11, "compact": False, "roles": ["button", "link"], "name": "save", "limit": 10,
     }), "filtered snapshot payload mismatch")
 
+    server.browser_snapshot(tab_id=11, include_active_dialog=True)
+    expect(last_request() == ("observe", {
+        "tabId": 11, "compact": True, "limit": 50, "includeActiveDialog": True,
+    }), "active-dialog snapshot payload mismatch")
+
     # 5. extract_text default max_chars.
     server.browser_extract_text(tab_id=11)
     expect(last_request() == ("extractText", {"tabId": 11, "maxChars": 20000}), "extract_text payload mismatch")
 
     # 6. click / type / fill payloads.
     server.browser_click("#go", tab_id=11)
-    expect(last_request() == ("click", {"tabId": 11, "selector": "#go"}), "click payload mismatch")
+    expect(last_request() == ("click", {
+        "tabId": 11, "selector": "#go", "settleMs": 500,
+    }), "click payload mismatch")
+    server.browser_click("#fast", tab_id=11, settle_ms=0)
+    expect(last_request() == ("click", {
+        "tabId": 11, "selector": "#fast", "settleMs": 0,
+    }), "click settle override mismatch")
     server.browser_type("#q", "hello", tab_id=11)
     expect(last_request() == ("type", {"tabId": 11, "selector": "#q", "text": "hello"}), "type payload mismatch")
     server.browser_fill("#q", "hi", tab_id=11)
