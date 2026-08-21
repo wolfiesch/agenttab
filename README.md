@@ -51,7 +51,20 @@ Then:
 
 1. Open `chrome://extensions/`, enable Developer mode, **Load unpacked** from the directory printed by `setup.sh`.
 2. Keep **only one** Chrome Bridge extension enabled - duplicates race to bind port 9223.
-3. Register the MCP server in your client config:
+3. Choose the harness integration:
+
+**Oh My Pi (preferred locally):**
+
+```bash
+omp plugin link /ABSOLUTE/PATH/TO/chrome-bridge
+```
+
+Restart OMP, then use `chrome_bridge_state` and `chrome_bridge_control`. The
+extension presents the common task-session workflow as two native tools while
+every request still crosses the same host policy, confirmation, audit, and
+lease gates.
+
+**MCP clients:**
 
 ```json
 {
@@ -67,6 +80,9 @@ Then:
   }
 }
 ```
+
+The OMP extension and MCP server are parallel adapters over the same bridge;
+installing one does not remove or weaken the other.
 
 Full instructions: [setup](docs/setup.md) and [MCP registration](docs/mcp.md).
 
@@ -91,7 +107,7 @@ Full instructions: [setup](docs/setup.md) and [MCP registration](docs/mcp.md).
 | **Visible status** | Toolbar popup with connection/task state and a foreground-only agent-pointer toggle; task groups use `✦`, `↗`, and `✓` status labels |
 | **Multi-agent** | Named per-client tokens, cooperative leasing, task-owned tab groups with stable colors that never touch unrelated human tabs |
 | **Reliability** | Machine-readable background runs detecting active-tab changes, frontmost-app changes, unexpected tabs, and owned tabs becoming active |
-| **Integrations** | MCP server (Claude Desktop, Cursor, Cline, ...) with read-only and sensitive-tool scoping; optional Rust native-host parity port |
+| **Integrations** | Native OMP extension with two high-level task-session tools; MCP server (Claude Desktop, Cursor, Cline, ...) with granular read-only and sensitive-tool scoping; optional Rust native-host parity port |
 
 > [!WARNING]
 > **Trusted local use only.** Chrome Bridge controls your real Chrome profile: it can read page content, take screenshots, drive forms, download files, inspect cookies through redacted probes, and attach Chrome's debugger. Install only on machines you control, and keep `bridge_token.txt`, `bridge_tokens.txt`, `extension_key.pem`, `bridge_policy.json`, and debug/audit logs private and git-ignored. Host defaults are fail-closed; normal automation requires explicit local policy grants.

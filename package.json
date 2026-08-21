@@ -1,0 +1,16 @@
+{
+  "name": "chrome-bridge",
+  "version": "0.1.0",
+  "description": "Policy-governed control of a real Chrome profile for Oh My Pi and MCP clients",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test:omp": "bun test omp"
+  },
+  "omp": {
+    "extensions": [
+      "./omp/index.mjs"
+    ]
+  }
+}
