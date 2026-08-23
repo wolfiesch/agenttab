@@ -36,6 +36,15 @@ if (derivedDevelopmentId !== identity.developmentExtension.id) {
   );
 }
 const outputRoot = join(packageRoot, "dist");
+const compatibilityFiles = [
+  "manifest.json",
+  "background.js",
+  "popup.html",
+  "popup.css",
+  "popup.js",
+  "wake.html",
+  "wake.js",
+];
 
 await rm(outputRoot, { recursive: true, force: true });
 await mkdir(outputRoot, { recursive: true });
@@ -65,7 +74,10 @@ if (!result.success) {
 for (const name of ["manifest.json", "popup.html", "popup.css", "wake.html"]) {
   await writeFile(join(outputRoot, name), await readFile(join(sourceRoot, name)));
 }
-await cp(join(sourceRoot, "icons"), join(outputRoot, "icons"), { recursive: true });
+await mkdir(join(outputRoot, "icons"), { recursive: true });
+for (const size of [16, 32, 48, 128]) {
+  await cp(join(sourceRoot, "icons", `icon${size}.png`), join(outputRoot, "icons", `icon${size}.png`));
+}
 
 const manifest = JSON.parse(await readFile(join(outputRoot, "manifest.json"), "utf8")) as Record<string, unknown>;
 const packageManifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as Record<string, unknown>;
@@ -104,6 +116,18 @@ for (const output of result.outputs) {
   const source = await output.text();
   if (/\beval\s*\(|\bnew\s+Function\s*\(/.test(source)) {
     throw new Error(`Dynamic code execution found in ${basename(output.path)}`);
+  }
+}
+if (channel === "development") {
+  const extensionMirror = join(repoRoot, "extension");
+  await rm(extensionMirror, { recursive: true, force: true });
+  await mkdir(extensionMirror, { recursive: true });
+  await rm(join(repoRoot, "icons"), { recursive: true, force: true });
+  for (const root of [repoRoot, extensionMirror]) {
+    for (const name of compatibilityFiles) {
+      await cp(join(outputRoot, name), join(root, name));
+    }
+    await cp(join(outputRoot, "icons"), join(root, "icons"), { recursive: true });
   }
 }
 

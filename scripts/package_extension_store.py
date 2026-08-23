@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Build a store-ready Chrome extension upload zip.
-
-This script only writes a local zip. It never uploads, never talks to the
-Chrome Web Store API, and never creates, reads, or packages a private
-extension key.
-"""
+"""Build a deterministic, store-ready AgentTab extension upload."""
 
 from __future__ import annotations
 
@@ -15,63 +10,46 @@ import shutil
 import subprocess
 import sys
 import zipfile
-from fnmatch import fnmatch
 from pathlib import Path
 
-# Exactly the extension surface. Nothing else may enter the archive.
-EXTENSION_FILES = ("manifest.json", "background.js", "wake.html", "wake.js")
-
-# Native messaging host name convention for this repo.
-NATIVE_HOST_NAME = "com.automation.bridge"
-
-# Local artifacts that must never reach a store upload.
-FORBIDDEN_GLOBS = (
-    "bridge_token*",
-    ".bridge_tokens*",
-    "bridge_tokens*",
-    "bridge_policy.json",
-    "bridge_policy*.json",
-    "bridge_secrets*",
-    "extension_key.pem",
-    "*.pem",
-    "*.key",
-    "*.log",
-    "*.pyc",
-    "__pycache__/*",
-    "docs/*",
-    "tests/*",
-    "test_*",
-    "verify_*",
-    ".env*",
-    "com.automation.bridge*.json",
+EXTENSION_FILES = (
+    "manifest.json",
+    "background.js",
+    "popup.html",
+    "popup.css",
+    "popup.js",
+    "wake.html",
+    "wake.js",
+    "icons/icon16.png",
+    "icons/icon32.png",
+    "icons/icon48.png",
+    "icons/icon128.png",
 )
-
-# Deterministic archive timestamp (earliest value the zip format accepts).
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 
 class PackagingError(Exception):
-    """Raised when the extension surface fails a pre-write validation."""
+    """Raised before an invalid store package can be written."""
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Package the extension surface into a Chrome Web Store upload zip",
+        description="Package the canonical AgentTab extension build for Chrome Web Store upload",
     )
     parser.add_argument(
         "--out",
-        default="dist/chrome-bridge-extension-store.zip",
-        help="Output zip path (default: dist/chrome-bridge-extension-store.zip)",
+        default="dist/agenttab-extension-store.zip",
+        help="Output zip path",
     )
     parser.add_argument(
         "--source",
-        default=None,
-        help="Directory holding the extension surface files (default: repository root)",
+        default="packages/extension/dist",
+        help="Canonical extension build directory",
     )
     parser.add_argument(
         "--check-js",
         action="store_true",
-        help="Run 'node --check' on the packaged JavaScript; requires node on PATH",
+        help="Run node --check on packaged JavaScript",
     )
     return parser.parse_args(argv)
 
@@ -84,120 +62,84 @@ def read_bytes(path: Path) -> bytes:
     try:
         return path.read_bytes()
     except OSError as exc:
-        raise PackagingError(f"cannot read {path.name}: {exc}") from exc
+        raise PackagingError(f"cannot read {path}: {exc}") from exc
 
 
-def validate_extension_copy_parity(root: Path) -> None:
-    """Root files are canonical; the extension/ mirror must be byte-identical."""
-    mirror = root / "extension"
-    if not mirror.is_dir():
-        return
-    for name in ("background.js", "manifest.json"):
-        copy = mirror / name
-        if not copy.is_file():
-            raise PackagingError(f"extension/{name} is missing while extension/ exists")
-        if read_bytes(root / name) != read_bytes(copy):
-            raise PackagingError(
-                f"extension/{name} is not byte-identical to the canonical root {name}; "
-                "re-sync the extension copy before packaging"
-            )
+def source_members(source: Path) -> set[str]:
+    return {
+        path.relative_to(source).as_posix()
+        for path in source.rglob("*")
+        if path.is_file()
+    }
 
 
-def validate_manifest(manifest: dict, root_manifest: dict) -> None:
+def validate_manifest(manifest: dict[str, object], identity: dict[str, object]) -> None:
     if manifest.get("manifest_version") != 3:
-        raise PackagingError(
-            f"manifest_version must be 3, got {manifest.get('manifest_version')!r}"
-        )
+        raise PackagingError("manifest_version must be 3")
     if "key" in manifest:
+        raise PackagingError("store manifest must not contain an unpacked-extension key")
+    if not identity.get("webStoreExtensionId"):
         raise PackagingError(
-            "manifest contains a 'key' field; store uploads must not carry a local extension key"
+            "config/identity.json webStoreExtensionId is unset; create the dashboard item before packaging"
         )
-    if not manifest.get("name"):
-        raise PackagingError("manifest is missing 'name'")
-    if not manifest.get("version"):
-        raise PackagingError("manifest is missing 'version'")
-
-    background = manifest.get("background") or {}
-    if background.get("service_worker") != "background.js":
-        raise PackagingError("manifest background.service_worker must be 'background.js'")
-
-    permissions = set(manifest.get("permissions") or [])
-    if "nativeMessaging" not in permissions:
-        raise PackagingError("manifest permissions must include 'nativeMessaging'")
-    missing = sorted(set(root_manifest.get("permissions") or []) - permissions)
-    if missing:
-        raise PackagingError(
-            "manifest is missing permissions required by the canonical root manifest: "
-            + ", ".join(missing)
-        )
-
-
-def validate_native_host_name(background_source: str) -> None:
-    if NATIVE_HOST_NAME not in background_source:
-        raise PackagingError(
-            f"background.js does not reference the native messaging host {NATIVE_HOST_NAME!r}"
-        )
-
-
-def forbidden_matches(names: list[str]) -> list[str]:
-    hits = []
-    for name in names:
-        posix = Path(name).as_posix()
-        base = Path(name).name
-        if any(fnmatch(posix, pattern) or fnmatch(base, pattern) for pattern in FORBIDDEN_GLOBS):
-            hits.append(name)
-    return hits
-
-
-def check_js(paths: list[Path]) -> None:
-    node = shutil.which("node")
-    if node is None:
-        raise PackagingError("--check-js requires node on PATH")
-    for path in paths:
-        result = subprocess.run(
-            [node, "--check", str(path)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise PackagingError(f"node --check failed for {path.name}: {detail}")
+    if manifest.get("name") != identity.get("product"):
+        raise PackagingError("extension name does not match the frozen product identity")
+    if manifest.get("version") != identity.get("chromeManifestVersion"):
+        raise PackagingError("extension version does not match config/identity.json")
+    if manifest.get("version_name") != identity.get("version"):
+        raise PackagingError("extension version_name does not match config/identity.json")
+    background = manifest.get("background")
+    if not isinstance(background, dict) or background.get("service_worker") != "background.js":
+        raise PackagingError("manifest background.service_worker must be background.js")
+    permissions = manifest.get("permissions")
+    if not isinstance(permissions, list) or "nativeMessaging" not in permissions:
+        raise PackagingError("manifest permissions must include nativeMessaging")
 
 
 def collect_members(source: Path, root: Path) -> dict[str, bytes]:
-    """Return the exact archive payload, keyed by archive name."""
-    missing = [name for name in EXTENSION_FILES if not (source / name).is_file()]
-    if missing:
-        raise PackagingError("missing extension file(s): " + ", ".join(missing))
+    expected = set(EXTENSION_FILES)
+    actual = source_members(source)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected: " + ", ".join(unexpected))
+        raise PackagingError("extension staging tree is not exhaustive (" + "; ".join(details) + ")")
 
-    root_manifest = json.loads(read_bytes(root / "manifest.json").decode("utf-8"))
     try:
-        manifest = json.loads(read_bytes(source / "manifest.json").decode("utf-8"))
+        identity = json.loads(read_bytes(root / "config" / "identity.json"))
+        manifest = json.loads(read_bytes(source / "manifest.json"))
     except json.JSONDecodeError as exc:
-        raise PackagingError(f"manifest.json is not valid JSON: {exc}") from exc
-    # Fail closed BEFORE the manifest is touched. Silently stripping "key" here
-    # would have produced a clean-looking package from a manifest that still
-    # carries a local unpacked-extension key on disk, hiding exactly the mistake
-    # this packager exists to catch.
-    if "key" in manifest:
-        raise PackagingError(
-            "manifest contains a 'key' field; store uploads must not carry a local extension key"
+        raise PackagingError(f"invalid JSON: {exc}") from exc
+    if not isinstance(identity, dict) or not isinstance(manifest, dict):
+        raise PackagingError("identity and manifest documents must be JSON objects")
+    validate_manifest(manifest, identity)
+
+    background = read_bytes(source / "background.js").decode("utf-8", errors="replace")
+    native_host = identity.get("nativeHost")
+    if not isinstance(native_host, str) or native_host not in background:
+        raise PackagingError("background.js does not reference the frozen AgentTab native host")
+
+    return {name: read_bytes(source / name) for name in EXTENSION_FILES}
+
+
+def check_javascript(source: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        raise PackagingError("--check-js requires node on PATH")
+    for name in ("background.js", "popup.js", "wake.js"):
+        result = subprocess.run(
+            [node, "--check", str(source / name)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
-    validate_manifest(manifest, root_manifest)
-
-    background = read_bytes(source / "background.js")
-    validate_native_host_name(background.decode("utf-8", errors="replace"))
-
-    members = {
-        "manifest.json": (json.dumps(manifest, indent=2) + "\n").encode("utf-8"),
-        "background.js": background,
-        "wake.html": read_bytes(source / "wake.html"),
-        "wake.js": read_bytes(source / "wake.js"),
-    }
-    hits = forbidden_matches(sorted(members))
-    if hits:
-        raise PackagingError("forbidden artifact(s) in package: " + ", ".join(hits))
-    return members
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise PackagingError(f"node --check failed for {name}: {detail}")
 
 
 def write_zip(out_path: Path, members: dict[str, bytes]) -> None:
@@ -213,20 +155,18 @@ def write_zip(out_path: Path, members: dict[str, bytes]) -> None:
 
 def build_store_package(
     out_path: Path,
+    *,
     source: Path | None = None,
     root: Path | None = None,
     run_js_check: bool = False,
-) -> dict:
-    """Write the store upload zip and return metadata only."""
+) -> dict[str, object]:
     root = (root or repo_root()).resolve()
-    source = (source or root).resolve()
-    if source == root:
-        validate_extension_copy_parity(root)
+    source = (source or root / "packages" / "extension" / "dist").resolve()
     members = collect_members(source, root)
     if run_js_check:
-        check_js([source / "background.js", source / "wake.js"])
+        check_javascript(source)
     write_zip(out_path, members)
-    payload = out_path.read_bytes()
+    payload = read_bytes(out_path)
     return {
         "path": out_path.as_posix(),
         "sha256": hashlib.sha256(payload).hexdigest(),
@@ -244,10 +184,12 @@ def build_store_package(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    out_path = Path(args.out)
-    source = Path(args.source) if args.source else None
     try:
-        metadata = build_store_package(out_path, source=source, run_js_check=args.check_js)
+        metadata = build_store_package(
+            Path(args.out),
+            source=Path(args.source),
+            run_js_check=args.check_js,
+        )
     except PackagingError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
