@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-developer.schema.json",
+  "title": "browser_developer parameters",
+  "type": "object",
+  "required": ["action", "params"],
+  "properties": {
+    "action": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "params": { "type": "object" }
+  },
+  "additionalProperties": false
+}

@@ -52,10 +52,10 @@ jobs:
 
       - name: Validate sources and extension mirror
         run: |
-          python3 -m pip install -e ./mcp
+          python3 -m pip install -e ./mcp jsonschema==4.25.1
           python3 -m unittest scripts/test_prepare_ci_cache.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_brand_shell_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/background_reliability.py scripts/package_release.py
-          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tests/architecture/verify_permissions.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tests/architecture/verify_permissions.py tests/architecture/verify_protocol_schemas.py
           node --check background.js
           node --check wake.js
           node --check popup.js
@@ -89,7 +89,11 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_permissions.py
           cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_protocol_schemas.py
 
+
+      - name: Test the AgentTab runtime core
+        run: cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
 
       - name: Build the Rust native host
         run: cargo build --release --locked --manifest-path host-rs/Cargo.toml
@@ -123,6 +127,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify Linux IPC primitives
         run: cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
+      - name: Test the AgentTab runtime core on Linux
+        run: cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
 
   ipc-windows:
     runs-on: windows-latest
@@ -134,3 +140,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify Windows IPC primitives
         run: cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
+      - name: Test the AgentTab runtime core on Windows
+        run: cargo test --workspace --locked --manifest-path host-rs/Cargo.toml

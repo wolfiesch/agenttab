@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-wait.schema.json",
+  "title": "browser_wait parameters",
+  "$defs": {
+    "condition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "enum": ["load", "network_idle", "download"] } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "enum": ["url", "text", "selector"] },
+            "value": { "type": "string", "minLength": 1, "maxLength": 65536 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "required": ["tab_id", "condition"],
+  "properties": {
+    "tab_id": { "type": "integer", "minimum": 0 },
+    "condition": { "$ref": "#/$defs/condition" },
+    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120000, "default": 30000 }
+  },
+  "additionalProperties": false
+}
