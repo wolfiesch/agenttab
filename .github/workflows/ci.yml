@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, pivot/agenttab]
   push:
     branches: [main]
 
@@ -53,6 +53,7 @@ jobs:
           python3 -m pip install -e ./mcp
           python3 -m unittest scripts/test_prepare_ci_cache.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_brand_shell_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/background_reliability.py scripts/package_release.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile tests/architecture/verify_permissions.py
           node --check background.js
           node --check wake.js
           node --check popup.js
@@ -82,6 +83,12 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
           PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
 
+      - name: Run architecture decision probes
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_permissions.py
+          cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
+
+
       - name: Build the Rust native host
         run: cargo build --release --locked --manifest-path host-rs/Cargo.toml
 
@@ -103,3 +110,21 @@ jobs:
         run: |
           python3 scripts/prepare_ci_cache.py \
             --root "$HOME/Library/Caches/chrome-bridge-ci/rust-1.97"
+
+  ipc-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Linux IPC primitives
+        run: cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
+
+  ipc-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify Windows IPC primitives
+        run: cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
