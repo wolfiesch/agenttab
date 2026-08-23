@@ -352,7 +352,7 @@ function installChromeMock(): void {
       },
       runtime: {
         id: EXTENSION_ID,
-        getManifest() { return { version: "0.2.0" }; },
+        getManifest() { return { version: "2.0.0" }; },
         connectNative() {
           if (!nativePort) throw new Error("native host unavailable");
           return nativePort;
@@ -1360,7 +1360,7 @@ describe("native bridge transport", () => {
       protocol: "agenttab.native",
       version: 1,
       kind: "hello",
-      extension_version: "0.2.0",
+      extension_version: "2.0.0",
       inventory: [{
         tab_id: 44,
         window_id: 1,

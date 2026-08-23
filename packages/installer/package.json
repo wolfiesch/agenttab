@@ -1,0 +1,25 @@
+{
+  "name": "agenttab",
+  "version": "2.0.0-rc.1",
+  "description": "AgentTab installer and local CLI",
+  "type": "module",
+  "bin": {
+    "agenttab": "dist/cli.mjs"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "sign-artifacts": "bun run scripts/sign-artifact-manifest.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.23",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.3",
+    "yaml": "^2.8.1"
+  }
+}

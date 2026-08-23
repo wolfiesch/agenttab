@@ -13,7 +13,8 @@ import { mutateState, readState } from "./storage";
 import { OwnershipLedger } from "./ownership";
 import { isRecord } from "./type-guards";
 
-const NATIVE_HOST = "dev.agenttab.host";
+declare const AGENTTAB_NATIVE_HOST: string;
+const NATIVE_HOST = typeof AGENTTAB_NATIVE_HOST === "string" ? AGENTTAB_NATIVE_HOST : "dev.agenttab.host";
 const RECONNECT_ALARM = "agenttab-native-reconnect";
 const RECONNECT_MAX_MS = 30_000;
 type CommandHandler = (command: NativeDispatchCommand) => Promise<NativeResponse>;

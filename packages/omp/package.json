@@ -1,5 +1,5 @@
 {
-  "name": "@agenttab/extension",
+  "name": "@agenttab/omp",
   "version": "2.0.0-rc.1",
   "private": true,
   "type": "module",
@@ -10,7 +10,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.2.23",
-    "@types/chrome": "^0.1.36",
+    "@types/node": "^24.5.2",
     "typescript": "^5.9.3"
   }
 }

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agenttab-host"
-version = "0.2.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "agenttab-protocol",
  "base64",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "agenttab-protocol"
-version = "0.2.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",

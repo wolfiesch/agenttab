@@ -1,8 +1,15 @@
 {
-  "name": "@agenttab/extension",
+  "name": "agenttab-mcp",
   "version": "2.0.0-rc.1",
-  "private": true,
+  "description": "Seven-tool MCP adapter for AgentTab",
   "type": "module",
+  "bin": {
+    "agenttab-mcp": "dist/server.mjs"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "bun run scripts/build.ts",
     "typecheck": "tsc --noEmit",
@@ -10,7 +17,7 @@
   },
   "devDependencies": {
     "@types/bun": "^1.2.23",
-    "@types/chrome": "^0.1.36",
+    "@types/node": "^24.5.2",
     "typescript": "^5.9.3"
   }
 }

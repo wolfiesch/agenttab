@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agenttab"
+version = "2.0.0rc1"
+description = "Typed Python client for AgentTab Core RPC"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Wolfgang Schoenberger" }]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agenttab"]

@@ -1,0 +1,23 @@
+{
+  "name": "@agenttab/sdk",
+  "version": "2.0.0-rc.1",
+  "description": "Typed local AgentTab Core RPC client",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.23",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.3"
+  }
+}
