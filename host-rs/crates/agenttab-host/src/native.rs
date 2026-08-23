@@ -1,10 +1,11 @@
 use crate::handoff::HandoffState;
 use crate::lifecycle::Lifecycle;
 use agenttab_protocol::{
-    native_close_task, native_command, native_ready, read_frame, write_frame,
-    NativeDisconnectRecovery, NativeEvent, NativeEventPayload, NativeHello, NativeOriginPolicy,
-    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ProtocolError, RuntimeState,
-    EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, PROTOCOL_VERSION,
+    native_close_task, native_command, native_event_ack, native_ready, read_frame, write_frame,
+    NativeDisconnectRecovery, NativeEvent, NativeEventName, NativeEventPayload, NativeHandoff,
+    NativeHello, NativeOriginPolicy, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
+    ProtocolError, RuntimeState, EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES,
+    NATIVE_PROTOCOL, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -35,10 +36,10 @@ pub trait NativeEventSink: Send + Sync {
         &self,
         inventory: &[NativeTab],
         staged_commits: &[NativeStagedCommit],
+        handoff: &NativeHandoff,
     ) -> Result<(), String>;
-    fn handle(&self, payload: &NativeEventPayload) -> Result<(), String>;
+    fn handle(&self, payload: &NativeEventPayload, event_id: Option<&str>) -> Result<(), String>;
 }
-
 pub trait NativeTransport: Send + Sync {
     fn dispatch(
         &self,
@@ -100,14 +101,14 @@ impl StdioNative {
                 Ok(None) => {
                     self.disconnected.store(true, Ordering::Release);
                     self.lifecycle.extension_disconnected();
-                    self.handoff.restore(false);
+                    self.handoff.restore(true);
                     self.fail_all(NativeError::Disconnected);
                     return Ok(());
                 }
                 Err(error) => {
                     self.disconnected.store(true, Ordering::Release);
                     self.lifecycle.terminal(error.to_string());
-                    self.handoff.restore(false);
+                    self.handoff.restore(true);
                     self.fail_all(NativeError::Protocol(error.to_string()));
                     return Err(error);
                 }
@@ -115,7 +116,7 @@ impl StdioNative {
             if let Err(error) = self.handle_inbound(value) {
                 self.disconnected.store(true, Ordering::Release);
                 self.lifecycle.terminal(error.to_string());
-                self.handoff.restore(false);
+                self.handoff.restore(true);
                 self.fail_all(NativeError::Protocol(error.to_string()));
                 return Err(error);
             }
@@ -142,7 +143,7 @@ impl StdioNative {
                 let hello = NativeHello::parse(value)?;
                 self.lifecycle.begin_reconciliation();
                 if let Some(sink) = self.event_sink.read().clone() {
-                    sink.reconcile(&hello.inventory, &hello.staged_commits)
+                    sink.reconcile(&hello.inventory, &hello.staged_commits, &hello.handoff)
                         .map_err(ProtocolError::InvalidNativeEvent)?;
                 }
                 self.handoff.restore(hello.handoff.active);
@@ -167,19 +168,51 @@ impl StdioNative {
                 }
             }
             Some("event") => {
-                let (_, payload) = NativeEvent::parse(value)?;
-                if let Some(sink) = self.event_sink.read().clone() {
-                    sink.handle(&payload)
-                        .map_err(ProtocolError::InvalidNativeEvent)?;
+                let (event, payload) = NativeEvent::parse(value)?;
+                let clear_handoff = matches!(
+                    &payload,
+                    NativeEventPayload::Handoff(NativeHandoff { active: false, .. })
+                );
+                if clear_handoff
+                    && !matches!(
+                        self.lifecycle.state(),
+                        RuntimeState::Ready | RuntimeState::Paused
+                    )
+                {
+                    return Err(ProtocolError::InvalidNativeEvent(
+                        "handoff clear cannot be acknowledged before reconciliation".into(),
+                    ));
                 }
+                let applied = if let Some(sink) = self.event_sink.read().clone() {
+                    sink.handle(&payload, event.event_id.as_deref())
+                        .map_err(ProtocolError::InvalidNativeEvent)?;
+                    true
+                } else {
+                    false
+                };
                 match payload {
                     NativeEventPayload::Pause(event) => {
                         self.lifecycle.set_paused(event.paused);
                     }
                     NativeEventPayload::Handoff(handoff) => {
                         self.handoff.restore(handoff.active);
+                        if !handoff.active {
+                            if !applied {
+                                return Err(ProtocolError::InvalidNativeEvent(
+                                    "handoff clear cannot be acknowledged without durable state"
+                                        .into(),
+                                ));
+                            }
+                            self.write_value(&native_event_ack(
+                                NativeEventName::HandoffChanged,
+                                event.event_id.as_deref().expect(
+                                    "validated inactive handoff event must carry an event_id",
+                                ),
+                            ))?;
+                        }
                     }
                     NativeEventPayload::ExtensionDisconnected(_) => {
+                        self.handoff.restore(true);
                         self.lifecycle.extension_disconnected();
                         self.fail_all(NativeError::Disconnected);
                     }
@@ -191,6 +224,7 @@ impl StdioNative {
             Some("disconnect_recovery") => {
                 let _ = NativeDisconnectRecovery::parse(value)?;
                 self.disconnected.store(true, Ordering::Release);
+                self.handoff.restore(true);
                 self.lifecycle.begin_reconciliation();
                 self.fail_all(NativeError::Disconnected);
             }
@@ -331,6 +365,7 @@ impl NativeTransport for StdioNative {
             let _ = sender.send(Err(NativeError::Disconnected));
         }
         task_ids.sort_unstable();
+
         task_ids.dedup();
         for task_id in task_ids {
             let _ = self.write_value(&native_command(
@@ -355,6 +390,37 @@ mod tests {
     use agenttab_protocol::{write_frame, EXTENSION_TO_HOST_MAX_BYTES};
     use serde_json::json;
     use std::io::Cursor;
+    #[derive(Default)]
+    struct DurableHandoffSink {
+        clear_event_ids: Mutex<Vec<String>>,
+    }
+
+    impl NativeEventSink for DurableHandoffSink {
+        fn reconcile(
+            &self,
+            _inventory: &[NativeTab],
+            _staged_commits: &[NativeStagedCommit],
+            _handoff: &NativeHandoff,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn handle(
+            &self,
+            payload: &NativeEventPayload,
+            event_id: Option<&str>,
+        ) -> Result<(), String> {
+            if matches!(
+                payload,
+                NativeEventPayload::Handoff(NativeHandoff { active: false, .. })
+            ) {
+                self.clear_event_ids
+                    .lock()
+                    .push(event_id.unwrap_or_default().to_owned());
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn hello_reconciles_before_ready_frame_is_emitted() {
@@ -381,6 +447,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ready["kind"], "ready");
+    }
+    #[test]
+    fn handoff_clear_is_acknowledged_only_after_sink_applies_it() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+        let handoff = Arc::new(HandoffState::default());
+        handoff.restore(true);
+        let output = SharedWriter::default();
+        let native = StdioNative::new(output.clone(), lifecycle, handoff.clone());
+        let sink = Arc::new(DurableHandoffSink::default());
+        native.set_event_sink(sink.clone());
+
+        native
+            .handle_inbound(json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "event",
+                "event": "handoff_changed",
+                "event_id": "handoff-clear-0001",
+                "payload": {"active": false}
+            }))
+            .unwrap();
+
+        assert!(!handoff.is_active());
+        assert_eq!(
+            sink.clear_event_ids.lock().clone(),
+            vec!["handoff-clear-0001".to_owned()]
+        );
+        let bytes = output.bytes.lock().clone();
+        assert_eq!(
+            read_frame(&mut bytes.as_slice(), HOST_TO_EXTENSION_MAX_BYTES)
+                .unwrap()
+                .unwrap(),
+            json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "event_ack",
+                "event": "handoff_changed",
+                "event_id": "handoff-clear-0001",
+            })
+        );
     }
 
     #[test]

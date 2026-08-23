@@ -185,6 +185,11 @@ def scrubbed_error_code(response: dict[str, Any]) -> str:
     error = response.get("error")
     return error.get("code", "missing_error_code") if isinstance(error, dict) else "missing_error_code"
 
+def scrubbed_error_message(response: dict[str, Any]) -> str:
+    error = response.get("error")
+    if not isinstance(error, dict) or not isinstance(error.get("message"), str):
+        return "missing_error_message"
+    return " ".join(error["message"].split())[:160]
 
 
 def response_outcome(response: dict[str, Any]) -> str:
@@ -200,7 +205,7 @@ def require_completed(operation: str, response: dict[str, Any]) -> dict[str, Any
         raise GateFailure(f"{operation}: completed response omitted object result")
     raise GateFailure(
         f"{operation}: expected completed; received {response_outcome(response)}"
-        f" ({scrubbed_error_code(response)})"
+        f" ({scrubbed_error_code(response)}: {scrubbed_error_message(response)})"
     )
 
 
@@ -711,7 +716,6 @@ class ChromeInspector:
     def assert_automation_permissions(self, expected: bool, operation: str) -> None:
         self.assert_permission("scripting", expected, operation)
         self.assert_permission("debugger", expected, operation)
-
     def selection(self) -> tuple[int, int]:
         state = self.state()
         return state["active_window_id"], state["active_tab_id"]
@@ -1452,6 +1456,7 @@ class LiveLifecycleProbe:
         }
 
     def restore_and_cleanup(self, fixture_filename: str | None) -> None:
+
         try:
             if self.client.task_id is not None:
                 self.prompt(

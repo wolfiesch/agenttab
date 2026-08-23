@@ -79,10 +79,17 @@ def round_trip(proc, port, action, result_payload, label, payload=None):
     assert response.get("result") == result_payload, "payload corrupted/truncated in transit"
     print(f"[TEST] OK: round-tripped {len(json.dumps(response))} bytes intact.\n")
 
+def unused_loopback_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
+
+
 def main():
     print("[TEST] Starting integration verification of Native Messaging Host...")
+    port = unused_loopback_port()
     test_env = os.environ.copy()
-    test_env['BRIDGE_PORT'] = '9224'
+    test_env['BRIDGE_PORT'] = str(port)
     token_fixture = "/tmp/chrome-bridge-verify-token.txt"
     with open(token_fixture, "w", encoding="utf-8") as f:
         f.write("verify-token\n")
@@ -103,16 +110,16 @@ def main():
     threading.Thread(target=read_from_bridge, args=(proc,), daemon=True).start()
 
     # Case 1: small ping/pong.
-    round_trip(proc, 9224, "ping", "pong", "Case 1: small payload")
+    round_trip(proc, port, "ping", "pong", "Case 1: small payload")
 
     # Case 2: large payload that exceeds a single recv() buffer (the framing bug).
     big = "x" * 500_000
-    round_trip(proc, 9224, "getCookies", big, "Case 2: 500KB payload", {"domain": "example.com"})
+    round_trip(proc, port, "getCookies", big, "Case 2: 500KB payload", {"domain": "example.com"})
 
     # Case 3: a wrong token must be rejected without forwarding to the extension.
     print("[TEST] --- Case 3: invalid token rejected ---")
     bad = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    bad.connect(('127.0.0.1', 9224))
+    bad.connect(('127.0.0.1', port))
     bad.sendall((json.dumps({"action": "ping", "payload": {}, "token": "WRONG"}) + "\n").encode('utf-8'))
     rej = json.loads(recv_line(bad).decode('utf-8'))
     bad.close()

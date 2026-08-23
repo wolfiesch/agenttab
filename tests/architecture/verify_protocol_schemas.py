@@ -130,6 +130,16 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         mutation=False,
     )
     expect_invalid(request_validator, missing_key, "mutation idempotency")
+    forbidden_viewport = core_request(
+        "browser_act",
+        {
+            "tab_id": 1,
+            "expected_page_revision": 2,
+            "actions": [{"kind": "set_viewport", "width": 1280, "height": 720}],
+        },
+        mutation=True,
+    )
+    expect_invalid(request_validator, forbidden_viewport, "Standard browser-global action")
     unknown = dict(requests[0], unexpected=True)
     expect_invalid(request_validator, unknown, "unknown request field")
 

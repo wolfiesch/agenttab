@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "AgentTab",
+  "short_name": "AgentTab",
+  "version": "0.2.0",
+  "description": "A local browser runtime for task-owned automation in your signed-in Chrome profile.",
+  "minimum_chrome_version": "127",
+  "permissions": [
+    "nativeMessaging",
+    "tabs",
+    "tabGroups",
+    "storage",
+    "alarms",
+    "downloads"
+  ],
+  "optional_permissions": [
+    "scripting",
+    "debugger"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AgentTab",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

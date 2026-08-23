@@ -40,6 +40,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Prepare persistent M1 build cache
@@ -50,8 +53,12 @@ jobs:
           python3 scripts/prepare_ci_cache.py --root "$cache_root"
           echo "CARGO_TARGET_DIR=$cache_root/cargo-target" >> "$GITHUB_ENV"
 
+      - name: Install AgentTab workspace dependencies
+        run: bun install --frozen-lockfile
+
       - name: Validate sources and extension mirror
         run: |
+          bun run extension:check
           python3 -m pip install -e ./mcp jsonschema==4.25.1
           python3 -m unittest scripts/test_prepare_ci_cache.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_brand_shell_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/background_reliability.py scripts/package_release.py

@@ -1,4 +1,4 @@
-use agenttab_protocol::{NativeStagedCommit, RpcMethod};
+use agenttab_protocol::{NativeHandoff, NativeStagedCommit, NativeTab, RpcMethod};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use parking_lot::Mutex;
@@ -45,6 +45,22 @@ pub enum JournalError {
     ResumeRotationLost,
     #[error("task is closed or missing")]
     MissingTask,
+    #[error("tab {tab_id} is not owned by this active task")]
+    TabNotOwned { tab_id: u64 },
+    #[error("page revision is stale: expected {expected}, current {actual}")]
+    StalePageRevision { expected: u64, actual: u64 },
+    #[error("staged commit no longer matches current task ownership or page revision")]
+    StaleStagedCommit,
+    #[error("staged commit is not bound to the task's current tab and page revision")]
+    InvalidStagedBinding,
+    #[error("page revision cannot be represented by the durable state store")]
+    InvalidPageRevision,
+    #[error("invalid native inventory: {0}")]
+    InvalidInventory(String),
+    #[error("handoff event id was reused with different state")]
+    HandoffEventConflict,
+    #[error("handoff clear event is missing its acknowledgement id")]
+    MissingHandoffEventId,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("native task cleanup failed: {0}")]
@@ -120,6 +136,34 @@ impl Journal {
              );
              CREATE INDEX IF NOT EXISTS idx_idempotency_retention
                  ON idempotency_journal(task_id, state, completed_at_ms);
+             CREATE TABLE IF NOT EXISTS task_tabs (
+                 task_id TEXT NOT NULL,
+                 tab_id INTEGER NOT NULL,
+                 window_id INTEGER NOT NULL,
+                 group_id INTEGER NOT NULL,
+                 url TEXT NOT NULL,
+                 page_revision INTEGER NOT NULL,
+                 PRIMARY KEY (task_id, tab_id),
+                 UNIQUE (tab_id),
+                 FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS tab_revision_floors (
+                 tab_id INTEGER PRIMARY KEY,
+                 page_revision INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS handoff_state (
+                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                 active INTEGER NOT NULL CHECK (active IN (0, 1)),
+                 task_id TEXT,
+                 tab_id INTEGER,
+                 started_at_ms INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS native_event_receipts (
+                 event_id TEXT PRIMARY KEY,
+                 event_name TEXT NOT NULL,
+                 payload_hash BLOB NOT NULL,
+                 applied_at_ms INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS staged_commits (
                  token_hash BLOB PRIMARY KEY,
                  task_id TEXT NOT NULL,
@@ -132,7 +176,9 @@ impl Journal {
                  used INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)),
                  upload_paths_json TEXT NOT NULL DEFAULT '[]',
                  FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
-             );",
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_staged_commits_native_token
+                 ON staged_commits(native_token);",
         )?;
         ensure_column(
             &connection,
@@ -288,16 +334,100 @@ impl Journal {
         Ok(())
     }
 
-    pub fn reconcile_inventory(&self, tab_counts: &[(Uuid, u64)]) -> Result<(), JournalError> {
+    pub fn reconcile_inventory(&self, inventory: &[NativeTab]) -> Result<(), JournalError> {
         let now = now_ms();
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut seen_tabs = std::collections::HashSet::with_capacity(inventory.len());
+        let mut owned = Vec::new();
+        let mut counts = std::collections::HashMap::<Uuid, u64>::new();
+
+        for tab in inventory {
+            let Some(task_id) = tab.task_id else {
+                continue;
+            };
+            let Some(group_id) = tab.group_id else {
+                return Err(JournalError::InvalidInventory(
+                    "task-owned tab has no visible group".into(),
+                ));
+            };
+            if tab.tab_id == 0 || tab.window_id == 0 || tab.url.is_empty() {
+                return Err(JournalError::InvalidInventory(
+                    "task-owned tab lacks a valid tab, window, or URL".into(),
+                ));
+            }
+            if !seen_tabs.insert(tab.tab_id) {
+                return Err(JournalError::InvalidInventory(
+                    "native inventory contains duplicate tab ids".into(),
+                ));
+            }
+            let tab_id = sqlite_u64(tab.tab_id)?;
+            let page_revision = sqlite_u64(tab.page_revision)?;
+            let active: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM tasks WHERE task_id = ?1 AND state = 'active'",
+                    params![task_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if active.is_none() {
+                return Err(JournalError::MissingTask);
+            }
+            let floor: Option<i64> = transaction
+                .query_row(
+                    "SELECT page_revision FROM tab_revision_floors WHERE tab_id = ?1",
+                    params![tab_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if floor.is_some_and(|floor| page_revision < floor) {
+                return Err(JournalError::InvalidInventory(
+                    "native inventory regressed a persisted page revision".into(),
+                ));
+            }
+            *counts.entry(task_id).or_insert(0) += 1;
+            owned.push((
+                task_id,
+                tab_id,
+                sqlite_u64(tab.window_id)?,
+                group_id,
+                &tab.url,
+                page_revision,
+            ));
+        }
+
+        transaction.execute(
+            "DELETE FROM task_tabs
+             WHERE task_id IN (SELECT task_id FROM tasks WHERE state = 'active')",
+            [],
+        )?;
         transaction.execute("UPDATE tasks SET tab_count = 0 WHERE state = 'active'", [])?;
-        for (task_id, tab_count) in tab_counts {
+        for (task_id, tab_id, window_id, group_id, url, page_revision) in owned {
+            transaction.execute(
+                "INSERT INTO tab_revision_floors(tab_id, page_revision)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(tab_id) DO UPDATE
+                 SET page_revision = MAX(tab_revision_floors.page_revision, excluded.page_revision)",
+                params![tab_id, page_revision],
+            )?;
+            transaction.execute(
+                "INSERT INTO task_tabs(task_id, tab_id, window_id, group_id, url, page_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task_id.to_string(),
+                    tab_id,
+                    window_id,
+                    group_id,
+                    url,
+                    page_revision
+                ],
+            )?;
+        }
+        for (task_id, tab_count) in counts {
             transaction.execute(
                 "UPDATE tasks SET tab_count = ?1, updated_at_ms = ?2
                  WHERE task_id = ?3 AND state = 'active'",
-                params![*tab_count as i64, now, task_id.to_string()],
+                params![sqlite_u64(tab_count)?, now, task_id.to_string()],
             )?;
         }
         transaction.commit()?;
@@ -309,23 +439,67 @@ impl Journal {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
+            "DELETE FROM task_tabs WHERE task_id = ?1",
+            params![task_id.to_string()],
+        )?;
+        let updated = transaction.execute(
             "UPDATE tasks SET tab_count = ?1, updated_at_ms = ?2
              WHERE task_id = ?3 AND state = 'active'",
-            params![tab_count as i64, now, task_id.to_string()],
+            params![sqlite_u64(tab_count)?, now, task_id.to_string()],
         )?;
+        if updated != 1 {
+            return Err(JournalError::MissingTask);
+        }
         transaction.commit()?;
         Ok(())
     }
 
+    pub fn verify_task_tab(
+        &self,
+        task_id: Uuid,
+        tab_id: u64,
+        expected_page_revision: Option<u64>,
+    ) -> Result<u64, JournalError> {
+        let connection = self.connection.lock();
+        let actual: Option<i64> = connection
+            .query_row(
+                "SELECT task_tabs.page_revision
+                 FROM task_tabs JOIN tasks USING(task_id)
+                 WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
+                   AND tasks.state = 'active'",
+                params![task_id.to_string(), sqlite_u64(tab_id)?],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(actual) = actual else {
+            return Err(JournalError::TabNotOwned { tab_id });
+        };
+        let actual = actual as u64;
+        if expected_page_revision.is_some_and(|expected| expected != actual) {
+            return Err(JournalError::StalePageRevision {
+                expected: expected_page_revision.expect("checked"),
+                actual,
+            });
+        }
+        Ok(actual)
+    }
+
     pub fn close_task(&self, task_id: Uuid) -> Result<(), JournalError> {
         let now = now_ms();
-        let connection = self.connection.lock();
-        connection.execute(
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM task_tabs WHERE task_id = ?1",
+            params![task_id.to_string()],
+        )?;
+        transaction.execute(
             "UPDATE tasks
-             SET state = 'closed', updated_at_ms = ?1, closed_at_ms = COALESCE(closed_at_ms, ?1)
+             SET state = 'closed', tab_count = 0, updated_at_ms = ?1,
+                 closed_at_ms = COALESCE(closed_at_ms, ?1)
              WHERE task_id = ?2",
             params![now, task_id.to_string()],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -424,8 +598,24 @@ impl Journal {
         let host_token = generate_capability();
         let token_hash = capability_hash(&host_token);
         let upload_paths_json = serde_json::to_string(upload_paths)?;
-        let connection = self.connection.lock();
-        connection.execute(
+        let page_revision = sqlite_u64(staged.page_revision)?;
+        let tab_id = sqlite_u64(staged.tab_id)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT task_tabs.page_revision
+                 FROM task_tabs JOIN tasks USING(task_id)
+                 WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
+                   AND tasks.state = 'active'",
+                params![staged.task_id.to_string(), tab_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_revision != Some(page_revision) {
+            return Err(JournalError::InvalidStagedBinding);
+        }
+        transaction.execute(
             "INSERT INTO staged_commits(
                  token_hash, task_id, native_token, tab_id, page_revision,
                  effect, fingerprint, expires_at_ms, used, upload_paths_json
@@ -434,14 +624,15 @@ impl Journal {
                 token_hash.as_slice(),
                 staged.task_id.to_string(),
                 staged.native_token,
-                staged.tab_id as i64,
-                staged.page_revision as i64,
+                tab_id,
+                page_revision,
                 staged.effect,
                 staged.fingerprint,
                 staged.expires_at_ms,
                 upload_paths_json,
             ],
         )?;
+        transaction.commit()?;
         Ok(host_token)
     }
 
@@ -497,12 +688,30 @@ impl Journal {
             transaction.rollback()?;
             return Err(JournalError::InvalidStagedToken);
         }
+        let current_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT task_tabs.page_revision
+                 FROM task_tabs JOIN tasks USING(task_id)
+                 WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
+                   AND tasks.state = 'active'",
+                params![task_id.to_string(), tab_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_revision != Some(page_revision) {
+            transaction.execute(
+                "DELETE FROM staged_commits WHERE token_hash = ?1",
+                params![token_hash.as_slice()],
+            )?;
+            transaction.commit()?;
+            return Err(JournalError::StaleStagedCommit);
+        }
         transaction.commit()?;
         Ok(StagedRecord {
             task_id: Uuid::parse_str(&stored_task)?,
             native_token,
-            tab_id: tab_id as u64,
-            page_revision: page_revision as u64,
+            tab_id: sqlite_to_u64(tab_id)?,
+            page_revision: sqlite_to_u64(page_revision)?,
             effect,
             fingerprint,
             expires_at_ms,
@@ -572,6 +781,84 @@ impl Journal {
             .transpose()
             .map(|paths| paths.unwrap_or_default())
             .map_err(JournalError::from)
+    }
+    pub fn reconcile_handoff(&self, handoff: &NativeHandoff) -> Result<(), JournalError> {
+        self.store_handoff(handoff, None, false)
+    }
+
+    pub fn apply_handoff_event(
+        &self,
+        handoff: &NativeHandoff,
+        event_id: Option<&str>,
+    ) -> Result<(), JournalError> {
+        self.store_handoff(handoff, event_id, true)
+    }
+
+    fn store_handoff(
+        &self,
+        handoff: &NativeHandoff,
+        event_id: Option<&str>,
+        receipt_required: bool,
+    ) -> Result<(), JournalError> {
+        if receipt_required && !handoff.active && event_id.is_none() {
+            return Err(JournalError::MissingHandoffEventId);
+        }
+        let payload_hash = handoff_payload_hash(handoff);
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(event_id) = event_id {
+            let previous: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT payload_hash FROM native_event_receipts
+                     WHERE event_id = ?1 AND event_name = 'handoff_changed'",
+                    params![event_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(previous) = previous {
+                if previous.as_slice() != payload_hash.as_slice() {
+                    return Err(JournalError::HandoffEventConflict);
+                }
+                transaction.commit()?;
+                return Ok(());
+            }
+        }
+        transaction.execute(
+            "INSERT INTO handoff_state(singleton, active, task_id, tab_id, started_at_ms)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton) DO UPDATE SET
+                 active = excluded.active,
+                 task_id = excluded.task_id,
+                 tab_id = excluded.tab_id,
+                 started_at_ms = excluded.started_at_ms",
+            params![
+                if handoff.active { 1_i64 } else { 0_i64 },
+                handoff.task_id.map(|task_id| task_id.to_string()),
+                handoff.tab_id.map(sqlite_u64).transpose()?,
+                handoff.started_at_ms,
+            ],
+        )?;
+        if let Some(event_id) = event_id {
+            transaction.execute(
+                "INSERT INTO native_event_receipts(event_id, event_name, payload_hash, applied_at_ms)
+                 VALUES (?1, 'handoff_changed', ?2, ?3)",
+                params![event_id, payload_hash.as_slice(), now_ms()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn handoff_active(&self) -> Result<bool, JournalError> {
+        let connection = self.connection.lock();
+        let active: Option<i64> = connection
+            .query_row(
+                "SELECT active FROM handoff_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(active == Some(1))
     }
 }
 
@@ -644,6 +931,29 @@ fn capability_hash(capability: &str) -> [u8; 32] {
     Sha256::digest(capability.as_bytes()).into()
 }
 
+fn handoff_payload_hash(handoff: &NativeHandoff) -> [u8; 32] {
+    let task_id = handoff.task_id.map(|task_id| task_id.to_string());
+    let tab_id = handoff.tab_id.map(|tab_id| tab_id.to_string());
+    Sha256::digest(
+        format!(
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            handoff.active,
+            task_id.as_deref().unwrap_or_default(),
+            tab_id.as_deref().unwrap_or_default(),
+            handoff.started_at_ms.unwrap_or_default(),
+        )
+        .as_bytes(),
+    )
+    .into()
+}
+fn sqlite_u64(value: u64) -> Result<i64, JournalError> {
+    i64::try_from(value).map_err(|_| JournalError::InvalidPageRevision)
+}
+
+fn sqlite_to_u64(value: i64) -> Result<u64, JournalError> {
+    u64::try_from(value).map_err(|_| JournalError::InvalidPageRevision)
+}
+
 fn validate_key_timestamp(key: Uuid) -> Result<(), JournalError> {
     let timestamp = uuid_v7_timestamp_ms(key);
     let now = now_ms();
@@ -676,11 +986,21 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agenttab_protocol::{NativeStagedCommit, RpcMethod};
+    use agenttab_protocol::{NativeHandoff, NativeStagedCommit, NativeTab, RpcMethod};
     use serde_json::json;
 
     fn open_journal(temp: &tempfile::TempDir) -> Journal {
         Journal::open(&temp.path().join("state.sqlite3")).unwrap()
+    }
+    fn owned_tab(task_id: Uuid, page_revision: u64) -> NativeTab {
+        NativeTab {
+            tab_id: 7,
+            window_id: 3,
+            group_id: Some(11),
+            url: "https://example.test/".into(),
+            page_revision,
+            task_id: Some(task_id),
+        }
     }
 
     #[test]
@@ -888,6 +1208,9 @@ mod tests {
         let journal = open_journal(&temp);
         let task = journal.create_task(None).unwrap();
         let other = journal.create_task(None).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(task.task_id, 9)])
+            .unwrap();
         let staged = NativeStagedCommit {
             native_token: "native-token-123456".into(),
             task_id: task.task_id,
@@ -927,5 +1250,87 @@ mod tests {
             journal.reconcile_staged_commits(&[]).unwrap(),
             vec![upload_path],
         );
+    }
+    #[test]
+    fn ownership_and_revision_floor_reject_stale_task_operations_and_commits() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let task = journal.create_task(None).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(task.task_id, 9)])
+            .unwrap();
+        assert_eq!(
+            journal.verify_task_tab(task.task_id, 7, Some(9)).unwrap(),
+            9
+        );
+        let staged = NativeStagedCommit {
+            native_token: "native-token-revision".into(),
+            task_id: task.task_id,
+            tab_id: 7,
+            page_revision: 9,
+            effect: "submit order".into(),
+            fingerprint: "b".repeat(64),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        let token = journal.store_staged_commit(&staged, &[]).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(task.task_id, 10)])
+            .unwrap();
+        assert!(matches!(
+            journal.verify_task_tab(task.task_id, 7, Some(9)),
+            Err(JournalError::StalePageRevision {
+                expected: 9,
+                actual: 10
+            })
+        ));
+        assert!(matches!(
+            journal.consume_staged_commit(task.task_id, &token),
+            Err(JournalError::StaleStagedCommit)
+        ));
+        assert!(matches!(
+            journal.reconcile_inventory(&[owned_tab(task.task_id, 9)]),
+            Err(JournalError::InvalidInventory(_))
+        ));
+    }
+
+    #[test]
+    fn handoff_clear_is_durable_before_idempotent_acknowledgement() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let active = NativeHandoff {
+            active: true,
+            task_id: Some(Uuid::now_v7()),
+            tab_id: Some(7),
+            started_at_ms: Some(now_ms()),
+        };
+        journal.reconcile_handoff(&active).unwrap();
+        assert!(journal.handoff_active().unwrap());
+
+        let clear = NativeHandoff {
+            active: false,
+            task_id: None,
+            tab_id: None,
+            started_at_ms: None,
+        };
+        assert!(matches!(
+            journal.apply_handoff_event(&clear, None),
+            Err(JournalError::MissingHandoffEventId)
+        ));
+        journal
+            .apply_handoff_event(&clear, Some("handoff-clear-0001"))
+            .unwrap();
+        assert!(!journal.handoff_active().unwrap());
+        journal
+            .apply_handoff_event(&clear, Some("handoff-clear-0001"))
+            .unwrap();
+        assert!(matches!(
+            journal.apply_handoff_event(&active, Some("handoff-clear-0001")),
+            Err(JournalError::HandoffEventConflict)
+        ));
+        let reopened = open_journal(&temp);
+        assert!(!reopened.handoff_active().unwrap());
+        reopened
+            .apply_handoff_event(&clear, Some("handoff-clear-0001"))
+            .unwrap();
     }
 }

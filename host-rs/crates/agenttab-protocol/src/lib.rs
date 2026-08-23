@@ -1000,6 +1000,34 @@ pub struct NativeTab {
     #[serde(default)]
     pub task_id: Option<Uuid>,
 }
+impl NativeTab {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.tab_id == 0 || self.window_id == 0 || self.url.is_empty() {
+            return Err(ProtocolError::InvalidNativeMessage(
+                "native tab id, window id, and URL must be present".into(),
+            ));
+        }
+        if self.task_id.is_some() && self.group_id.is_none() {
+            return Err(ProtocolError::InvalidNativeMessage(
+                "task-owned native tabs must have a visible group".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_native_inventory(inventory: &[NativeTab]) -> Result<(), ProtocolError> {
+    let mut tab_ids = std::collections::HashSet::with_capacity(inventory.len());
+    for tab in inventory {
+        tab.validate()?;
+        if !tab_ids.insert(tab.tab_id) {
+            return Err(ProtocolError::InvalidNativeMessage(
+                "native inventory must not contain duplicate tab ids".into(),
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1039,6 +1067,7 @@ impl NativeHello {
                 "extension_version must not be empty".into(),
             ));
         }
+        validate_native_inventory(&hello.inventory)?;
         validate_native_handoff(&hello.handoff)?;
         for staged in &hello.staged_commits {
             staged.validate()?;
@@ -1196,13 +1225,15 @@ pub struct NativeStagedCommit {
 }
 impl NativeStagedCommit {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.native_token.chars().count() < 16
+        if !(16..=256).contains(&self.native_token.chars().count())
+            || self.tab_id == 0
             || self.effect.is_empty()
-            || self.fingerprint.chars().count() < 32
+            || self.effect.chars().count() > 512
+            || !(32..=256).contains(&self.fingerprint.chars().count())
             || self.expires_at_ms < 0
         {
             return Err(ProtocolError::InvalidNativeMessage(
-                "staged operation violates native token, effect, fingerprint, or expiry constraints"
+                "staged operation violates native token, tab, effect, fingerprint, or expiry constraints"
                     .into(),
             ));
         }
@@ -1211,9 +1242,21 @@ impl NativeStagedCommit {
 }
 
 fn validate_native_handoff(handoff: &NativeHandoff) -> Result<(), ProtocolError> {
-    if handoff.started_at_ms.is_some_and(|value| value < 0) {
+    let complete_binding = handoff.task_id.is_some()
+        && handoff.tab_id.is_some_and(|tab_id| tab_id != 0)
+        && handoff.started_at_ms.is_some_and(|value| value >= 0);
+    if handoff.active && !complete_binding {
         return Err(ProtocolError::InvalidNativeMessage(
-            "handoff started_at_ms must not be negative".into(),
+            "active handoff must bind a task, tab, and non-negative start time".into(),
+        ));
+    }
+    if !handoff.active
+        && (handoff.task_id.is_some()
+            || handoff.tab_id.is_some()
+            || handoff.started_at_ms.is_some())
+    {
+        return Err(ProtocolError::InvalidNativeMessage(
+            "inactive handoff must not retain task, tab, or start-time data".into(),
         ));
     }
     Ok(())
@@ -1226,6 +1269,8 @@ pub struct NativeEvent {
     pub version: u16,
     pub kind: NativeEventKind,
     pub event: NativeEventName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
     pub payload: Map<String, Value>,
 }
 
@@ -1279,6 +1324,11 @@ impl NativeEvent {
                 version: event.version,
             });
         }
+        if event.event_id.is_some() && !matches!(event.event, NativeEventName::HandoffChanged) {
+            return Err(ProtocolError::InvalidNativeMessage(
+                "event_id is only supported for handoff_changed".into(),
+            ));
+        }
         let payload = match event.event {
             NativeEventName::Inventory => {
                 NativeEventPayload::Inventory(decode_native_event_payload(event.payload.clone())?)
@@ -1302,10 +1352,27 @@ impl NativeEvent {
             ),
         };
         match &payload {
-            NativeEventPayload::Handoff(handoff) => validate_native_handoff(handoff)?,
-            NativeEventPayload::CommitExpired(event) if event.native_token.chars().count() < 16 => {
+            NativeEventPayload::Handoff(handoff) => {
+                validate_native_handoff(handoff)?;
+                if !handoff.active && event.event_id.is_none() {
+                    return Err(ProtocolError::InvalidNativeMessage(
+                        "inactive handoff event must carry an event_id for durable acknowledgement"
+                            .into(),
+                    ));
+                }
+                if let Some(event_id) = &event.event_id {
+                    if !(1..=128).contains(&event_id.chars().count()) {
+                        return Err(ProtocolError::InvalidNativeMessage(
+                            "event_id must contain 1 to 128 characters".into(),
+                        ));
+                    }
+                }
+            }
+            NativeEventPayload::CommitExpired(event)
+                if !(16..=256).contains(&event.native_token.chars().count()) =>
+            {
                 return Err(ProtocolError::InvalidNativeMessage(
-                    "expired native_token must contain at least 16 characters".into(),
+                    "expired native_token must contain 16 to 256 characters".into(),
                 ));
             }
             NativeEventPayload::ExtensionDisconnected(event) if event.reason.is_empty() => {
@@ -1355,6 +1422,7 @@ pub struct NativeOriginPolicy {
 
 pub fn native_command(
     request_id: Uuid,
+
     connection_id: Uuid,
     task_id: Uuid,
     method: &str,
@@ -1375,6 +1443,15 @@ pub fn native_command(
         command["origin_policy"] = serde_json::json!(origin_policy);
     }
     command
+}
+pub fn native_event_ack(event: NativeEventName, event_id: &str) -> Value {
+    serde_json::json!({
+        "protocol": NATIVE_PROTOCOL,
+        "version": PROTOCOL_VERSION,
+        "kind": "event_ack",
+        "event": event,
+        "event_id": event_id,
+    })
 }
 
 pub fn native_close_task(request_id: Uuid, task_id: Uuid) -> Value {
@@ -1783,5 +1860,60 @@ mod tests {
         assert!(!failure.ok);
         assert!(failure.result.is_none());
         assert!(failure.error.is_some());
+    }
+    #[test]
+    fn handoff_clear_event_requires_acknowledgement_id_and_preserves_it() {
+        let clear = json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "event",
+            "event": "handoff_changed",
+            "payload": {"active": false}
+        });
+        assert!(matches!(
+            NativeEvent::parse(clear),
+            Err(ProtocolError::InvalidNativeMessage(_))
+        ));
+
+        let event_id = "handoff-clear-0001";
+        let (event, payload) = NativeEvent::parse(json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "event",
+            "event": "handoff_changed",
+            "event_id": event_id,
+            "payload": {"active": false}
+        }))
+        .unwrap();
+        assert_eq!(event.event_id.as_deref(), Some(event_id));
+        assert!(matches!(
+            payload,
+            NativeEventPayload::Handoff(NativeHandoff { active: false, .. })
+        ));
+        assert_eq!(
+            native_event_ack(NativeEventName::HandoffChanged, event_id),
+            json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "event_ack",
+                "event": "handoff_changed",
+                "event_id": event_id,
+            })
+        );
+    }
+
+    #[test]
+    fn acknowledgement_ids_are_reserved_for_handoff_events() {
+        assert!(matches!(
+            NativeEvent::parse(json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "event",
+                "event": "pause_changed",
+                "event_id": "not-allowed",
+                "payload": {"paused": true}
+            })),
+            Err(ProtocolError::InvalidNativeMessage(_))
+        ));
     }
 }

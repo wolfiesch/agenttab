@@ -7,9 +7,10 @@ use crate::native::{NativeError, NativeEventSink, NativeTransport};
 use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
-    BrowserCommitParams, BrowserHandoffParams, BrowserWaitParams, ConnectionAck, ConnectionInit,
-    MethodParams, NativeEventPayload, NativeStagedCommit, NativeTab, Outcome, RpcError, RpcMethod,
-    RpcRequest, RpcResponse, TaskBinding, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams,
+    ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload, NativeHandoff,
+    NativeStagedCommit, NativeTab, Outcome, RpcError, RpcMethod, RpcRequest, RpcResponse,
+    TaskBinding, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -50,19 +51,23 @@ impl NativeEventSink for JournalNativeEventSink {
         &self,
         inventory: &[NativeTab],
         staged_commits: &[NativeStagedCommit],
+        handoff: &NativeHandoff,
     ) -> Result<(), String> {
         replace_inventory_urls(&self.tab_urls, inventory);
         self.journal
-            .reconcile_inventory(&inventory_counts(inventory))
+            .reconcile_inventory(inventory)
             .map_err(|error| error.to_string())?;
         let removed_uploads = self
             .journal
             .reconcile_staged_commits(staged_commits)
             .map_err(|error| error.to_string())?;
-        Self::cleanup_uploads(removed_uploads)
+        Self::cleanup_uploads(removed_uploads)?;
+        self.journal
+            .reconcile_handoff(handoff)
+            .map_err(|error| error.to_string())
     }
 
-    fn handle(&self, payload: &NativeEventPayload) -> Result<(), String> {
+    fn handle(&self, payload: &NativeEventPayload, event_id: Option<&str>) -> Result<(), String> {
         if let NativeEventPayload::CommitExpired(event) = payload {
             let removed_uploads = self
                 .journal
@@ -73,15 +78,15 @@ impl NativeEventSink for JournalNativeEventSink {
         let result = match payload {
             NativeEventPayload::Inventory(event) => {
                 replace_inventory_urls(&self.tab_urls, &event.inventory);
-                self.journal
-                    .reconcile_inventory(&inventory_counts(&event.inventory))
+                self.journal.reconcile_inventory(&event.inventory)
             }
             NativeEventPayload::TaskTabs(event) => self
                 .journal
                 .update_task_tab_count(event.task_id, event.tab_count),
-            NativeEventPayload::Pause(_)
-            | NativeEventPayload::Handoff(_)
-            | NativeEventPayload::ExtensionDisconnected(_) => Ok(()),
+            NativeEventPayload::Handoff(handoff) => {
+                self.journal.apply_handoff_event(handoff, event_id)
+            }
+            NativeEventPayload::Pause(_) | NativeEventPayload::ExtensionDisconnected(_) => Ok(()),
             NativeEventPayload::CommitExpired(_) => unreachable!("handled above"),
         };
         result.map_err(|error| error.to_string())
@@ -92,16 +97,6 @@ fn replace_inventory_urls(tab_urls: &RwLock<HashMap<u64, String>>, inventory: &[
     let mut urls = tab_urls.write();
     urls.clear();
     urls.extend(inventory.iter().map(|tab| (tab.tab_id, tab.url.clone())));
-}
-
-fn inventory_counts(inventory: &[NativeTab]) -> Vec<(Uuid, u64)> {
-    let mut counts = HashMap::new();
-    for tab in inventory {
-        if let Some(task_id) = tab.task_id {
-            *counts.entry(task_id).or_insert(0) += 1;
-        }
-    }
-    counts.into_iter().collect()
 }
 
 pub struct Runtime {
@@ -135,6 +130,9 @@ impl Runtime {
     ) -> Result<Arc<Self>, RuntimeBuildError> {
         paths.prepare()?;
         let journal = Arc::new(Journal::open(&paths.state_db)?);
+        if journal.handoff_active()? {
+            handoff.restore(true);
+        }
         let tab_urls = Arc::new(RwLock::new(HashMap::new()));
         native.set_event_sink(Arc::new(JournalNativeEventSink {
             journal: journal.clone(),
@@ -281,14 +279,7 @@ impl Runtime {
             .gate(request.method)
             .err()
             .or_else(|| self.handoff_blackout_error())
-            .or_else(|| self.guardrails.authorize(request.method, &params).err())
-            .or_else(|| {
-                let tab_id = params_value.get("tab_id").and_then(Value::as_u64)?;
-                let tab_url = self.tab_urls.read().get(&tab_id).cloned();
-                self.guardrails
-                    .authorize_current_tab(tab_url.as_deref())
-                    .err()
-            });
+            .or_else(|| self.guardrails.authorize(request.method, &params).err());
         if let Some(error) = early_error {
             let response =
                 RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
@@ -326,6 +317,21 @@ impl Runtime {
                 );
             }
         };
+        if let Err(error) = self.validate_task_scope(task_id, &params) {
+            let response =
+                RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
+            return self.audited_value(
+                connection,
+                Some(task_id),
+                &request,
+                &params_value,
+                response,
+                started_at_ms,
+                started,
+                false,
+                true,
+            );
+        }
         let (_global_read, _global_write) = if request.method == RpcMethod::BrowserHandoff {
             (None, Some(self.global_gate.write()))
         } else {
@@ -345,9 +351,18 @@ impl Runtime {
         };
         let _task_guard = task_lock.lock();
         if connection.is_cancelled() {
-            return self
-                .attach_new_capability(connection, cancelled_response(request.request_id))
-                .value();
+            let response = cancelled_response(request.request_id.clone());
+            return self.audited_value(
+                connection,
+                Some(task_id),
+                &request,
+                &params_value,
+                response,
+                started_at_ms,
+                started,
+                false,
+                true,
+            );
         }
         let _lifecycle_admission = match self.lifecycle.admit(request.method) {
             Ok(admission) => admission,
@@ -368,6 +383,21 @@ impl Runtime {
             }
         };
         if let Some(error) = self.handoff_blackout_error() {
+            let response =
+                RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
+            return self.audited_value(
+                connection,
+                Some(task_id),
+                &request,
+                &params_value,
+                response,
+                started_at_ms,
+                started,
+                false,
+                true,
+            );
+        }
+        if let Err(error) = self.validate_task_scope(task_id, &params) {
             let response =
                 RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
             return self.audited_value(
@@ -459,6 +489,16 @@ impl Runtime {
                     )
                     .with_recovery("Inspect the task before deciding whether to use a new UUIDv7 key."),
                 );
+                let _ = self.record_audit(
+                    connection,
+                    Some(task_id),
+                    &request,
+                    &params_value,
+                    &response,
+                    started_at_ms,
+                    started,
+                    false,
+                );
             }
         }
         // Resume capabilities are never part of the journaled response: only their hashes
@@ -497,6 +537,17 @@ impl Runtime {
             }),
         )
     }
+    fn validate_task_scope(&self, task_id: Uuid, params: &MethodParams) -> Result<(), RpcError> {
+        let Some((tab_id, expected_page_revision)) = requested_tab(params) else {
+            return Ok(());
+        };
+        self.journal
+            .verify_task_tab(task_id, tab_id, expected_page_revision)
+            .map_err(journal_rpc_error)?;
+        let tab_url = self.tab_urls.read().get(&tab_id).cloned();
+        self.guardrails.authorize_current_tab(tab_url.as_deref())
+    }
+
     // Keeping the audit envelope explicit at each call site makes timing and replay semantics visible.
     #[allow(clippy::too_many_arguments)]
     fn record_audit(
@@ -760,6 +811,24 @@ impl Runtime {
     }
 }
 
+fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
+    match params {
+        MethodParams::Snapshot(
+            BrowserSnapshotParams::Accessibility { tab_id, .. }
+            | BrowserSnapshotParams::Text { tab_id, .. }
+            | BrowserSnapshotParams::Html { tab_id, .. }
+            | BrowserSnapshotParams::Screenshot { tab_id, .. },
+        )
+        | MethodParams::Wait(BrowserWaitParams { tab_id, .. }) => Some((*tab_id, None)),
+        MethodParams::Act(params) => Some((params.tab_id, Some(params.expected_page_revision))),
+        MethodParams::Handoff(params) => Some((params.tab_id, Some(params.expected_page_revision))),
+        MethodParams::Open(_)
+        | MethodParams::Tabs(_)
+        | MethodParams::Commit(_)
+        | MethodParams::Status(_)
+        | MethodParams::Developer(_) => None,
+    }
+}
 fn staged_matches_act(params: &MethodParams, staged: &NativeStagedCommit) -> bool {
     matches!(
         params,
@@ -897,6 +966,18 @@ fn journal_rpc_error(error: JournalError) -> RpcError {
             "staged_token_invalid",
             "Request a new staged operation and review its effect before committing.",
         ),
+        JournalError::StaleStagedCommit | JournalError::InvalidStagedBinding => (
+            "staged_token_stale",
+            "Page state or task ownership changed; request and review a new staged operation.",
+        ),
+        JournalError::TabNotOwned { .. } => (
+            "tab_not_owned",
+            "Open a task tab or explicitly adopt the active tab before using it.",
+        ),
+        JournalError::StalePageRevision { .. } => (
+            "stale_page_revision",
+            "Take a new snapshot and use its current page_revision.",
+        ),
         _ => (
             "state_store_error",
             "Repair ~/.agenttab ownership or free disk space before retrying.",
@@ -946,7 +1027,7 @@ mod tests {
     use super::*;
     use agenttab_protocol::{
         ConnectKind, NativeOriginPolicy, NativeResponse, NativeResponseKind, NativeStagedCommit,
-        RPC_PROTOCOL,
+        NativeTab, RPC_PROTOCOL,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -1260,6 +1341,26 @@ mod tests {
         assert!(runtime.journal.resume_task(&capability).unwrap().is_some());
     }
 
+    fn own_tab(runtime: &Runtime, connection: &ConnectionContext, page_revision: u64) -> Uuid {
+        let task_id = connection.ensure_task(&runtime.journal).unwrap();
+        runtime
+            .journal
+            .reconcile_inventory(&[NativeTab {
+                tab_id: 3,
+                window_id: 1,
+                group_id: Some(9),
+                url: "https://allowed.test/".into(),
+                page_revision,
+                task_id: Some(task_id),
+            }])
+            .unwrap();
+        runtime
+            .tab_urls
+            .write()
+            .insert(3, "https://allowed.test/".into());
+        task_id
+    }
+
     #[test]
     fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
         let native = FakeNative::normal();
@@ -1421,6 +1522,8 @@ mod tests {
                 resume_capability: None,
             })
             .unwrap();
+        own_tab(&runtime, &connection, 7);
+        runtime.tab_urls.write().remove(&3);
         let snapshot = |request_id: &str| {
             json!({
                 "protocol": RPC_PROTOCOL,
@@ -1459,6 +1562,7 @@ mod tests {
     #[test]
     fn handoff_timeout_keeps_global_blackout_active() {
         let (_temp, runtime, connection) = connected_runtime(Arc::new(TimeoutNative));
+        own_tab(&runtime, &connection, 7);
         let response = runtime.handle(
             &connection,
             json!({
@@ -1495,6 +1599,7 @@ mod tests {
     #[test]
     fn rejected_handoff_releases_global_blackout() {
         let (_temp, runtime, connection) = connected_runtime(Arc::new(RejectedHandoffNative));
+        own_tab(&runtime, &connection, 7);
         let response = runtime.handle(
             &connection,
             json!({
@@ -1521,6 +1626,7 @@ mod tests {
     fn host_token_is_bound_and_native_commit_token_is_never_exposed() {
         let native = FakeNative::staging();
         let (_temp, runtime, connection) = connected_runtime(native.clone());
+        own_tab(&runtime, &connection, 7);
         let stage = runtime.handle(
             &connection,
             json!({
@@ -1564,6 +1670,7 @@ mod tests {
         let native = FakeNative::staging();
         let (_temp, runtime, connection, upload_root) =
             connected_runtime_with_upload_root(native.clone());
+        own_tab(&runtime, &connection, 7);
         let source = upload_root.join("fixture.txt");
         std::fs::write(&source, b"approved upload bytes").unwrap();
         let stage = runtime.handle(
