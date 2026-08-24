@@ -501,9 +501,9 @@ impl Runtime {
                 );
             }
         }
-        // Resume capabilities are never part of the journaled response: only their hashes
-        // are durable. Attach the one-time plaintext capability after terminal persistence.
-        response = self.attach_new_capability(connection, response);
+        // Task identity is journaled with the terminal response. The server adds any
+        // pending plaintext resume capability immediately before delivery.
+        response = self.attach_task_binding(connection, response);
         enforce_response_limit(response).value()
     }
 
@@ -602,7 +602,7 @@ impl Runtime {
             response = self.audit_failure(request.request_id.clone(), error);
         }
         if attach_capability {
-            self.attach_new_capability(connection, response).value()
+            self.attach_task_binding(connection, response).value()
         } else {
             enforce_response_limit(response).value()
         }
@@ -789,7 +789,7 @@ impl Runtime {
         }
     }
 
-    fn attach_new_capability(
+    fn attach_task_binding(
         &self,
         connection: &ConnectionContext,
         mut response: RpcResponse,
@@ -803,7 +803,7 @@ impl Runtime {
             if let Some(task_id) = task_id {
                 response.task = Some(TaskBinding {
                     task_id,
-                    resume_capability: new_lease.map(|lease| lease.resume_capability),
+                    resume_capability: None,
                 });
             }
         }
@@ -1377,11 +1377,19 @@ mod tests {
         });
         let first = runtime.handle(&connection, request.clone());
         assert_eq!(first["outcome"], "completed");
-        assert!(first["task"]["resume_capability"].as_str().is_some());
+        assert!(first["task"].get("resume_capability").is_none());
         assert!(!first["result"]["body"]
             .as_str()
             .unwrap()
             .contains("123-45-6789"));
+        let capability = connection
+            .pending_new_capability()
+            .unwrap()
+            .unwrap()
+            .resume_capability;
+        assert!(connection
+            .acknowledge_new_capability(&capability)
+            .unwrap());
         runtime.lifecycle.set_paused(true);
         let mut retry = request;
         retry["request_id"] = json!("retry");

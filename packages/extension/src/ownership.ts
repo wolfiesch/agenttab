@@ -474,12 +474,15 @@ export class OwnershipLedger {
 
   private async tabResult(tabId: number): Promise<Record<string, unknown>> {
     const tab = (await chrome.tabs.get(tabId)) as TabLike;
+    const state = await readState();
+    const owner = Object.values(state.tasks).find((task) => task.tabIds.includes(tabId));
     return {
       tab_id: tabId,
       window_id: tab.windowId,
       group_id: tab.groupId,
       url: tab.url ?? "",
       page_revision: await this.revisions.current(tabId),
+      tab_count: owner?.tabIds.length ?? 0,
     };
   }
 

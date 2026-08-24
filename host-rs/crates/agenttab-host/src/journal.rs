@@ -435,22 +435,15 @@ impl Journal {
     }
 
     pub fn update_task_tab_count(&self, task_id: Uuid, tab_count: u64) -> Result<(), JournalError> {
-        let now = now_ms();
-        let mut connection = self.connection.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM task_tabs WHERE task_id = ?1",
-            params![task_id.to_string()],
-        )?;
-        let updated = transaction.execute(
+        let connection = self.connection.lock();
+        let updated = connection.execute(
             "UPDATE tasks SET tab_count = ?1, updated_at_ms = ?2
              WHERE task_id = ?3 AND state = 'active'",
-            params![sqlite_u64(tab_count)?, now, task_id.to_string()],
+            params![sqlite_u64(tab_count)?, now_ms(), task_id.to_string()],
         )?;
         if updated != 1 {
             return Err(JournalError::MissingTask);
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -1259,6 +1252,11 @@ mod tests {
         journal
             .reconcile_inventory(&[owned_tab(task.task_id, 9)])
             .unwrap();
+        assert_eq!(
+            journal.verify_task_tab(task.task_id, 7, Some(9)).unwrap(),
+            9
+        );
+        journal.update_task_tab_count(task.task_id, 3).unwrap();
         assert_eq!(
             journal.verify_task_tab(task.task_id, 7, Some(9)).unwrap(),
             9

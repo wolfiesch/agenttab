@@ -30,6 +30,10 @@ interface AxNode {
   description?: AxValue;
   properties?: Array<{ name?: string; value?: AxValue }>;
 }
+interface PageIdentity {
+  documentId?: string;
+  loaderId?: string;
+}
 
 type CloseTab = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
@@ -95,16 +99,31 @@ export class StandardBrowserRuntime {
     }
     const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
     const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
+    const before = await this.pageIdentity(tabId);
+    const pageRevision = await this.revisions.observeDocument(
+      tabId,
+      before.documentId,
+      before.loaderId,
+    );
     const result = typeof params.root_ref === "string"
       ? await this.send(tabId, "Accessibility.getPartialAXTree", {
-        backendNodeId: this.backendNodeId(await this.revisions.current(tabId), params.root_ref),
+        backendNodeId: this.backendNodeId(pageRevision, params.root_ref),
         fetchRelatives: true,
       })
       : await this.send(tabId, "Accessibility.getFullAXTree", { depth: maxDepth });
+    const after = await this.pageIdentity(tabId);
+    if (before.documentId !== after.documentId || before.loaderId !== after.loaderId) {
+      const currentPageRevision = await this.revisions.observeDocument(
+        tabId,
+        after.documentId,
+        after.loaderId,
+      );
+      throw Object.assign(new Error("Page changed while capturing the accessibility tree"), {
+        code: "stale_revision",
+        currentPageRevision,
+      });
+    }
     const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
-    const frameTree = await this.send(tabId, "Page.getFrameTree", {});
-    const loaderId = this.frameLoaderId(frameTree);
-    const pageRevision = await this.revisions.observeDocument(tabId, undefined, loaderId);
     const encoded = nodes.slice(0, maxNodes).map((node) => ({
       ...(node.backendDOMNodeId
         ? { ref: `r${pageRevision}-${node.backendDOMNodeId}` }
@@ -299,9 +318,10 @@ export class StandardBrowserRuntime {
     }
     const condition = params.condition;
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30_000;
-    const deadline = Date.now() + timeoutMs;
+    const waitStartedAtMs = Date.now();
+    const deadline = waitStartedAtMs + timeoutMs;
     do {
-      const matched = await this.conditionMatched(tabId, condition);
+      const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
       if (matched) {
         return {
           tab_id: tabId,
@@ -562,9 +582,17 @@ export class StandardBrowserRuntime {
       try {
         await this.callOnNode(tabId, backendNodeId, "function(){this.click()}", [], true);
       } finally {
-        if (Number.isInteger(activeTab?.id) && Number.isInteger(activeTab?.windowId)) {
-          const current = await chrome.tabs.get(activeTab.id as number).catch(() => null);
-          if (current?.windowId === activeTab.windowId) {
+        const [currentActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        const actionOwnsFocusChange =
+          currentActiveTab?.id !== activeTab?.id &&
+          (currentActiveTab?.id === tabId || currentActiveTab?.openerTabId === tabId);
+        if (
+          actionOwnsFocusChange &&
+          Number.isInteger(activeTab?.id) &&
+          Number.isInteger(activeTab?.windowId)
+        ) {
+          const original = await chrome.tabs.get(activeTab.id as number).catch(() => null);
+          if (original?.windowId === activeTab.windowId) {
             await chrome.tabs.update(activeTab.id as number, { active: true }).catch(() => undefined);
             await chrome.windows.update(activeTab.windowId as number, { focused: true }).catch(() => undefined);
           }
@@ -620,7 +648,11 @@ export class StandardBrowserRuntime {
     return { kind, completed: true };
   }
 
-  private async conditionMatched(tabId: number, condition: Record<string, unknown>): Promise<boolean> {
+  private async conditionMatched(
+    tabId: number,
+    condition: Record<string, unknown>,
+    waitStartedAtMs: number,
+  ): Promise<boolean> {
     const kind = condition.kind;
     if (kind === "load") return (await chrome.tabs.get(tabId)).status === "complete";
     if (kind === "url") return (await chrome.tabs.get(tabId)).url === condition.value;
@@ -642,7 +674,8 @@ export class StandardBrowserRuntime {
     }
     if (kind === "download") {
       const downloads = await chrome.downloads.search({ state: "complete", limit: 1, orderBy: ["-endTime"] });
-      return downloads.length > 0 && Date.now() - new Date(downloads[0].endTime ?? 0).getTime() < 5_000;
+      const completedAtMs = Date.parse(downloads[0]?.endTime ?? "");
+      return Number.isFinite(completedAtMs) && completedAtMs >= waitStartedAtMs;
     }
     throw Object.assign(new Error(`Unsupported wait condition: ${String(kind)}`), {
       code: "invalid_request",
@@ -706,6 +739,27 @@ export class StandardBrowserRuntime {
     return {
       x: (points[0] + points[2] + points[4] + points[6]) / 4,
       y: (points[1] + points[3] + points[5] + points[7]) / 4,
+    };
+  }
+
+  private async pageIdentity(tabId: number): Promise<PageIdentity> {
+    const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
+    const frameTree = await this.send(tabId, "Page.getFrameTree", {});
+    const root = isRecord(document.root) ? document.root : null;
+    const documentId = typeof root?.backendNodeId === "number"
+      ? `backend:${root.backendNodeId}`
+      : typeof root?.nodeId === "number"
+        ? `frontend:${root.nodeId}`
+        : undefined;
+    const loaderId = this.frameLoaderId(frameTree);
+    if (documentId === undefined && loaderId === undefined) {
+      throw Object.assign(new Error("Could not identify the page document"), {
+        code: "snapshot_failed",
+      });
+    }
+    return {
+      ...(documentId !== undefined ? { documentId } : {}),
+      ...(loaderId !== undefined ? { loaderId } : {}),
     };
   }
 

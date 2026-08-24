@@ -1,4 +1,5 @@
 use crate::runtime::{request_lock_scope, RequestLockScope, Runtime};
+use crate::task::ConnectionContext;
 use agenttab_protocol::{
     ConnectionInit, Outcome, RpcError, RpcMethod, RpcResponse, CLIENT_TO_HOST_MAX_BYTES,
     HOST_TO_CLIENT_MAX_BYTES,
@@ -663,6 +664,10 @@ async fn write_frame_async<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    use crate::journal::Journal;
+    use agenttab_protocol::{
+        ConnectKind, RuntimeState, TaskBinding, PROTOCOL_VERSION, RPC_PROTOCOL,
+    };
 
     #[test]
     fn ordered_queue_runs_workers_in_issue_order() {
@@ -692,6 +697,50 @@ mod queue_tests {
         second.join().unwrap();
         assert_eq!(*order.lock(), vec![first_ticket, second_ticket]);
     }
+    #[test]
+    fn response_preparation_keeps_capability_pending_until_writer_acknowledges_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&temp.path().join("state.sqlite3")).unwrap());
+        let (connection, _) = ConnectionContext::negotiate(
+            ConnectionInit {
+                protocol: RPC_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: ConnectKind::Connect,
+                conversation_id: None,
+                resume_capability: None,
+            },
+            &journal,
+            RuntimeState::Ready,
+        )
+        .unwrap();
+        let task_id = connection.ensure_task(&journal).unwrap();
+        let response = RpcResponse::success("request", Outcome::Completed, Value::Null)
+            .with_task(TaskBinding {
+                task_id,
+                resume_capability: None,
+            })
+            .value();
+
+        let (first, first_capability) =
+            prepare_response_for_delivery(&connection, response.clone());
+        let first_capability = first_capability.unwrap();
+        assert_eq!(
+            first["task"]["resume_capability"],
+            Value::String(first_capability.clone())
+        );
+        let (retry, retry_capability) =
+            prepare_response_for_delivery(&connection, response.clone());
+        assert_eq!(retry_capability.as_deref(), Some(first_capability.as_str()));
+        assert_eq!(retry["task"]["resume_capability"], first["task"]["resume_capability"]);
+
+        assert!(connection
+            .acknowledge_new_capability(&first_capability)
+            .unwrap());
+        let (delivered, capability) = prepare_response_for_delivery(&connection, response);
+        assert!(capability.is_none());
+        assert!(delivered["task"].get("resume_capability").is_none());
+    }
+
 }
 
 #[cfg(unix)]

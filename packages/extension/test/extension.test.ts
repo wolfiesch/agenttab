@@ -74,6 +74,10 @@ let normalizeStoredObjectKeys: boolean;
 let focusedWindowUpdates: number[];
 let focusStealOnClickTabId: number | null;
 let callFunctionException: boolean;
+let debuggerCommandOverride:
+  | ((method: string, params: Record<string, unknown>) => Record<string, unknown> | undefined)
+  | null;
+let completedDownloads: Array<Record<string, unknown>>;
 interface DebuggerCommand {
   method: string;
   params: Record<string, unknown>;
@@ -135,6 +139,8 @@ function installChromeMock(): void {
   focusStealOnClickTabId = null;
   debuggerCommands = [];
   callFunctionException = false;
+  debuggerCommandOverride = null;
+  completedDownloads = [];
   automationPermission = true;
   permissionRequests = [];
   permissionRequestResult = true;
@@ -174,6 +180,12 @@ function installChromeMock(): void {
         async sendCommand(_target: unknown, method: string, params: Record<string, unknown>) {
           debuggerCalls.push(method);
           debuggerCommands.push({ method, params: clone(params) });
+          const overridden = debuggerCommandOverride?.(method, clone(params));
+          if (overridden !== undefined) return clone(overridden);
+          if (method === "DOM.getDocument") return { root: { nodeId: 1, backendNodeId: 1 } };
+          if (method === "Page.getFrameTree") {
+            return { frameTree: { frame: { loaderId: "loader-default" } } };
+          }
           if (method === "DOM.resolveNode") return { object: { objectId: `node-${String(params.backendNodeId)}` } };
           if (method === "DOM.getBoxModel") return { model: { content: [10, 20, 30, 20, 30, 40, 10, 40] } };
           if (method === "Runtime.callFunctionOn" && callFunctionException) {
@@ -308,7 +320,7 @@ function installChromeMock(): void {
         async update() { },
         onRemoved: { addListener() { } },
       },
-      downloads: { async search() { return []; } },
+      downloads: { async search() { return clone(completedDownloads); } },
       alarms: {
         create(name: string, options: { when: number }) {
           alarmCreates.push({ name, when: options.when });
@@ -654,6 +666,61 @@ describe("page revision monotonicity", () => {
     expect(second.page_revision).toBe(1);
     expect((await readState()).revisions["61"]).toMatchObject({ floor: 1, current: 1 });
     await runtime.detach(61);
+  });
+
+  test("rejects an accessibility snapshot when the document changes during capture", async () => {
+    let frameTreeReads = 0;
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.getFrameTree") {
+        frameTreeReads += 1;
+        return {
+          frameTree: {
+            frame: { loaderId: frameTreeReads === 1 ? "loader-before" : "loader-after" },
+          },
+        };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+
+    await expect(runtime.snapshot(61, { mode: "accessibility" })).rejects.toMatchObject({
+      code: "stale_revision",
+      currentPageRevision: 2,
+    });
+    expect((await readState()).revisions["61"]).toMatchObject({ floor: 2, current: 2 });
+  });
+
+  test("matches only downloads completed after the wait starts", async () => {
+    completedDownloads = [{
+      id: 1,
+      state: "complete",
+      endTime: new Date(Date.now() - 60_000).toISOString(),
+    }];
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+
+    await expect(runtime.wait(61, {
+      condition: { kind: "download" },
+      timeout_ms: 1,
+    })).rejects.toMatchObject({ code: "wait_timeout" });
+
+    completedDownloads = [];
+    const waiting = runtime.wait(61, {
+      condition: { kind: "download" },
+      timeout_ms: 500,
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    completedDownloads = [{
+      id: 2,
+      state: "complete",
+      endTime: new Date().toISOString(),
+    }];
+    await expect(waiting).resolves.toMatchObject({
+      tab_id: 61,
+      condition: "download",
+      matched: true,
+    });
   });
 
   test("types into a background field through one DOM mutation", async () => {
@@ -1044,8 +1111,8 @@ describe("native bridge transport", () => {
 describe("consequential action staging", () => {
   test("stages a purchase-like click, commits it once, and consumes the token", async () => {
     tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
-    tabStore.set(91, { id: 91, windowId: 1, groupId: -1, active: false });
-    focusStealOnClickTabId = 91;
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    focusStealOnClickTabId = 7;
     const revisions = new RevisionTracker();
     const events: string[] = [];
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event));
@@ -1063,7 +1130,7 @@ describe("consequential action staging", () => {
     const result = await runtime.commit("018f47b8-2f80-7c20-9c77-f8a38c9e621e", { native_token: token });
     expect(result.actions).toHaveLength(1);
     expect(tabStore.get(90)?.active).toBe(true);
-    expect(tabStore.get(91)?.active).toBe(false);
+    expect(tabStore.get(7)?.active).toBe(false);
     expect(focusedWindowUpdates).toEqual([1]);
     expect(
       debuggerCommands.filter(
@@ -1079,6 +1146,25 @@ describe("consequential action staging", () => {
     await runtime.detach(7);
     expect(events).toEqual([]);
   });
+  test("preserves a concurrent human tab selection during a task click", async () => {
+    tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    tabStore.set(91, { id: 91, windowId: 1, groupId: -1, active: false });
+    focusStealOnClickTabId = 91;
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(7);
+    const prepared = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+
+    await runtime.commit(TASK_A, { native_token: prepared.staged?.native_token });
+
+    expect(tabStore.get(90)?.active).toBe(false);
+    expect(tabStore.get(91)?.active).toBe(true);
+    expect(focusedWindowUpdates).toEqual([]);
+  });
+
 
   test("rejects and deletes an expired staged token", async () => {
     const revisions = new RevisionTracker();
@@ -1215,6 +1301,7 @@ describe("extension entrypoint admission boundaries", () => {
         tab_id: 100,
         group_id: 50,
         page_revision: 1,
+        tab_count: 1,
       },
     });
     expect(await sendPopupMessage({ kind: "get_ui_state" })).toMatchObject({
