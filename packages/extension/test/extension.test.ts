@@ -713,6 +713,32 @@ describe("page revision monotonicity", () => {
     expect((await readState()).revisions["61"]).toMatchObject({ floor: 2, current: 2 });
   });
 
+  test("rejects a full-page screenshot when the document changes during capture", async () => {
+    let frameTreeReads = 0;
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.getFrameTree") {
+        frameTreeReads += 1;
+        return {
+          frameTree: {
+            frame: { loaderId: frameTreeReads === 1 ? "loader-before" : "loader-after" },
+          },
+        };
+      }
+      if (method === "Page.captureScreenshot") return { data: "captured-stale-page" };
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+
+    await expect(runtime.snapshot(61, { mode: "screenshot", full_page: true })).rejects.toMatchObject({
+      code: "stale_revision",
+      currentPageRevision: 2,
+    });
+    expect(debuggerCalls).toContain("Page.getLayoutMetrics");
+    expect(debuggerCalls.filter((call) => call === "Page.captureScreenshot")).toHaveLength(1);
+    expect((await readState()).revisions["61"]).toMatchObject({ floor: 2, current: 2 });
+  });
+
   test("matches only downloads completed after the wait starts", async () => {
     completedDownloads = [{
       id: 1,
@@ -745,6 +771,34 @@ describe("page revision monotonicity", () => {
     });
   });
 
+  test("stops a browser wait after the user moves its tab out of the task group", async () => {
+    await seedTask(TASK_A, [61], 5);
+    scriptResult = false;
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    let ownershipChecks = 0;
+    const waiting = runtime.wait(
+      61,
+      {
+        condition: { kind: "selector", value: "#never" },
+        timeout_ms: 1_000,
+      },
+      async () => {
+        ownershipChecks += 1;
+        await ownership.assertOwned(TASK_A, 61);
+      },
+    );
+    await waitForCondition(() => ownershipChecks >= 2);
+    const tab = tabStore.get(61);
+    if (!tab) throw new Error("missing task tab");
+    tab.groupId = 9;
+
+    await expect(waiting).rejects.toMatchObject({ code: "ownership_revoked" });
+    expect(ownershipChecks).toBeGreaterThan(2);
+  });
+
   test("types into a background field through one DOM mutation", async () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
@@ -758,6 +812,57 @@ describe("page revision monotonicity", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.params.functionDeclaration).toContain("InputEvent('input'");
     expect(debuggerCalls).not.toContain("Input.insertText");
+  });
+
+  test("routes password and payment fields through a human handoff before mutation", async () => {
+    let focusCalls = 0;
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("agenttab_sensitive_field")
+      ) {
+        const attributes = String(params.objectId).endsWith("-22")
+          ? { type: "password" }
+          : { autocomplete: "section-checkout billing cc-number" };
+        const target = {
+          getAttribute(name: string) {
+            return attributes[name as keyof typeof attributes] ?? null;
+          },
+          focus() {
+            focusCalls += 1;
+          },
+        };
+        const declaration = Function(`return (${String(params.functionDeclaration)})`)() as (
+          this: typeof target,
+          value: string,
+        ) => unknown;
+        const args = Array.isArray(params.arguments) ? params.arguments : [];
+        const argument = args[0];
+        const value =
+          argument !== null && typeof argument === "object" && "value" in argument
+            ? String(argument.value ?? "")
+            : "";
+        return { result: { value: declaration.call(target, value) } };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(63);
+
+    for (const action of [
+      { kind: "type", ref: `r${pageRevision}-22`, text: "password" },
+      { kind: "fill", ref: `r${pageRevision}-23`, text: "4111111111111111" },
+    ]) {
+      await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
+        code: "sensitive_field_requires_handoff",
+        recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
+      });
+    }
+    expect(focusCalls).toBe(0);
+    expect(
+      debuggerCommands.filter(({ method }) => method === "Runtime.callFunctionOn"),
+    ).toHaveLength(2);
   });
 
   test("rejects a page action that raises in the target document", async () => {

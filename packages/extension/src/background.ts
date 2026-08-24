@@ -41,6 +41,7 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   origin_unavailable: true,
   origin_policy_mismatch: true,
   scheme_denied: true,
+  sensitive_field_requires_handoff: true,
 };
 
 const scheduler = new MutationScheduler();
@@ -222,11 +223,22 @@ async function dispatch(command: NativeCommand): Promise<NativeResponse> {
     const targetTabId = tabId(params);
     if (command.method === "browser_snapshot" || command.method === "browser_wait") {
       const result = await scheduler.readAfterWrites(targetTabId, async () => {
-        await ownership.assertOwned(command.task_id, targetTabId);
-        await assertCurrentOrigin(targetTabId, command.origin_policy);
-        return command.method === "browser_snapshot"
-          ? browser.snapshot(targetTabId, params)
-          : browser.wait(targetTabId, params);
+        if (command.method === "browser_snapshot") {
+          await ownership.assertOwned(command.task_id, targetTabId);
+          await assertCurrentOrigin(targetTabId, command.origin_policy);
+          return browser.snapshot(targetTabId, params);
+        }
+        const revalidate = async () => {
+          if (!scheduler.isAccepting()) {
+            throw new NotStartedError("paused", "AgentTab stopped the active browser wait");
+          }
+          await ownership.assertOwned(command.task_id, targetTabId);
+          await assertCurrentOrigin(targetTabId, command.origin_policy);
+          if (!scheduler.isAccepting()) {
+            throw new NotStartedError("paused", "AgentTab stopped the active browser wait");
+          }
+        };
+        return browser.wait(targetTabId, params, revalidate);
       });
       return completed(command.request_id, result);
     }

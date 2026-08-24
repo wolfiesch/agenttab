@@ -312,7 +312,11 @@ export class StandardBrowserRuntime {
     }
   }
 
-  async wait(tabId: number, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async wait(
+    tabId: number,
+    params: Record<string, unknown>,
+    revalidate?: () => Promise<void>,
+  ): Promise<Record<string, unknown>> {
     if (!isRecord(params.condition) || typeof params.condition.kind !== "string") {
       throw Object.assign(new Error("browser_wait requires a condition"), { code: "invalid_request" });
     }
@@ -321,7 +325,9 @@ export class StandardBrowserRuntime {
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     do {
+      if (revalidate) await revalidate();
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
+      if (revalidate) await revalidate();
       if (matched) {
         return {
           tab_id: tabId,
@@ -379,6 +385,8 @@ export class StandardBrowserRuntime {
   }
 
   private async screenshot(tabId: number, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const before = await this.pageIdentity(tabId);
+    const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
     const capture: Record<string, unknown> = {
       format: "png",
       fromSurface: true,
@@ -425,9 +433,21 @@ export class StandardBrowserRuntime {
       }
     }
     const result = await this.send(tabId, "Page.captureScreenshot", capture);
+    const after = await this.pageIdentity(tabId);
+    const currentPageRevision = await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
+    if (
+      before.documentId !== after.documentId ||
+      before.loaderId !== after.loaderId ||
+      currentPageRevision !== pageRevision
+    ) {
+      throw Object.assign(new Error("Page changed while the screenshot was captured"), {
+        code: "stale_revision",
+        currentPageRevision,
+      });
+    }
     return {
       tab_id: tabId,
-      page_revision: await this.revisions.current(tabId),
+      page_revision: pageRevision,
       mode: "screenshot",
       data: result.data,
       encoding: "base64",
@@ -602,14 +622,14 @@ export class StandardBrowserRuntime {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        "function(value){this.focus();if(this.isContentEditable){this.textContent=(this.textContent||'')+value}else{const current=String(this.value||'');const start=Number.isInteger(this.selectionStart)?this.selectionStart:current.length;const end=Number.isInteger(this.selectionEnd)?this.selectionEnd:start;this.value=current.slice(0,start)+value+current.slice(end);if(typeof this.setSelectionRange==='function'){const position=start+value.length;this.setSelectionRange(position,position)}}this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}",
+        "function(value){const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);if(type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))){return {agenttab_sensitive_field:true}}this.focus();if(this.isContentEditable){this.textContent=(this.textContent||'')+value}else{const current=String(this.value||'');const start=Number.isInteger(this.selectionStart)?this.selectionStart:current.length;const end=Number.isInteger(this.selectionEnd)?this.selectionEnd:start;this.value=current.slice(0,start)+value+current.slice(end);if(typeof this.setSelectionRange==='function'){const position=start+value.length;this.setSelectionRange(position,position)}}this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}",
         [{ value: String(action.text ?? "") }],
       );
     } else if (kind === "fill") {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        "function(value){this.focus();this.value=value;this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));this.dispatchEvent(new Event('change',{bubbles:true}))}",
+        "function(value){const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);if(type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))){return {agenttab_sensitive_field:true}}this.focus();this.value=value;this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));this.dispatchEvent(new Event('change',{bubbles:true}))}",
         [{ value: String(action.text ?? "") }],
       );
     } else if (kind === "select") {
@@ -711,6 +731,16 @@ export class StandardBrowserRuntime {
         returnByValue: true,
         userGesture,
       });
+      if (
+        isRecord(invoked.result) &&
+        isRecord(invoked.result.value) &&
+        invoked.result.value.agenttab_sensitive_field === true
+      ) {
+        throw Object.assign(new Error("Sensitive fields require a human Your Turn handoff"), {
+          code: "sensitive_field_requires_handoff",
+          recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
+        });
+      }
       if (isRecord(invoked.exceptionDetails)) {
         const text =
           typeof invoked.exceptionDetails.text === "string"
