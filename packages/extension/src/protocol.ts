@@ -52,6 +52,12 @@ export type Outcome =
   | "needs_user"
   | "commit_required";
 
+export interface NativeOriginPolicy {
+  tab_id: number;
+  allowed_origins: string[];
+  denied_origins: string[];
+}
+
 export interface NativeCommand {
   protocol: typeof NATIVE_PROTOCOL;
   version: typeof PROTOCOL_VERSION;
@@ -61,6 +67,7 @@ export interface NativeCommand {
   task_id: string;
   method: NativeMethod;
   params: Record<string, unknown>;
+  origin_policy?: NativeOriginPolicy;
 }
 
 export interface NativeEventAck {
@@ -152,6 +159,27 @@ function assertUuid(value: unknown, field: string): string {
 function assertTabId(value: unknown, field = "tab_id"): number {
   if (!isIntegerInRange(value, 0)) commandError(`${field} must be a non-negative integer`);
   return value;
+}
+
+function assertOriginPatterns(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string" && entry.length > 0)) {
+    commandError(`${field} must be an array of non-empty strings`);
+  }
+  return [...value] as string[];
+}
+
+function assertOriginPolicy(value: unknown): NativeOriginPolicy {
+  const policy = assertExactObject(
+    value,
+    ["tab_id", "allowed_origins", "denied_origins"],
+    [],
+    "origin_policy",
+  );
+  return {
+    tab_id: assertTabId(policy.tab_id, "origin_policy.tab_id"),
+    allowed_origins: assertOriginPatterns(policy.allowed_origins, "origin_policy.allowed_origins"),
+    denied_origins: assertOriginPatterns(policy.denied_origins, "origin_policy.denied_origins"),
+  };
 }
 
 function assertRevision(value: unknown): number {
@@ -372,7 +400,11 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
 
 export function parseCommand(value: unknown): NativeCommand {
   if (!isRecord(value)) throw new Error("native command must be an object");
-  if (!hasOnlyKeys(value, ["protocol", "version", "kind", "request_id", "connection_id", "task_id", "method", "params"])) {
+  if (!hasOnlyKeys(
+    value,
+    ["protocol", "version", "kind", "request_id", "connection_id", "task_id", "method", "params"],
+    ["origin_policy"],
+  )) {
     throw new Error("native command contains unknown fields");
   }
   if (value.protocol !== NATIVE_PROTOCOL || value.version !== PROTOCOL_VERSION || value.kind !== "command") {
@@ -386,6 +418,9 @@ export function parseCommand(value: unknown): NativeCommand {
   if (typeof value.method !== "string" || !Object.hasOwn(CORE_METHODS, value.method)) {
     throw new Error("native command method is unsupported");
   }
+  const originPolicy = value.origin_policy === undefined
+    ? undefined
+    : assertOriginPolicy(value.origin_policy);
   return {
     protocol: NATIVE_PROTOCOL,
     version: PROTOCOL_VERSION,
@@ -395,6 +430,7 @@ export function parseCommand(value: unknown): NativeCommand {
     task_id: value.task_id,
     method: value.method as NativeMethod,
     params: validateParams(value.method as NativeMethod, value.params),
+    ...(originPolicy === undefined ? {} : { origin_policy: originPolicy }),
   };
 }
 

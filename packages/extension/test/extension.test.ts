@@ -3,7 +3,7 @@ import { StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
 import { OwnershipLedger } from "../src/ownership";
-import { parseCommand } from "../src/protocol";
+import { parseCommand, type NativeOriginPolicy } from "../src/protocol";
 import { RevisionTracker } from "../src/revisions";
 import { MutationScheduler } from "../src/scheduler";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
@@ -399,6 +399,7 @@ async function sendNativeCommand(
   taskId: string,
   method: string,
   params: Record<string, unknown>,
+  originPolicy?: NativeOriginPolicy,
 ): Promise<Record<string, unknown>> {
   const port = nativePort;
   if (!port) throw new Error("native port is unavailable");
@@ -411,6 +412,7 @@ async function sendNativeCommand(
     connection_id: NATIVE_CONNECTION_ID,
     method,
     params,
+    ...(originPolicy === undefined ? {} : { origin_policy: originPolicy }),
   });
   await waitForCondition(() =>
     port.posted.some(
@@ -463,6 +465,26 @@ describe("native protocol", () => {
     expect(() => parseCommand({ ...command, extra: true })).toThrow("unknown fields");
     expect(() => parseCommand({ ...command, version: 2 })).toThrow("mismatch");
     expect(() => parseCommand({ ...command, task_id: "not-a-uuid" })).toThrow("UUIDs");
+    expect(parseCommand({
+      ...command,
+      origin_policy: {
+        tab_id: 42,
+        allowed_origins: ["https://example.test"],
+        denied_origins: ["*.blocked.test"],
+      },
+    }).origin_policy).toEqual({
+      tab_id: 42,
+      allowed_origins: ["https://example.test"],
+      denied_origins: ["*.blocked.test"],
+    });
+    expect(() => parseCommand({
+      ...command,
+      origin_policy: {
+        tab_id: 42,
+        allowed_origins: [""],
+        denied_origins: [],
+      },
+    })).toThrow("non-empty strings");
   });
 });
 
@@ -1311,6 +1333,58 @@ describe("extension entrypoint admission boundaries", () => {
       handoff: null,
       tasks: [{ task_id: TASK_A, state: "working", tab_count: 1 }],
     });
+
+    const currentOriginPolicy: NativeOriginPolicy = {
+      tab_id: 100,
+      allowed_origins: ["https://example.test"],
+      denied_origins: [],
+    };
+    const allowedAtExecution = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6237",
+      TASK_A,
+      "browser_snapshot",
+      { tab_id: 100, mode: "text" },
+      currentOriginPolicy,
+    );
+    expect(allowedAtExecution).toMatchObject({ outcome: "completed" });
+    const openedTab = tabStore.get(100);
+    if (!openedTab) throw new Error("opened task tab is unavailable");
+    openedTab.url = "https://redirected.test/account";
+    const commandsBeforeRedirectRejection = debuggerCommands.length;
+    const redirectedOrigin = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6238",
+      TASK_A,
+      "browser_snapshot",
+      { tab_id: 100, mode: "accessibility" },
+      currentOriginPolicy,
+    );
+    expect(redirectedOrigin).toMatchObject({
+      outcome: "not_started",
+      error: { code: "origin_not_allowed" },
+    });
+    expect(debuggerCommands).toHaveLength(commandsBeforeRedirectRejection);
+    openedTab.url = "https://checkout.example.test/cart";
+    const deniedMutation = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6239",
+      TASK_A,
+      "browser_act",
+      {
+        tab_id: 100,
+        expected_page_revision: 1,
+        actions: [{ kind: "scroll", delta_x: 0, delta_y: 1 }],
+      },
+      {
+        tab_id: 100,
+        allowed_origins: ["*.example.test"],
+        denied_origins: ["https://checkout.example.test"],
+      },
+    );
+    expect(deniedMutation).toMatchObject({
+      outcome: "not_started",
+      error: { code: "origin_denied" },
+    });
+    expect(debuggerCommands).toHaveLength(commandsBeforeRedirectRejection);
+    openedTab.url = "https://example.test/workspace";
 
     automationPermission = false;
     const deniedBeforePermission = debuggerCommands.length;

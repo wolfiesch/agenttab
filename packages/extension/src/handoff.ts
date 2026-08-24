@@ -7,6 +7,7 @@ import { isRecord } from "./type-guards";
 const HANDOFF_ALARM = "agenttab-handoff-timeout";
 const DEFAULT_TIMEOUT_MS = 300_000;
 type EventSink = (event: string, payload: Record<string, unknown>, eventId?: string) => void;
+type OriginGuard = () => Promise<void>;
 
 export class HandoffController {
   private transitionTail: Promise<unknown> = Promise.resolve();
@@ -27,8 +28,12 @@ export class HandoffController {
     return this.serialize(() => this.restoreNow());
   }
 
-  begin(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.serialize(() => this.beginNow(taskId, params));
+  begin(
+    taskId: string,
+    params: Record<string, unknown>,
+    originGuard?: OriginGuard,
+  ): Promise<Record<string, unknown>> {
+    return this.serialize(() => this.beginNow(taskId, params, originGuard));
   }
 
   finish(completed: boolean): Promise<{ completed: boolean; reason?: string }> {
@@ -67,7 +72,11 @@ export class HandoffController {
     });
   }
 
-  private async beginNow(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async beginNow(
+    taskId: string,
+    params: Record<string, unknown>,
+    originGuard?: OriginGuard,
+  ): Promise<Record<string, unknown>> {
     const tabId = params.tab_id;
     const timeoutMs = params.timeout_ms === undefined ? DEFAULT_TIMEOUT_MS : params.timeout_ms;
     if (
@@ -121,6 +130,7 @@ export class HandoffController {
       await barrier;
       await this.ownership.assertOwned(taskId, numericTabId);
       await this.revisions.assertExpected(numericTabId, next.expectedRevision);
+      if (originGuard) await originGuard();
       await this.ownership.setTaskState(taskId, "needs_user");
       chrome.alarms.create(HANDOFF_ALARM, { when: startedAt + next.timeoutMs });
       const tab = await chrome.tabs.update(numericTabId, { active: true });

@@ -8,6 +8,7 @@ import {
   failed,
   needsUser,
   type NativeCommand,
+  type NativeOriginPolicy,
   type NativeResponse,
   type Outcome,
 } from "./protocol";
@@ -35,6 +36,11 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   staged_commit_mismatch: true,
   handoff_in_progress: true,
   handoff_blackout: true,
+  origin_denied: true,
+  origin_not_allowed: true,
+  origin_unavailable: true,
+  origin_policy_mismatch: true,
+  scheme_denied: true,
 };
 
 const scheduler = new MutationScheduler();
@@ -71,6 +77,56 @@ function tabId(params: Record<string, unknown>): number {
     });
   }
   return Number(params.tab_id);
+}
+
+function originMatches(pattern: string, url: URL): boolean {
+  if (pattern === url.origin) return true;
+  if (!pattern.startsWith("*.")) return false;
+  const suffix = pattern.slice(2);
+  return url.hostname !== suffix && url.hostname.endsWith(`.${suffix}`);
+}
+
+async function assertCurrentOrigin(tabId: number, policy: NativeOriginPolicy | undefined): Promise<void> {
+  if (policy === undefined) return;
+  if (policy.tab_id !== tabId) {
+    throw Object.assign(new Error("origin_policy.tab_id does not match the command target"), {
+      code: "origin_policy_mismatch",
+    });
+  }
+  const tab = await chrome.tabs.get(tabId);
+  const rawUrl = tab.pendingUrl ?? tab.url;
+  if (typeof rawUrl !== "string") {
+    throw Object.assign(new Error("AgentTab cannot determine the target tab's current origin"), {
+      code: "origin_unavailable",
+    });
+  }
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw Object.assign(new Error("AgentTab cannot determine the target tab's current origin"), {
+      code: "origin_unavailable",
+    });
+  }
+  if (url.protocol === "about:") return;
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw Object.assign(new Error(`AgentTab Standard mode does not allow ${url.protocol.slice(0, -1)} URLs`), {
+      code: "scheme_denied",
+    });
+  }
+  if (policy.denied_origins.some((pattern) => originMatches(pattern, url))) {
+    throw Object.assign(new Error(`AgentTab policy denies ${url.origin}`), {
+      code: "origin_denied",
+    });
+  }
+  if (
+    policy.allowed_origins.length > 0 &&
+    !policy.allowed_origins.some((pattern) => originMatches(pattern, url))
+  ) {
+    throw Object.assign(new Error(`AgentTab policy does not allow ${url.origin}`), {
+      code: "origin_not_allowed",
+    });
+  }
 }
 
 function errorCode(error: unknown): string {
@@ -123,12 +179,20 @@ async function dispatch(command: NativeCommand): Promise<NativeResponse> {
       if (!scheduler.isAccepting() || (await readState()).paused) {
         throw new NotStartedError("paused", "AgentTab is paused");
       }
-      return needsUser(command.request_id, await handoff.begin(command.task_id, params));
+      return needsUser(
+        command.request_id,
+        await handoff.begin(
+          command.task_id,
+          params,
+          () => assertCurrentOrigin(tabId(params), command.origin_policy),
+        ),
+      );
     }
     if (command.method === "browser_commit") {
       const targetTabId = await browser.stagedTabId(command.task_id, params.native_token);
       const result = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
         await ownership.assertOwned(command.task_id, targetTabId);
+        await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.commit(command.task_id, params);
       });
       return completed(command.request_id, result);
@@ -150,6 +214,7 @@ async function dispatch(command: NativeCommand): Promise<NativeResponse> {
       delete cdpParams.tab_id;
       const result = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
         await ownership.assertOwned(command.task_id, targetTabId);
+        await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.developer(targetTabId, action, cdpParams);
       });
       return completed(command.request_id, result);
@@ -158,6 +223,7 @@ async function dispatch(command: NativeCommand): Promise<NativeResponse> {
     if (command.method === "browser_snapshot" || command.method === "browser_wait") {
       const result = await scheduler.readAfterWrites(targetTabId, async () => {
         await ownership.assertOwned(command.task_id, targetTabId);
+        await assertCurrentOrigin(targetTabId, command.origin_policy);
         return command.method === "browser_snapshot"
           ? browser.snapshot(targetTabId, params)
           : browser.wait(targetTabId, params);
@@ -167,6 +233,7 @@ async function dispatch(command: NativeCommand): Promise<NativeResponse> {
     if (command.method === "browser_act") {
       const execution = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
         await ownership.assertOwned(command.task_id, targetTabId);
+        await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
       });
       if (execution.staged) {
