@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@v5
         if: ${{ runner.name != 'wolfie-m1-chrome-bridge' }}
         with:
@@ -116,6 +118,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify Linux IPC primitives
         run: cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
@@ -125,6 +129,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify Windows IPC primitives
         run: cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml

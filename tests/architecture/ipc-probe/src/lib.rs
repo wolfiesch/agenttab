@@ -203,8 +203,10 @@ mod framing_tests {
 mod unix_probe {
     use super::*;
     use serde_json::json;
+    use std::fs::{File, OpenOptions};
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::net::UnixStream as StdUnixStream;
     use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinSet;
 
@@ -252,7 +254,41 @@ mod unix_probe {
         }
     }
 
-    fn bind_user_socket(path: &Path, expected_uid: u32) -> Result<UnixListener, ProbeError> {
+    #[derive(Debug)]
+    struct BoundUserSocket {
+        listener: UnixListener,
+        _lock: File,
+    }
+
+    fn acquire_host_lock(path: &Path, expected_uid: u32) -> Result<File, ProbeError> {
+        let lock_path = path.with_extension("lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(SOCKET_MODE)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)?;
+        let metadata = lock.metadata()?;
+        if !metadata.is_file() || metadata.uid() != expected_uid {
+            return Err(ProbeError::InvalidBoundary(
+                "host lock is not a regular current-user file".to_owned(),
+            ));
+        }
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(SOCKET_MODE))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(ProbeError::InvalidBoundary(
+                    "another host owns the per-user IPC lock".to_owned(),
+                ));
+            }
+            return Err(error.into());
+        }
+        Ok(lock)
+    }
+
+    fn bind_user_socket(path: &Path, expected_uid: u32) -> Result<BoundUserSocket, ProbeError> {
         let parent = path.parent().ok_or_else(|| {
             ProbeError::InvalidBoundary("socket path has no parent directory".to_owned())
         })?;
@@ -271,6 +307,7 @@ mod unix_probe {
             std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
         )?;
 
+        let lock = acquire_host_lock(path, expected_uid)?;
         if path.exists() {
             let metadata = std::fs::symlink_metadata(path)?;
             if !metadata.file_type().is_socket() || metadata.uid() != expected_uid {
@@ -278,7 +315,17 @@ mod unix_probe {
                     "refusing to replace a non-socket or foreign-owned IPC path".to_owned(),
                 ));
             }
-            std::fs::remove_file(path)?;
+            match StdUnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(ProbeError::InvalidBoundary(
+                        "refusing to replace a live AgentTab IPC socket".to_owned(),
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
         let listener = UnixListener::bind(path)?;
@@ -289,13 +336,16 @@ mod unix_probe {
                 "socket ownership or permissions are unsafe".to_owned(),
             ));
         }
-        Ok(listener)
+        Ok(BoundUserSocket {
+            listener,
+            _lock: lock,
+        })
     }
 
-    async fn serve_two(listener: UnixListener, expected_uid: u32) -> Result<(), ProbeError> {
+    async fn serve_two(bound: BoundUserSocket, expected_uid: u32) -> Result<(), ProbeError> {
         let mut handlers = JoinSet::new();
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().await?;
+            let (mut stream, _) = bound.listener.accept().await?;
             let actual_uid = peer_uid(&stream)?;
             if actual_uid != expected_uid {
                 return Err(ProbeError::PeerDenied {
@@ -359,7 +409,7 @@ mod unix_probe {
         let scratch = tempfile::tempdir().unwrap();
         let uid = unsafe { libc::geteuid() };
         let path = scratch.path().join("run/agenttab.sock");
-        let listener = bind_user_socket(&path, uid).unwrap();
+        let bound = bind_user_socket(&path, uid).unwrap();
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.mode() & 0o777, SOCKET_MODE);
@@ -368,7 +418,7 @@ mod unix_probe {
             SOCKET_DIRECTORY_MODE
         );
 
-        let server = tokio::spawn(serve_two(listener, uid));
+        let server = tokio::spawn(serve_two(bound, uid));
         let (first, second) = tokio::join!(request(&path, 1), request(&path, 2));
         assert_eq!(first, json!({"request_id": 1, "ok": true}));
         assert_eq!(second, json!({"request_id": 2, "ok": true}));
@@ -387,6 +437,54 @@ mod unix_probe {
             ProbeError::InvalidBoundary(_)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"preserve me");
+    }
+
+    #[tokio::test]
+    async fn live_socket_is_never_unlinked_even_without_the_host_lock() {
+        let scratch = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let path = scratch.path().join("run/agenttab.sock");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let live_listener = UnixListener::bind(&path).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+
+        assert!(matches!(
+            bind_user_socket(&path, uid).unwrap_err(),
+            ProbeError::InvalidBoundary(_)
+        ));
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        drop(live_listener);
+    }
+
+    #[tokio::test]
+    async fn host_lock_blocks_a_second_listener_before_socket_probe() {
+        let scratch = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let path = scratch.path().join("run/agenttab.sock");
+        let first = bind_user_socket(&path, uid).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+
+        assert!(matches!(
+            bind_user_socket(&path, uid).unwrap_err(),
+            ProbeError::InvalidBoundary(_)
+        ));
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn stale_socket_is_replaced_only_after_lock_and_failed_probe() {
+        let scratch = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let path = scratch.path().join("run/agenttab.sock");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let stale_listener = UnixListener::bind(&path).unwrap();
+        let stale_inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        drop(stale_listener);
+
+        let replacement = bind_user_socket(&path, uid).unwrap();
+        assert_ne!(std::fs::symlink_metadata(&path).unwrap().ino(), stale_inode);
+        drop(replacement);
     }
 }
 
