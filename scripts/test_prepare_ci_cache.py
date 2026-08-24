@@ -14,13 +14,13 @@ class PrepareCiCacheTests(unittest.TestCase):
     def fixture(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         temporary = tempfile.TemporaryDirectory()
         home = Path(temporary.name)
-        root = home / "Library" / "Caches" / "chrome-bridge-ci" / "v-test"
+        root = home / "Library" / "Caches" / "agenttab-ci" / "v-test"
         (root / "cargo-target").mkdir(parents=True)
         self.addCleanup(temporary.cleanup)
         return temporary, root
 
     def test_rejects_paths_outside_project_cache(self) -> None:
-        with self.assertRaisesRegex(ValueError, "chrome-bridge-ci"):
+        with self.assertRaisesRegex(ValueError, "agenttab-ci"):
             prepare_ci_cache(Path("/tmp/cargo-target"))
 
     def test_keeps_a_healthy_cache(self) -> None:
