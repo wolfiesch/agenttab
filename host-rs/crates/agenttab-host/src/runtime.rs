@@ -803,7 +803,7 @@ impl Runtime {
             if let Some(task_id) = task_id {
                 response.task = Some(TaskBinding {
                     task_id,
-                    resume_capability: None,
+                    resume_capability: new_lease.map(|lease| lease.resume_capability),
                 });
             }
         }
@@ -1362,7 +1362,12 @@ mod tests {
     }
 
     #[test]
-    fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
+82:     fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
+83:         connection.finish_new_capability_delivery(true);
+        runtime.lifecycle.set_paused(true);
+        let mut retry = request;
+        retry["request_id"] = json!("retry");
+        let second = runtime.handle(&connection, retry);
         let native = FakeNative::normal();
         let (_temp, runtime, connection) = connected_runtime(native.clone());
         let key = Uuid::now_v7();
@@ -1377,19 +1382,16 @@ mod tests {
         });
         let first = runtime.handle(&connection, request.clone());
         assert_eq!(first["outcome"], "completed");
-        assert!(first["task"].get("resume_capability").is_none());
+        let capability = first["task"]["resume_capability"]
+            .as_str()
+            .expect("first response must carry the new task capability");
+        assert!(!capability.is_empty());
         assert!(!first["result"]["body"]
             .as_str()
             .unwrap()
             .contains("123-45-6789"));
-        let capability = connection
-            .pending_new_capability()
-            .unwrap()
-            .unwrap()
-            .resume_capability;
-        assert!(connection
-            .acknowledge_new_capability(&capability)
-            .unwrap());
+82:     fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
+83:         connection.finish_new_capability_delivery(true);
         runtime.lifecycle.set_paused(true);
         let mut retry = request;
         retry["request_id"] = json!("retry");
