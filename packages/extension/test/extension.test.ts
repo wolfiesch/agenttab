@@ -807,6 +807,46 @@ describe("ownership and task isolation", () => {
     expect(removedTabIds).toEqual([100]);
     expect((await readState()).tasks).toEqual({});
   });
+  test("creates additional task tabs in the existing task window", async () => {
+    await seedTask(TASK_A, [31], 7);
+    const taskTab = tabStore.get(31);
+    if (!taskTab) throw new Error("missing task tab");
+    taskTab.active = true;
+    taskTab.lastAccessed = 1;
+    tabStore.set(90, {
+      id: 90,
+      windowId: 2,
+      groupId: -1,
+      active: true,
+      lastAccessed: 100,
+      url: "https://human.example/",
+      status: "complete",
+    });
+    Object.assign(chrome.windows, {
+      async getAll() {
+        return [
+          { id: 1, tabs: clone([...tabStore.values()].filter((tab) => tab.windowId === 1)) },
+          { id: 2, tabs: clone([...tabStore.values()].filter((tab) => tab.windowId === 2)) },
+        ];
+      },
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    const opened = await ownership.open(TASK_A, {
+      mode: "create",
+      url: "https://example.test/additional",
+      background: true,
+    });
+
+    expect(opened).toMatchObject({ window_id: 1, group_id: 7, tab_count: 2 });
+    expect(tabStore.get(100)).toMatchObject({ windowId: 1, groupId: 7 });
+    expect(tabStore.get(90)).toMatchObject({ windowId: 2, active: true });
+  });
+
 
   test("publishes a loading tab's pending URL in native inventory", async () => {
     await seedTask(TASK_A, [31], 7);

@@ -228,7 +228,18 @@ export class OwnershipLedger {
     }
     const url = typeof params.url === "string" ? params.url : "about:blank";
     const active = params.background === false;
-    const tab = await this.createTabInUsableWindow(url, active);
+    const existingTask = (await readState()).tasks[taskId];
+    let taskWindowId: number | undefined;
+    if (existingTask && existingTask.groupId !== null) {
+      for (const tabId of existingTask.tabIds) {
+        const candidate = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
+        if (candidate?.groupId === existingTask.groupId && Number.isInteger(candidate.windowId)) {
+          taskWindowId = candidate.windowId;
+          break;
+        }
+      }
+    }
+    const tab = await this.createTabInUsableWindow(url, active, taskWindowId);
     const createdTabId = tab.id;
     if (createdTabId === undefined) throw new Error("Chrome did not return a created tab ID");
     try {
@@ -448,7 +459,14 @@ export class OwnershipLedger {
     await this.emitInventory();
   }
 
-  private async createTabInUsableWindow(url: string, active: boolean): Promise<TabLike> {
+  private async createTabInUsableWindow(
+    url: string,
+    active: boolean,
+    preferredWindowId?: number,
+  ): Promise<TabLike> {
+    if (preferredWindowId !== undefined) {
+      return chrome.tabs.create({ windowId: preferredWindowId, url, active });
+    }
     const windows = (await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] })) as Array<{
       id?: number;
       tabs?: TabLike[];
