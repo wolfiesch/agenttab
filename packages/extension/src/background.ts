@@ -19,6 +19,14 @@ import { isRecord } from "./type-guards";
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
 let automationRevocationGeneration = 0;
+let automationCleanupEpoch = 0;
+const AUTOMATION_CLEANUP_ALARM = "agenttabAutomationCleanup";
+const AUTOMATION_CLEANUP_RETRY_BASE_MS = 1_000;
+const AUTOMATION_CLEANUP_RETRY_MAX_MS = 30_000;
+let automationCleanupPending = false;
+let automationCleanupDelayMs = AUTOMATION_CLEANUP_RETRY_BASE_MS;
+let automationCleanupTimer: ReturnType<typeof setTimeout> | undefined;
+let automationCleanupQueue = Promise.resolve();
 
 const PRE_DISPATCH_ERRORS: Record<string, true> = {
   invalid_request: true,
@@ -50,6 +58,24 @@ let nativeBridge: NativeBridge | null = null;
 const emit = (event: string, payload: Record<string, unknown>, eventId?: string) =>
   nativeBridge?.sendEvent(event, payload, eventId);
 const ownership = new OwnershipLedger(scheduler, revisions, emit);
+async function recordDebuggerCandidate(tabId: number): Promise<void> {
+  const current = await readState();
+  if (current.automationCleanup.tabIds.includes(tabId)) return;
+  await mutateState((state) => {
+    if (!state.automationCleanup.tabIds.includes(tabId)) {
+      state.automationCleanup.tabIds.push(tabId);
+    }
+  });
+}
+
+async function forgetDebuggerCandidate(tabId: number): Promise<void> {
+  const current = await readState();
+  if (!current.automationCleanup.tabIds.includes(tabId)) return;
+  await mutateState((state) => {
+    state.automationCleanup.tabIds =
+      state.automationCleanup.tabIds.filter((candidate) => candidate !== tabId);
+  });
+}
 let browser: StandardBrowserRuntime;
 browser = new StandardBrowserRuntime(
   revisions,
@@ -60,12 +86,21 @@ browser = new StandardBrowserRuntime(
   },
   emit,
   authorizeOwnedTab,
+  recordDebuggerCandidate,
+  forgetDebuggerCandidate,
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber(() => browser.scrubForHandoff());
 
 async function automationEnabled(): Promise<boolean> {
-  return chrome.permissions.contains({ permissions: ["scripting"] });
+  if (automationCleanupPending) return false;
+  const state = await readState();
+  if (state.automationCleanup.pending) return false;
+  const [scripting, debuggerPermission] = await Promise.all([
+    chrome.permissions.contains({ permissions: ["scripting"] }),
+    chrome.permissions.contains({ permissions: ["debugger"] }),
+  ]);
+  return scripting && debuggerPermission;
 }
 
 function automationRequired(): Error {
@@ -85,6 +120,93 @@ async function authorizeOwnedTab(tabId: number): Promise<void> {
   }
   await ownership.assertOwned(taskId, tabId);
   if (!(await automationEnabled())) throw automationRequired();
+}
+function cancelAutomationCleanupRetry(): void {
+  if (automationCleanupTimer) clearTimeout(automationCleanupTimer);
+  automationCleanupTimer = undefined;
+  automationCleanupDelayMs = AUTOMATION_CLEANUP_RETRY_BASE_MS;
+  void chrome.alarms.clear(AUTOMATION_CLEANUP_ALARM);
+}
+
+function queueAutomationCleanup(): Promise<void> {
+  automationCleanupQueue = automationCleanupQueue
+    .catch(() => undefined)
+    .then(clearAutomationRuntime);
+  return automationCleanupQueue;
+}
+
+function scheduleAutomationCleanupRetry(): void {
+  if (automationCleanupTimer) return;
+  const delay = automationCleanupDelayMs;
+  automationCleanupTimer = setTimeout(() => {
+    automationCleanupTimer = undefined;
+    void queueAutomationCleanup().catch((error) => {
+      console.warn("AgentTab debugger cleanup retry failed", error);
+    });
+  }, delay);
+  chrome.alarms.create(AUTOMATION_CLEANUP_ALARM, { when: Date.now() + delay });
+  automationCleanupDelayMs = Math.min(delay * 2, AUTOMATION_CLEANUP_RETRY_MAX_MS);
+}
+
+async function persistAutomationCleanupRequest(requestedEpoch: number): Promise<void> {
+  const tabIds = browser.debuggerTabIds();
+  const cleanup = await mutateState((state) => {
+    state.automationCleanup.pending = true;
+    state.automationCleanup.epoch = Math.max(
+      state.automationCleanup.epoch + 1,
+      requestedEpoch,
+    );
+    state.automationCleanup.tabIds = [
+      ...new Set([...state.automationCleanup.tabIds, ...tabIds]),
+    ];
+    return structuredClone(state.automationCleanup);
+  });
+  automationCleanupEpoch = Math.max(automationCleanupEpoch, cleanup.epoch);
+}
+
+async function clearAutomationRuntime(): Promise<void> {
+  if (!automationCleanupPending) return;
+  try {
+    await start();
+    await scheduler.drain();
+    const cleanup = await mutateState((state) => {
+      state.automationCleanup.pending = true;
+      state.automationCleanup.epoch = Math.max(
+        state.automationCleanup.epoch,
+        automationCleanupEpoch,
+      );
+      state.automationCleanup.tabIds = [
+        ...new Set([...state.automationCleanup.tabIds, ...browser.debuggerTabIds()]),
+      ];
+      return structuredClone(state.automationCleanup);
+    });
+    await browser.scrubForHandoff(cleanup.tabIds);
+    const completed = await mutateState((state) => {
+      if (state.automationCleanup.epoch !== cleanup.epoch) {
+        return structuredClone(state.automationCleanup);
+      }
+      state.automationCleanup.pending = false;
+      state.automationCleanup.tabIds = [];
+      state.automationCleanup.generation += 1;
+      return structuredClone(state.automationCleanup);
+    });
+    automationCleanupEpoch = Math.max(automationCleanupEpoch, completed.epoch);
+    automationRevocationGeneration = Math.max(
+      automationRevocationGeneration,
+      completed.generation,
+    );
+    automationCleanupPending =
+      completed.pending || automationCleanupEpoch > completed.epoch;
+    if (automationCleanupPending) {
+      void queueAutomationCleanup().catch(() => undefined);
+      return;
+    }
+    cancelAutomationCleanupRetry();
+    if (await automationEnabled()) scheduler.restorePermissions();
+  } catch (error) {
+    scheduleAutomationCleanupRetry();
+    throw error;
+  }
 }
 
 function tabId(params: Record<string, unknown>): number {
@@ -329,14 +451,39 @@ function start(): Promise<void> {
   if (startup) return startup;
   startup = (async () => {
     const state = await readState();
+    browser.restoreDebuggerCandidates(state.automationCleanup.tabIds);
+    automationCleanupPending =
+      automationCleanupPending ||
+      state.automationCleanup.pending ||
+      state.automationCleanup.tabIds.length > 0;
+    automationCleanupEpoch = Math.max(
+      automationCleanupEpoch,
+      state.automationCleanup.epoch,
+    );
+    automationRevocationGeneration = Math.max(
+      automationRevocationGeneration,
+      state.automationCleanup.generation,
+    );
     scheduler.setInitialPaused(state.paused || state.handoff.active);
     if (!(await automationEnabled())) scheduler.revokePermissions();
-    await ownership.reconcile();
+    const revokedTabIds = await ownership.reconcile();
+    await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
     await browser.expireCommits();
     await handoff.restore();
     await nativeBridge?.connect();
   })();
+  void startup.then(() => {
+    if (!automationCleanupPending) return;
+    void queueAutomationCleanup().catch((error) => {
+      console.warn("AgentTab restored debugger cleanup failed; retry scheduled", error);
+    });
+  });
   return startup;
+}
+
+async function reconcileOwnership(): Promise<void> {
+  const revokedTabIds = await ownership.reconcile();
+  await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
 }
 
 chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) => {
@@ -356,34 +503,55 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
       scheduler.invalidateTab(updatedTabId);
       await revisions.markNavigation(updatedTabId);
     }
-    if ("groupId" in changeInfo) await ownership.revokeIfMoved(updatedTabId);
+    if ("groupId" in changeInfo) {
+      const revoked = await ownership.revokeIfMoved(updatedTabId);
+      if (revoked) await browser.detach(updatedTabId);
+    }
     if (typeof changeInfo.url === "string" || changeInfo.status === "complete") {
       await ownership.publishInventory();
     }
   });
 });
-chrome.tabs.onAttached.addListener(() => void start().then(() => ownership.reconcile()));
-chrome.tabs.onDetached.addListener(() => void start().then(() => ownership.reconcile()));
-chrome.tabGroups.onRemoved.addListener(() => void start().then(() => ownership.reconcile()));
+chrome.tabs.onAttached.addListener(() => void start().then(reconcileOwnership));
+chrome.tabs.onDetached.addListener(() => void start().then(reconcileOwnership));
+chrome.tabGroups.onRemoved.addListener(() => void start().then(reconcileOwnership));
 chrome.runtime.onStartup.addListener(() => void start());
 chrome.runtime.onInstalled.addListener(() => void start());
 chrome.permissions.onRemoved.addListener((permissions) => {
   if (!permissions.permissions?.includes("scripting")) return;
   scheduler.revokePermissions();
-  automationRevocationGeneration += 1;
-  void start().then(() => browser.scrubForHandoff());
+  automationCleanupPending = true;
+  automationCleanupEpoch += 1;
+  const requestedEpoch = automationCleanupEpoch;
+  void persistAutomationCleanupRequest(requestedEpoch)
+    .then(queueAutomationCleanup)
+    .catch((error) => {
+      scheduleAutomationCleanupRetry();
+      console.warn("AgentTab debugger cleanup failed; retry scheduled", error);
+    });
 });
 
 chrome.permissions.onAdded.addListener((permissions) => {
   if (!permissions.permissions?.includes("scripting")) return;
-  void automationEnabled().then((enabled) => {
-    if (enabled) scheduler.restorePermissions();
+  void start().then(async () => {
+    if (automationCleanupPending) {
+      await queueAutomationCleanup().catch((error) => {
+        console.warn("AgentTab debugger cleanup after permission restoration failed", error);
+      });
+      return;
+    }
+    if (await automationEnabled()) scheduler.restorePermissions();
   });
 });
 chrome.alarms.onAlarm.addListener((alarm: { name: string }) => {
   void start().then(async () => {
     if (alarm.name === RECONNECT_ALARM) await nativeBridge?.reconnectFromAlarm(alarm.name);
     if (alarm.name === HANDOFF_ALARM) await handoff.finish(false);
+    if (alarm.name === AUTOMATION_CLEANUP_ALARM) {
+      if (automationCleanupTimer) clearTimeout(automationCleanupTimer);
+      automationCleanupTimer = undefined;
+      await queueAutomationCleanup().catch(() => undefined);
+    }
     await browser.expireCommits();
   });
 });

@@ -42,6 +42,13 @@ export type HandoffRecord =
     pendingClearEventId?: string;
   };
 
+export interface AutomationCleanupRecord {
+  pending: boolean;
+  tabIds: number[];
+  generation: number;
+  epoch: number;
+}
+
 export interface ExtensionState {
   schemaVersion: typeof SCHEMA_VERSION;
   paused: boolean;
@@ -51,6 +58,7 @@ export interface ExtensionState {
   revisions: Record<string, RevisionRecord>;
   handoff: HandoffRecord;
   stagedCommits: Record<string, StagedCommit>;
+  automationCleanup: AutomationCleanupRecord;
 }
 
 let mutationQueue: Promise<unknown> = Promise.resolve();
@@ -67,6 +75,12 @@ function defaultState(): ExtensionState {
     revisions: {},
     handoff: { active: false },
     stagedCommits: {},
+    automationCleanup: {
+      pending: false,
+      tabIds: [],
+      generation: 0,
+      epoch: 0,
+    },
   };
 }
 
@@ -117,7 +131,25 @@ function parseState(value: unknown): ExtensionState | null {
   const revisionsValue = objectValue(raw.revisions);
   const handoffValue = objectValue(raw.handoff);
   const commitsValue = objectValue(raw.stagedCommits);
-  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue) return null;
+  const cleanupValue = raw.automationCleanup === undefined
+    ? {
+      pending: false,
+      tabIds: [],
+      generation: 0,
+      epoch: 0,
+    }
+    : objectValue(raw.automationCleanup);
+  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue || !cleanupValue) return null;
+  if (
+    typeof cleanupValue.pending !== "boolean" ||
+    !Array.isArray(cleanupValue.tabIds) ||
+    !cleanupValue.tabIds.every((tabId) => finiteInteger(tabId)) ||
+    new Set(cleanupValue.tabIds).size !== cleanupValue.tabIds.length ||
+    !finiteInteger(cleanupValue.generation) ||
+    !finiteInteger(cleanupValue.epoch)
+  ) {
+    return null;
+  }
 
   const tasks: Record<string, TaskRecord> = {};
   const assignedTabIds = new Set<number>();
@@ -226,6 +258,7 @@ function parseState(value: unknown): ExtensionState | null {
     revisions,
     handoff: handoffValue as unknown as HandoffRecord,
     stagedCommits,
+    automationCleanup: cleanupValue as unknown as AutomationCleanupRecord,
   };
 }
 

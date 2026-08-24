@@ -156,6 +156,12 @@ export class MutationScheduler {
     this.accepting = this.lifecycleAccepting;
   }
 
+  async drain(): Promise<void> {
+    while (this.pending.size > 0) {
+      await Promise.allSettled([...this.pending]);
+    }
+  }
+
   disconnect(): void {
     this.accepting = false;
     this.lifecycleAccepting = false;
@@ -174,9 +180,7 @@ export class MutationScheduler {
       code: "paused",
       message: "AgentTab is paused",
     };
-    while (this.pending.size > 0) {
-      await Promise.allSettled([...this.pending]);
-    }
+    await this.drain();
   }
 
   resume(): void {

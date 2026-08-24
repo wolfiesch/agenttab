@@ -13,9 +13,10 @@ interface JavaScriptDialog {
 
 interface DebugSession {
   attached: boolean;
-  initializing?: Promise<void>;
-  cancelled?: boolean;
+  attachPromise?: Promise<void>;
+  detachPromise?: Promise<void>;
   idleTimer?: ReturnType<typeof setTimeout>;
+  busyCount: number;
   inflight: Set<string>;
   lastNetworkActivity: number;
   dialogGeneration: number;
@@ -45,7 +46,8 @@ interface PageIdentity {
 
 type CloseTab = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
-type AuthorizeTab = (tabId: number) => Promise<void>;
+type AuthorizeDebuggerUse = (tabId: number) => Promise<void>;
+type DebuggerLifecycle = (tabId: number) => Promise<void>;
 
 export interface ActionExecution {
   result?: Record<string, unknown>;
@@ -67,17 +69,27 @@ interface StagedConsequence {
 
 export class StandardBrowserRuntime {
   private readonly sessions = new Map<number, DebugSession>();
+  private readonly expectedDetaches = new Map<number, number>();
+  private readonly debuggerCandidates = new Set<number>();
 
   constructor(
     private readonly revisions: RevisionTracker,
     private readonly closeTab: CloseTab,
     private readonly emit: EventSink,
-    private readonly authorize: AuthorizeTab,
+    private readonly authorizeDebuggerUse: AuthorizeDebuggerUse = async () => undefined,
+    private readonly recordDebuggerCandidate: DebuggerLifecycle = async () => undefined,
+    private readonly forgetDebuggerCandidate: DebuggerLifecycle = async () => undefined,
   ) {
     chrome.debugger.onDetach.addListener((source: { tabId?: number }) => {
       if (source.tabId === undefined) return;
+      const expected = this.expectedDetaches.get(source.tabId) ?? 0;
+      if (expected > 0) {
+        if (expected === 1) this.expectedDetaches.delete(source.tabId);
+        else this.expectedDetaches.set(source.tabId, expected - 1);
+        return;
+      }
       const session = this.sessions.get(source.tabId);
-      if (session) session.cancelled = true;
+      if (session?.idleTimer) clearTimeout(session.idleTimer);
       this.sessions.delete(source.tabId);
       void this.invalidateStagedDialogs(source.tabId);
     });
@@ -117,20 +129,114 @@ export class StandardBrowserRuntime {
     this.revisions.onChange((tabId) => this.invalidateStagedDialogs(tabId));
   }
 
+  debuggerTabIds(): number[] {
+    return [...this.debuggerCandidates];
+  }
+
+  restoreDebuggerCandidates(tabIds: readonly number[]): void {
+    for (const tabId of tabIds) this.debuggerCandidates.add(tabId);
+  }
+
   async detach(tabId: number): Promise<void> {
     const session = this.sessions.get(tabId);
-    if (session) session.cancelled = true;
-    if (session?.idleTimer) clearTimeout(session.idleTimer);
-    this.sessions.delete(tabId);
-    await this.invalidateStagedDialogs(tabId);
-    if (session?.attached) await chrome.debugger.detach({ tabId }).catch(() => undefined);
+    if (!session) {
+      if (this.debuggerCandidates.has(tabId)) {
+        await this.detachRecovered(tabId);
+      } else {
+        await this.invalidateStagedDialogs(tabId);
+      }
+      return;
+    }
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
+    if (session.detachPromise) return session.detachPromise;
+    if (session.attachPromise) {
+      const attaching = session.attachPromise;
+      try {
+        await attaching;
+      } catch {
+        // Initialization failure can leave an attached session requiring cleanup.
+      }
+      if (this.sessions.get(tabId) !== session) return;
+      if (session.attachPromise === attaching) session.attachPromise = undefined;
+      return this.detach(tabId);
+    }
+    if (!session.attached) {
+      if (this.sessions.get(tabId) === session) this.sessions.delete(tabId);
+      await this.invalidateStagedDialogs(tabId);
+      return;
+    }
+    return this.detachTrackedSession(tabId, session);
   }
-  async scrubForHandoff(): Promise<void> {
-    await Promise.all([...this.sessions.keys()].map((tabId) => this.detach(tabId)));
+
+  async scrubForHandoff(recoveredTabIds: readonly number[] = []): Promise<void> {
+    const tabIds = [
+      ...new Set([...this.sessions.keys(), ...this.debuggerCandidates, ...recoveredTabIds]),
+    ];
+    const results = await Promise.allSettled(tabIds.map((tabId) => this.detachRecovered(tabId)));
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failed) throw failed.reason;
+  }
+
+  private async detachRecovered(tabId: number): Promise<void> {
+    if (this.sessions.has(tabId)) {
+      await this.detach(tabId);
+      return;
+    }
+    const targets = await chrome.debugger.getTargets();
+    const target = targets.find(
+      (candidate: { attached?: boolean; tabId?: number }) =>
+        candidate.attached === true && candidate.tabId === tabId,
+    );
+    if (!target) {
+      await this.invalidateStagedDialogs(tabId);
+      await this.forgetTrackedDebuggerCandidate(tabId);
+      return;
+    }
+    const expected = this.expectedDetaches.get(tabId) ?? 0;
+    this.expectedDetaches.set(tabId, expected + 1);
+    try {
+      await chrome.debugger.detach({ tabId });
+      await this.invalidateStagedDialogs(tabId);
+      await this.forgetTrackedDebuggerCandidate(tabId);
+    } catch (error) {
+      this.consumeExpectedDetach(tabId);
+      throw error;
+    }
+  }
+
+  private detachTrackedSession(tabId: number, session: DebugSession): Promise<void> {
+    const expected = this.expectedDetaches.get(tabId) ?? 0;
+    this.expectedDetaches.set(tabId, expected + 1);
+    const detaching = (async () => {
+      try {
+        await chrome.debugger.detach({ tabId });
+        if (this.sessions.get(tabId) === session) this.sessions.delete(tabId);
+        await this.invalidateStagedDialogs(tabId);
+        await this.forgetTrackedDebuggerCandidate(tabId);
+      } catch (error) {
+        this.consumeExpectedDetach(tabId);
+        if (this.sessions.get(tabId) === session) session.detachPromise = undefined;
+        this.scheduleIdleDetach(tabId, session);
+        throw error;
+      }
+    })();
+    session.detachPromise = detaching;
+    return detaching;
+  }
+  private async forgetTrackedDebuggerCandidate(tabId: number): Promise<void> {
+    await this.forgetDebuggerCandidate(tabId);
+    this.debuggerCandidates.delete(tabId);
+  }
+
+  private consumeExpectedDetach(tabId: number): void {
+    const pendingExpected = this.expectedDetaches.get(tabId) ?? 0;
+    if (pendingExpected <= 1) this.expectedDetaches.delete(tabId);
+    else this.expectedDetaches.set(tabId, pendingExpected - 1);
   }
 
   async snapshot(tabId: number, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const mode = params.mode;
     if (mode === "text" || mode === "html") return this.scriptSnapshot(tabId, mode, params);
     if (mode === "screenshot") return this.screenshot(tabId, params);
@@ -189,7 +295,7 @@ export class StandardBrowserRuntime {
     expectedRevision: unknown,
     actions: unknown,
   ): Promise<ActionExecution> {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const pageRevision = await this.revisions.assertExpected(tabId, expectedRevision);
     if (!Array.isArray(actions) || actions.length === 0 || actions.length > 64) {
       throw Object.assign(new Error("actions must contain between 1 and 64 operations"), {
@@ -394,7 +500,7 @@ export class StandardBrowserRuntime {
   async commit(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     const nativeToken = params.native_token;
     const tabId = await this.stagedTabId(taskId, nativeToken);
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const staged = (await readState()).stagedCommits[String(nativeToken)];
     if (!staged || staged.task_id !== taskId || staged.tab_id !== tabId) {
       throw Object.assign(new Error("Staged commit token is invalid, used, or belongs to another task"), {
@@ -481,7 +587,7 @@ export class StandardBrowserRuntime {
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     do {
-      await this.authorize(tabId);
+      await this.authorizeDebuggerUse(tabId);
       if (revalidate) await revalidate();
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
       if (revalidate) await revalidate();
@@ -504,7 +610,7 @@ export class StandardBrowserRuntime {
   }
 
   async developer(tabId: number, action: string, params: Record<string, unknown>): Promise<unknown> {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const [domain, ...rest] = action.split(".");
     if (!domain || rest.length === 0) {
       throw Object.assign(new Error("Developer action must be a CDP Domain.method"), {
@@ -519,7 +625,7 @@ export class StandardBrowserRuntime {
     mode: "text" | "html",
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const selector = typeof params.selector === "string" ? params.selector : null;
     const maxBytes = typeof params.max_bytes === "number" ? params.max_bytes : 256_000;
     const [{ result }] = await chrome.scripting.executeScript({
@@ -715,7 +821,7 @@ export class StandardBrowserRuntime {
       throw Object.assign(new Error("Staged dialog binding is missing"), { code: "staged_commit_mismatch" });
     }
     await this.ensureAttached(tabId);
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const dialog = this.sessions.get(tabId)?.dialog;
     if (!dialog || dialog.generation !== stagedDialog.generation) {
       throw Object.assign(new Error("The staged JavaScript dialog is no longer open"), {
@@ -732,12 +838,7 @@ export class StandardBrowserRuntime {
         code: "staged_commit_mismatch",
       });
     }
-    await this.authorize(tabId);
-    await chrome.debugger.sendCommand(
-      { tabId },
-      "Page.handleJavaScriptDialog",
-      { accept: true },
-    );
+    await this.send(tabId, "Page.handleJavaScriptDialog", { accept: true });
     return { kind: "dialog", completed: true };
   }
 
@@ -786,7 +887,7 @@ export class StandardBrowserRuntime {
     pageRevision: number,
     action: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const kind = action.kind;
     if (kind === "navigate") {
       if (typeof action.url !== "string") throw Object.assign(new Error("navigate requires url"), { code: "invalid_request" });
@@ -820,11 +921,7 @@ export class StandardBrowserRuntime {
           code: "invalid_request",
         });
       }
-      await chrome.debugger.sendCommand({
-        tabId,
-      }, "Page.handleJavaScriptDialog", {
-        accept: false,
-      });
+      await this.send(tabId, "Page.handleJavaScriptDialog", { accept: false });
       return { kind, completed: true };
     }
     if (kind === "scroll" && action.ref === undefined) {
@@ -1040,84 +1137,98 @@ export class StandardBrowserRuntime {
   }
 
   private async ensureAttached(tabId: number): Promise<void> {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     let session = this.sessions.get(tabId);
+    if (session?.detachPromise) {
+      await session.detachPromise;
+      session = this.sessions.get(tabId);
+    }
     if (!session) {
       session = {
         attached: false,
+        busyCount: 0,
         inflight: new Set(),
         lastNetworkActivity: Date.now(),
         dialogGeneration: 0,
       };
       this.sessions.set(tabId, session);
     }
-    if (!session.attached && !session.initializing) {
-      const initialization = (async () => {
-        try {
-          await this.authorize(tabId);
-          if (session.cancelled || this.sessions.get(tabId) !== session) {
-            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
-              code: "ownership_revoked",
-            });
-          }
-          await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
-          session.attached = true;
-          if (session.cancelled || this.sessions.get(tabId) !== session) {
-            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
-              code: "ownership_revoked",
-            });
-          }
-          await this.authorize(tabId);
-          await Promise.all([
-            chrome.debugger.sendCommand({ tabId }, "Page.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "Network.enable", {}),
-          ]);
-        } catch (error) {
-          if (session.attached) {
-            session.attached = false;
-            await chrome.debugger.detach({ tabId }).catch(() => undefined);
-          }
-          if (this.sessions.get(tabId) === session) this.sessions.delete(tabId);
-          throw error;
-        }
-      })();
-      session.initializing = initialization;
+    if (session.attachPromise) {
+      await session.attachPromise;
+      await this.authorizeDebuggerUse(tabId);
+      return;
+    }
+    if (session.attached) {
+      await this.authorizeDebuggerUse(tabId);
+      return;
+    }
+
+    const attaching = (async () => {
+      await this.authorizeDebuggerUse(tabId);
+      this.debuggerCandidates.add(tabId);
+      await this.recordDebuggerCandidate(tabId);
+      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+      session.attached = true;
       try {
-        await initialization;
-      } finally {
-        if (session.initializing === initialization) session.initializing = undefined;
+        for (const method of [
+          "Page.enable",
+          "DOM.enable",
+          "Accessibility.enable",
+          "Runtime.enable",
+          "Network.enable",
+        ]) {
+          await this.authorizeDebuggerUse(tabId);
+          await chrome.debugger.sendCommand({ tabId }, method, {});
+        }
+      } catch (error) {
+        try {
+          await this.detachTrackedSession(tabId, session);
+        } catch (detachError) {
+          throw new AggregateError(
+            [error, detachError],
+            "Debugger initialization and cleanup both failed",
+          );
+        }
+        throw error;
       }
-    } else if (session.initializing) {
-      await session.initializing;
-    }
+    })();
+    session.attachPromise = attaching;
     try {
-      await this.authorize(tabId);
-    } catch (error) {
-      await this.detach(tabId);
-      throw error;
+      await attaching;
+    } finally {
+      if (this.sessions.get(tabId) === session) session.attachPromise = undefined;
     }
-    if (session.cancelled || !session.attached || this.sessions.get(tabId) !== session) {
-      throw Object.assign(new Error("Debugger session was revoked while attaching"), {
-        code: "ownership_revoked",
-      });
-    }
+  }
+
+  private scheduleIdleDetach(tabId: number, session: DebugSession): void {
     if (session.idleTimer) clearTimeout(session.idleTimer);
-    session.idleTimer = setTimeout(() => void this.detach(tabId), DEBUGGER_IDLE_MS);
+    session.idleTimer = setTimeout(() => {
+      void this.detach(tabId).catch(() => {
+        if (this.sessions.get(tabId) === session) this.scheduleIdleDetach(tabId, session);
+      });
+    }, DEBUGGER_IDLE_MS);
   }
 
   private async send(tabId: number, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     await this.ensureAttached(tabId);
-    await this.authorize(tabId);
     const session = this.sessions.get(tabId);
-    if (!session?.attached || session.cancelled) {
-      throw Object.assign(new Error("Debugger session is no longer authorized"), {
-        code: "ownership_revoked",
+    if (!session?.attached) {
+      throw Object.assign(new Error("Debugger detached before the command could run"), {
+        code: "debugger_detached",
       });
     }
-    const result: unknown = await chrome.debugger.sendCommand({ tabId }, method, params);
-    return isRecord(result) ? result : {};
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
+    session.busyCount += 1;
+    try {
+      await this.authorizeDebuggerUse(tabId);
+      const result: unknown = await chrome.debugger.sendCommand({ tabId }, method, params);
+      return isRecord(result) ? result : {};
+    } finally {
+      session.busyCount -= 1;
+      if (this.sessions.get(tabId) === session && session.busyCount === 0) {
+        this.scheduleIdleDetach(tabId, session);
+      }
+    }
   }
 }

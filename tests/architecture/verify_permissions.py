@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Verify AgentTab's offline permission decision and explicit PR3 live lifecycle.
 
-Without ``--live-lifecycle`` this remains the PR1 decision gate: it only derives
-and validates a reduced manifest in memory.  It neither writes extension files,
-opens Chrome, reloads an extension, nor changes Chrome permissions.
+Without ``--live-lifecycle`` this remains the PR1 decision gate: it validates
+the canonical required/optional split and a normalized copy in memory. It
+neither writes extension files, opens Chrome, reloads an extension, nor changes
+Chrome permissions.
 
 The explicit live mode runs only against a preloaded AgentTab candidate on the
-trusted macOS runner.  It observes permission changes made by a human through
+trusted macOS runner. It observes permission changes made by a human through
 the AgentTab UI; this probe never calls ``chrome.permissions.request`` or
-``chrome.permissions.remove``.  Its only mutations are local fixture HTTP
-requests and task-owned tabs created through AgentTab Core RPC.  Cleanup closes
-those tabs, restores the original optional-permission state through a human UI
+``chrome.permissions.remove``. Its only mutations are local fixture HTTP
+requests and task-owned tabs created through AgentTab Core RPC. Cleanup closes
+those tabs, restores the original optional-scripting state through a human UI
 checkpoint, and removes only the exact fixture download from an explicit test
 download directory.
 """
@@ -25,6 +26,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import socket
@@ -51,6 +53,7 @@ REQUIRED_PERMISSIONS = (
     "storage",
     "alarms",
     "downloads",
+    "debugger",
 )
 OPTIONAL_PERMISSIONS = ("scripting",)
 REMOVED_PERMISSIONS = (
@@ -112,24 +115,70 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def verify_extension_permission_contract() -> None:
+    """Check the built Automation control cannot dynamically toggle debugger."""
+    pairs = (
+        (ROOT / "background.js", ROOT / "extension" / "background.js"),
+        (ROOT / "popup.js", ROOT / "extension" / "popup.js"),
+        (ROOT / "popup.css", ROOT / "extension" / "popup.css"),
+    )
+    for root_path, mirror_path in pairs:
+        root_payload = manifest_bytes(root_path)
+        mirror_payload = manifest_bytes(mirror_path)
+        if root_payload != mirror_payload:
+            raise GateFailure(
+                f"{root_path.relative_to(ROOT)} and {mirror_path.relative_to(ROOT)} differ"
+            )
+
+    background = manifest_bytes(ROOT / "background.js").decode("utf-8")
+    for required in (
+        "automationEnabled",
+        "clearAutomationRuntime",
+        "scheduler.revokePermissions",
+        "chrome.permissions.onRemoved.addListener",
+    ):
+        if required not in background:
+            raise GateFailure(f"background permission lifecycle omits {required!r}")
+    debugger_mutation = re.compile(
+        r"permissions\.(?:request|remove)\s*\(\s*\{\s*permissions\s*:\s*\[\s*['\"]debugger['\"]"
+    )
+    if debugger_mutation.search(background):
+        raise GateFailure("background must not dynamically request or remove debugger")
+
+    popup = manifest_bytes(ROOT / "popup.js").decode("utf-8")
+    for required in (
+        "changeOptionalScriptingPermission",
+        'permissions: ["scripting"]',
+        "optional scripting",
+        "install-time debugger grant stays installed",
+    ):
+        if required not in popup:
+            raise GateFailure(f"popup permission disclosure omits {required!r}")
+    if debugger_mutation.search(popup):
+        raise GateFailure("popup must not request or remove debugger")
+
+
 def verify() -> dict[str, Any]:
     """Run the side-effect-free PR1 manifest decision gate."""
     root_bytes = manifest_bytes(ROOT_MANIFEST)
     mirror_bytes = manifest_bytes(MIRROR_MANIFEST)
     if root_bytes != mirror_bytes:
         raise GateFailure("manifest.json and extension/manifest.json differ")
+    verify_extension_permission_contract()
 
     source = parse_manifest(ROOT_MANIFEST, root_bytes)
     if source.get("manifest_version") != 3:
         raise GateFailure("permission gate requires a Manifest V3 source")
 
-    source_grants = string_set(source, "permissions") | string_set(source, "optional_permissions")
-    expected_grants = set(REQUIRED_PERMISSIONS) | set(OPTIONAL_PERMISSIONS)
-    missing = sorted(expected_grants - source_grants)
-    if missing:
-        raise GateFailure(f"source manifest cannot produce target; missing grants: {missing}")
-    if not set(HOST_PERMISSIONS).issubset(string_set(source, "host_permissions")):
-        raise GateFailure("source manifest cannot produce target; <all_urls> is missing")
+    source_required = string_set(source, "permissions")
+    source_optional = string_set(source, "optional_permissions")
+    source_host = string_set(source, "host_permissions")
+    if source_required != set(REQUIRED_PERMISSIONS):
+        raise GateFailure("source manifest required permissions differ from the ADR target")
+    if source_optional != set(OPTIONAL_PERMISSIONS):
+        raise GateFailure("source manifest optional permissions differ from the ADR target")
+    if source_host != set(HOST_PERMISSIONS):
+        raise GateFailure("source manifest host permissions differ from the ADR target")
 
     staged = reduced_manifest(source)
     required = string_set(staged, "permissions")
@@ -153,10 +202,12 @@ def verify() -> dict[str, Any]:
         "schema_version": 1,
         "decision_gate": True,
         "installed_extension_modified": False,
-        "permissions": list(REQUIRED_PERMISSIONS),
+        "required_permissions": list(REQUIRED_PERMISSIONS),
         "optional_permissions": list(OPTIONAL_PERMISSIONS),
         "host_permissions": list(HOST_PERMISSIONS),
         "removed_permissions": list(REMOVED_PERMISSIONS),
+        "debugger_required_at_install": True,
+        "scripting_optional_at_runtime": True,
         "active_tab_retained": False,
         "source_manifest_sha256": hashlib.sha256(root_bytes).hexdigest(),
         "staged_manifest_sha256": hashlib.sha256(staged_bytes).hexdigest(),
@@ -186,11 +237,6 @@ def scrubbed_error_code(response: dict[str, Any]) -> str:
     error = response.get("error")
     return error.get("code", "missing_error_code") if isinstance(error, dict) else "missing_error_code"
 
-def scrubbed_error_message(response: dict[str, Any]) -> str:
-    error = response.get("error")
-    if not isinstance(error, dict) or not isinstance(error.get("message"), str):
-        return "missing_error_message"
-    return " ".join(error["message"].split())[:160]
 
 
 def response_outcome(response: dict[str, Any]) -> str:
@@ -206,7 +252,7 @@ def require_completed(operation: str, response: dict[str, Any]) -> dict[str, Any
         raise GateFailure(f"{operation}: completed response omitted object result")
     raise GateFailure(
         f"{operation}: expected completed; received {response_outcome(response)}"
-        f" ({scrubbed_error_code(response)}: {scrubbed_error_message(response)})"
+        f" ({scrubbed_error_code(response)})"
     )
 
 
@@ -599,7 +645,7 @@ class ChromeInspector:
     _READ_ONLY_STATE = """(async () => {
       const contains = (permission) => new Promise((resolve) =>
         chrome.permissions.contains({ permissions: [permission] }, resolve));
-      const [scripting, debuggerPermission, activeTabs, uiState] = await Promise.all([
+      const [scripting, debuggerRequiredGranted, activeTabs, uiState] = await Promise.all([
         contains('scripting'),
         contains('debugger'),
         chrome.tabs.query({ active: true, lastFocusedWindow: true }),
@@ -619,11 +665,11 @@ class ChromeInspector:
       return {
         runtime_id: chrome.runtime.id,
         scripting: Boolean(scripting),
-        debugger_permission: Boolean(debuggerPermission),
+        debugger_required_granted: Boolean(debuggerRequiredGranted),
         active_window_id: activeTabs[0]?.windowId ?? null,
         active_tab_id: activeTabs[0]?.id ?? null,
         debugger_targets_available: targetState.available,
-        attached_tab_ids: targetState.targets
+        debugger_attached_tab_ids: targetState.targets
           .filter((target) => target.attached && Number.isInteger(target.tabId))
           .map((target) => target.tabId),
         task_ids: tasks
@@ -691,13 +737,13 @@ class ChromeInspector:
                 time.sleep(0.1)
         if state.get("runtime_id") != self.extension_id:
             raise ChromeOperationFailure("chrome.runtime.id did not match the requested AgentTab candidate")
-        if not isinstance(state.get("scripting"), bool) or not isinstance(state.get("debugger_permission"), bool):
-            raise ChromeOperationFailure("chrome.permissions.contains returned invalid automation state")
+        if not isinstance(state.get("scripting"), bool) or not isinstance(state.get("debugger_required_granted"), bool):
+            raise ChromeOperationFailure("chrome.permissions.contains returned invalid required/optional permission state")
         if not isinstance(state.get("active_window_id"), int) or not isinstance(state.get("active_tab_id"), int):
             raise ChromeOperationFailure("chrome.tabs.query(active,lastFocusedWindow) returned no active IDs")
         if not isinstance(state.get("debugger_targets_available"), bool):
             raise ChromeOperationFailure("chrome.debugger.getTargets returned invalid availability state")
-        attached = state.get("attached_tab_ids")
+        attached = state.get("debugger_attached_tab_ids")
         if not isinstance(attached, list) or any(not isinstance(tab_id, int) for tab_id in attached):
             raise ChromeOperationFailure("chrome.debugger.getTargets returned invalid attachment state")
         task_ids = state.get("task_ids")
@@ -705,18 +751,22 @@ class ChromeInspector:
             raise ChromeOperationFailure("AgentTab UI state returned invalid task inventory")
         return state
 
-    def assert_permission(self, permission: str, expected: bool, operation: str) -> None:
-        field = "debugger_permission" if permission == "debugger" else permission
-        actual = self.state()[field]
-        if actual is not expected:
-            expected_text = "granted" if expected else "not granted"
+    def assert_required_debugger(self, operation: str) -> None:
+        if self.state()["debugger_required_granted"] is not True:
             raise ChromeOperationFailure(
-                f"chrome.permissions.contains({permission}) ({operation}) expected {expected_text}"
+                f"chrome.permissions.contains(debugger) ({operation}) expected the required install grant"
             )
 
-    def assert_automation_permissions(self, expected: bool, operation: str) -> None:
-        self.assert_permission("scripting", expected, operation)
-        self.assert_permission("debugger", True, operation)
+    def assert_scripting_permission(self, expected: bool, operation: str) -> None:
+        if self.state()["scripting"] is not expected:
+            expected_text = "granted" if expected else "not granted"
+            raise ChromeOperationFailure(
+                f"chrome.permissions.contains(scripting) ({operation}) expected {expected_text}"
+            )
+
+    def assert_permission_model(self, scripting_expected: bool, operation: str) -> None:
+        self.assert_required_debugger(operation)
+        self.assert_scripting_permission(scripting_expected, operation)
     def selection(self) -> tuple[int, int]:
         state = self.state()
         return state["active_window_id"], state["active_tab_id"]
@@ -731,9 +781,16 @@ class ChromeInspector:
 
     def debugger_is_attached(self, tab_id: int) -> bool:
         state = self.state()
-        if state["debugger_permission"] and not state["debugger_targets_available"]:
-            raise ChromeOperationFailure("chrome.debugger.getTargets unavailable while debugger permission is granted")
-        return tab_id in state["attached_tab_ids"]
+        if state["debugger_required_granted"] and not state["debugger_targets_available"]:
+            raise ChromeOperationFailure("chrome.debugger.getTargets unavailable while required debugger is granted")
+        return tab_id in state["debugger_attached_tab_ids"]
+
+    def assert_no_debugger_attachments(self, operation: str) -> None:
+        state = self.state()
+        if state["debugger_required_granted"] and not state["debugger_targets_available"]:
+            raise ChromeOperationFailure(f"{operation}: chrome.debugger.getTargets unavailable")
+        if state["debugger_attached_tab_ids"]:
+            raise ChromeOperationFailure(f"{operation}: scripting is off but AgentTab retained debugger attachments")
 
     def task_ids(self) -> set[str]:
         return set(self.state()["task_ids"])
@@ -1311,8 +1368,8 @@ class LiveLifecycleProbe:
         fixture.download_filename = f"agenttab-permission-probe-{uuid.uuid4().hex}.txt"
         initial_state = self.inspector.state()
         run_start_permissions = initial_state["scripting"]
-        if not initial_state["debugger_permission"]:
-            raise ChromeOperationFailure("AgentTab required debugger permission is unavailable")
+        if initial_state["debugger_required_granted"] is not True:
+            raise ChromeOperationFailure("AgentTab's required debugger install grant is unavailable")
         if self.initial_automation_permissions is None:
             self.initial_automation_permissions = run_start_permissions
         if run_start_permissions:
@@ -1323,7 +1380,7 @@ class LiveLifecycleProbe:
         else:
             denial_instruction = "Leave AgentTab at Automation is off; no Chrome permission prompt is expected."
         self.prompt(f"run {run_number}: automation denial state", denial_instruction)
-        self.inspector.assert_automation_permissions(False, "denial observation")
+        self.inspector.assert_permission_model(False, "denial observation")
         self.connect()
         self.status("initial lifecycle status")
         selection_before = self.inspector.selection()
@@ -1334,9 +1391,9 @@ class LiveLifecycleProbe:
 
         self.prompt(
             f"run {run_number}: optional automation grant",
-            "Choose Enable AgentTab automation. Chrome grants the optional scripting permission from the click.",
+            "Choose Enable AgentTab automation. Chrome grants only optional scripting; the required debugger grant remains installed.",
         )
-        self.inspector.assert_automation_permissions(True, "grant observation")
+        self.inspector.assert_permission_model(True, "grant observation")
         self.snapshot(tab_id, "text", "browser_snapshot text after automation grant")
         revision = self.assert_debugger_lifecycle(tab_id)
         self.assert_popup_and_download(tab_id, revision, fixture)
@@ -1375,23 +1432,21 @@ class LiveLifecycleProbe:
         revocation_generation = self.inspector.automation_revocation_generation()
         self.prompt(
             f"run {run_number}: optional automation revocation",
-            "Open AgentTab Settings and choose Turn off under Automation access. This removes scripting and detaches task debugger sessions.",
+            "Open AgentTab Settings and choose Turn off under Automation access. This removes optional scripting only.",
         )
-        self.inspector.assert_automation_permissions(False, "revocation observation")
+        self.inspector.assert_permission_model(False, "revocation observation")
         detach_deadline = time.monotonic() + self.args.timeout_seconds
         while self.inspector.automation_revocation_generation() <= revocation_generation:
             if time.monotonic() >= detach_deadline:
                 raise ChromeOperationFailure("automation revocation did not acknowledge debugger-session cleanup")
             time.sleep(0.1)
-        detached_state = self.inspector.state()
-        if detached_state["debugger_targets_available"] and tab_id in detached_state["attached_tab_ids"]:
-            raise ChromeOperationFailure("debugger revocation retained an attached task tab")
+        self.inspector.assert_no_debugger_attachments("automation revocation")
         self.assert_scripting_denied(tab_id, "browser_snapshot after automation revocation")
         self.prompt(
             f"run {run_number}: optional automation re-grant",
-            "Choose Enable AgentTab automation.",
+            "Choose Enable AgentTab automation. This restores optional scripting only.",
         )
-        self.inspector.assert_automation_permissions(True, "re-grant observation")
+        self.inspector.assert_permission_model(True, "re-grant observation")
         self.snapshot(tab_id, "accessibility", "browser_snapshot after automation re-grant")
 
         self.prompt(
@@ -1441,7 +1496,7 @@ class LiveLifecycleProbe:
             "Re-enable AgentTab in chrome://extensions, then open or reload its wake page without changing permissions.",
         )
         self.reconnect_until_ready("AgentTab re-enable")
-        self.inspector.assert_automation_permissions(True, "post-disable re-enable")
+        self.inspector.assert_permission_model(True, "post-disable re-enable")
 
         self.close_owned_tabs()
         self.remove_fixture_download(fixture.download_filename)
@@ -1457,7 +1512,6 @@ class LiveLifecycleProbe:
         }
 
     def restore_and_cleanup(self, fixture_filename: str | None) -> None:
-
         try:
             if self.client.task_id is not None:
                 self.prompt(
@@ -1480,7 +1534,7 @@ class LiveLifecycleProbe:
                     f"Restore AgentTab automation permissions to their state before this run ({expected}): {action}. "
                     "Ensure the extension remains enabled, agents are resumed, and any active handoff is complete.",
                 )
-                self.inspector.assert_automation_permissions(
+                self.inspector.assert_permission_model(
                     self.initial_automation_permissions,
                     "transactional restoration",
                 )

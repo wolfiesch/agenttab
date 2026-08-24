@@ -69,6 +69,7 @@ let nextGroupId: number;
 let scriptResult: boolean;
 let alarmCreates: Array<{ name: string; when: number }>;
 let alarmClears: string[];
+let alarmListeners: Array<(alarm: { name: string }) => void>;
 let nativePort: MockNativePort | null;
 let tabRemovalProbe: (() => void | Promise<void>) | null;
 let normalizeStoredObjectKeys: boolean;
@@ -80,6 +81,8 @@ let debuggerCommandOverride:
   | null;
 let debuggerAttachGate: Promise<void> | null;
 let completedDownloads: Array<Record<string, unknown>>;
+let debuggerDetachFailures: number;
+let debuggerAttachedTabIds: Set<number>;
 interface DebuggerCommand {
   method: string;
   params: Record<string, unknown>;
@@ -91,6 +94,12 @@ type PopupMessageListener = (
   sendResponse: (response: Record<string, unknown>) => void,
 ) => boolean | undefined;
 type PermissionRemovedListener = (permissions: { permissions?: string[] }) => void;
+type PermissionAddedListener = (permissions: { permissions?: string[] }) => void;
+type TabUpdatedListener = (
+  tabId: number,
+  changeInfo: Record<string, unknown>,
+) => void;
+type AlarmListener = (alarm: { name: string }) => void;
 
 const EXTENSION_ID = "agenttab-test-extension";
 
@@ -100,7 +109,10 @@ let permissionRequests: Array<Record<string, unknown>>;
 let permissionRequestResult: boolean;
 let popupMessageListeners: PopupMessageListener[];
 let permissionRemovedListeners: PermissionRemovedListener[];
+let permissionAddedListeners: PermissionAddedListener[];
+let tabUpdatedListeners: TabUpdatedListener[];
 let debuggerEventListeners: Array<(...args: unknown[]) => void>;
+let debuggerDetachListeners: Array<(...args: unknown[]) => void>;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -134,6 +146,10 @@ function emitDebuggerEvent(
   }
 }
 
+function emitDebuggerDetach(tabId: number): void {
+  for (const listener of debuggerDetachListeners) listener({ tabId });
+}
+
 function installChromeMock(): void {
   persisted = {};
   debuggerCalls = [];
@@ -145,12 +161,15 @@ function installChromeMock(): void {
   scriptResult = true;
   alarmCreates = [];
   alarmClears = [];
+  alarmListeners = [];
   nativePort = null;
   tabRemovalProbe = null;
   normalizeStoredObjectKeys = false;
   focusedWindowUpdates = [];
   focusStealOnClickTabId = null;
   debuggerCommands = [];
+  debuggerDetachFailures = 0;
+  debuggerAttachedTabIds = new Set();
   callFunctionException = false;
   debuggerCommandOverride = null;
   debuggerAttachGate = null;
@@ -159,10 +178,13 @@ function installChromeMock(): void {
   permissionRequests = [];
   permissionRequestResult = true;
   popupMessageListeners = [];
+  permissionAddedListeners = [];
+  tabUpdatedListeners = [];
   permissionRemovedListeners = [];
   debuggerEventListeners = [];
+  debuggerDetachListeners = [];
   const listeners = {
-    detach: [] as Array<(...args: unknown[]) => void>,
+    detach: debuggerDetachListeners,
     event: debuggerEventListeners,
   };
   const createTab = (url = "about:blank", active = false, windowId = 1): MockTab => {
@@ -193,11 +215,29 @@ function installChromeMock(): void {
       debugger: {
         onDetach: { addListener(listener: (...args: unknown[]) => void) { listeners.detach.push(listener); } },
         onEvent: { addListener(listener: (...args: unknown[]) => void) { listeners.event.push(listener); } },
-        async attach() {
+        async getTargets() {
+          return [...debuggerAttachedTabIds].map((tabId) => ({
+            id: `tab-${tabId}`,
+            type: "page",
+            title: `Tab ${tabId}`,
+            url: tabStore.get(tabId)?.url ?? "https://example.test/",
+            attached: true,
+            tabId,
+          }));
+        },
+        async attach(target: { tabId: number }) {
           debuggerCalls.push("attach");
           if (debuggerAttachGate) await debuggerAttachGate;
+          debuggerAttachedTabIds.add(target.tabId);
         },
-        async detach() { debuggerCalls.push("detach"); },
+        async detach(target: { tabId: number }) {
+          debuggerCalls.push("detach");
+          if (debuggerDetachFailures > 0) {
+            debuggerDetachFailures -= 1;
+            throw new Error("debugger detach failed");
+          }
+          debuggerAttachedTabIds.delete(target.tabId);
+        },
         async sendCommand(_target: unknown, method: string, params: Record<string, unknown>) {
           debuggerCalls.push(method);
           debuggerCommands.push({ method, params: clone(params) });
@@ -234,7 +274,11 @@ function installChromeMock(): void {
       tabs: {
         onCreated: { addListener() { } },
         onRemoved: { addListener() { } },
-        onUpdated: { addListener() { } },
+        onUpdated: {
+          addListener(listener: TabUpdatedListener) {
+            tabUpdatedListeners.push(listener);
+          },
+        },
         onAttached: { addListener() { } },
         onDetached: { addListener() { } },
         SPLIT_VIEW_ID_NONE: -1,
@@ -350,7 +394,11 @@ function installChromeMock(): void {
           alarmClears.push(name);
           return true;
         },
-        onAlarm: { addListener() { } },
+        onAlarm: {
+          addListener(listener: AlarmListener) {
+            alarmListeners.push(listener);
+          },
+        },
       },
       action: {
         async setBadgeText() { },
@@ -364,7 +412,11 @@ function installChromeMock(): void {
           automationPermission = permissionRequestResult;
           return permissionRequestResult;
         },
-        onAdded: { addListener() { } },
+        onAdded: {
+          addListener(listener: PermissionAddedListener) {
+            permissionAddedListeners.push(listener);
+          },
+        },
         onRemoved: {
           addListener(listener: PermissionRemovedListener) {
             permissionRemovedListeners.push(listener);
@@ -840,7 +892,138 @@ describe("page revision monotonicity", () => {
     await runtime.detach(61);
   });
 
-  test("authorizes again immediately before a direct Chrome API call", async () => {
+  test("serializes concurrent attachment and keeps a failed detach recoverable", async () => {
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+    );
+
+    await Promise.all([
+      runtime.snapshot(62, { mode: "accessibility" }),
+      runtime.snapshot(62, { mode: "accessibility" }),
+    ]);
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+
+    debuggerDetachFailures = 1;
+    await expect(runtime.detach(62)).rejects.toThrow("debugger detach failed");
+    await expect(runtime.detach(62)).resolves.toBeUndefined();
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(2);
+  });
+
+  test("retains a partially initialized debugger session until cleanup succeeds", async () => {
+    const recorded: number[] = [];
+    const forgotten: number[] = [];
+    let failEnable = true;
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.enable" && failEnable) {
+        failEnable = false;
+        throw new Error("debugger initialization failed");
+      }
+      return undefined;
+    };
+    debuggerDetachFailures = 1;
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+      async (tabId) => {
+        recorded.push(tabId);
+      },
+      async (tabId) => {
+        forgotten.push(tabId);
+      },
+    );
+
+    await expect(runtime.snapshot(63, { mode: "accessibility" })).rejects.toThrow(
+      "Debugger initialization and cleanup both failed",
+    );
+    expect(recorded).toEqual([63]);
+    expect(debuggerAttachedTabIds.has(63)).toBe(true);
+    expect(forgotten).toEqual([]);
+
+    await runtime.detach(63);
+    expect(debuggerAttachedTabIds.has(63)).toBe(false);
+    expect(forgotten).toEqual([63]);
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(2);
+  });
+
+  test("recovers a persisted debugger candidate after the runtime restarts", async () => {
+    debuggerAttachedTabIds.add(64);
+    const forgotten: number[] = [];
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+      async () => undefined,
+      async (tabId) => {
+        forgotten.push(tabId);
+      },
+    );
+
+    await runtime.scrubForHandoff([64]);
+
+    expect(debuggerAttachedTabIds.has(64)).toBe(false);
+    expect(forgotten).toEqual([64]);
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(1);
+  });
+
+  test("retains a debugger candidate across external detach and reattachment", async () => {
+    const recorded: number[] = [];
+    const forgotten: number[] = [];
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+      async (tabId) => {
+        recorded.push(tabId);
+      },
+      async (tabId) => {
+        forgotten.push(tabId);
+      },
+    );
+
+    await runtime.snapshot(65, { mode: "accessibility" });
+    debuggerAttachedTabIds.delete(65);
+    emitDebuggerDetach(65);
+    await Promise.resolve();
+
+    expect(runtime.debuggerTabIds()).toEqual([65]);
+    expect(forgotten).toEqual([]);
+    await runtime.snapshot(65, { mode: "accessibility" });
+    expect(recorded).toEqual([65, 65]);
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
+
+    await runtime.detach(65);
+    expect(forgotten).toEqual([65]);
+  });
+
+  test("detaches a restored debugger candidate during ownership revocation", async () => {
+    debuggerAttachedTabIds.add(66);
+    const forgotten: number[] = [];
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+      async () => undefined,
+      async (tabId) => {
+        forgotten.push(tabId);
+      },
+    );
+    runtime.restoreDebuggerCandidates([66]);
+
+    await runtime.detach(66);
+
+    expect(debuggerAttachedTabIds.has(66)).toBe(false);
+    expect(runtime.debuggerTabIds()).toEqual([]);
+    expect(forgotten).toEqual([66]);
+  });
+
+  test("authorizes every debugger initialization command", async () => {
     let authorizationChecks = 0;
     const runtime = new StandardBrowserRuntime(
       new RevisionTracker(),
@@ -848,71 +1031,20 @@ describe("page revision monotonicity", () => {
       () => undefined,
       async () => {
         authorizationChecks += 1;
-        if (authorizationChecks === 2) {
-          throw Object.assign(new Error("Automation permission was revoked"), {
-            code: "permissions_required",
+        if (authorizationChecks === 5) {
+          throw Object.assign(new Error("ownership changed during debugger initialization"), {
+            code: "ownership_revoked",
           });
         }
       },
     );
 
-    await expect(runtime.snapshot(61, { mode: "text" })).rejects.toMatchObject({
-      code: "permissions_required",
+    await expect(runtime.snapshot(67, { mode: "accessibility" })).rejects.toMatchObject({
+      code: "ownership_revoked",
     });
-    expect(authorizationChecks).toBe(2);
-    expect(debuggerCalls).toEqual([]);
-  });
 
-  test("shares one debugger initialization across concurrent first use", async () => {
-    const gate = Promise.withResolvers<void>();
-    debuggerAttachGate = gate.promise;
-    const runtime = new StandardBrowserRuntime(
-      new RevisionTracker(),
-      async () => undefined,
-      () => undefined,
-      async () => undefined,
-    );
-    const calls = Array.from(
-      { length: 8 },
-      () => runtime.developer(61, "Page.getFrameTree", {}),
-    );
-    await waitForCondition(() => debuggerCalls.includes("attach"));
-    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
-
-    gate.resolve();
-    await Promise.all(calls);
-    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
-    await runtime.detach(61);
-  });
-
-  test("cleans up a failed debugger initialization before retrying", async () => {
-    let failInitialization = true;
-    debuggerCommandOverride = (method) => {
-      if (method === "Page.enable" && failInitialization) {
-        failInitialization = false;
-        throw new Error("Page domain unavailable");
-      }
-      return undefined;
-    };
-    const runtime = new StandardBrowserRuntime(
-      new RevisionTracker(),
-      async () => undefined,
-      () => undefined,
-      async () => undefined,
-    );
-
-    await expect(runtime.snapshot(61, { mode: "accessibility" })).rejects.toThrow(
-      "Page domain unavailable",
-    );
-    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
-    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(1);
-
-    await expect(runtime.snapshot(61, { mode: "accessibility" })).resolves.toMatchObject({
-      tab_id: 61,
-      mode: "accessibility",
-    });
-    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
-    await runtime.detach(61);
+    expect(debuggerCommands.map(({ method }) => method)).toEqual(["Page.enable"]);
+    expect(debuggerAttachedTabIds.has(67)).toBe(false);
   });
 
   test("rejects an accessibility snapshot when the document changes during capture", async () => {
@@ -1883,7 +2015,8 @@ describe("consequential action staging", () => {
     });
     expect(
       debuggerCommands.findLast(({ method }) => method === "Page.handleJavaScriptDialog"),
-    ).toMatchObject({
+    ).toEqual({
+      method: "Page.handleJavaScriptDialog",
       params: { accept: true },
     });
   });
@@ -2476,6 +2609,7 @@ describe("extension entrypoint admission boundaries", () => {
     expect(taskDeletedBeforeRemove).toBe(true);
     expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
     const detachCountBeforeRevocation = debuggerCalls.filter((call) => call === "detach").length;
+    debuggerDetachFailures = 2;
     automationPermission = false;
     for (const listener of permissionRemovedListeners) listener({ permissions: ["scripting"] });
     const tabsDeniedSynchronously = await sendNativeCommand(
@@ -2491,6 +2625,81 @@ describe("extension entrypoint admission boundaries", () => {
     await waitForCondition(
       () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeRevocation + 1,
     );
+    expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
+    const cleanupAlarm = alarmCreates.find((alarm) => alarm.name === "agenttabAutomationCleanup");
+    expect(cleanupAlarm).toBeDefined();
+    if (!cleanupAlarm) throw new Error("cleanup alarm was not scheduled");
+    automationPermission = true;
+    for (const listener of permissionAddedListeners) listener({ permissions: ["scripting"] });
+    await waitForCondition(
+      () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeRevocation + 2,
+    );
+    expect(await sendPopupMessage({ kind: "get_ui_state" })).toMatchObject({
+      automation_enabled: false,
+    });
+    expect((await readState()).automationCleanup).toMatchObject({
+      pending: true,
+      generation: 0,
+    });
+    const deniedDuringRegrantCleanup = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6301",
+      TASK_A,
+      "browser_tabs",
+      {},
+    );
+    expect(deniedDuringRegrantCleanup).toMatchObject({
+      outcome: "not_started",
+      error: { code: "permissions_required" },
+    });
+    for (const listener of alarmListeners) listener({ name: cleanupAlarm.name });
+    await waitForCondition(
+      () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeRevocation + 3,
+    );
+    await waitForCondition(() => alarmClears.includes(cleanupAlarm.name));
     expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 1 });
+    expect(await sendPopupMessage({ kind: "get_ui_state" })).toMatchObject({
+      automation_enabled: true,
+    });
+    expect((await readState()).automationCleanup).toEqual({
+      pending: false,
+      tabIds: [],
+      generation: 1,
+      epoch: 1,
+    });
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6302",
+      TASK_A,
+      "browser_tabs",
+      {},
+    )).toMatchObject({ outcome: "completed" });
+
+    const reopened = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6303",
+      TASK_B,
+      "browser_open",
+      { mode: "create", url: "https://example.test/moved" },
+    );
+    expect(reopened).toMatchObject({
+      outcome: "completed",
+      result: { tab_id: 101, group_id: 51 },
+    });
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6304",
+      TASK_B,
+      "browser_snapshot",
+      { tab_id: 101, mode: "accessibility" },
+    )).toMatchObject({ outcome: "completed" });
+    expect((await readState()).automationCleanup.tabIds).toEqual([101]);
+    const detachCountBeforeMove = debuggerCalls.filter((call) => call === "detach").length;
+    const movedTab = tabStore.get(101);
+    if (!movedTab) throw new Error("task tab for move test is unavailable");
+    movedTab.groupId = 99;
+    for (const listener of tabUpdatedListeners) listener(101, { groupId: 99 });
+    await waitForCondition(
+      () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeMove + 1,
+    );
+    expect(debuggerAttachedTabIds.has(101)).toBe(false);
+    expect((await readState()).automationCleanup.tabIds).toEqual([]);
+    expect((await readState()).tasks[TASK_B]).toMatchObject({ groupId: null, tabIds: [] });
   });
 });

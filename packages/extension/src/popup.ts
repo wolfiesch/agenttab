@@ -407,20 +407,27 @@ function reload(): void {
     .catch(fatal);
 }
 
+async function changeOptionalScriptingPermission(method: "request" | "remove"): Promise<boolean> {
+  return chrome.permissions[method]({ permissions: ["scripting"] });
+}
+
 enableButton.addEventListener("click", () => {
   void guard(permissionError, async () => {
-    const granted = await chrome.permissions.request({ permissions: ["scripting"] });
+    const granted = await changeOptionalScriptingPermission("request");
     if (!granted) {
-      throw new Error("Chrome denied AgentTab automation. AgentTab stays installed and disabled until you enable it here.");
+      throw new Error("Chrome denied optional scripting access. AgentTab stays installed but page automation remains disabled.");
     }
   });
 });
 
 disableButton.addEventListener("click", () => {
   void guard(settingsError, async () => {
-    await chrome.permissions.remove({ permissions: ["scripting"] });
-    if (await chrome.permissions.contains({ permissions: ["scripting"] })) {
-      throw new Error("Chrome kept the optional scripting permission. Disable AgentTab from chrome://extensions, then try again.");
+    const removed = await changeOptionalScriptingPermission("remove");
+    const scripting = await chrome.permissions.contains({ permissions: ["scripting"] });
+    if (!removed || scripting) {
+      throw new Error(
+        "Chrome kept optional scripting access. The install-time debugger grant stays installed; disable AgentTab from chrome://extensions to remove it.",
+      );
     }
   });
 });

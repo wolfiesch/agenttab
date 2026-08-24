@@ -603,7 +603,13 @@ function defaultState() {
     tasks: {},
     revisions: {},
     handoff: { active: false },
-    stagedCommits: {}
+    stagedCommits: {},
+    automationCleanup: {
+      pending: false,
+      tabIds: [],
+      generation: 0,
+      epoch: 0
+    }
   };
 }
 function objectValue(value) {
@@ -637,8 +643,17 @@ function parseState(value) {
   const revisionsValue = objectValue(raw.revisions);
   const handoffValue = objectValue(raw.handoff);
   const commitsValue = objectValue(raw.stagedCommits);
-  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue)
+  const cleanupValue = raw.automationCleanup === undefined ? {
+    pending: false,
+    tabIds: [],
+    generation: 0,
+    epoch: 0
+  } : objectValue(raw.automationCleanup);
+  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue || !cleanupValue)
     return null;
+  if (typeof cleanupValue.pending !== "boolean" || !Array.isArray(cleanupValue.tabIds) || !cleanupValue.tabIds.every((tabId) => finiteInteger(tabId)) || new Set(cleanupValue.tabIds).size !== cleanupValue.tabIds.length || !finiteInteger(cleanupValue.generation) || !finiteInteger(cleanupValue.epoch)) {
+    return null;
+  }
   const tasks = {};
   const assignedTabIds = new Set;
   const assignedGroupIds = new Map;
@@ -687,7 +702,8 @@ function parseState(value) {
     tasks,
     revisions,
     handoff: handoffValue,
-    stagedCommits
+    stagedCommits,
+    automationCleanup: cleanupValue
   };
 }
 function legacyTasks(value) {
@@ -810,19 +826,39 @@ class StandardBrowserRuntime {
   revisions;
   closeTab;
   emit;
-  authorize;
+  authorizeDebuggerUse;
+  recordDebuggerCandidate;
+  forgetDebuggerCandidate;
   sessions = new Map;
-  constructor(revisions, closeTab, emit, authorize) {
+  expectedDetaches = new Map;
+  debuggerCandidates = new Set;
+  constructor(revisions, closeTab, emit, authorizeDebuggerUse = async () => {
+    return;
+  }, recordDebuggerCandidate = async () => {
+    return;
+  }, forgetDebuggerCandidate = async () => {
+    return;
+  }) {
     this.revisions = revisions;
     this.closeTab = closeTab;
     this.emit = emit;
-    this.authorize = authorize;
+    this.authorizeDebuggerUse = authorizeDebuggerUse;
+    this.recordDebuggerCandidate = recordDebuggerCandidate;
+    this.forgetDebuggerCandidate = forgetDebuggerCandidate;
     chrome.debugger.onDetach.addListener((source) => {
       if (source.tabId === undefined)
         return;
+      const expected = this.expectedDetaches.get(source.tabId) ?? 0;
+      if (expected > 0) {
+        if (expected === 1)
+          this.expectedDetaches.delete(source.tabId);
+        else
+          this.expectedDetaches.set(source.tabId, expected - 1);
+        return;
+      }
       const session = this.sessions.get(source.tabId);
-      if (session)
-        session.cancelled = true;
+      if (session?.idleTimer)
+        clearTimeout(session.idleTimer);
       this.sessions.delete(source.tabId);
       this.invalidateStagedDialogs(source.tabId);
     });
@@ -858,24 +894,113 @@ class StandardBrowserRuntime {
     });
     this.revisions.onChange((tabId) => this.invalidateStagedDialogs(tabId));
   }
+  debuggerTabIds() {
+    return [...this.debuggerCandidates];
+  }
+  restoreDebuggerCandidates(tabIds) {
+    for (const tabId of tabIds)
+      this.debuggerCandidates.add(tabId);
+  }
   async detach(tabId) {
     const session = this.sessions.get(tabId);
-    if (session)
-      session.cancelled = true;
-    if (session?.idleTimer)
+    if (!session) {
+      if (this.debuggerCandidates.has(tabId)) {
+        await this.detachRecovered(tabId);
+      } else {
+        await this.invalidateStagedDialogs(tabId);
+      }
+      return;
+    }
+    if (session.idleTimer)
       clearTimeout(session.idleTimer);
-    this.sessions.delete(tabId);
-    await this.invalidateStagedDialogs(tabId);
-    if (session?.attached)
-      await chrome.debugger.detach({ tabId }).catch(() => {
+    session.idleTimer = undefined;
+    if (session.detachPromise)
+      return session.detachPromise;
+    if (session.attachPromise) {
+      const attaching = session.attachPromise;
+      try {
+        await attaching;
+      } catch {}
+      if (this.sessions.get(tabId) !== session)
         return;
-      });
+      if (session.attachPromise === attaching)
+        session.attachPromise = undefined;
+      return this.detach(tabId);
+    }
+    if (!session.attached) {
+      if (this.sessions.get(tabId) === session)
+        this.sessions.delete(tabId);
+      await this.invalidateStagedDialogs(tabId);
+      return;
+    }
+    return this.detachTrackedSession(tabId, session);
   }
-  async scrubForHandoff() {
-    await Promise.all([...this.sessions.keys()].map((tabId) => this.detach(tabId)));
+  async scrubForHandoff(recoveredTabIds = []) {
+    const tabIds = [
+      ...new Set([...this.sessions.keys(), ...this.debuggerCandidates, ...recoveredTabIds])
+    ];
+    const results = await Promise.allSettled(tabIds.map((tabId) => this.detachRecovered(tabId)));
+    const failed2 = results.find((result) => result.status === "rejected");
+    if (failed2)
+      throw failed2.reason;
+  }
+  async detachRecovered(tabId) {
+    if (this.sessions.has(tabId)) {
+      await this.detach(tabId);
+      return;
+    }
+    const targets = await chrome.debugger.getTargets();
+    const target = targets.find((candidate) => candidate.attached === true && candidate.tabId === tabId);
+    if (!target) {
+      await this.invalidateStagedDialogs(tabId);
+      await this.forgetTrackedDebuggerCandidate(tabId);
+      return;
+    }
+    const expected = this.expectedDetaches.get(tabId) ?? 0;
+    this.expectedDetaches.set(tabId, expected + 1);
+    try {
+      await chrome.debugger.detach({ tabId });
+      await this.invalidateStagedDialogs(tabId);
+      await this.forgetTrackedDebuggerCandidate(tabId);
+    } catch (error) {
+      this.consumeExpectedDetach(tabId);
+      throw error;
+    }
+  }
+  detachTrackedSession(tabId, session) {
+    const expected = this.expectedDetaches.get(tabId) ?? 0;
+    this.expectedDetaches.set(tabId, expected + 1);
+    const detaching = (async () => {
+      try {
+        await chrome.debugger.detach({ tabId });
+        if (this.sessions.get(tabId) === session)
+          this.sessions.delete(tabId);
+        await this.invalidateStagedDialogs(tabId);
+        await this.forgetTrackedDebuggerCandidate(tabId);
+      } catch (error) {
+        this.consumeExpectedDetach(tabId);
+        if (this.sessions.get(tabId) === session)
+          session.detachPromise = undefined;
+        this.scheduleIdleDetach(tabId, session);
+        throw error;
+      }
+    })();
+    session.detachPromise = detaching;
+    return detaching;
+  }
+  async forgetTrackedDebuggerCandidate(tabId) {
+    await this.forgetDebuggerCandidate(tabId);
+    this.debuggerCandidates.delete(tabId);
+  }
+  consumeExpectedDetach(tabId) {
+    const pendingExpected = this.expectedDetaches.get(tabId) ?? 0;
+    if (pendingExpected <= 1)
+      this.expectedDetaches.delete(tabId);
+    else
+      this.expectedDetaches.set(tabId, pendingExpected - 1);
   }
   async snapshot(tabId, params) {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const mode = params.mode;
     if (mode === "text" || mode === "html")
       return this.scriptSnapshot(tabId, mode, params);
@@ -918,7 +1043,7 @@ class StandardBrowserRuntime {
     };
   }
   async act(taskId, tabId, expectedRevision, actions) {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const pageRevision = await this.revisions.assertExpected(tabId, expectedRevision);
     if (!Array.isArray(actions) || actions.length === 0 || actions.length > 64) {
       throw Object.assign(new Error("actions must contain between 1 and 64 operations"), {
@@ -1084,7 +1209,7 @@ class StandardBrowserRuntime {
   async commit(taskId, params) {
     const nativeToken = params.native_token;
     const tabId = await this.stagedTabId(taskId, nativeToken);
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const staged = (await readState()).stagedCommits[String(nativeToken)];
     if (!staged || staged.task_id !== taskId || staged.tab_id !== tabId) {
       throw Object.assign(new Error("Staged commit token is invalid, used, or belongs to another task"), {
@@ -1155,7 +1280,7 @@ class StandardBrowserRuntime {
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     do {
-      await this.authorize(tabId);
+      await this.authorizeDebuggerUse(tabId);
       if (revalidate)
         await revalidate();
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
@@ -1179,7 +1304,7 @@ class StandardBrowserRuntime {
     });
   }
   async developer(tabId, action, params) {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const [domain, ...rest] = action.split(".");
     if (!domain || rest.length === 0) {
       throw Object.assign(new Error("Developer action must be a CDP Domain.method"), {
@@ -1189,7 +1314,7 @@ class StandardBrowserRuntime {
     return this.send(tabId, action, params);
   }
   async scriptSnapshot(tabId, mode, params) {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const selector = typeof params.selector === "string" ? params.selector : null;
     const maxBytes = typeof params.max_bytes === "number" ? params.max_bytes : 256000;
     const [{ result }] = await chrome.scripting.executeScript({
@@ -1351,7 +1476,7 @@ class StandardBrowserRuntime {
       throw Object.assign(new Error("Staged dialog binding is missing"), { code: "staged_commit_mismatch" });
     }
     await this.ensureAttached(tabId);
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const dialog = this.sessions.get(tabId)?.dialog;
     if (!dialog || dialog.generation !== stagedDialog.generation) {
       throw Object.assign(new Error("The staged JavaScript dialog is no longer open"), {
@@ -1364,8 +1489,7 @@ class StandardBrowserRuntime {
         code: "staged_commit_mismatch"
       });
     }
-    await this.authorize(tabId);
-    await chrome.debugger.sendCommand({ tabId }, "Page.handleJavaScriptDialog", { accept: true });
+    await this.send(tabId, "Page.handleJavaScriptDialog", { accept: true });
     return { kind: "dialog", completed: true };
   }
   async invalidateStagedDialogs(tabId) {
@@ -1397,7 +1521,7 @@ class StandardBrowserRuntime {
     return described.result.value;
   }
   async performAction(tabId, pageRevision, action) {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     const kind = action.kind;
     if (kind === "navigate") {
       if (typeof action.url !== "string")
@@ -1432,11 +1556,7 @@ class StandardBrowserRuntime {
           code: "invalid_request"
         });
       }
-      await chrome.debugger.sendCommand({
-        tabId
-      }, "Page.handleJavaScriptDialog", {
-        accept: false
-      });
+      await this.send(tabId, "Page.handleJavaScriptDialog", { accept: false });
       return { kind, completed: true };
     }
     if (kind === "scroll" && action.ref === undefined) {
@@ -1604,89 +1724,97 @@ class StandardBrowserRuntime {
     return typeof frame.loaderId === "string" ? frame.loaderId : undefined;
   }
   async ensureAttached(tabId) {
-    await this.authorize(tabId);
+    await this.authorizeDebuggerUse(tabId);
     let session = this.sessions.get(tabId);
+    if (session?.detachPromise) {
+      await session.detachPromise;
+      session = this.sessions.get(tabId);
+    }
     if (!session) {
       session = {
         attached: false,
+        busyCount: 0,
         inflight: new Set,
         lastNetworkActivity: Date.now(),
         dialogGeneration: 0
       };
       this.sessions.set(tabId, session);
     }
-    if (!session.attached && !session.initializing) {
-      const initialization2 = (async () => {
-        try {
-          await this.authorize(tabId);
-          if (session.cancelled || this.sessions.get(tabId) !== session) {
-            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
-              code: "ownership_revoked"
-            });
-          }
-          await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
-          session.attached = true;
-          if (session.cancelled || this.sessions.get(tabId) !== session) {
-            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
-              code: "ownership_revoked"
-            });
-          }
-          await this.authorize(tabId);
-          await Promise.all([
-            chrome.debugger.sendCommand({ tabId }, "Page.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}),
-            chrome.debugger.sendCommand({ tabId }, "Network.enable", {})
-          ]);
-        } catch (error) {
-          if (session.attached) {
-            session.attached = false;
-            await chrome.debugger.detach({ tabId }).catch(() => {
-              return;
-            });
-          }
-          if (this.sessions.get(tabId) === session)
-            this.sessions.delete(tabId);
-          throw error;
-        }
-      })();
-      session.initializing = initialization2;
+    if (session.attachPromise) {
+      await session.attachPromise;
+      await this.authorizeDebuggerUse(tabId);
+      return;
+    }
+    if (session.attached) {
+      await this.authorizeDebuggerUse(tabId);
+      return;
+    }
+    const attaching = (async () => {
+      await this.authorizeDebuggerUse(tabId);
+      this.debuggerCandidates.add(tabId);
+      await this.recordDebuggerCandidate(tabId);
+      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+      session.attached = true;
       try {
-        await initialization2;
-      } finally {
-        if (session.initializing === initialization2)
-          session.initializing = undefined;
+        for (const method of [
+          "Page.enable",
+          "DOM.enable",
+          "Accessibility.enable",
+          "Runtime.enable",
+          "Network.enable"
+        ]) {
+          await this.authorizeDebuggerUse(tabId);
+          await chrome.debugger.sendCommand({ tabId }, method, {});
+        }
+      } catch (error) {
+        try {
+          await this.detachTrackedSession(tabId, session);
+        } catch (detachError) {
+          throw new AggregateError([error, detachError], "Debugger initialization and cleanup both failed");
+        }
+        throw error;
       }
-    } else if (session.initializing) {
-      await session.initializing;
-    }
+    })();
+    session.attachPromise = attaching;
     try {
-      await this.authorize(tabId);
-    } catch (error) {
-      await this.detach(tabId);
-      throw error;
+      await attaching;
+    } finally {
+      if (this.sessions.get(tabId) === session)
+        session.attachPromise = undefined;
     }
-    if (session.cancelled || !session.attached || this.sessions.get(tabId) !== session) {
-      throw Object.assign(new Error("Debugger session was revoked while attaching"), {
-        code: "ownership_revoked"
+  }
+  scheduleIdleDetach(tabId, session) {
+    if (session.idleTimer)
+      clearTimeout(session.idleTimer);
+    session.idleTimer = setTimeout(() => {
+      this.detach(tabId).catch(() => {
+        if (this.sessions.get(tabId) === session)
+          this.scheduleIdleDetach(tabId, session);
+      });
+    }, DEBUGGER_IDLE_MS);
+  }
+  async send(tabId, method, params) {
+    await this.ensureAttached(tabId);
+    const session = this.sessions.get(tabId);
+    if (!session?.attached) {
+      throw Object.assign(new Error("Debugger detached before the command could run"), {
+        code: "debugger_detached"
       });
     }
     if (session.idleTimer)
       clearTimeout(session.idleTimer);
-    session.idleTimer = setTimeout(() => void this.detach(tabId), DEBUGGER_IDLE_MS);
-  }
-  async send(tabId, method, params) {
-    await this.ensureAttached(tabId);
-    await this.authorize(tabId);
-    const session = this.sessions.get(tabId);
-    if (!session?.attached || session.cancelled) {
-      throw Object.assign(new Error("Debugger session is no longer authorized"), {
-        code: "ownership_revoked"
-      });
+    session.idleTimer = undefined;
+    session.busyCount += 1;
+    try {
+      await this.authorizeDebuggerUse(tabId);
+      const result = await chrome.debugger.sendCommand({ tabId }, method, params);
+      return isRecord(result) ? result : {};
+    } finally {
+      session.busyCount -= 1;
+      if (this.sessions.get(tabId) === session && session.busyCount === 0) {
+        this.scheduleIdleDetach(tabId, session);
+      }
     }
-    const result = await chrome.debugger.sendCommand({ tabId }, method, params);
-    return isRecord(result) ? result : {};
   }
 }
 
@@ -1834,6 +1962,11 @@ class MutationScheduler {
     this.permissionsAvailable = true;
     this.accepting = this.lifecycleAccepting;
   }
+  async drain() {
+    while (this.pending.size > 0) {
+      await Promise.allSettled([...this.pending]);
+    }
+  }
   disconnect() {
     this.accepting = false;
     this.lifecycleAccepting = false;
@@ -1851,9 +1984,7 @@ class MutationScheduler {
       code: "paused",
       message: "AgentTab is paused"
     };
-    while (this.pending.size > 0) {
-      await Promise.allSettled([...this.pending]);
-    }
+    await this.drain();
   }
   resume() {
     this.lifecycleAccepting = true;
@@ -2420,6 +2551,18 @@ class OwnershipLedger {
   assertOwned(taskId, tabId) {
     return this.serialize(() => this.assertOwnedNow(taskId, tabId));
   }
+  assertOwnedTab(tabId) {
+    return this.serialize(async () => {
+      const state = await readState();
+      const task = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
+      if (!task) {
+        throw Object.assign(new Error("Tab is not owned by AgentTab"), {
+          code: "ownership_denied"
+        });
+      }
+      return this.assertOwnedNow(task.taskId, tabId);
+    });
+  }
   open(taskId, params) {
     return this.serialize(() => this.openNow(taskId, params));
   }
@@ -2540,6 +2683,7 @@ class OwnershipLedger {
       this.emit("ownership_revoked", { task_id: changed.taskId, tab_count: changed.count });
     }
     await this.emitInventory();
+    return changedTasks.flatMap((changed) => changed.revokedTabIds);
   }
   async assertOwnedNow(taskId, tabId) {
     const state = await readState();
@@ -2672,11 +2816,12 @@ class OwnershipLedger {
     const state = await readState();
     const task = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
     if (!task)
-      return;
+      return false;
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab || task.groupId === null || tab.groupId !== task.groupId) {
-      await this.revokeNow(tabId, "group_membership_changed");
+      return this.revokeNow(tabId, "group_membership_changed");
     }
+    return false;
   }
   async revokeNow(tabId, event) {
     this.scheduler.revokeTab(tabId);
@@ -2693,13 +2838,14 @@ class OwnershipLedger {
       return null;
     });
     if (!changed)
-      return;
+      return false;
     await this.revisions.remove(tabId);
     this.emit(event, {
       task_id: changed.taskId,
       tab_count: changed.count
     });
     await this.emitInventory();
+    return true;
   }
   async closeTaskNow(taskId) {
     const existing = (await readState()).tasks[taskId];
@@ -2948,6 +3094,14 @@ class RevisionTracker {
 // src/background.ts
 var RUNTIME_INSTANCE_ID = crypto.randomUUID();
 var automationRevocationGeneration = 0;
+var automationCleanupEpoch = 0;
+var AUTOMATION_CLEANUP_ALARM = "agenttabAutomationCleanup";
+var AUTOMATION_CLEANUP_RETRY_BASE_MS = 1000;
+var AUTOMATION_CLEANUP_RETRY_MAX_MS = 30000;
+var automationCleanupPending = false;
+var automationCleanupDelayMs = AUTOMATION_CLEANUP_RETRY_BASE_MS;
+var automationCleanupTimer;
+var automationCleanupQueue = Promise.resolve();
 var PRE_DISPATCH_ERRORS = {
   invalid_request: true,
   ownership_denied: true,
@@ -2976,16 +3130,43 @@ var revisions = new RevisionTracker;
 var nativeBridge = null;
 var emit = (event, payload, eventId) => nativeBridge?.sendEvent(event, payload, eventId);
 var ownership = new OwnershipLedger(scheduler, revisions, emit);
+async function recordDebuggerCandidate(tabId) {
+  const current = await readState();
+  if (current.automationCleanup.tabIds.includes(tabId))
+    return;
+  await mutateState((state) => {
+    if (!state.automationCleanup.tabIds.includes(tabId)) {
+      state.automationCleanup.tabIds.push(tabId);
+    }
+  });
+}
+async function forgetDebuggerCandidate(tabId) {
+  const current = await readState();
+  if (!current.automationCleanup.tabIds.includes(tabId))
+    return;
+  await mutateState((state) => {
+    state.automationCleanup.tabIds = state.automationCleanup.tabIds.filter((candidate) => candidate !== tabId);
+  });
+}
 var browser;
 browser = new StandardBrowserRuntime(revisions, async (tabId) => {
   await ownership.revoke(tabId, "tab_removed");
   await browser.detach(tabId);
   await chrome.tabs.remove(tabId);
-}, emit, authorizeOwnedTab);
+}, emit, authorizeOwnedTab, recordDebuggerCandidate, forgetDebuggerCandidate);
 var handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber(() => browser.scrubForHandoff());
 async function automationEnabled() {
-  return chrome.permissions.contains({ permissions: ["scripting"] });
+  if (automationCleanupPending)
+    return false;
+  const state = await readState();
+  if (state.automationCleanup.pending)
+    return false;
+  const [scripting, debuggerPermission] = await Promise.all([
+    chrome.permissions.contains({ permissions: ["scripting"] }),
+    chrome.permissions.contains({ permissions: ["debugger"] })
+  ]);
+  return scripting && debuggerPermission;
 }
 function automationRequired() {
   return Object.assign(new Error("AgentTab automation permissions have not been enabled"), {
@@ -3005,6 +3186,85 @@ async function authorizeOwnedTab(tabId) {
   await ownership.assertOwned(taskId, tabId);
   if (!await automationEnabled())
     throw automationRequired();
+}
+function cancelAutomationCleanupRetry() {
+  if (automationCleanupTimer)
+    clearTimeout(automationCleanupTimer);
+  automationCleanupTimer = undefined;
+  automationCleanupDelayMs = AUTOMATION_CLEANUP_RETRY_BASE_MS;
+  chrome.alarms.clear(AUTOMATION_CLEANUP_ALARM);
+}
+function queueAutomationCleanup() {
+  automationCleanupQueue = automationCleanupQueue.catch(() => {
+    return;
+  }).then(clearAutomationRuntime);
+  return automationCleanupQueue;
+}
+function scheduleAutomationCleanupRetry() {
+  if (automationCleanupTimer)
+    return;
+  const delay = automationCleanupDelayMs;
+  automationCleanupTimer = setTimeout(() => {
+    automationCleanupTimer = undefined;
+    queueAutomationCleanup().catch((error) => {
+      console.warn("AgentTab debugger cleanup retry failed", error);
+    });
+  }, delay);
+  chrome.alarms.create(AUTOMATION_CLEANUP_ALARM, { when: Date.now() + delay });
+  automationCleanupDelayMs = Math.min(delay * 2, AUTOMATION_CLEANUP_RETRY_MAX_MS);
+}
+async function persistAutomationCleanupRequest(requestedEpoch) {
+  const tabIds = browser.debuggerTabIds();
+  const cleanup = await mutateState((state) => {
+    state.automationCleanup.pending = true;
+    state.automationCleanup.epoch = Math.max(state.automationCleanup.epoch + 1, requestedEpoch);
+    state.automationCleanup.tabIds = [
+      ...new Set([...state.automationCleanup.tabIds, ...tabIds])
+    ];
+    return structuredClone(state.automationCleanup);
+  });
+  automationCleanupEpoch = Math.max(automationCleanupEpoch, cleanup.epoch);
+}
+async function clearAutomationRuntime() {
+  if (!automationCleanupPending)
+    return;
+  try {
+    await start();
+    await scheduler.drain();
+    const cleanup = await mutateState((state) => {
+      state.automationCleanup.pending = true;
+      state.automationCleanup.epoch = Math.max(state.automationCleanup.epoch, automationCleanupEpoch);
+      state.automationCleanup.tabIds = [
+        ...new Set([...state.automationCleanup.tabIds, ...browser.debuggerTabIds()])
+      ];
+      return structuredClone(state.automationCleanup);
+    });
+    await browser.scrubForHandoff(cleanup.tabIds);
+    const completed2 = await mutateState((state) => {
+      if (state.automationCleanup.epoch !== cleanup.epoch) {
+        return structuredClone(state.automationCleanup);
+      }
+      state.automationCleanup.pending = false;
+      state.automationCleanup.tabIds = [];
+      state.automationCleanup.generation += 1;
+      return structuredClone(state.automationCleanup);
+    });
+    automationCleanupEpoch = Math.max(automationCleanupEpoch, completed2.epoch);
+    automationRevocationGeneration = Math.max(automationRevocationGeneration, completed2.generation);
+    automationCleanupPending = completed2.pending || automationCleanupEpoch > completed2.epoch;
+    if (automationCleanupPending) {
+      queueAutomationCleanup().catch(() => {
+        return;
+      });
+      return;
+    }
+    cancelAutomationCleanupRetry();
+    if (await automationEnabled())
+      scheduler.restorePermissions();
+  } catch (error) {
+    scheduleAutomationCleanupRetry();
+    throw error;
+  }
 }
 function tabId(params) {
   if (!Number.isInteger(params.tab_id) || Number(params.tab_id) < 0) {
@@ -3207,15 +3467,31 @@ function start() {
     return startup;
   startup = (async () => {
     const state = await readState();
+    browser.restoreDebuggerCandidates(state.automationCleanup.tabIds);
+    automationCleanupPending = automationCleanupPending || state.automationCleanup.pending || state.automationCleanup.tabIds.length > 0;
+    automationCleanupEpoch = Math.max(automationCleanupEpoch, state.automationCleanup.epoch);
+    automationRevocationGeneration = Math.max(automationRevocationGeneration, state.automationCleanup.generation);
     scheduler.setInitialPaused(state.paused || state.handoff.active);
     if (!await automationEnabled())
       scheduler.revokePermissions();
-    await ownership.reconcile();
+    const revokedTabIds = await ownership.reconcile();
+    await Promise.all(revokedTabIds.map((tabId2) => browser.detach(tabId2)));
     await browser.expireCommits();
     await handoff.restore();
     await nativeBridge?.connect();
   })();
+  startup.then(() => {
+    if (!automationCleanupPending)
+      return;
+    queueAutomationCleanup().catch((error) => {
+      console.warn("AgentTab restored debugger cleanup failed; retry scheduled", error);
+    });
+  });
   return startup;
+}
+async function reconcileOwnership() {
+  const revokedTabIds = await ownership.reconcile();
+  await Promise.all(revokedTabIds.map((tabId2) => browser.detach(tabId2)));
 }
 chrome.tabs.onCreated.addListener((tab) => {
   start().then(() => ownership.adoptOwnedChild(tab));
@@ -3235,30 +3511,44 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
       scheduler.invalidateTab(updatedTabId);
       await revisions.markNavigation(updatedTabId);
     }
-    if ("groupId" in changeInfo)
-      await ownership.revokeIfMoved(updatedTabId);
+    if ("groupId" in changeInfo) {
+      const revoked = await ownership.revokeIfMoved(updatedTabId);
+      if (revoked)
+        await browser.detach(updatedTabId);
+    }
     if (typeof changeInfo.url === "string" || changeInfo.status === "complete") {
       await ownership.publishInventory();
     }
   });
 });
-chrome.tabs.onAttached.addListener(() => void start().then(() => ownership.reconcile()));
-chrome.tabs.onDetached.addListener(() => void start().then(() => ownership.reconcile()));
-chrome.tabGroups.onRemoved.addListener(() => void start().then(() => ownership.reconcile()));
+chrome.tabs.onAttached.addListener(() => void start().then(reconcileOwnership));
+chrome.tabs.onDetached.addListener(() => void start().then(reconcileOwnership));
+chrome.tabGroups.onRemoved.addListener(() => void start().then(reconcileOwnership));
 chrome.runtime.onStartup.addListener(() => void start());
 chrome.runtime.onInstalled.addListener(() => void start());
 chrome.permissions.onRemoved.addListener((permissions) => {
   if (!permissions.permissions?.includes("scripting"))
     return;
   scheduler.revokePermissions();
-  automationRevocationGeneration += 1;
-  start().then(() => browser.scrubForHandoff());
+  automationCleanupPending = true;
+  automationCleanupEpoch += 1;
+  const requestedEpoch = automationCleanupEpoch;
+  persistAutomationCleanupRequest(requestedEpoch).then(queueAutomationCleanup).catch((error) => {
+    scheduleAutomationCleanupRetry();
+    console.warn("AgentTab debugger cleanup failed; retry scheduled", error);
+  });
 });
 chrome.permissions.onAdded.addListener((permissions) => {
   if (!permissions.permissions?.includes("scripting"))
     return;
-  automationEnabled().then((enabled) => {
-    if (enabled)
+  start().then(async () => {
+    if (automationCleanupPending) {
+      await queueAutomationCleanup().catch((error) => {
+        console.warn("AgentTab debugger cleanup after permission restoration failed", error);
+      });
+      return;
+    }
+    if (await automationEnabled())
       scheduler.restorePermissions();
   });
 });
@@ -3268,6 +3558,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       await nativeBridge?.reconnectFromAlarm(alarm.name);
     if (alarm.name === HANDOFF_ALARM)
       await handoff.finish(false);
+    if (alarm.name === AUTOMATION_CLEANUP_ALARM) {
+      if (automationCleanupTimer)
+        clearTimeout(automationCleanupTimer);
+      automationCleanupTimer = undefined;
+      await queueAutomationCleanup().catch(() => {
+        return;
+      });
+    }
     await browser.expireCommits();
   });
 });

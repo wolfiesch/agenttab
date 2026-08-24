@@ -43,12 +43,25 @@ export class OwnershipLedger {
     private readonly emit: EventSink,
   ) { }
 
-  reconcile(): Promise<void> {
+  reconcile(): Promise<number[]> {
     return this.serialize(() => this.reconcileNow());
   }
 
   assertOwned(taskId: string, tabId: number): Promise<TaskRecord> {
     return this.serialize(() => this.assertOwnedNow(taskId, tabId));
+  }
+
+  assertOwnedTab(tabId: number): Promise<TaskRecord> {
+    return this.serialize(async () => {
+      const state = await readState();
+      const task = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
+      if (!task) {
+        throw Object.assign(new Error("Tab is not owned by AgentTab"), {
+          code: "ownership_denied",
+        });
+      }
+      return this.assertOwnedNow(task.taskId, tabId);
+    });
   }
 
   open(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -63,14 +76,14 @@ export class OwnershipLedger {
     return this.serialize(() => this.adoptOwnedChildNow(tab));
   }
 
-  revokeIfMoved(tabId: number): Promise<void> {
+  revokeIfMoved(tabId: number): Promise<boolean> {
     return this.serialize(() => this.revokeIfMovedNow(tabId));
   }
 
   revoke(
     tabId: number,
     event: "ownership_revoked" | "group_membership_changed" | "tab_removed",
-  ): Promise<void> {
+  ): Promise<boolean> {
     return this.serialize(() => this.revokeNow(tabId, event));
   }
 
@@ -161,7 +174,7 @@ export class OwnershipLedger {
     return task?.groupId === null ? null : task?.taskId ?? null;
   }
 
-  private async reconcileNow(): Promise<void> {
+  private async reconcileNow(): Promise<number[]> {
     const tabs = (await chrome.tabs.query({})) as TabLike[];
     const byId = new Map(
       tabs.filter((tab) => Number.isInteger(tab.id)).map((tab) => [tab.id as number, tab]),
@@ -186,6 +199,7 @@ export class OwnershipLedger {
       this.emit("ownership_revoked", { task_id: changed.taskId, tab_count: changed.count });
     }
     await this.emitInventory();
+    return changedTasks.flatMap((changed) => changed.revokedTabIds);
   }
 
   private async assertOwnedNow(taskId: string, tabId: number): Promise<TaskRecord> {
@@ -322,20 +336,21 @@ export class OwnershipLedger {
     }
   }
 
-  private async revokeIfMovedNow(tabId: number): Promise<void> {
+  private async revokeIfMovedNow(tabId: number): Promise<boolean> {
     const state = await readState();
     const task = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
-    if (!task) return;
+    if (!task) return false;
     const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
     if (!tab || task.groupId === null || tab.groupId !== task.groupId) {
-      await this.revokeNow(tabId, "group_membership_changed");
+      return this.revokeNow(tabId, "group_membership_changed");
     }
+    return false;
   }
 
   private async revokeNow(
     tabId: number,
     event: "ownership_revoked" | "group_membership_changed" | "tab_removed",
-  ): Promise<void> {
+  ): Promise<boolean> {
     this.scheduler.revokeTab(tabId);
     const changed = await mutateState((state) => {
       for (const task of Object.values(state.tasks)) {
@@ -347,13 +362,14 @@ export class OwnershipLedger {
       }
       return null;
     });
-    if (!changed) return;
+    if (!changed) return false;
     await this.revisions.remove(tabId);
     this.emit(event, {
       task_id: changed.taskId,
       tab_count: changed.count,
     });
     await this.emitInventory();
+    return true;
   }
 
   private async closeTaskNow(taskId: string): Promise<number[]> {
