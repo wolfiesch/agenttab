@@ -217,6 +217,48 @@ impl Runtime {
                 false,
             );
         }
+        let input_hash = request_hash(request.method, &params_value);
+        let key = request.idempotency_key;
+        if let (Some(task_id), Some(key)) = (connection.task_id().ok().flatten(), key) {
+            match self
+                .journal
+                .lookup_mutation(task_id, key, request.method, &input_hash)
+            {
+                Ok(Some(decision)) => {
+                    let response = existing_mutation_response(&request.request_id, decision);
+                    return self.audited_value(
+                        connection,
+                        Some(task_id),
+                        &request,
+                        &params_value,
+                        response,
+                        started_at_ms,
+                        started,
+                        true,
+                        true,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let response = RpcResponse::failure(
+                        request.request_id.clone(),
+                        Outcome::NotStarted,
+                        journal_rpc_error(error),
+                    );
+                    return self.audited_value(
+                        connection,
+                        Some(task_id),
+                        &request,
+                        &params_value,
+                        response,
+                        started_at_ms,
+                        started,
+                        false,
+                        true,
+                    );
+                }
+            }
+        }
 
         let early_error = self
             .lifecycle
@@ -324,62 +366,14 @@ impl Runtime {
                 true,
             );
         }
-        let input_hash = request_hash(request.method, &params_value);
-        let key = request.idempotency_key;
         if let Some(key) = key {
             match self
                 .journal
                 .begin_mutation(task_id, key, request.method, &input_hash)
             {
                 Ok(BeginDecision::Dispatch) => {}
-                Ok(BeginDecision::Cached(cached)) => {
-                    let mut response: RpcResponse = match serde_json::from_value(cached) {
-                        Ok(response) => response,
-                        Err(error) => {
-                            let response = RpcResponse::failure(
-                                request.request_id.clone(),
-                                Outcome::NotStarted,
-                                RpcError::new("journal_corrupt", error.to_string()),
-                            );
-                            return self.audited_value(
-                                connection,
-                                Some(task_id),
-                                &request,
-                                &params_value,
-                                response,
-                                started_at_ms,
-                                started,
-                                true,
-                                true,
-                            );
-                        }
-                    };
-                    response.request_id = request.request_id.clone();
-                    response = enforce_response_limit(response);
-                    return self.audited_value(
-                        connection,
-                        Some(task_id),
-                        &request,
-                        &params_value,
-                        response,
-                        started_at_ms,
-                        started,
-                        true,
-                        true,
-                    );
-                }
-                Ok(BeginDecision::Unknown) => {
-                    let response = RpcResponse::failure(
-                        request.request_id.clone(),
-                        Outcome::Unknown,
-                        RpcError::new(
-                            "idempotency_outcome_unknown",
-                            "A previous attempt started but no durable terminal response exists",
-                        )
-                        .with_recovery(
-                            "Inspect the task state before deciding whether to use a new UUIDv7 key.",
-                        ),
-                    );
+                Ok(decision) => {
+                    let response = existing_mutation_response(&request.request_id, decision);
                     return self.audited_value(
                         connection,
                         Some(task_id),
@@ -748,6 +742,41 @@ fn request_hash(method: RpcMethod, params: &Value) -> String {
         Sha256::digest(serde_json::to_vec(&value).expect("request hash serializes"))
     )
 }
+fn existing_mutation_response(request_id: &str, decision: BeginDecision) -> RpcResponse {
+    match decision {
+        BeginDecision::Cached(cached) => match serde_json::from_value(cached) {
+            Ok(response) => {
+                let mut response: RpcResponse = response;
+                response.request_id = request_id.to_owned();
+                enforce_response_limit(response)
+            }
+            Err(error) => RpcResponse::failure(
+                request_id,
+                Outcome::NotStarted,
+                RpcError::new("journal_corrupt", error.to_string()),
+            ),
+        },
+        BeginDecision::Unknown => RpcResponse::failure(
+            request_id,
+            Outcome::Unknown,
+            RpcError::new(
+                "idempotency_outcome_unknown",
+                "A previous attempt started but no durable terminal response exists",
+            )
+            .with_recovery(
+                "Inspect the task state before deciding whether to use a new UUIDv7 key.",
+            ),
+        ),
+        BeginDecision::Dispatch => RpcResponse::failure(
+            request_id,
+            Outcome::Unknown,
+            RpcError::new(
+                "journal_corrupt",
+                "Mutation lookup returned a new-dispatch decision",
+            ),
+        ),
+    }
+}
 
 fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
     let (code, recovery) = match error {
@@ -795,7 +824,7 @@ pub(crate) fn request_lock_scope(method: RpcMethod, params: &Value) -> RequestLo
 
 fn request_lock_key(task_id: Uuid, method: RpcMethod, params: &Value) -> String {
     match request_lock_scope(method, params) {
-        RequestLockScope::Global => format!("{task_id}:global"),
+        RequestLockScope::Global => "global".into(),
         RequestLockScope::Tab(tab_id) => format!("{task_id}:tab:{tab_id}"),
     }
 }
@@ -1084,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_is_dispatched_once_and_cached_without_plaintext_capabilities_or_secrets() {
+    fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
         let native = FakeNative::normal();
         let (_temp, runtime, connection) = connected_runtime(native.clone());
         let key = Uuid::now_v7();
@@ -1104,13 +1133,17 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("123-45-6789"));
-        let second = runtime.handle(&connection, request);
+        runtime.lifecycle.set_paused(true);
+        let mut retry = request;
+        retry["request_id"] = json!("retry");
+        let second = runtime.handle(&connection, retry);
         assert_eq!(second["outcome"], first["outcome"]);
         assert_eq!(second["result"], first["result"]);
         assert_eq!(second["task"]["task_id"], first["task"]["task_id"]);
         assert!(second["task"].get("resume_capability").is_none());
         assert_eq!(native.calls.load(Ordering::Relaxed), 1);
 
+        assert_eq!(second["request_id"], "retry");
         let task_id = first["task"]["task_id"]
             .as_str()
             .unwrap()
@@ -1125,6 +1158,20 @@ mod tests {
             panic!("completed mutation was not cached");
         };
         assert!(cached.pointer("/task/resume_capability").is_none());
+    }
+
+    #[test]
+    fn browser_global_requests_share_one_lock_across_tasks() {
+        let first_task = Uuid::new_v4();
+        let second_task = Uuid::new_v4();
+        assert_eq!(
+            request_lock_key(first_task, RpcMethod::BrowserOpen, &json!({})),
+            request_lock_key(second_task, RpcMethod::BrowserOpen, &json!({}))
+        );
+        assert_ne!(
+            request_lock_key(first_task, RpcMethod::BrowserAct, &json!({"tab_id": 7})),
+            request_lock_key(second_task, RpcMethod::BrowserAct, &json!({"tab_id": 7}))
+        );
     }
 
     #[test]

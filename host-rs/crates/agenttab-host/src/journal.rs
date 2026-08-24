@@ -317,6 +317,18 @@ impl Journal {
         Ok(())
     }
 
+    pub fn lookup_mutation(
+        &self,
+        task_id: Uuid,
+        key: Uuid,
+        method: RpcMethod,
+        input_hash: &str,
+    ) -> Result<Option<BeginDecision>, JournalError> {
+        validate_key_timestamp(key)?;
+        let connection = self.connection.lock();
+        mutation_decision(&connection, task_id, key, method, input_hash)
+    }
+
     pub fn begin_mutation(
         &self,
         task_id: Uuid,
@@ -336,29 +348,7 @@ impl Journal {
             params![task_id.to_string(), now - IDEMPOTENCY_RETENTION_MS],
         )?;
 
-        let existing: Option<(String, String, String, Option<String>)> = transaction
-            .query_row(
-                "SELECT method, input_hash, state, response_json
-                 FROM idempotency_journal
-                 WHERE task_id = ?1 AND idempotency_key = ?2",
-                params![task_id.to_string(), key.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        if let Some((stored_method, stored_hash, state, response_json)) = existing {
-            if stored_method != method.to_string() || stored_hash != input_hash {
-                transaction.rollback()?;
-                return Err(JournalError::IdempotencyConflict);
-            }
-            let decision = if state == "completed" {
-                BeginDecision::Cached(serde_json::from_str(
-                    response_json
-                        .as_deref()
-                        .ok_or(JournalError::MissingStartedRecord)?,
-                )?)
-            } else {
-                BeginDecision::Unknown
-            };
+        if let Some(decision) = mutation_decision(&transaction, task_id, key, method, input_hash)? {
             transaction.rollback()?;
             return Ok(decision);
         }
@@ -545,6 +535,38 @@ impl Journal {
         )?;
         Ok(())
     }
+}
+
+fn mutation_decision(
+    connection: &Connection,
+    task_id: Uuid,
+    key: Uuid,
+    method: RpcMethod,
+    input_hash: &str,
+) -> Result<Option<BeginDecision>, JournalError> {
+    let existing: Option<(String, String, String, Option<String>)> = connection
+        .query_row(
+            "SELECT method, input_hash, state, response_json
+             FROM idempotency_journal
+             WHERE task_id = ?1 AND idempotency_key = ?2",
+            params![task_id.to_string(), key.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((stored_method, stored_hash, state, response_json)) = existing else {
+        return Ok(None);
+    };
+    if stored_method != method.to_string() || stored_hash != input_hash {
+        return Err(JournalError::IdempotencyConflict);
+    }
+    if state == "completed" {
+        return Ok(Some(BeginDecision::Cached(serde_json::from_str(
+            response_json
+                .as_deref()
+                .ok_or(JournalError::MissingStartedRecord)?,
+        )?)));
+    }
+    Ok(Some(BeginDecision::Unknown))
 }
 
 fn ensure_column(
