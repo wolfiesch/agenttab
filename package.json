@@ -1,0 +1,12 @@
+{
+  "name": "agenttab",
+  "version": "0.2.0",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "extension:build": "bun run --cwd packages/extension build",
+    "extension:check": "bun run --cwd packages/extension typecheck && bun run --cwd packages/extension test && bun run --cwd packages/extension build"
+  }
+}

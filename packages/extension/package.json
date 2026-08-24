@@ -1,0 +1,16 @@
+{
+  "name": "@agenttab/extension",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.23",
+    "@types/chrome": "^0.1.36",
+    "typescript": "^5.9.3"
+  }
+}

@@ -123,10 +123,11 @@ impl Drop for Admission<'_> {
 fn gate_state(data: &StateData, method: RpcMethod) -> Result<(), RpcError> {
     match data.state {
         RuntimeState::Ready => Ok(()),
-        RuntimeState::Paused => Err(
-            RpcError::new("automation_paused", "AgentTab is paused in Chrome")
-                .with_recovery("Resume AgentTab from the extension popup, then retry."),
-        ),
+        RuntimeState::Paused => Err(RpcError::new(
+            "automation_paused",
+            "AgentTab is paused in Chrome",
+        )
+        .with_recovery("Resume AgentTab from the extension popup, then retry.")),
         RuntimeState::Starting | RuntimeState::Reconciling => Err(RpcError::new(
             "runtime_not_ready",
             format!("AgentTab is not ready for {method}"),
@@ -138,9 +139,7 @@ fn gate_state(data: &StateData, method: RpcMethod) -> Result<(), RpcError> {
                 .clone()
                 .unwrap_or_else(|| "terminal protocol failure".into()),
         )
-        .with_recovery(
-            "Update AgentTab so the host and extension use the same protocol version.",
-        )),
+        .with_recovery("Update AgentTab so the host and extension use the same protocol version.")),
     }
 }
 

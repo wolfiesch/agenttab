@@ -229,6 +229,21 @@
         { "$ref": "#/$defs/base" },
         {
           "type": "object",
+          "required": ["kind", "event", "event_id"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "event_ack" },
+            "event": { "const": "handoff_changed" },
+            "event_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
           "required": ["kind", "event", "payload"],
           "properties": {
             "protocol": {}, "version": {}, "kind": { "const": "event" },
@@ -244,7 +259,8 @@
                 "extension_disconnected"
               ]
             },
-            "payload": { "type": "object" }
+            "payload": { "type": "object" },
+            "event_id": { "type": "string", "minLength": 1, "maxLength": 128 }
           },
           "allOf": [
             {
@@ -261,7 +277,22 @@
             },
             {
               "if": { "properties": { "event": { "const": "handoff_changed" } } },
-              "then": { "properties": { "payload": { "$ref": "#/$defs/handoff" } } }
+              "then": {
+                "properties": { "payload": { "$ref": "#/$defs/handoff" } },
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "payload": {
+                          "properties": { "active": { "const": false } },
+                          "required": ["active"]
+                        }
+                      }
+                    },
+                    "then": { "required": ["event_id"] }
+                  }
+                ]
+              }
             },
             {
               "if": { "properties": { "event": { "const": "commit_expired" } } },
@@ -270,6 +301,10 @@
             {
               "if": { "properties": { "event": { "const": "extension_disconnected" } } },
               "then": { "properties": { "payload": { "$ref": "#/$defs/disconnect_payload" } } }
+            },
+            {
+              "if": { "required": ["event_id"] },
+              "then": { "properties": { "event": { "const": "handoff_changed" } } }
             }
           ],
           "additionalProperties": false

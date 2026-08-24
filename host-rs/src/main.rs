@@ -136,7 +136,10 @@ fn load_tokens(host_dir: &Path, logger: &Arc<Logger>) -> HashMap<String, String>
                         None => {
                             log_warn(
                                 logger,
-                                &format!("Ignoring malformed token line (expected name:token): {}", trimmed),
+                                &format!(
+                                    "Ignoring malformed token line (expected name:token): {}",
+                                    trimmed
+                                ),
                             );
                         }
                     }
@@ -145,7 +148,11 @@ fn load_tokens(host_dir: &Path, logger: &Arc<Logger>) -> HashMap<String, String>
             Err(e) => {
                 log_error(
                     logger,
-                    &format!("Could not read tokens file {}: {}", tokens_file.display(), e),
+                    &format!(
+                        "Could not read tokens file {}: {}",
+                        tokens_file.display(),
+                        e
+                    ),
                 );
             }
         }
@@ -283,7 +290,12 @@ fn confirmation_ttl_ms() -> u128 {
         .unwrap_or(60_000)
 }
 
-fn confirmation_fingerprint(client: &str, action: &str, payload: &Value, targets: &[String]) -> String {
+fn confirmation_fingerprint(
+    client: &str,
+    action: &str,
+    payload: &Value,
+    targets: &[String],
+) -> String {
     let data = json!({
         "client": client,
         "action": action,
@@ -311,14 +323,17 @@ fn issue_confirmation(
     let fingerprint = confirmation_fingerprint(client, action, payload, targets);
     if let Ok(mut map) = confirmations.lock() {
         prune_confirmations_locked(&mut map, now_ms());
-        map.insert(token.clone(), Confirmation {
-            fingerprint,
-            expires_at,
-            client: client.to_string(),
-            action: action.to_string(),
-            payload: payload.clone(),
-            targets: targets.to_vec(),
-        });
+        map.insert(
+            token.clone(),
+            Confirmation {
+                fingerprint,
+                expires_at,
+                client: client.to_string(),
+                action: action.to_string(),
+                payload: payload.clone(),
+                targets: targets.to_vec(),
+            },
+        );
     }
     (token, expires_at)
 }
@@ -334,7 +349,11 @@ fn resume_confirmation(
         // Keep these fields in the pending entry so the normal fingerprint
         // check still binds token/client/action/payload/live targets.
         let _targets = &entry.targets;
-        return Some((entry.client.clone(), entry.action.clone(), entry.payload.clone()));
+        return Some((
+            entry.client.clone(),
+            entry.action.clone(),
+            entry.payload.clone(),
+        ));
     }
     None
 }
@@ -376,7 +395,12 @@ fn live_owner(lease: &mut Lease, now: u128) -> Option<String> {
 
 /// Handle lease/release/leaseStatus host-side. Returns None if `action` is not
 /// a lease verb (caller should forward to the extension instead).
-fn handle_lease_action(action: &str, payload: Option<&Value>, client: &str, lease: &LeaseState) -> Option<Value> {
+fn handle_lease_action(
+    action: &str,
+    payload: Option<&Value>,
+    client: &str,
+    lease: &LeaseState,
+) -> Option<Value> {
     let now = now_ms();
     match action {
         "lease" => {
@@ -519,7 +543,9 @@ type Handoffs = Arc<Mutex<HandoffRegistry>>;
 /// The numeric tabId a request targets, or None for "the active tab", which
 /// only the extension can resolve.
 fn handoff_tab_id(payload: Option<&Value>) -> Option<i64> {
-    payload.and_then(|p| p.get("tabId")).and_then(|v| v.as_i64())
+    payload
+        .and_then(|p| p.get("tabId"))
+        .and_then(|v| v.as_i64())
 }
 
 /// Register an in-flight handoff just before forwarding it. The returned handle
@@ -530,7 +556,11 @@ fn register_handoff(handoffs: &Handoffs, tab_id: Option<i64>, client: &str) -> O
     let handle = reg.next;
     reg.active.insert(
         handle,
-        HandoffRecord { tab_id, started_at: now_ms(), client: client.to_string() },
+        HandoffRecord {
+            tab_id,
+            started_at: now_ms(),
+            client: client.to_string(),
+        },
     );
     Some(handle)
 }
@@ -624,34 +654,79 @@ fn composite_handoff_reason(action: &str, payload: Option<&Value>) -> Option<Str
 #[allow(dead_code)]
 fn sensitive_actions() -> &'static [&'static str] {
     &[
-        "getCookies", "storageState", "executeScript", "executeScriptCDP",
-        "startInterception", "downloadUrl", "screencastFrames",
+        "getCookies",
+        "storageState",
+        "executeScript",
+        "executeScriptCDP",
+        "startInterception",
+        "downloadUrl",
+        "screencastFrames",
     ]
 }
 
 #[allow(dead_code)]
 fn mutating_actions() -> &'static [&'static str] {
     &[
-        "navigate", "navigateAndSnapshot", "click", "clickAt", "type", "fill",
-        "insertRichText", "hover", "scroll", "press", "drag",
-        "select", "uploadFile", "activateTab", "closeTab", "reload", "goBack",
-        "goForward", "windowControl", "setViewport", "setGeolocation", "clearGeolocation",
-        "setCpuThrottling", "setNetworkConditions", "clearNetworkConditions",
-        "setColorScheme", "setUserAgent",
-        "setCookie", "deleteCookie", "setStorageItem", "removeStorageItem", "clearStorage",
-        "githubAttachUploadedFiles", "githubSubmitComment", "githubAttachPrBody",
-        "startInterception", "stopInterception",
-        "startMonitoring", "stopMonitoring", "startScreencast", "stopScreencast",
-        "handleDialog", "downloadUrl", "batch",
-        "createTaskSession", "navigateTaskSession", "updateTaskSessionState", "closeTaskSession",
+        "navigate",
+        "navigateAndSnapshot",
+        "click",
+        "clickAt",
+        "type",
+        "fill",
+        "insertRichText",
+        "hover",
+        "scroll",
+        "press",
+        "drag",
+        "select",
+        "uploadFile",
+        "activateTab",
+        "closeTab",
+        "reload",
+        "goBack",
+        "goForward",
+        "windowControl",
+        "setViewport",
+        "setGeolocation",
+        "clearGeolocation",
+        "setCpuThrottling",
+        "setNetworkConditions",
+        "clearNetworkConditions",
+        "setColorScheme",
+        "setUserAgent",
+        "setCookie",
+        "deleteCookie",
+        "setStorageItem",
+        "removeStorageItem",
+        "clearStorage",
+        "githubAttachUploadedFiles",
+        "githubSubmitComment",
+        "githubAttachPrBody",
+        "startInterception",
+        "stopInterception",
+        "startMonitoring",
+        "stopMonitoring",
+        "startScreencast",
+        "stopScreencast",
+        "handleDialog",
+        "downloadUrl",
+        "batch",
+        "createTaskSession",
+        "navigateTaskSession",
+        "updateTaskSessionState",
+        "closeTaskSession",
     ]
 }
 
 #[allow(dead_code)]
 fn destructive_actions() -> &'static [&'static str] {
     &[
-        "executeScript", "executeScriptCDP", "startInterception", "downloadUrl",
-        "getCookies", "storageState",
+        "executeScript",
+        "executeScriptCDP",
+        "startInterception",
+        "downloadUrl",
+        "getCookies",
+        "storageState",
     ]
 }
 
@@ -671,9 +746,17 @@ const SITE_MODES: [&str; 3] = ["manual", "auto", "skip"];
 fn non_skippable_confirmation(action: &str) -> bool {
     matches!(
         action,
-        "executeScript" | "executeScriptCDP" | "getCookies" | "storageState"
-            | "setCookie" | "deleteCookie" | "setStorageItem" | "removeStorageItem"
-            | "clearStorage" | "startScreencast" | "clickAt"
+        "executeScript"
+            | "executeScriptCDP"
+            | "getCookies"
+            | "storageState"
+            | "setCookie"
+            | "deleteCookie"
+            | "setStorageItem"
+            | "removeStorageItem"
+            | "clearStorage"
+            | "startScreencast"
+            | "clickAt"
     )
 }
 
@@ -777,16 +860,34 @@ fn effective_action_tier(action: &str, payload: Option<&Value>) -> &'static str 
 fn origin_exempt_action(action: &str) -> bool {
     matches!(
         action,
-        "ping" | "getTabs" | "navigate" | "navigateAndSnapshot" | "downloadUrl" | "getCookies"
-            | "sessionStatus" | "createTaskSession" | "navigateTaskSession"
-            | "getTaskSessions" | "updateTaskSessionState" | "closeTaskSession"
-            | "batch" | "lease" | "release" | "leaseStatus"
-            | "policyCheck" | "policyInfo"
+        "ping"
+            | "getTabs"
+            | "navigate"
+            | "navigateAndSnapshot"
+            | "downloadUrl"
+            | "getCookies"
+            | "sessionStatus"
+            | "createTaskSession"
+            | "navigateTaskSession"
+            | "getTaskSessions"
+            | "updateTaskSessionState"
+            | "closeTaskSession"
+            | "batch"
+            | "lease"
+            | "release"
+            | "leaseStatus"
+            | "policyCheck"
+            | "policyInfo"
     )
 }
 
-const TARGET_REQUIRED_ACTIONS: [&str; 5] =
-    ["navigate", "navigateTaskSession", "navigateAndSnapshot", "downloadUrl", "getCookies"];
+const TARGET_REQUIRED_ACTIONS: [&str; 5] = [
+    "navigate",
+    "navigateTaskSession",
+    "navigateAndSnapshot",
+    "downloadUrl",
+    "getCookies",
+];
 
 /// Actions that make the browser issue a NEW outbound request to a host named in
 /// the request payload, so the host can bound the destination before forwarding.
@@ -803,8 +904,13 @@ const TARGET_REQUIRED_ACTIONS: [&str; 5] =
 /// extension fulfills from the inline `body` and fetches nothing); and
 /// `deleteCookie` (names a url but removes state and sends nothing).
 /// Mirrors bridge.py::EGRESS_URL_ACTIONS.
-const EGRESS_URL_ACTIONS: [&str; 5] =
-    ["navigate", "navigateTaskSession", "navigateAndSnapshot", "downloadUrl", "setCookie"];
+const EGRESS_URL_ACTIONS: [&str; 5] = [
+    "navigate",
+    "navigateTaskSession",
+    "navigateAndSnapshot",
+    "downloadUrl",
+    "setCookie",
+];
 
 // --- Data-loss-prevention channels (policy key `dlp`) -----------------------
 // `dlp` is a map of CHANNEL -> MODE:
@@ -876,7 +982,12 @@ fn dlp_modes_for_client(cp: &Value) -> serde_json::Map<String, Value> {
 /// Channels resolving to `mode` for this request, recursing into composites so a
 /// batch or replayWorkflow step is seen. Ordered by DLP_CHANNELS and
 /// deduplicated. Mirrors bridge.py::dlp_channels_in_mode.
-fn dlp_channels_in_mode(cp: &Value, action: &str, payload: Option<&Value>, mode: &str) -> Vec<String> {
+fn dlp_channels_in_mode(
+    cp: &Value,
+    action: &str,
+    payload: Option<&Value>,
+    mode: &str,
+) -> Vec<String> {
     let mut found: Vec<&'static str> = Vec::new();
     dlp_walk_channels(cp, action, payload, mode, &mut found);
     DLP_CHANNELS
@@ -915,7 +1026,11 @@ fn dlp_walk_channels(
 /// composite steps in dispatch order so a denial can name the smuggled step's own
 /// action rather than the enclosing `batch`. Mirrors
 /// bridge.py::dlp_blocked_target.
-fn dlp_blocked_target(cp: &Value, action: &str, payload: Option<&Value>) -> Option<(String, &'static str)> {
+fn dlp_blocked_target(
+    cp: &Value,
+    action: &str,
+    payload: Option<&Value>,
+) -> Option<(String, &'static str)> {
     if action == "batch" || action == "replayWorkflow" {
         let steps = if action == "batch" {
             step_payloads(payload)
@@ -1176,8 +1291,16 @@ fn policy_bundle_config(doc: &Value) -> Option<(String, String)> {
         if !cfg.is_object() {
             return Some((String::new(), String::new()));
         }
-        let path = cfg.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let lockfile = cfg.get("lockfile").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let path = cfg
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let lockfile = cfg
+            .get("lockfile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         if path.is_empty() || lockfile.is_empty() {
             return Some((String::new(), String::new()));
         }
@@ -1204,7 +1327,11 @@ fn read_lock_digest(path: &str) -> (Option<String>, Option<&'static str>) {
         Some(s) => s.trim().to_lowercase(),
         None => return (None, Some(POLICY_BUNDLE_LOCK_MALFORMED)),
     };
-    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
+    if digest.len() != 64
+        || !digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
         return (None, Some(POLICY_BUNDLE_LOCK_MALFORMED));
     }
     (Some(digest), None)
@@ -1216,7 +1343,12 @@ fn read_lock_digest(path: &str) -> (Option<String>, Option<&'static str>) {
 fn verify_policy_bundle(
     path: &str,
     lockfile: &str,
-) -> (Option<Value>, Option<String>, Option<String>, Option<&'static str>) {
+) -> (
+    Option<Value>,
+    Option<String>,
+    Option<String>,
+    Option<&'static str>,
+) {
     if path.is_empty() || lockfile.is_empty() {
         return (None, None, None, Some(POLICY_BUNDLE_MISCONFIGURED));
     }
@@ -1326,7 +1458,8 @@ fn bundle_conflict_reason(key: &str, bundle_pattern: &str, local_pattern: &str) 
     format!(
         "{}: {} bundle pattern \"{}\" and local pattern \"{}\" are different \
          globs with no representable intersection",
-        POLICY_BUNDLE_CONFLICT, key, bundle_pattern, local_pattern)
+        POLICY_BUNDLE_CONFLICT, key, bundle_pattern, local_pattern
+    )
 }
 
 /// The string entries of one pattern list, in order. A non-string entry is
@@ -1341,10 +1474,11 @@ fn bundle_pattern_strings(list: &Value) -> Vec<&str> {
 /// Whether any pattern in `constraint` permits `name`, using the same glob the
 /// gates use. This is the only sound direction: `name` is a NAME, not a pattern.
 fn bundle_permits_name(constraint: &[&str], name: &str) -> bool {
-    constraint
-        .iter()
-        .copied()
-        .any(|p| glob::Pattern::new(p).map(|g| g.matches(name)).unwrap_or(false))
+    constraint.iter().copied().any(|p| {
+        glob::Pattern::new(p)
+            .map(|g| g.matches(name))
+            .unwrap_or(false)
+    })
 }
 
 /// Explicit intersection of two allow-list PATTERN lists, bundle order first,
@@ -1369,9 +1503,7 @@ fn bundle_intersect_lists(
     let bundle = bundle_pattern_strings(bundle_list);
     let local = bundle_pattern_strings(local_list);
     let mut out: Vec<&str> = Vec::new();
-    for (source, constraint, local_side) in
-        [(&bundle, &local, false), (&local, &bundle, true)]
-    {
+    for (source, constraint, local_side) in [(&bundle, &local, false), (&local, &bundle, true)] {
         let unconstrained = constraint.iter().any(|p| *p == "*");
         let constraint_globs: Vec<&str> = constraint
             .iter()
@@ -1400,7 +1532,11 @@ fn bundle_intersect_lists(
             }
         }
     }
-    Ok(Value::Array(out.into_iter().map(|s| Value::String(s.to_string())).collect()))
+    Ok(Value::Array(
+        out.into_iter()
+            .map(|s| Value::String(s.to_string()))
+            .collect(),
+    ))
 }
 
 fn bundle_mode_rank(order: &[&str; 3], unknown_rank: usize, mode: &Value) -> usize {
@@ -1487,7 +1623,10 @@ fn compose_bundle_key(
             let (order, unknown) = if rule == "dlp" {
                 (&POLICY_BUNDLE_DLP_ORDER, POLICY_BUNDLE_DLP_UNKNOWN_RANK)
             } else {
-                (&POLICY_BUNDLE_SITE_MODE_ORDER, POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK)
+                (
+                    &POLICY_BUNDLE_SITE_MODE_ORDER,
+                    POLICY_BUNDLE_SITE_MODE_UNKNOWN_RANK,
+                )
             };
             let mut composed = local_value
                 .and_then(|v| v.as_object())
@@ -1522,7 +1661,9 @@ fn compose_bundle_key(
             match union.len() {
                 0 => Ok(None),
                 1 => Ok(Some(Value::String(union.remove(0)))),
-                _ => Ok(Some(Value::Array(union.into_iter().map(Value::String).collect()))),
+                _ => Ok(Some(Value::Array(
+                    union.into_iter().map(Value::String).collect(),
+                ))),
             }
         }
         _ => Ok(None),
@@ -1576,8 +1717,14 @@ fn compose_bundle_policy(bundle: &Value, local: &Value) -> Result<Value, String>
         "default".to_string(),
         merge_bundle_layer(bundle.get("default"), local.get("default"), &local_default)?,
     );
-    let bundle_clients = bundle.get("clients").and_then(|v| v.as_object()).unwrap_or(&empty);
-    let local_clients = local.get("clients").and_then(|v| v.as_object()).unwrap_or(&empty);
+    let bundle_clients = bundle
+        .get("clients")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
+    let local_clients = local
+        .get("clients")
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty);
     let mut names: Vec<String> = bundle_clients.keys().cloned().collect();
     for name in local_clients.keys() {
         if !names.contains(name) {
@@ -1589,7 +1736,10 @@ fn compose_bundle_policy(bundle: &Value, local: &Value) -> Result<Value, String>
         clients.insert(
             name.clone(),
             merge_bundle_layer(
-                bundle_clients.get(&name), local_clients.get(&name), &local_default)?,
+                bundle_clients.get(&name),
+                local_clients.get(&name),
+                &local_default,
+            )?,
         );
     }
     composed.insert("clients".to_string(), Value::Object(clients));
@@ -1619,18 +1769,26 @@ fn audit_policy_bundle_rejected(
     expected: Option<&str>,
     actual: Option<&str>,
 ) {
-    let targets: Vec<String> = if path.is_empty() { Vec::new() } else { vec![path.to_string()] };
-    write_audit_event(host_dir, logger, &json!({
-        "ts": now_ms() as u64,
-        "client": "host",
-        "action": "policyBundle",
-        "targets": targets,
-        "decision": POLICY_BUNDLE_DECISION,
-        "reason": reason,
-        "requestId": Value::Null,
-        "expectedDigest": expected,
-        "actualDigest": actual,
-    }));
+    let targets: Vec<String> = if path.is_empty() {
+        Vec::new()
+    } else {
+        vec![path.to_string()]
+    };
+    write_audit_event(
+        host_dir,
+        logger,
+        &json!({
+            "ts": now_ms() as u64,
+            "client": "host",
+            "action": "policyBundle",
+            "targets": targets,
+            "decision": POLICY_BUNDLE_DECISION,
+            "reason": reason,
+            "requestId": Value::Null,
+            "expectedDigest": expected,
+            "actualDigest": actual,
+        }),
+    );
 }
 
 /// The local policy file only: fail-closed default and logs load errors.
@@ -1640,16 +1798,28 @@ fn load_local_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
         Ok(s) => match serde_json::from_str::<Value>(&s) {
             Ok(v) if v.is_object() => v,
             Ok(_) => {
-                log_error(logger, &format!("Could not load policy file {}: root must be an object", path.display()));
+                log_error(
+                    logger,
+                    &format!(
+                        "Could not load policy file {}: root must be an object",
+                        path.display()
+                    ),
+                );
                 default_policy()
             }
             Err(e) => {
-                log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
+                log_error(
+                    logger,
+                    &format!("Could not load policy file {}: {}", path.display(), e),
+                );
                 default_policy()
             }
         },
         Err(e) => {
-            log_error(logger, &format!("Could not load policy file {}: {}", path.display(), e));
+            log_error(
+                logger,
+                &format!("Could not load policy file {}: {}", path.display(), e),
+            );
             default_policy()
         }
     }
@@ -1698,7 +1868,13 @@ fn load_policy(host_dir: &Path, logger: &Arc<Logger>) -> Value {
             actual.clone().unwrap_or_else(|| "none".to_string()),
         ));
         audit_policy_bundle_rejected(
-            host_dir, logger, &path, &reason, expected.as_deref(), actual.as_deref());
+            host_dir,
+            logger,
+            &path,
+            &reason,
+            expected.as_deref(),
+            actual.as_deref(),
+        );
         return default_policy();
     }
     set_policy_bundle_state(PolicyBundleState {
@@ -1728,7 +1904,10 @@ fn policy_source_signature(host_dir: &Path) -> PolicySourceSig {
         policy_mtime: file_mtime(&policy_file_path(host_dir)),
         bundle_mtime: state.path.as_ref().and_then(|p| file_mtime(Path::new(p))),
         bundle_path: state.path,
-        lock_mtime: state.lockfile.as_ref().and_then(|p| file_mtime(Path::new(p))),
+        lock_mtime: state
+            .lockfile
+            .as_ref()
+            .and_then(|p| file_mtime(Path::new(p))),
         lock_path: state.lockfile,
     }
 }
@@ -1781,8 +1960,13 @@ fn current_policy(policy: &Policy, host_dir: &Path, logger: &Arc<Logger>) -> Val
 }
 
 const POLICY_LIST_KEYS: [&str; 7] = [
-    "allowedActions", "deniedActions", "allowedOrigins", "deniedOrigins",
-    "requireConfirmation", "redactPatterns", "egressAllowlist",
+    "allowedActions",
+    "deniedActions",
+    "allowedOrigins",
+    "deniedOrigins",
+    "requireConfirmation",
+    "redactPatterns",
+    "egressAllowlist",
 ];
 const POLICY_BOOL_KEYS: [&str; 2] = ["redact", "audit"];
 /// String-valued policy keys merged like bools: a later layer replaces the value.
@@ -1892,7 +2076,10 @@ fn normalize_url_targets(raw_url: &str) -> Vec<String> {
         Some(p) => format!("{}:{}", host_part, p),
         None => host_part,
     };
-    vec![format!("{}://{}", scheme, netloc), format!("*://{}", netloc)]
+    vec![
+        format!("{}://{}", scheme, netloc),
+        format!("*://{}", netloc),
+    ]
 }
 
 /// Ordered list of normalized policy targets derived from a request payload.
@@ -2005,7 +2192,11 @@ fn step_payloads(payload: Option<&Value>) -> Vec<(String, Value)> {
     let default_tab = obj.get("tabId").filter(|v| !v.is_null()).cloned();
     if let Some(Value::Array(steps)) = obj.get("steps") {
         for step in steps {
-            let s_action = step.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            let s_action = step
+                .get("action")
+                .and_then(|a| a.as_str())
+                .unwrap_or("")
+                .to_string();
             let mut s_payload = match step.get("payload") {
                 Some(Value::Object(m)) => Value::Object(m.clone()),
                 _ => json!({}),
@@ -2052,7 +2243,11 @@ fn workflow_step_payloads(payload: Option<&Value>) -> Vec<(String, Value)> {
     };
     let default_tab = obj.get("tabId").filter(|v| v.as_i64().is_some()).cloned();
     for step in steps {
-        let s_action = step.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+        let s_action = step
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string();
         if s_action.is_empty() {
             continue;
         }
@@ -2186,8 +2381,7 @@ fn resolve_site_mode(cp: &Value, targets: &[String]) -> Option<String> {
         let better = match best {
             None => true,
             Some((bp, _)) => {
-                pattern.len() > bp.len()
-                    || (pattern.len() == bp.len() && pattern.as_str() < bp)
+                pattern.len() > bp.len() || (pattern.len() == bp.len() && pattern.as_str() < bp)
             }
         };
         if better {
@@ -2251,18 +2445,45 @@ fn evaluate_policy(
     // Reserved host-internal actions are never client-invokable, including as a
     // batch step (runBatch would otherwise dispatch them). Deny centrally here.
     if reserved_action(action) {
-        return (false, Some(format!("action {} denied", action)), false, redact_enabled, audit_enabled, targets);
+        return (
+            false,
+            Some(format!("action {} denied", action)),
+            false,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
     if TARGET_REQUIRED_ACTIONS.contains(&action) && targets.is_empty() {
-        return (false, Some("target unresolved".to_string()), false, redact_enabled, audit_enabled, targets);
+        return (
+            false,
+            Some("target unresolved".to_string()),
+            false,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
-
 
     if action_matches(cp.get("deniedActions"), action) {
-        return (false, Some(format!("action {} denied", action)), false, redact_enabled, audit_enabled, targets);
+        return (
+            false,
+            Some(format!("action {} denied", action)),
+            false,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
     if !action_matches(cp.get("allowedActions"), action) {
-        return (false, Some(format!("action {} not allowed", action)), false, redact_enabled, audit_enabled, targets);
+        return (
+            false,
+            Some(format!("action {} not allowed", action)),
+            false,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
     // Data-loss-prevention channel gate. Placed after the action gates and before
     // anything that could forward, so a blocked channel is refused while the
@@ -2271,7 +2492,14 @@ fn evaluate_policy(
     // recursively below and produce "<batch|workflow> step N: dlp blocked".
     // Mirrors bridge.py::evaluate_policy.
     if resolve_dlp_mode(&cp, dlp_channel_for_action(action)) == Some("block") {
-        return (false, Some(DLP_BLOCKED_ERROR.to_string()), false, redact_enabled, audit_enabled, targets);
+        return (
+            false,
+            Some(DLP_BLOCKED_ERROR.to_string()),
+            false,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
     // Per-site permission mode. Applied to the confirmation requirement only,
     // and only after the action gates: every deny path below returns
@@ -2311,12 +2539,25 @@ fn evaluate_policy(
                 evaluate_policy(policy, name, &s_action, Some(&s_payload), origins);
             if !s_allowed {
                 let reason = s_reason.unwrap_or_default();
-                return (false, Some(format!("batch step {}: {}", i, reason)), false,
-                        redact_enabled, audit_enabled, s_targets);
+                return (
+                    false,
+                    Some(format!("batch step {}: {}", i, reason)),
+                    false,
+                    redact_enabled,
+                    audit_enabled,
+                    s_targets,
+                );
             }
             step_confirm = step_confirm || s_confirm;
         }
-        return (true, None, step_confirm, redact_enabled, audit_enabled, targets);
+        return (
+            true,
+            None,
+            step_confirm,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
 
     // replayWorkflow reproduces recorded mutating actions through the extension's
@@ -2336,22 +2577,48 @@ fn evaluate_policy(
                 evaluate_policy(policy, name, &s_action, Some(&s_payload), origins);
             if !s_allowed {
                 let reason = s_reason.unwrap_or_default();
-                return (false, Some(format!("workflow step {}: {}", i, reason)), false,
-                        redact_enabled, audit_enabled, s_targets);
+                return (
+                    false,
+                    Some(format!("workflow step {}: {}", i, reason)),
+                    false,
+                    redact_enabled,
+                    audit_enabled,
+                    s_targets,
+                );
             }
             if s_confirm {
-                return (false, Some(format!("workflow step {} requires confirmation", i)), false,
-                        redact_enabled, audit_enabled, s_targets);
+                return (
+                    false,
+                    Some(format!("workflow step {} requires confirmation", i)),
+                    false,
+                    redact_enabled,
+                    audit_enabled,
+                    s_targets,
+                );
             }
         }
         return (true, None, confirm, redact_enabled, audit_enabled, targets);
     }
 
     if !targets.is_empty() && target_matches(cp.get("deniedOrigins"), &targets) {
-        return (false, Some("target denied".to_string()), false, redact_enabled, audit_enabled, targets);
+        return (
+            false,
+            Some("target denied".to_string()),
+            false,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
     if !targets.is_empty() && !target_matches(cp.get("allowedOrigins"), &targets) {
-        return (false, Some("target not allowed".to_string()), false, redact_enabled, audit_enabled, targets);
+        return (
+            false,
+            Some("target not allowed".to_string()),
+            false,
+            redact_enabled,
+            audit_enabled,
+            targets,
+        );
     }
 
     // Egress allowlist (`egressAllowlist`): where the agent may make the browser
@@ -2366,9 +2633,19 @@ fn evaluate_policy(
         // Fail closed: an egress-bearing action whose destination the host cannot
         // resolve is denied rather than forwarded unchecked.
         if e_targets.is_empty() || !target_matches(egress_allow, &e_targets) {
-            let reported = if e_targets.is_empty() { targets } else { e_targets };
-            return (false, Some("egress not allowed".to_string()), false,
-                    redact_enabled, audit_enabled, reported);
+            let reported = if e_targets.is_empty() {
+                targets
+            } else {
+                e_targets
+            };
+            return (
+                false,
+                Some("egress not allowed".to_string()),
+                false,
+                redact_enabled,
+                audit_enabled,
+                reported,
+            );
         }
     }
     (true, None, confirm, redact_enabled, audit_enabled, targets)
@@ -2450,7 +2727,15 @@ fn plan_step_verdicts(policy: &Value, name: &str, plan: &[Value]) -> Vec<Value> 
 /// error string. The error string itself stays byte-stable for API and
 /// contract compatibility; this object tells a client exactly what to grant, in
 /// which list, and in which file. Mirrors bridge.py::policy_denial.
-fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, host_dir: &Path, policy: &Value, payload: Option<&Value>) -> Value {
+fn policy_denial(
+    reason: &str,
+    action: &str,
+    targets: &[String],
+    name: &str,
+    host_dir: &Path,
+    policy: &Value,
+    payload: Option<&Value>,
+) -> Value {
     let policy_file = policy_file_path(host_dir).to_string_lossy().to_string();
     let sample = targets.first().cloned();
     // Strip a "batch step N: <inner>" wrapper so a denied batch step yields the
@@ -2493,7 +2778,9 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
     // composite denial names the smuggled step's own action rather than "batch".
     let mut dlp_channel: Option<&'static str> = None;
     if reason == DLP_BLOCKED_ERROR {
-        if let Some((hit_action, channel)) = dlp_blocked_target(&policy_for_client(policy, name), &action, payload) {
+        if let Some((hit_action, channel)) =
+            dlp_blocked_target(&policy_for_client(policy, name), &action, payload)
+        {
             action = hit_action;
             dlp_channel = Some(channel);
         }
@@ -2510,96 +2797,162 @@ fn policy_denial(reason: &str, action: &str, targets: &[String], name: &str, hos
             .and_then(|l| l.get(list_key))
             .map(|v| v.is_array())
             .unwrap_or(false);
-        if has_client_list { format!("clients.{}", name) } else { "default".to_string() }
+        if has_client_list {
+            format!("clients.{}", name)
+        } else {
+            "default".to_string()
+        }
     };
-    let (kind, remediation, suggested): (&str, String, Value) =
-        if reason.starts_with("action ") && reason.ends_with("not allowed") {
-            let section = section_for("allowedActions");
-            ("action",
-             format!("Add '{}' to {}.allowedActions in {}", action, section, policy_file),
-             json!({"op": "add", "section": section, "list": "allowedActions", "value": action}))
-        } else if reason == "target not allowed" {
-            let section = section_for("allowedOrigins");
-            ("origin",
-             match &sample {
-                 Some(s) => format!("Add an origin pattern covering '{}' to {}.allowedOrigins in {}", s, section, policy_file),
-                 None => format!("Add the request origin to {}.allowedOrigins in {}", section, policy_file),
-             },
-             match &sample {
-                 Some(_) => json!({"op": "add", "section": section, "list": "allowedOrigins", "value": sample}),
-                 None => Value::Null,
-             })
-        } else if reason == "target denied" {
-            let section = section_for("deniedOrigins");
-            let cp = policy_for_client(policy, name);
-            let matched: Vec<String> = cp.get("deniedOrigins")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter()
+    let (kind, remediation, suggested): (&str, String, Value) = if reason.starts_with("action ")
+        && reason.ends_with("not allowed")
+    {
+        let section = section_for("allowedActions");
+        (
+            "action",
+            format!(
+                "Add '{}' to {}.allowedActions in {}",
+                action, section, policy_file
+            ),
+            json!({"op": "add", "section": section, "list": "allowedActions", "value": action}),
+        )
+    } else if reason == "target not allowed" {
+        let section = section_for("allowedOrigins");
+        (
+            "origin",
+            match &sample {
+                Some(s) => format!(
+                    "Add an origin pattern covering '{}' to {}.allowedOrigins in {}",
+                    s, section, policy_file
+                ),
+                None => format!(
+                    "Add the request origin to {}.allowedOrigins in {}",
+                    section, policy_file
+                ),
+            },
+            match &sample {
+                Some(_) => {
+                    json!({"op": "add", "section": section, "list": "allowedOrigins", "value": sample})
+                }
+                None => Value::Null,
+            },
+        )
+    } else if reason == "target denied" {
+        let section = section_for("deniedOrigins");
+        let cp = policy_for_client(policy, name);
+        let matched: Vec<String> = cp
+            .get("deniedOrigins")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
                     .filter_map(|p| p.as_str())
                     .filter(|p| target_matches(Some(&json!([p])), targets))
                     .map(|p| p.to_string())
-                    .collect())
-                .unwrap_or_default();
-            ("origin",
-             match &sample {
-                 Some(s) => format!("Remove or narrow the {}.deniedOrigins pattern(s) {:?} matching '{}' in {}", section, matched, s, policy_file),
-                 None => format!("Remove or narrow the matching {}.deniedOrigins pattern in {}", section, policy_file),
-             },
-             if matched.is_empty() { Value::Null }
-             else { json!({"op": "removePattern", "section": section, "list": "deniedOrigins", "value": sample, "patterns": matched}) })
-        } else if reason == "egress not allowed" {
-            let section = section_for("egressAllowlist");
-            ("egress",
-             match &sample {
-                 Some(s) => format!("Add a host pattern covering '{}' to {}.egressAllowlist in {}", s, section, policy_file),
-                 None => format!("Add the destination host to {}.egressAllowlist in {}", section, policy_file),
-             },
-             match &sample {
-                 Some(_) => json!({"op": "add", "section": section, "list": "egressAllowlist", "value": sample}),
-                 None => Value::Null,
-             })
-        } else if reason.starts_with("action ") && reason.ends_with("denied") {
-            let section = section_for("deniedActions");
-            let cp = policy_for_client(policy, name);
-            let matched: Vec<String> = cp.get("deniedActions")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter()
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            "origin",
+            match &sample {
+                Some(s) => format!(
+                    "Remove or narrow the {}.deniedOrigins pattern(s) {:?} matching '{}' in {}",
+                    section, matched, s, policy_file
+                ),
+                None => format!(
+                    "Remove or narrow the matching {}.deniedOrigins pattern in {}",
+                    section, policy_file
+                ),
+            },
+            if matched.is_empty() {
+                Value::Null
+            } else {
+                json!({"op": "removePattern", "section": section, "list": "deniedOrigins", "value": sample, "patterns": matched})
+            },
+        )
+    } else if reason == "egress not allowed" {
+        let section = section_for("egressAllowlist");
+        (
+            "egress",
+            match &sample {
+                Some(s) => format!(
+                    "Add a host pattern covering '{}' to {}.egressAllowlist in {}",
+                    s, section, policy_file
+                ),
+                None => format!(
+                    "Add the destination host to {}.egressAllowlist in {}",
+                    section, policy_file
+                ),
+            },
+            match &sample {
+                Some(_) => {
+                    json!({"op": "add", "section": section, "list": "egressAllowlist", "value": sample})
+                }
+                None => Value::Null,
+            },
+        )
+    } else if reason.starts_with("action ") && reason.ends_with("denied") {
+        let section = section_for("deniedActions");
+        let cp = policy_for_client(policy, name);
+        let matched: Vec<String> = cp
+            .get("deniedActions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
                     .filter_map(|p| p.as_str())
                     .filter(|p| action_matches(Some(&json!([p])), action))
                     .map(|p| p.to_string())
-                    .collect())
-                .unwrap_or_default();
-            ("action",
-             format!("Remove or narrow the {}.deniedActions pattern(s) {:?} matching '{}' in {}", section, matched, action, policy_file),
-             json!({"op": "removePattern", "section": section, "list": "deniedActions", "value": action, "patterns": matched}))
-        } else if reason == "target unresolved" || reason == "tab origin unresolved" {
-            ("target",
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            "action",
+            format!(
+                "Remove or narrow the {}.deniedActions pattern(s) {:?} matching '{}' in {}",
+                section, matched, action, policy_file
+            ),
+            json!({"op": "removePattern", "section": section, "list": "deniedActions", "value": action, "patterns": matched}),
+        )
+    } else if reason == "target unresolved" || reason == "tab origin unresolved" {
+        ("target",
              "The request carried no resolvable target origin; supply a valid url/domain/tabId so site policy can be evaluated".to_string(),
              Value::Null)
-        } else if reason == DLP_BLOCKED_ERROR {
-            // `dlp` is a MAP key, so section_for (which tests for a list) cannot
-            // resolve it. It is also merged per channel, so a client layer only
-            // governs the channel it names.
-            let client_owns = dlp_channel
-                .and_then(|channel| policy
+    } else if reason == DLP_BLOCKED_ERROR {
+        // `dlp` is a MAP key, so section_for (which tests for a list) cannot
+        // resolve it. It is also merged per channel, so a client layer only
+        // governs the channel it names.
+        let client_owns = dlp_channel
+            .and_then(|channel| {
+                policy
                     .get("clients")
                     .and_then(|c| c.get(name))
                     .and_then(|l| l.get("dlp"))
-                    .and_then(|d| d.get(channel)))
-                .is_some();
-            let section = if client_owns { format!("clients.{}", name) } else { "default".to_string() };
-            let channel_name = dlp_channel.unwrap_or("the requested");
-            ("dlp",
-             format!("Set {}.dlp.{} to 'audit' or 'allow' in {} to permit '{}'",
-                     section, channel_name, policy_file, action),
-             match dlp_channel {
-                 Some(channel) => json!({"op": "setChannelMode", "section": section, "map": "dlp",
-                                         "channel": channel, "value": "audit"}),
-                 None => Value::Null,
-             })
+                    .and_then(|d| d.get(channel))
+            })
+            .is_some();
+        let section = if client_owns {
+            format!("clients.{}", name)
         } else {
-            ("other", format!("Review default policy in {}", policy_file), Value::Null)
+            "default".to_string()
         };
+        let channel_name = dlp_channel.unwrap_or("the requested");
+        (
+            "dlp",
+            format!(
+                "Set {}.dlp.{} to 'audit' or 'allow' in {} to permit '{}'",
+                section, channel_name, policy_file, action
+            ),
+            match dlp_channel {
+                Some(channel) => json!({"op": "setChannelMode", "section": section, "map": "dlp",
+                                         "channel": channel, "value": "audit"}),
+                None => Value::Null,
+            },
+        )
+    } else {
+        (
+            "other",
+            format!("Review default policy in {}", policy_file),
+            Value::Null,
+        )
+    };
     json!({
         "kind": kind,
         "action": action,
@@ -2719,20 +3072,29 @@ fn load_secret_mask_path(
                 state.known.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
             }
         }
-        state.cache.insert(path.to_string(), (mtime, entries.clone()));
+        state
+            .cache
+            .insert(path.to_string(), (mtime, entries.clone()));
     }
     // Emit outside the lock: write_audit_event masks with the same state.
     if let Some(reason) = warn_once {
-        log_warn(logger, &format!("Could not load secretMaskFile {}: {}", path, reason));
-        write_audit_event(host_dir, logger, &json!({
-            "ts": now_ms() as u64,
-            "client": Value::Null,
-            "action": "secretMaskFile",
-            "targets": [path],
-            "decision": "secret_mask_unavailable",
-            "reason": reason,
-            "requestId": Value::Null,
-        }));
+        log_warn(
+            logger,
+            &format!("Could not load secretMaskFile {}: {}", path, reason),
+        );
+        write_audit_event(
+            host_dir,
+            logger,
+            &json!({
+                "ts": now_ms() as u64,
+                "client": Value::Null,
+                "action": "secretMaskFile",
+                "targets": [path],
+                "decision": "secret_mask_unavailable",
+                "reason": reason,
+                "requestId": Value::Null,
+            }),
+        );
     }
     entries
 }
@@ -2782,15 +3144,16 @@ fn mask_secrets_value(value: Value, secrets: &[(String, String)]) -> Value {
                 .map(|(k, v)| (k, mask_secrets_value(v, secrets)))
                 .collect(),
         ),
-        Value::Array(arr) => {
-            Value::Array(arr.into_iter().map(|v| mask_secrets_value(v, secrets)).collect())
-        }
+        Value::Array(arr) => Value::Array(
+            arr.into_iter()
+                .map(|v| mask_secrets_value(v, secrets))
+                .collect(),
+        ),
         other => other,
     }
 }
 
 static AUDIT_WRITE_LOCK: Mutex<()> = Mutex::new(());
-
 
 /// Append one JSON line to the audit log. Never writes payload/response bodies,
 /// and never any known secretMaskFile value (a denial reason can quote a
@@ -2812,10 +3175,16 @@ fn write_audit_event(host_dir: &Path, logger: &Arc<Logger>, event: &Value) {
             .append(true)
             .open(&path)
             .and_then(|mut f| writeln!(f, "{}", line)),
-        Err(e) => Err(io::Error::other(format!("audit write lock poisoned: {}", e))),
+        Err(e) => Err(io::Error::other(format!(
+            "audit write lock poisoned: {}",
+            e
+        ))),
     };
     if let Err(e) = result {
-        log_error(logger, &format!("Could not write audit event to {}: {}", path.display(), e));
+        log_error(
+            logger,
+            &format!("Could not write audit event to {}: {}", path.display(), e),
+        );
         return;
     }
     queue_audit_export(host_dir, logger, event);
@@ -2890,8 +3259,14 @@ const CEF_SEVERITY_INFO: u16 = 3;
 
 /// Fixed field order for syslog structured data, so a Rust line and a Python
 /// line for the same event are byte-identical.
-const AUDIT_EXPORT_FIELDS: [&str; 6] =
-    ["client", "action", "decision", "reason", "requestId", "targets"];
+const AUDIT_EXPORT_FIELDS: [&str; 6] = [
+    "client",
+    "action",
+    "decision",
+    "reason",
+    "requestId",
+    "targets",
+];
 
 /// Key for the base (built-in + `default`) export layer. Client names are
 /// parsed from `name:token` lines, so a NUL can never collide with a real one.
@@ -2943,7 +3318,10 @@ static AUDIT_EXPORT_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 
 /// Deny and blackout outcomes ride at the higher severity in both formats.
 fn audit_export_alerting(decision: Option<&Value>) -> bool {
-    let text = decision.and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let text = decision
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
     text.contains("deny") || text.contains("blackout") || text.contains("unavailable")
 }
 
@@ -2996,13 +3374,19 @@ fn syslog_timestamp(event: &Value) -> String {
 
 /// RFC 5424 6.3.3: only these three characters are escaped in PARAM-VALUE.
 fn syslog_escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"").replace(']', "\\]")
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(']', "\\]")
 }
 
 /// MSGID is PRINTUSASCII, capped so a long action cannot unbalance the line.
 fn syslog_msgid(event: &Value) -> String {
     let action = event.get("action").and_then(|v| v.as_str()).unwrap_or("");
-    let safe: String = action.chars().filter(|c| c.is_ascii_graphic()).take(32).collect();
+    let safe: String = action
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .take(32)
+        .collect();
     if safe.is_empty() {
         "-".to_string()
     } else {
@@ -3034,7 +3418,11 @@ fn format_audit_export_line(format: &str, event: &Value) -> Result<String, Strin
     let alerting = audit_export_alerting(event.get("decision"));
     if format == "syslog" {
         let pri = SYSLOG_FACILITY * 8
-            + if alerting { SYSLOG_SEVERITY_ALERT } else { SYSLOG_SEVERITY_INFO };
+            + if alerting {
+                SYSLOG_SEVERITY_ALERT
+            } else {
+                SYSLOG_SEVERITY_INFO
+            };
         let data = AUDIT_EXPORT_FIELDS
             .iter()
             .copied()
@@ -3063,7 +3451,11 @@ fn format_audit_export_line(format: &str, event: &Value) -> Result<String, Strin
             CEF_VERSION,
             cef_header_escape(&field("decision")),
             cef_header_escape(&field("action")),
-            if alerting { CEF_SEVERITY_ALERT } else { CEF_SEVERITY_INFO }
+            if alerting {
+                CEF_SEVERITY_ALERT
+            } else {
+                CEF_SEVERITY_INFO
+            }
         );
         let extension = format!(
             "rt={} suser={} act={} outcome={} externalId={} reason={} cs1Label=targets cs1={}",
@@ -3121,7 +3513,13 @@ fn normalize_audit_export(config: Option<&Value>) -> Result<Option<AuditExportCo
         _ => return Err("auditExport.retainDays must be a positive number".to_string()),
     };
     let key = format!("{}|{}", format, destination);
-    Ok(Some(AuditExportConfig { format, destination, rotate_bytes, retain_days, key }))
+    Ok(Some(AuditExportConfig {
+        format,
+        destination,
+        rotate_bytes,
+        retain_days,
+        key,
+    }))
 }
 
 /// Resolve the merged auditExport for the base layer and every named client at
@@ -3151,7 +3549,11 @@ fn prime_audit_export(policy: &Value, host_dir: &Path, logger: &Arc<Logger>) {
         state.layers = layers;
     }
     for (name, reason) in errors {
-        let label = if name == POLICY_BASE_LAYER { "default" } else { name.as_str() };
+        let label = if name == POLICY_BASE_LAYER {
+            "default"
+        } else {
+            name.as_str()
+        };
         let key = format!("config|{}", label);
         match AUDIT_EXPORT_STATE.lock() {
             Ok(mut guard) => {
@@ -3164,18 +3566,29 @@ fn prime_audit_export(policy: &Value, host_dir: &Path, logger: &Arc<Logger>) {
         }
         log_error(
             logger,
-            &format!("Disabling auditExport for policy layer {}: {}", label, reason),
+            &format!(
+                "Disabling auditExport for policy layer {}: {}",
+                label, reason
+            ),
         );
-        let client = if name == POLICY_BASE_LAYER { Value::Null } else { json!(label) };
-        write_audit_event(host_dir, logger, &json!({
-            "ts": now_ms() as u64,
-            "client": client,
-            "action": "auditExport",
-            "targets": [label],
-            "decision": "audit_export_unavailable",
-            "reason": reason,
-            "requestId": Value::Null,
-        }));
+        let client = if name == POLICY_BASE_LAYER {
+            Value::Null
+        } else {
+            json!(label)
+        };
+        write_audit_event(
+            host_dir,
+            logger,
+            &json!({
+                "ts": now_ms() as u64,
+                "client": client,
+                "action": "auditExport",
+                "targets": [label],
+                "decision": "audit_export_unavailable",
+                "reason": reason,
+                "requestId": Value::Null,
+            }),
+        );
     }
 }
 
@@ -3324,8 +3737,7 @@ fn queue_audit_export(host_dir: &Path, logger: &Arc<Logger>, event: Value) {
     if guard.is_none() {
         // One worker draining one FIFO channel: sink order equals local append
         // order.
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<QueuedAuditExport>(AUDIT_EXPORT_QUEUE_MAX);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<QueuedAuditExport>(AUDIT_EXPORT_QUEUE_MAX);
         let worker_logger = Arc::clone(logger);
         let worker_dir = host_dir.to_path_buf();
         std::thread::spawn(move || {
@@ -3403,15 +3815,19 @@ fn forward_audit_export(
     );
     // The sink is already marked dead, so this event's own forward is a no-op:
     // exactly one audit_export_unavailable per sink, never a recursion.
-    write_audit_event(host_dir, logger, &json!({
-        "ts": now_ms() as u64,
-        "client": event.get("client").cloned().unwrap_or(Value::Null),
-        "action": "auditExport",
-        "targets": [config.destination.clone()],
-        "decision": "audit_export_unavailable",
-        "reason": reason,
-        "requestId": Value::Null,
-    }));
+    write_audit_event(
+        host_dir,
+        logger,
+        &json!({
+            "ts": now_ms() as u64,
+            "client": event.get("client").cloned().unwrap_or(Value::Null),
+            "action": "auditExport",
+            "targets": [config.destination.clone()],
+            "decision": "audit_export_unavailable",
+            "reason": reason,
+            "requestId": Value::Null,
+        }),
+    );
 }
 
 // --- Session trace artifacts (policy `traceDir`) ---------------------------
@@ -3422,8 +3838,12 @@ fn forward_audit_export(
 // timeout). The artifact is metadata only -- decision, timing, tab ids, and
 // content hashes -- never a payload body, a response body, or a token.
 
-const TRACE_SESSION_ACTIONS: [&str; 4] =
-    ["createTaskSession", "navigateTaskSession", "navigateAndSnapshot", "closeTaskSession"];
+const TRACE_SESSION_ACTIONS: [&str; 4] = [
+    "createTaskSession",
+    "navigateTaskSession",
+    "navigateAndSnapshot",
+    "closeTaskSession",
+];
 /// Response keys whose array values are an observe snapshot (or its diff).
 const TRACE_SNAPSHOT_KEYS: [&str; 4] = ["nodes", "snapshot", "diff", "observe"];
 const TRACE_ID_MAX: usize = 80;
@@ -3482,7 +3902,11 @@ fn sanitize_trace_id(trace_id: &str) -> String {
 /// install directory, matching the policy and audit paths.
 fn trace_dir_for(policy: &Value, name: &str, host_dir: &Path) -> Option<PathBuf> {
     let cp = policy_for_client(policy, name);
-    let raw = cp.get("traceDir").and_then(|v| v.as_str())?.trim().to_string();
+    let raw = cp
+        .get("traceDir")
+        .and_then(|v| v.as_str())?
+        .trim()
+        .to_string();
     if raw.is_empty() {
         return None;
     }
@@ -3547,7 +3971,10 @@ fn trace_hash(value: &Value) -> String {
 }
 
 fn trace_snapshot_subobject(response: &Value) -> Option<Value> {
-    for source in [response.get("result"), Some(response)].into_iter().flatten() {
+    for source in [response.get("result"), Some(response)]
+        .into_iter()
+        .flatten()
+    {
         let mut sub = serde_json::Map::new();
         for key in TRACE_SNAPSHOT_KEYS {
             if let Some(v) = source.get(key) {
@@ -3576,10 +4003,16 @@ fn write_trace_event(dir: &Path, trace_id: &str, logger: &Arc<Logger>, event: &V
                 .open(&path)
                 .and_then(|mut f| writeln!(f, "{}", line))
         }),
-        Err(e) => Err(io::Error::other(format!("trace write lock poisoned: {}", e))),
+        Err(e) => Err(io::Error::other(format!(
+            "trace write lock poisoned: {}",
+            e
+        ))),
     };
     if let Err(e) = result {
-        log_error(logger, &format!("Could not write trace event to {}: {}", path.display(), e));
+        log_error(
+            logger,
+            &format!("Could not write trace event to {}: {}", path.display(), e),
+        );
     }
 }
 
@@ -3608,8 +4041,16 @@ fn trace_request(
     } else {
         None
     };
-    let otel = otel_finish_request(logger, client, action, payload, response, decision,
-                                   request_id, trace_id.as_deref());
+    let otel = otel_finish_request(
+        logger,
+        client,
+        action,
+        payload,
+        response,
+        decision,
+        request_id,
+        trace_id.as_deref(),
+    );
     let (dir, trace_id) = match (dir, trace_id) {
         (Some(d), Some(t)) => (d, t),
         _ => return,
@@ -3743,9 +4184,7 @@ fn parse_traceparent(value: Option<&str>) -> Option<(String, String)> {
     if !hex(parts[0], 2) || !hex(parts[1], 32) || !hex(parts[2], 16) || !hex(parts[3], 2) {
         return None;
     }
-    if parts[0] == "ff"
-        || parts[1].chars().all(|c| c == '0')
-        || parts[2].chars().all(|c| c == '0')
+    if parts[0] == "ff" || parts[1].chars().all(|c| c == '0') || parts[2].chars().all(|c| c == '0')
     {
         return None;
     }
@@ -3840,7 +4279,10 @@ fn otel_finish_request(
     let ctx = OTEL_REQUEST.with(|slot| slot.borrow_mut().take())?;
     let end_ns = otel_now_ns();
     let secrets = known_secret_masks();
-    let success = response.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = response
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let targets = trace_targets(action, payload, response);
     // OpenTelemetry GenAI tool-execution convention for the span name and the
     // gen_ai.* attributes; everything host-specific lives under bridge.*.
@@ -3849,7 +4291,11 @@ fn otel_finish_request(
     } else {
         format!("execute_tool {}", action)
     };
-    let status_code = if success { OTEL_STATUS_OK } else { OTEL_STATUS_ERROR };
+    let status_code = if success {
+        OTEL_STATUS_OK
+    } else {
+        OTEL_STATUS_ERROR
+    };
     let mut span = json!({
         "traceId": &ctx.trace_id,
         "spanId": &ctx.span_id,
@@ -3930,7 +4376,10 @@ fn otel_export(logger: &Arc<Logger>, spans: Vec<Value>) {
         };
         if let Err(e) = result {
             OTEL_EXPORT_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-            log_error(logger, &format!("OpenTelemetry export disabled after failure: {}", e));
+            log_error(
+                logger,
+                &format!("OpenTelemetry export disabled after failure: {}", e),
+            );
             return;
         }
     }
@@ -3955,8 +4404,13 @@ fn otel_enqueue(logger: &Arc<Logger>, encoded: String) {
                 if let Err(e) = otel_post(&document) {
                     if !logged {
                         logged = true;
-                        log_error(&worker_logger, &format!(
-                            "OpenTelemetry OTLP export failed (further failures silent): {}", e));
+                        log_error(
+                            &worker_logger,
+                            &format!(
+                                "OpenTelemetry OTLP export failed (further failures silent): {}",
+                                e
+                            ),
+                        );
                     }
                 }
             }
@@ -4001,7 +4455,10 @@ fn otel_post(encoded: &str) -> io::Result<()> {
     let head = format!(
         "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
-        path, host, port, encoded.len()
+        path,
+        host,
+        port,
+        encoded.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(encoded.as_bytes())?;
@@ -4013,8 +4470,9 @@ fn otel_post(encoded: &str) -> io::Result<()> {
     Ok(())
 }
 
-const REDACT_KEY_SUBSTRINGS: [&str; 7] =
-    ["token", "secret", "password", "cookie", "session", "csrf", "auth"];
+const REDACT_KEY_SUBSTRINGS: [&str; 7] = [
+    "token", "secret", "password", "cookie", "session", "csrf", "auth",
+];
 
 fn redact_storage_value(value: Value) -> Value {
     match value {
@@ -4100,9 +4558,11 @@ fn redact_content_value(value: Value, compiled: &[regex::Regex]) -> Value {
                 .map(|(k, v)| (k, redact_content_value(v, compiled)))
                 .collect(),
         ),
-        Value::Array(arr) => {
-            Value::Array(arr.into_iter().map(|v| redact_content_value(v, compiled)).collect())
-        }
+        Value::Array(arr) => Value::Array(
+            arr.into_iter()
+                .map(|v| redact_content_value(v, compiled))
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -4166,9 +4626,7 @@ fn redact_response_patterns(
                 redacted.push(redact_unknown_batch_item(item));
                 continue;
             };
-            let step_payload = steps
-                .get(i)
-                .and_then(|s| s.get("payload"));
+            let step_payload = steps.get(i).and_then(|s| s.get("payload"));
             let wrapped = redact_response_patterns(
                 step_action,
                 json!({ "result": item.clone() }),
@@ -4379,7 +4837,10 @@ fn handle_socket_client(
             Some(name) => name,
             None => {
                 log_warn(logger, "Rejected unauthenticated/invalid-token request.");
-                let _ = write_line(&mut stream, &json!({"success": false, "error": "unauthorized"}));
+                let _ = write_line(
+                    &mut stream,
+                    &json!({"success": false, "error": "unauthorized"}),
+                );
                 return;
             }
         };
@@ -4391,7 +4852,10 @@ fn handle_socket_client(
         let mut traceparent: Option<String> = None;
         let mut confirmation_token = if let Value::Object(map) = &mut cmd {
             map.remove("token");
-            dry_run = map.remove("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+            dry_run = map
+                .remove("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             traceparent = map
                 .remove("traceparent")
                 .and_then(|v| v.as_str().map(|s| s.to_string()));
@@ -4401,7 +4865,11 @@ fn handle_socket_client(
             None
         };
 
-        let mut action = cmd.get("action").and_then(|a| a.as_str()).unwrap_or("").to_string();
+        let mut action = cmd
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string();
         let mut payload = cmd.get("payload").cloned();
         // Start of the traced window: every exit below emits at most one trace
         // event, measured from here.
@@ -4415,14 +4883,39 @@ fn handle_socket_client(
         // bridge.py.
         if dry_run {
             if reserved_action(&action) {
-                log_warn(logger, &format!("Rejected reserved action from client: {}", action));
+                log_warn(
+                    logger,
+                    &format!("Rejected reserved action from client: {}", action),
+                );
                 let policy_value = current_policy(policy, host_dir, logger);
                 let cp = policy_for_client(&policy_value, &client_name);
                 let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some("unknown action"), None);
-                let resp = json!({"success": false, "error": format!("unknown action: {}", action)});
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                              &resp, "deny", Some("unknown action"), None, trace_started);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &[],
+                    "deny",
+                    Some("unknown action"),
+                    None,
+                );
+                let resp =
+                    json!({"success": false, "error": format!("unknown action: {}", action)});
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    payload.as_ref(),
+                    &resp,
+                    "deny",
+                    Some("unknown action"),
+                    None,
+                    trace_started,
+                );
                 let _ = write_line(&mut stream, &resp);
                 continue;
             }
@@ -4452,12 +4945,34 @@ fn handle_socket_client(
                 action.as_str(),
                 "lease" | "release" | "leaseStatus" | "policyCheck" | "policyInfo" | "confirm"
             );
-            let would_forward = verdict.get("allowed").and_then(|v| v.as_bool()).unwrap_or(false)
-                && !verdict.get("confirmationRequired").and_then(|v| v.as_bool()).unwrap_or(false)
+            let would_forward = verdict
+                .get("allowed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && !verdict
+                    .get("confirmationRequired")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
                 && !host_side;
-            let audit_enabled = verdict.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-            let reason = verdict.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string());
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "dry_run", reason.as_deref(), None);
+            let audit_enabled = verdict
+                .get("audit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let reason = verdict
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &targets,
+                "dry_run",
+                reason.as_deref(),
+                None,
+            );
             let resp = json!({
                 "success": true,
                 "dryRun": true,
@@ -4466,8 +4981,19 @@ fn handle_socket_client(
                 "targets": targets,
                 "verdict": verdict,
             });
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &resp, "dry_run", reason.as_deref(), None, trace_started);
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &resp,
+                "dry_run",
+                reason.as_deref(),
+                None,
+                trace_started,
+            );
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
@@ -4494,20 +5020,50 @@ fn handle_socket_client(
                     let policy_value = current_policy(policy, host_dir, logger);
                     let cp = policy_for_client(&policy_value, &requester_name);
                     let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-                    audit(host_dir, logger, audit_enabled, &requester_name, "confirm", &[], "confirmation_resume", None, None);
+                    audit(
+                        host_dir,
+                        logger,
+                        audit_enabled,
+                        &requester_name,
+                        "confirm",
+                        &[],
+                        "confirmation_resume",
+                        None,
+                        None,
+                    );
                 }
                 None => {
                     let policy_value = current_policy(policy, host_dir, logger);
                     let cp = policy_for_client(&policy_value, &client_name);
                     let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-                    audit(host_dir, logger, audit_enabled, &client_name, "confirm", &[], "confirmation_deny", Some("invalid or expired confirmation token"), None);
+                    audit(
+                        host_dir,
+                        logger,
+                        audit_enabled,
+                        &client_name,
+                        "confirm",
+                        &[],
+                        "confirmation_deny",
+                        Some("invalid or expired confirmation token"),
+                        None,
+                    );
                     let resp = json!({
                         "success": false,
                         "error": "invalid or expired confirmation token"
                     });
-                    trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                                  &resp, "confirmation_deny", Some("invalid or expired confirmation token"),
-                                  None, trace_started);
+                    trace_request(
+                        host_dir,
+                        logger,
+                        &policy_value,
+                        &client_name,
+                        &action,
+                        payload.as_ref(),
+                        &resp,
+                        "confirmation_deny",
+                        Some("invalid or expired confirmation token"),
+                        None,
+                        trace_started,
+                    );
                     let _ = write_line(&mut stream, &resp);
                     continue;
                 }
@@ -4518,14 +5074,38 @@ fn handle_socket_client(
         // from socket clients; reject as unknown so the internal surface cannot
         // be driven or probed externally.
         if reserved_action(&action) {
-            log_warn(logger, &format!("Rejected reserved action from client: {}", action));
+            log_warn(
+                logger,
+                &format!("Rejected reserved action from client: {}", action),
+            );
             let policy_value = current_policy(policy, host_dir, logger);
             let cp = policy_for_client(&policy_value, &client_name);
             let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some("unknown action"), None);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &[],
+                "deny",
+                Some("unknown action"),
+                None,
+            );
             let resp = json!({"success": false, "error": format!("unknown action: {}", action)});
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &resp, "deny", Some("unknown action"), None, trace_started);
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &resp,
+                "deny",
+                Some("unknown action"),
+                None,
+                trace_started,
+            );
             let _ = write_line(&mut stream, &resp);
             continue;
         }
@@ -4535,12 +5115,36 @@ fn handle_socket_client(
             let policy_value = current_policy(policy, host_dir, logger);
             let cp = policy_for_client(&policy_value, &client_name);
             let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-            let success = resp.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let success = resp
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let decision = if success { "lease_allow" } else { "lease_deny" };
             let reason = resp.get("error").and_then(|v| v.as_str());
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], decision, reason, None);
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &resp, decision, reason, None, trace_started);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &[],
+                decision,
+                reason,
+                None,
+            );
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &resp,
+                decision,
+                reason,
+                None,
+                trace_started,
+            );
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
@@ -4562,18 +5166,60 @@ fn handle_socket_client(
                 let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
                 if plan.len() > PLAN_PREVIEW_MAX_STEPS {
                     let reason = format!("plan exceeds {} steps", PLAN_PREVIEW_MAX_STEPS);
-                    audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &[], "deny", Some(&reason), None);
+                    audit(
+                        host_dir,
+                        logger,
+                        audit_enabled,
+                        &client_name,
+                        "policyCheck",
+                        &[],
+                        "deny",
+                        Some(&reason),
+                        None,
+                    );
                     let resp = json!({"success": false, "error": reason});
-                    trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
-                                  &resp, "deny", Some(&reason), None, trace_started);
+                    trace_request(
+                        host_dir,
+                        logger,
+                        &policy_value,
+                        &client_name,
+                        &action,
+                        Some(&pc),
+                        &resp,
+                        "deny",
+                        Some(&reason),
+                        None,
+                        trace_started,
+                    );
                     let _ = write_line(&mut stream, &resp);
                     continue;
                 }
                 let steps = plan_step_verdicts(&policy_value, &client_name, plan);
-                audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &[], "allow", None, None);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    "policyCheck",
+                    &[],
+                    "allow",
+                    None,
+                    None,
+                );
                 let resp = json!({"success": true, "result": {"plan": steps}});
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
-                              &resp, "allow", None, None, trace_started);
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    Some(&pc),
+                    &resp,
+                    "allow",
+                    None,
+                    None,
+                    trace_started,
+                );
                 if write_line(&mut stream, &resp).is_err() {
                     return;
                 }
@@ -4582,8 +5228,14 @@ fn handle_socket_client(
             let target_action = pc.get("action").and_then(|a| a.as_str()).unwrap_or("");
             let target_payload = pc.get("payload");
             let no_origins = std::collections::BTreeMap::new();
-            let (allowed, reason, confirm, redact_enabled, audit_enabled, targets) = evaluate_policy(
-                &policy_value, &client_name, target_action, target_payload, &no_origins);
+            let (allowed, reason, confirm, redact_enabled, audit_enabled, targets) =
+                evaluate_policy(
+                    &policy_value,
+                    &client_name,
+                    target_action,
+                    target_payload,
+                    &no_origins,
+                );
             // Without forwarding, the host cannot see the live tab origin, so for
             // an origin-constrained policy a tab-scoped action's verdict is
             // provisional: report originDependent so callers don't trust an
@@ -4604,9 +5256,30 @@ fn handle_socket_client(
                     &policy_for_client(&policy_value, &client_name),
                     dlp_channel_for_action(target_action)),
             }});
-            audit(host_dir, logger, audit_enabled, &client_name, "policyCheck", &targets, "allow", None, None);
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, Some(&pc),
-                          &resp, "allow", None, None, trace_started);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                "policyCheck",
+                &targets,
+                "allow",
+                None,
+                None,
+            );
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                Some(&pc),
+                &resp,
+                "allow",
+                None,
+                None,
+                trace_started,
+            );
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
@@ -4634,9 +5307,30 @@ fn handle_socket_client(
                 "traceDir": trace_dir,
                 "client": client_name,
             }});
-            audit(host_dir, logger, audit_enabled, &client_name, "policyInfo", &[], "allow", None, None);
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &resp, "allow", None, None, trace_started);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                "policyInfo",
+                &[],
+                "allow",
+                None,
+                None,
+            );
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &resp,
+                "allow",
+                None,
+                None,
+                trace_started,
+            );
             if write_line(&mut stream, &resp).is_err() {
                 return;
             }
@@ -4649,14 +5343,35 @@ fn handle_socket_client(
         if handoff_blackout(handoffs, &action, payload.as_ref()) {
             let cp = policy_for_client(&policy_value, &client_name);
             let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "handoff_blackout", Some(HANDOFF_BLACKOUT_ERROR), None);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &[],
+                "handoff_blackout",
+                Some(HANDOFF_BLACKOUT_ERROR),
+                None,
+            );
             let resp = json!({
                 "success": false,
                 "error": HANDOFF_BLACKOUT_ERROR,
                 "blackout": true
             });
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &resp, "handoff_blackout", Some(HANDOFF_BLACKOUT_ERROR), None, trace_started);
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &resp,
+                "handoff_blackout",
+                Some(HANDOFF_BLACKOUT_ERROR),
+                None,
+                trace_started,
+            );
             let _ = write_line(&mut stream, &resp);
             continue;
         }
@@ -4668,14 +5383,35 @@ fn handle_socket_client(
         if let Some(reason) = composite_handoff_reason(&action, payload.as_ref()) {
             let cp = policy_for_client(&policy_value, &client_name);
             let audit_enabled = cp.get("audit").and_then(|v| v.as_bool()).unwrap_or(true);
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &[], "deny", Some(&reason), None);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &[],
+                "deny",
+                Some(&reason),
+                None,
+            );
             let resp = json!({
                 "success": false,
                 "error": format!("policy denied: {}", reason),
                 "policyDenial": policy_denial(&reason, &action, &[], &client_name, host_dir, &policy_value, payload.as_ref()),
             });
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &resp, "deny", Some(&reason), None, trace_started);
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &resp,
+                "deny",
+                Some(&reason),
+                None,
+                trace_started,
+            );
             let _ = write_line(&mut stream, &resp);
             continue;
         }
@@ -4686,15 +5422,41 @@ fn handle_socket_client(
         // round-trip. These run before the lease gate, preserving prior
         // precedence (policy denial wins over a lease for payload targets).
         let otel_policy_started = otel_child_start();
-        let (allowed, _reason, _confirm, redact_enabled, audit_enabled, targets) =
-            evaluate_policy(&policy_value, &client_name, &action, payload.as_ref(), &empty_origins);
+        let (allowed, _reason, _confirm, redact_enabled, audit_enabled, targets) = evaluate_policy(
+            &policy_value,
+            &client_name,
+            &action,
+            payload.as_ref(),
+            &empty_origins,
+        );
         otel_child_end("bridge.policy_evaluate", otel_policy_started);
         if !allowed {
             let reason = _reason.unwrap_or_default();
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &targets,
+                "deny",
+                Some(&reason),
+                None,
+            );
             let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value, payload.as_ref())});
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &resp, "deny", Some(&reason), None, trace_started);
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &resp,
+                "deny",
+                Some(&reason),
+                None,
+                trace_started,
+            );
             let _ = write_line(&mut stream, &resp);
             continue;
         }
@@ -4721,9 +5483,30 @@ fn handle_socket_client(
         let (confirm, targets) = if !needed.is_empty() {
             if let Some(blocked) = lease_gate(&client_name, lease) {
                 let reason = blocked.get("error").and_then(|v| v.as_str());
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "lease_deny", reason, None);
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                              &blocked, "lease_deny", reason, None, trace_started);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &targets,
+                    "lease_deny",
+                    reason,
+                    None,
+                );
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    payload.as_ref(),
+                    &blocked,
+                    "lease_deny",
+                    reason,
+                    None,
+                    trace_started,
+                );
                 if write_line(&mut stream, &blocked).is_err() {
                     return;
                 }
@@ -4733,24 +5516,74 @@ fn handle_socket_client(
             // Fail closed when any needed tab resolves to no usable origin
             // target (lookup failure, no such tab, opaque origin): under an
             // origin-constraining policy such a request must not proceed.
-            if needed.iter().any(|k| origin_targets(origins.get(k).and_then(|o| o.as_deref())).is_empty()) {
+            if needed
+                .iter()
+                .any(|k| origin_targets(origins.get(k).and_then(|o| o.as_deref())).is_empty())
+            {
                 let mut t = targets.clone();
                 t.push("<unresolved-origin>".to_string());
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &t, "deny", Some("tab origin unresolved"), None);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &t,
+                    "deny",
+                    Some("tab origin unresolved"),
+                    None,
+                );
                 let resp = json!({"success": false, "error": "policy denied: tab origin unresolved", "policyDenial": policy_denial("tab origin unresolved", &action, &t, &client_name, host_dir, &policy_value, payload.as_ref())});
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                              &resp, "deny", Some("tab origin unresolved"), None, trace_started);
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    payload.as_ref(),
+                    &resp,
+                    "deny",
+                    Some("tab origin unresolved"),
+                    None,
+                    trace_started,
+                );
                 let _ = write_line(&mut stream, &resp);
                 continue;
             }
-            let (allowed, reason, confirm, _, _, targets) =
-                evaluate_policy(&policy_value, &client_name, &action, payload.as_ref(), &origins);
+            let (allowed, reason, confirm, _, _, targets) = evaluate_policy(
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &origins,
+            );
             if !allowed {
                 let reason = reason.unwrap_or_default();
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "deny", Some(&reason), None);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &targets,
+                    "deny",
+                    Some(&reason),
+                    None,
+                );
                 let resp = json!({"success": false, "error": format!("policy denied: {}", reason), "policyDenial": policy_denial(&reason, &action, &targets, &client_name, host_dir, &policy_value, payload.as_ref())});
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                              &resp, "deny", Some(&reason), None, trace_started);
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    payload.as_ref(),
+                    &resp,
+                    "deny",
+                    Some(&reason),
+                    None,
+                    trace_started,
+                );
                 let _ = write_line(&mut stream, &resp);
                 continue;
             }
@@ -4767,8 +5600,17 @@ fn handle_socket_client(
             if action_matches(cp.get("requireConfirmation"), &action)
                 && resolve_site_mode(&cp, &targets).as_deref() == Some("skip")
             {
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets,
-                      "confirmation_waived", Some("siteMode skip"), None);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &targets,
+                    "confirmation_waived",
+                    Some("siteMode skip"),
+                    None,
+                );
             }
         }
 
@@ -4782,7 +5624,17 @@ fn handle_socket_client(
                 &confirm_payload,
                 &targets,
             ) {
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "confirmation_accepted", None, None);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &targets,
+                    "confirmation_accepted",
+                    None,
+                    None,
+                );
             } else {
                 let (token, expires_at) = issue_confirmation(
                     confirmations,
@@ -4791,7 +5643,17 @@ fn handle_socket_client(
                     &confirm_payload,
                     &targets,
                 );
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "confirmation_required", None, None);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &targets,
+                    "confirmation_required",
+                    None,
+                    None,
+                );
                 let resp = json!({
                     "success": false,
                     "error": "confirmation required",
@@ -4802,8 +5664,19 @@ fn handle_socket_client(
                     "expiresAt": expires_at,
                     "resumeCommand": format!("chrome-bridge confirm {}", token)
                 });
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                              &resp, "confirmation_required", None, None, trace_started);
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    payload.as_ref(),
+                    &resp,
+                    "confirmation_required",
+                    None,
+                    None,
+                    trace_started,
+                );
                 let _ = write_line(&mut stream, &resp);
                 continue;
             }
@@ -4812,9 +5685,30 @@ fn handle_socket_client(
         // A live lease held by another client blocks every other action.
         if let Some(blocked) = lease_gate(&client_name, lease) {
             let reason = blocked.get("error").and_then(|v| v.as_str());
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "lease_deny", reason, None);
-            trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                          &blocked, "lease_deny", reason, None, trace_started);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &targets,
+                "lease_deny",
+                reason,
+                None,
+            );
+            trace_request(
+                host_dir,
+                logger,
+                &policy_value,
+                &client_name,
+                &action,
+                payload.as_ref(),
+                &blocked,
+                "lease_deny",
+                reason,
+                None,
+                trace_started,
+            );
             if write_line(&mut stream, &blocked).is_err() {
                 return;
             }
@@ -4824,11 +5718,7 @@ fn handle_socket_client(
         // Audit "allow" with the generated id before the action is forwarded.
         let client_policy = policy_for_client(&policy_value, &client_name);
         let redact_patterns = client_policy.get("redactPatterns").cloned();
-        let secrets = load_secret_masks(
-            client_policy.get("secretMaskFile"),
-            host_dir,
-            logger,
-        );
+        let secrets = load_secret_masks(client_policy.get("secretMaskFile"), host_dir, logger);
 
         // DLP: record the permitted channels and stamp the enforcing modes on the
         // envelope. Runs once, here, after every gate and before the forward, so a
@@ -4838,8 +5728,17 @@ fn handle_socket_client(
         if !dlp_audited.is_empty() {
             // Channel names only: never a file name, a path, or frame data.
             let dlp_channels = dlp_audited.join(",");
-            audit(host_dir, logger, audit_enabled, &client_name, &action, &targets,
-                  DLP_AUDIT_DECISION, Some(dlp_channels.as_str()), None);
+            audit(
+                host_dir,
+                logger,
+                audit_enabled,
+                &client_name,
+                &action,
+                &targets,
+                DLP_AUDIT_DECISION,
+                Some(dlp_channels.as_str()),
+                None,
+            );
         }
         // The extension refuses a blocked channel independently (see background.js
         // dlpRefusal), so the host always overwrites this field: a client cannot
@@ -4879,16 +5778,54 @@ fn handle_socket_client(
         };
         match response {
             Some(response) => {
-                let success = response.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                let ext_decision = if success { "extension_success" } else { "extension_error" };
+                let success = response
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let ext_decision = if success {
+                    "extension_success"
+                } else {
+                    "extension_error"
+                };
                 let reason = response.get("error").and_then(|v| v.as_str());
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, ext_decision, reason, Some(&req_id));
-                let response = redact_response(&action, response, redact_enabled, redact_patterns.as_ref(), payload.as_ref(), &secrets);
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &targets,
+                    ext_decision,
+                    reason,
+                    Some(&req_id),
+                );
+                let response = redact_response(
+                    &action,
+                    response,
+                    redact_enabled,
+                    redact_patterns.as_ref(),
+                    payload.as_ref(),
+                    &secrets,
+                );
                 // Trace the response the client actually receives: already
                 // redacted and secret-masked, so the hash covers no raw content.
-                let reason = response.get("error").and_then(|v| v.as_str()).map(|s| s.to_string());
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                              &response, ext_decision, reason.as_deref(), Some(&req_id), trace_started);
+                let reason = response
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    payload.as_ref(),
+                    &response,
+                    ext_decision,
+                    reason.as_deref(),
+                    Some(&req_id),
+                    trace_started,
+                );
                 if write_line(&mut stream, &response).is_err() {
                     return;
                 }
@@ -4898,10 +5835,31 @@ fn handle_socket_client(
                     logger,
                     &format!("Timed out waiting for extension response to {}.", req_id),
                 );
-                audit(host_dir, logger, audit_enabled, &client_name, &action, &targets, "extension_error", Some("extension response timeout"), Some(&req_id));
+                audit(
+                    host_dir,
+                    logger,
+                    audit_enabled,
+                    &client_name,
+                    &action,
+                    &targets,
+                    "extension_error",
+                    Some("extension response timeout"),
+                    Some(&req_id),
+                );
                 let resp = json!({"success": false, "error": "extension response timeout"});
-                trace_request(host_dir, logger, &policy_value, &client_name, &action, payload.as_ref(),
-                              &resp, "extension_error", Some("extension response timeout"), Some(&req_id), trace_started);
+                trace_request(
+                    host_dir,
+                    logger,
+                    &policy_value,
+                    &client_name,
+                    &action,
+                    payload.as_ref(),
+                    &resp,
+                    "extension_error",
+                    Some("extension response timeout"),
+                    Some(&req_id),
+                    trace_started,
+                );
                 let _ = write_line(&mut stream, &resp);
                 return;
             }
@@ -4974,7 +5932,18 @@ fn socket_server_loop(
                 let stdout = Arc::clone(&stdout);
                 let logger = Arc::clone(&logger);
                 std::thread::spawn(move || {
-                    handle_socket_client(stream, &host_dir, &tokens, &pending, &lease, &confirmations, &handoffs, &policy, &stdout, &logger);
+                    handle_socket_client(
+                        stream,
+                        &host_dir,
+                        &tokens,
+                        &pending,
+                        &lease,
+                        &confirmations,
+                        &handoffs,
+                        &policy,
+                        &stdout,
+                        &logger,
+                    );
                 });
             }
             Err(e) => {
@@ -4986,12 +5955,10 @@ fn socket_server_loop(
 
 fn main() {
     let host_dir = host_dir();
-    let logger = Arc::new(
-        Logger::new(&log_path(&host_dir)).unwrap_or_else(|e| {
-            eprintln!("could not open log file: {}", e);
-            std::process::exit(1);
-        }),
-    );
+    let logger = Arc::new(Logger::new(&log_path(&host_dir)).unwrap_or_else(|e| {
+        eprintln!("could not open log file: {}", e);
+        std::process::exit(1);
+    }));
 
     log_info(&logger, "Native Messaging Host started.");
 
@@ -5017,7 +5984,17 @@ fn main() {
         let stdout = Arc::clone(&stdout);
         let logger = Arc::clone(&logger);
         std::thread::spawn(move || {
-            socket_server_loop(host_dir, tokens, pending, lease, confirmations, handoffs, policy, stdout, logger);
+            socket_server_loop(
+                host_dir,
+                tokens,
+                pending,
+                lease,
+                confirmations,
+                handoffs,
+                policy,
+                stdout,
+                logger,
+            );
         });
     }
 
@@ -5059,7 +6036,10 @@ fn main() {
             }
         };
 
-        let msg_id = msg.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let msg_id = msg
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         match msg_id {
             Some(id) => {
