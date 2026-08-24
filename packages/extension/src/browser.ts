@@ -470,9 +470,9 @@ export class StandardBrowserRuntime {
           matched: true,
         };
       }
-      const delay = Promise.withResolvers<void>();
-      setTimeout(delay.resolve, 100);
-      await delay.promise;
+      await new Promise<void>((resolve) => {
+        setTimeout(() => resolve(), 100);
+      });
     } while (Date.now() < deadline);
     throw Object.assign(new Error(`Timed out waiting for ${String(condition.kind)}`), {
       code: "wait_timeout",
