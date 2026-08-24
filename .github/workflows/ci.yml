@@ -118,9 +118,15 @@ jobs:
       - name: Verify adapters and transactional installer
         run: |
           bun run workspace:typecheck
-          bun run workspace:test
+          bun run --cwd packages/sdk-typescript test
+          bun run --cwd packages/mcp test
+          bun run --cwd packages/omp test
+          bun run --cwd packages/installer test
           bun run workspace:build
           python -m unittest discover -s packages/sdk-python/tests -v
+      - name: Verify browser extension on Unix
+        if: ${{ runner.os != 'Windows' }}
+        run: bun run --cwd packages/extension test
 
   ipc-linux:
     runs-on: ubuntu-latest
