@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_ROOT = ROOT / "schemas"
 RPC_ROOT = SCHEMA_ROOT / "rpc" / "v1"
 
+NATIVE_ROOT = SCHEMA_ROOT / "native" / "v1"
 
 def load_schemas() -> tuple[dict[Path, dict], Registry]:
     schemas: dict[Path, dict] = {}
@@ -208,10 +209,33 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
     return len(requests) + 8
 
 
+def verify_native_messages(schemas: dict[Path, dict], registry: Registry) -> int:
+    native_validator = validator(NATIVE_ROOT / "message.schema.json", schemas, registry)
+    close_task = {
+        "protocol": "agenttab.native",
+        "version": 1,
+        "kind": "close_task",
+        "request_id": "018f47a0-7b10-7abc-8def-0123456789ab",
+        "task_id": "018f47a0-7b10-7abc-8def-0123456789ac",
+    }
+    native_validator.validate(close_task)
+    expect_invalid(
+        native_validator,
+        dict(close_task, connection_id="018f47a0-7b10-7abc-8def-0123456789ad"),
+        "close_task unknown field",
+    )
+    missing_task = dict(close_task)
+    missing_task.pop("task_id")
+    expect_invalid(native_validator, missing_task, "close_task task binding")
+    return 3
+
+
 def main() -> int:
     try:
         schemas, registry = load_schemas()
-        messages = verify_core_messages(schemas, registry)
+        messages = verify_core_messages(schemas, registry) + verify_native_messages(
+            schemas, registry
+        )
     except (AssertionError, OSError, ValueError, ValidationError) as error:
         print(f"FAIL {error}", file=sys.stderr)
         return 1

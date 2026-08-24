@@ -7,7 +7,7 @@ import {
   completed,
   failed,
   needsUser,
-  type NativeCommand,
+  type NativeDispatchCommand,
   type NativeOriginPolicy,
   type NativeResponse,
   type Outcome,
@@ -146,7 +146,23 @@ function errorOutcome(error: unknown, mutating: boolean, code: string): Outcome 
   return mutating && !PRE_DISPATCH_ERRORS[code] ? "unknown" : "not_started";
 }
 
-async function dispatch(command: NativeCommand): Promise<NativeResponse> {
+async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse> {
+  if (command.kind === "close_task") {
+    try {
+      const closedTabIds = await ownership.closeTask(command.task_id);
+      return completed(command.request_id, {
+        task_id: command.task_id,
+        closed_tab_ids: closedTabIds,
+      });
+    } catch (error) {
+      return failed(
+        command.request_id,
+        errorCode(error),
+        error instanceof Error ? error.message : String(error),
+        "unknown",
+      );
+    }
+  }
   const params = command.params;
   const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer";
   try {
@@ -178,7 +194,7 @@ async function dispatch(command: NativeCommand): Promise<NativeResponse> {
     }
     if (command.method === "browser_handoff") {
       if (!scheduler.isAccepting() || (await readState()).paused) {
-        throw new NotStartedError("paused", "AgentTab is paused");
+        throw scheduler.notStarted("AgentTab is paused");
       }
       return needsUser(
         command.request_id,
@@ -230,12 +246,12 @@ async function dispatch(command: NativeCommand): Promise<NativeResponse> {
         }
         const revalidate = async () => {
           if (!scheduler.isAccepting()) {
-            throw new NotStartedError("paused", "AgentTab stopped the active browser wait");
+            throw scheduler.notStarted("AgentTab stopped the active browser wait");
           }
           await ownership.assertOwned(command.task_id, targetTabId);
           await assertCurrentOrigin(targetTabId, command.origin_policy);
           if (!scheduler.isAccepting()) {
-            throw new NotStartedError("paused", "AgentTab stopped the active browser wait");
+            throw scheduler.notStarted("AgentTab stopped the active browser wait");
           }
         };
         return browser.wait(targetTabId, params, revalidate);
@@ -285,6 +301,7 @@ function start(): Promise<void> {
   startup = (async () => {
     const state = await readState();
     scheduler.setInitialPaused(state.paused || state.handoff.active);
+    if (!(await automationEnabled())) scheduler.revokePermissions();
     await ownership.reconcile();
     await browser.expireCommits();
     await handoff.restore();
@@ -322,12 +339,21 @@ chrome.tabGroups.onRemoved.addListener(() => void start().then(() => ownership.r
 chrome.runtime.onStartup.addListener(() => void start());
 chrome.runtime.onInstalled.addListener(() => void start());
 chrome.permissions.onRemoved.addListener((permissions) => {
-  if (permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
-    void start().then(async () => {
-      await browser.scrubForHandoff();
-      automationRevocationGeneration += 1;
-    });
+  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
+    return;
   }
+  scheduler.revokePermissions();
+  automationRevocationGeneration += 1;
+  void start().then(() => browser.scrubForHandoff());
+});
+
+chrome.permissions.onAdded.addListener((permissions) => {
+  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
+    return;
+  }
+  void automationEnabled().then((enabled) => {
+    if (enabled) scheduler.restorePermissions();
+  });
 });
 chrome.alarms.onAlarm.addListener((alarm: { name: string }) => {
   void start().then(async () => {

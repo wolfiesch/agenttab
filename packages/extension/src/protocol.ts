@@ -70,6 +70,16 @@ export interface NativeCommand {
   origin_policy?: NativeOriginPolicy;
 }
 
+export interface NativeCloseTask {
+  protocol: typeof NATIVE_PROTOCOL;
+  version: typeof PROTOCOL_VERSION;
+  kind: "close_task";
+  request_id: string;
+  task_id: string;
+}
+
+export type NativeDispatchCommand = NativeCommand | NativeCloseTask;
+
 export interface NativeEventAck {
   protocol: typeof NATIVE_PROTOCOL;
   version: typeof PROTOCOL_VERSION;
@@ -86,7 +96,7 @@ export interface NativeReady {
   state: "ready" | "paused";
 }
 
-export type NativeInboundMessage = NativeCommand | NativeReady | NativeEventAck;
+export type NativeInboundMessage = NativeDispatchCommand | NativeReady | NativeEventAck;
 export interface RpcError {
   code: string;
   message: string;
@@ -434,11 +444,28 @@ export function parseCommand(value: unknown): NativeCommand {
   };
 }
 
+function parseCloseTask(value: unknown): NativeCloseTask {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["protocol", "version", "kind", "request_id", "task_id"])) {
+    commandError("native close_task contains missing or unknown fields");
+  }
+  if (value.protocol !== NATIVE_PROTOCOL || value.version !== PROTOCOL_VERSION || value.kind !== "close_task") {
+    commandError("native close_task protocol or version mismatch");
+  }
+  return {
+    protocol: NATIVE_PROTOCOL,
+    version: PROTOCOL_VERSION,
+    kind: "close_task",
+    request_id: assertUuid(value.request_id, "request_id"),
+    task_id: assertUuid(value.task_id, "task_id"),
+  };
+}
+
 export function parseInboundNativeMessage(value: unknown): NativeInboundMessage {
   if (!isRecord(value) || value.protocol !== NATIVE_PROTOCOL || value.version !== PROTOCOL_VERSION || typeof value.kind !== "string") {
     throw new Error("native message protocol or version mismatch");
   }
   if (value.kind === "command") return parseCommand(value);
+  if (value.kind === "close_task") return parseCloseTask(value);
   if (value.kind === "event_ack") {
     if (
       !hasOnlyKeys(value, ["protocol", "version", "kind", "event", "event_id"]) ||

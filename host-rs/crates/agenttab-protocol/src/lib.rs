@@ -1444,16 +1444,6 @@ pub fn native_command(
     }
     command
 }
-pub fn native_event_ack(event: NativeEventName, event_id: &str) -> Value {
-    serde_json::json!({
-        "protocol": NATIVE_PROTOCOL,
-        "version": PROTOCOL_VERSION,
-        "kind": "event_ack",
-        "event": event,
-        "event_id": event_id,
-    })
-}
-
 pub fn native_close_task(request_id: Uuid, task_id: Uuid) -> Value {
     serde_json::json!({
         "protocol": NATIVE_PROTOCOL,
@@ -1461,6 +1451,16 @@ pub fn native_close_task(request_id: Uuid, task_id: Uuid) -> Value {
         "kind": "close_task",
         "request_id": request_id,
         "task_id": task_id,
+    })
+}
+
+pub fn native_event_ack(event: NativeEventName, event_id: &str) -> Value {
+    serde_json::json!({
+        "protocol": NATIVE_PROTOCOL,
+        "version": PROTOCOL_VERSION,
+        "kind": "event_ack",
+        "event": event,
+        "event_id": event_id,
     })
 }
 

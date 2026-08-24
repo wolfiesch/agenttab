@@ -343,7 +343,7 @@ impl NativeTransport for StdioNative {
     }
 
     fn cancel_connection(&self, connection_id: Uuid) {
-        let (mut task_ids, senders) = {
+        let senders = {
             let mut pending = self.pending.lock();
             let request_ids = pending
                 .iter()
@@ -351,31 +351,13 @@ impl NativeTransport for StdioNative {
                     (*pending_connection_id == connection_id).then_some(*request_id)
                 })
                 .collect::<Vec<_>>();
-            let mut task_ids = Vec::with_capacity(request_ids.len());
-            let mut senders = Vec::with_capacity(request_ids.len());
-            for request_id in request_ids {
-                if let Some((_, task_id, sender)) = pending.remove(&request_id) {
-                    task_ids.push(task_id);
-                    senders.push(sender);
-                }
-            }
-            (task_ids, senders)
+            request_ids
+                .into_iter()
+                .filter_map(|request_id| pending.remove(&request_id).map(|(_, _, sender)| sender))
+                .collect::<Vec<_>>()
         };
         for sender in senders {
             let _ = sender.send(Err(NativeError::Disconnected));
-        }
-        task_ids.sort_unstable();
-
-        task_ids.dedup();
-        for task_id in task_ids {
-            let _ = self.write_value(&native_command(
-                Uuid::new_v4(),
-                connection_id,
-                task_id,
-                "cancel_connection",
-                serde_json::json!({}),
-                None,
-            ));
         }
     }
 

@@ -3,7 +3,7 @@ import { StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
 import { OwnershipLedger } from "../src/ownership";
-import { parseCommand, type NativeOriginPolicy } from "../src/protocol";
+import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from "../src/protocol";
 import { RevisionTracker } from "../src/revisions";
 import { MutationScheduler } from "../src/scheduler";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
@@ -343,6 +343,7 @@ function installChromeMock(): void {
           automationPermission = permissionRequestResult;
           return permissionRequestResult;
         },
+        onAdded: { addListener() { } },
         onRemoved: {
           addListener(listener: PermissionRemovedListener) {
             permissionRemovedListeners.push(listener);
@@ -434,6 +435,39 @@ async function sendNativeCommand(
   return response as Record<string, unknown>;
 }
 
+async function sendNativeCloseTask(
+  requestId: string,
+  taskId: string,
+): Promise<Record<string, unknown>> {
+  const port = nativePort;
+  if (!port) throw new Error("native port is unavailable");
+  port.receive({
+    protocol: "agenttab.native",
+    version: 1,
+    kind: "close_task",
+    request_id: requestId,
+    task_id: taskId,
+  });
+  await waitForCondition(() =>
+    port.posted.some(
+      (message) =>
+        message !== null &&
+        typeof message === "object" &&
+        (message as Record<string, unknown>).kind === "response" &&
+        (message as Record<string, unknown>).request_id === requestId,
+    ),
+  );
+  const response = port.posted.findLast(
+    (message) =>
+      message !== null &&
+      typeof message === "object" &&
+      (message as Record<string, unknown>).kind === "response" &&
+      (message as Record<string, unknown>).request_id === requestId,
+  );
+  if (!response || typeof response !== "object") throw new Error("native close_task did not produce a response");
+  return response as Record<string, unknown>;
+}
+
 async function sendPopupMessage(message: unknown): Promise<unknown> {
   const listener = popupMessageListeners.at(-1);
   if (!listener) throw new Error("popup message listener is unavailable");
@@ -485,6 +519,25 @@ describe("native protocol", () => {
         denied_origins: [],
       },
     })).toThrow("non-empty strings");
+  });
+
+  test("accepts only the strict native close_task lifecycle command", () => {
+    const closeTask = parseInboundNativeMessage({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "close_task",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621d",
+      task_id: TASK_A,
+    });
+    expect(closeTask).toMatchObject({ kind: "close_task", task_id: TASK_A });
+    expect(() => parseInboundNativeMessage({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "close_task",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621d",
+      task_id: TASK_A,
+      connection_id: NATIVE_CONNECTION_ID,
+    })).toThrow("unknown fields");
   });
 });
 
@@ -605,6 +658,53 @@ describe("mutation scheduler", () => {
     await paused;
     expect(await queuedOutcome).toMatchObject({ code: "paused" });
     expect(scheduler.isAccepting()).toBe(false);
+  });
+
+  test("permission revocation rejects an admitted queued tabs action before it can run", async () => {
+    const scheduler = new MutationScheduler();
+    const activeGate = Promise.withResolvers<void>();
+    const activeStarted = Promise.withResolvers<void>();
+    let queriedTabs = false;
+    const active = scheduler.enqueueTab(TASK_A, 4, async () => {
+      activeStarted.resolve();
+      await activeGate.promise;
+    });
+    const queuedTabs = scheduler.enqueueGlobal(async () => {
+      queriedTabs = true;
+      await chrome.tabs.query({});
+    });
+    await activeStarted.promise;
+
+    scheduler.revokePermissions();
+    activeGate.resolve();
+    await active;
+
+    await expect(queuedTabs).rejects.toMatchObject({
+      code: "permissions_required",
+    });
+    expect(queriedTabs).toBe(false);
+  });
+
+  test("restoring permissions does not bypass pause or disconnect", async () => {
+    const scheduler = new MutationScheduler();
+
+    await scheduler.pause();
+    scheduler.revokePermissions();
+    scheduler.restorePermissions();
+    await expect(scheduler.enqueueGlobal(async () => "must not run")).rejects.toMatchObject({
+      code: "paused",
+    });
+
+    scheduler.resume();
+    expect(await scheduler.enqueueGlobal(async () => "resumed")).toBe("resumed");
+
+    scheduler.disconnect();
+    scheduler.revokePermissions();
+    scheduler.restorePermissions();
+    await expect(scheduler.enqueueGlobal(async () => "must not run")).rejects.toMatchObject({
+      code: "paused",
+      message: "AgentTab connection is unavailable",
+    });
   });
 });
 
@@ -1044,7 +1144,27 @@ describe("ownership and task isolation", () => {
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
   });
 
-  test("inherits task-group ownership when Chrome reports an unowned opener", async () => {
+  test("keeps ownership deleted when one Chrome tab is already unavailable", async () => {
+    await seedTask(TASK_A, [21, 22]);
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(
+      scheduler,
+      new RevisionTracker(),
+      () => undefined,
+    );
+    const removeTab = chrome.tabs.remove.bind(chrome.tabs);
+    chrome.tabs.remove = (async (tabIds: number | number[]) => {
+      const tabId = Array.isArray(tabIds) ? tabIds[0] : tabIds;
+      if (tabId === 22) throw new Error("tab already closed");
+      await removeTab(tabId);
+    }) as typeof chrome.tabs.remove;
+
+    expect(await ownership.closeTask(TASK_A)).toEqual([21]);
+    expect(removedTabIds).toEqual([21]);
+    expect((await readState()).tasks[TASK_A]).toBeUndefined();
+  });
+
+  test("does not adopt a tab opened by an unowned opener even when Chrome groups it with a task", async () => {
     await seedTask(TASK_A, [21]);
     tabStore.set(99, {
       id: 99,
@@ -1069,9 +1189,32 @@ describe("ownership and task isolation", () => {
 
     await ownership.adoptOwnedChild(tabStore.get(22) ?? {});
 
-    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21, 22]);
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21]);
     expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 5, active: false });
-    expect(tabStore.get(99)?.active).toBe(true);
+    expect(removedTabIds).toEqual([]);
+  });
+
+  test("preserves a child in a foreign tab group despite its owned opener", async () => {
+    await seedTask(TASK_A, [21]);
+    tabStore.set(22, {
+      id: 22,
+      windowId: 1,
+      groupId: 9,
+      active: false,
+      openerTabId: 21,
+      url: "https://example.test/child",
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    await ownership.adoptOwnedChild(tabStore.get(22) ?? {});
+
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21]);
+    expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 9, active: false });
+    expect(removedTabIds).toEqual([]);
   });
 
   test("closes a task before a queued tab mutation can execute", async () => {
@@ -1657,25 +1800,6 @@ describe("extension entrypoint admission boundaries", () => {
       ),
     ).toBe(true);
 
-    expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
-    const detachCountBeforeRevocation = debuggerCalls.filter((call) => call === "detach").length;
-    automationPermission = false;
-    for (const listener of permissionRemovedListeners) listener({ permissions: ["debugger"] });
-    await waitForCondition(
-      () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeRevocation + 1,
-    );
-    expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 1 });
-    const deniedAfterRevocation = await sendNativeCommand(
-      "018f47b8-2f80-7c20-9c77-f8a38c9e6236",
-      TASK_A,
-      "browser_snapshot",
-      { tab_id: 100, mode: "accessibility" },
-    );
-    expect(deniedAfterRevocation).toMatchObject({
-      outcome: "not_started",
-      error: { code: "permissions_required" },
-    });
-    automationPermission = true;
 
     const staged = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6229",
@@ -1760,7 +1884,18 @@ describe("extension entrypoint admission boundaries", () => {
     expect(Object.values((await readState()).stagedCommits)).toContainEqual(
       expect.objectContaining({ task_id: TASK_A, tab_id: 100 }),
     );
-    expect(await sendPopupMessage({ kind: "close_task", task_id: TASK_A })).toEqual({ closed: true });
+    let taskDeletedBeforeRemove = false;
+    tabRemovalProbe = async () => {
+      taskDeletedBeforeRemove = (await readState()).tasks[TASK_A] === undefined;
+    };
+    const closedByHost = await sendNativeCloseTask(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6234",
+      TASK_A,
+    );
+    expect(closedByHost).toMatchObject({
+      outcome: "completed",
+      result: { task_id: TASK_A, closed_tab_ids: [100] },
+    });
     expect(removedTabIds).toContain(100);
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
     expect(Object.values((await readState()).stagedCommits)).not.toContainEqual(
@@ -1776,5 +1911,24 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: { code: "ownership_denied" },
     });
+    expect(taskDeletedBeforeRemove).toBe(true);
+    expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
+    const detachCountBeforeRevocation = debuggerCalls.filter((call) => call === "detach").length;
+    automationPermission = false;
+    for (const listener of permissionRemovedListeners) listener({ permissions: ["debugger"] });
+    const tabsDeniedSynchronously = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6236",
+      TASK_A,
+      "browser_tabs",
+      {},
+    );
+    expect(tabsDeniedSynchronously).toMatchObject({
+      outcome: "not_started",
+      error: { code: "permissions_required" },
+    });
+    await waitForCondition(
+      () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeRevocation + 1,
+    );
+    expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 1 });
   });
 });

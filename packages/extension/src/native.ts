@@ -3,7 +3,7 @@ import {
   nativeEvent,
   nativeHello,
   parseInboundNativeMessage,
-  type NativeCommand,
+  type NativeDispatchCommand,
   type NativeInboundMessage,
   type NativeResponse,
   type NativeTab,
@@ -16,7 +16,7 @@ import { isRecord } from "./type-guards";
 const NATIVE_HOST = "dev.agenttab.host";
 const RECONNECT_ALARM = "agenttab-native-reconnect";
 const RECONNECT_MAX_MS = 30_000;
-type CommandHandler = (command: NativeCommand) => Promise<NativeResponse>;
+type CommandHandler = (command: NativeDispatchCommand) => Promise<NativeResponse>;
 
 interface NativePort {
   postMessage(message: unknown): void;

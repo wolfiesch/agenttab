@@ -1039,6 +1039,7 @@ mod tests {
         staged: Mutex<bool>,
         sensitive_error: bool,
         close_task_error: bool,
+
         origin_policies: Mutex<Vec<Option<NativeOriginPolicy>>>,
         last_params: Mutex<Option<Value>>,
         closed_tasks: Mutex<Vec<Uuid>>,
@@ -1050,8 +1051,8 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: false,
-                origin_policies: Mutex::new(Vec::new()),
                 close_task_error: false,
+                origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
             })
@@ -1062,8 +1063,8 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: true,
-                origin_policies: Mutex::new(Vec::new()),
                 close_task_error: false,
+                origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
             })
@@ -1074,8 +1075,8 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(true),
                 sensitive_error: false,
-                origin_policies: Mutex::new(Vec::new()),
                 close_task_error: false,
+                origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
             })
@@ -1093,7 +1094,6 @@ mod tests {
             })
         }
     }
-
     impl NativeTransport for FakeNative {
         fn dispatch(
             &self,
@@ -1157,10 +1157,10 @@ mod tests {
             })
         }
         fn close_task(&self, task_id: Uuid, _timeout: Duration) -> Result<(), NativeError> {
+            self.closed_tasks.lock().push(task_id);
             if self.close_task_error {
                 return Err(NativeError::Disconnected);
             }
-            self.closed_tasks.lock().push(task_id);
             Ok(())
         }
     }
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn disconnect_keeps_an_undelivered_task_open_when_extension_cleanup_disconnects() {
         let native = FakeNative::cleanup_fails();
-        let (_temp, runtime, connection) = connected_runtime(native);
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
         let response = runtime.handle(
             &connection,
             json!({
@@ -1334,10 +1334,10 @@ mod tests {
             .unwrap()
             .to_string();
 
-        assert!(matches!(
-            runtime.disconnect(&connection),
-            Err(JournalError::NativeTaskCleanup(_))
-        ));
+        let error = runtime.disconnect(&connection).unwrap_err();
+
+        assert!(matches!(error, JournalError::NativeTaskCleanup(_)));
+        assert_eq!(native.closed_tasks.lock().len(), 1);
         assert!(runtime.journal.resume_task(&capability).unwrap().is_some());
     }
 
@@ -1362,12 +1362,7 @@ mod tests {
     }
 
     #[test]
-82:     fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
-83:         connection.finish_new_capability_delivery(true);
-        runtime.lifecycle.set_paused(true);
-        let mut retry = request;
-        retry["request_id"] = json!("retry");
-        let second = runtime.handle(&connection, retry);
+    fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
         let native = FakeNative::normal();
         let (_temp, runtime, connection) = connected_runtime(native.clone());
         let key = Uuid::now_v7();
@@ -1390,8 +1385,7 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("123-45-6789"));
-82:     fn completed_mutation_replays_through_pause_without_redispatch_or_plaintext_secrets() {
-83:         connection.finish_new_capability_delivery(true);
+        connection.finish_new_capability_delivery(true);
         runtime.lifecycle.set_paused(true);
         let mut retry = request;
         retry["request_id"] = json!("retry");

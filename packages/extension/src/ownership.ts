@@ -74,7 +74,7 @@ export class OwnershipLedger {
     return this.serialize(() => this.revokeNow(tabId, event));
   }
 
-  closeTask(taskId: string): Promise<void> {
+  closeTask(taskId: string): Promise<number[]> {
     return this.serialize(() => this.closeTaskNow(taskId));
   }
 
@@ -270,40 +270,32 @@ export class OwnershipLedger {
 
   private async adoptOwnedChildNow(tab: TabLike): Promise<void> {
     const childTabId = tab.id;
-    if (typeof childTabId !== "number" || !Number.isInteger(childTabId)) return;
+    const openerTabId = tab.openerTabId;
+    if (
+      typeof childTabId !== "number" ||
+      !Number.isInteger(childTabId) ||
+      typeof openerTabId !== "number" ||
+      !Number.isInteger(openerTabId)
+    ) {
+      return;
+    }
 
     const state = await readState();
-    const openerTabId = tab.openerTabId;
-    let parentTask = typeof openerTabId === "number" && Number.isInteger(openerTabId)
-      ? Object.values(state.tasks).find((task) => task.tabIds.includes(openerTabId))
-      : undefined;
-    if (!parentTask && typeof tab.groupId === "number" && tab.groupId !== NO_GROUP) {
-      parentTask = Object.values(state.tasks).find((task) => task.groupId === tab.groupId);
-    }
+    const parentTask = Object.values(state.tasks).find((task) => task.tabIds.includes(openerTabId));
     if (!parentTask) return;
 
-    let ownedParent: TaskRecord | null = null;
-    let ownedParentTabId: number | null = null;
-    const candidateParentTabIds = typeof openerTabId === "number" &&
-      parentTask.tabIds.includes(openerTabId)
-      ? [openerTabId]
-      : parentTask.tabIds;
-    for (const candidateTabId of candidateParentTabIds) {
-      try {
-        ownedParent = await this.assertOwnedNow(parentTask.taskId, candidateTabId);
-        ownedParentTabId = candidateTabId;
-        break;
-      } catch {
-        // A child already placed in the task group can use any still-valid task tab as its anchor.
-      }
+    let ownedParent: TaskRecord;
+    try {
+      ownedParent = await this.assertOwnedNow(parentTask.taskId, openerTabId);
+    } catch {
+      return;
     }
-    if (!ownedParent || ownedParentTabId === null) return;
 
     try {
-      const parent = (await chrome.tabs.get(ownedParentTabId).catch(() => null)) as TabLike | null;
+      const parent = (await chrome.tabs.get(openerTabId).catch(() => null)) as TabLike | null;
       const child = (await chrome.tabs.get(childTabId).catch(() => null)) as TabLike | null;
-      if (!parent || !child) {
-        if (child) await chrome.tabs.remove(childTabId).catch(() => undefined);
+      if (!parent || !child) return;
+      if (child.groupId !== undefined && child.groupId !== NO_GROUP && child.groupId !== ownedParent.groupId) {
         return;
       }
       if (
@@ -326,7 +318,7 @@ export class OwnershipLedger {
       }
       await this.grant(ownedParent.taskId, childTabId, ownedParent.name);
     } catch {
-      await chrome.tabs.remove(childTabId).catch(() => undefined);
+      // A popup or Chrome grouping race is not authority to close a user tab.
     }
   }
 
@@ -364,9 +356,9 @@ export class OwnershipLedger {
     await this.emitInventory();
   }
 
-  private async closeTaskNow(taskId: string): Promise<void> {
+  private async closeTaskNow(taskId: string): Promise<number[]> {
     const existing = (await readState()).tasks[taskId];
-    if (!existing) return;
+    if (!existing) return [];
     for (const tabId of existing.tabIds) this.scheduler.revokeTab(tabId);
     const tabIds = await mutateState((state) => {
       const task = state.tasks[taskId];
@@ -379,9 +371,18 @@ export class OwnershipLedger {
       return ownedTabIds;
     });
     for (const tabId of tabIds) await this.revisions.remove(tabId);
-    if (tabIds.length > 0) await chrome.tabs.remove(tabIds).catch(() => undefined);
+    const closedTabIds: number[] = [];
+    for (const tabId of tabIds) {
+      try {
+        await chrome.tabs.remove(tabId);
+        closedTabIds.push(tabId);
+      } catch {
+        // Ownership is already durably removed; a missing/closed tab is safe.
+      }
+    }
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
+    return closedTabIds;
   }
 
   private async grant(taskId: string, tabId: number, name: string): Promise<void> {

@@ -12,7 +12,13 @@ type Work<T> = () => Promise<T>;
 
 export class MutationScheduler {
   private accepting = true;
+  private lifecycleAccepting = true;
+  private permissionsAvailable = true;
   private admissionEpoch = 0;
+  private admissionFailure = {
+    code: "paused",
+    message: "AgentTab is paused",
+  };
   private readonly tabTails = new Map<number, Promise<unknown>>();
   private readonly taskTails = new Map<string, Promise<unknown>>();
   private globalTail: Promise<unknown> = Promise.resolve();
@@ -21,18 +27,35 @@ export class MutationScheduler {
   private readonly pending = new Set<Promise<unknown>>();
 
   setInitialPaused(paused: boolean): void {
-    this.accepting = !paused;
-    if (paused) this.admissionEpoch += 1;
+    if (!paused) return;
+    this.accepting = false;
+    this.lifecycleAccepting = false;
+    this.admissionEpoch += 1;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab is paused",
+    };
   }
 
   isAccepting(): boolean {
     return this.accepting;
   }
 
-  enqueueTab<T>(taskId: string, tabId: number, work: Work<T>): Promise<T> {
-    if (!this.accepting) {
-      return Promise.reject(new NotStartedError("paused", "AgentTab is paused"));
+  notStarted(message?: string): NotStartedError {
+    if (!this.permissionsAvailable) {
+      return new NotStartedError(
+        "permissions_required",
+        "AgentTab automation permissions have not been enabled",
+      );
     }
+    return new NotStartedError(
+      this.admissionFailure.code,
+      message ?? this.admissionFailure.message,
+    );
+  }
+
+  enqueueTab<T>(taskId: string, tabId: number, work: Work<T>): Promise<T> {
+    if (!this.accepting) return Promise.reject(this.notStarted());
     const admissionEpoch = this.admissionEpoch;
     const generation = this.generations.get(tabId) ?? 0;
     const priorGlobal = this.globalTail;
@@ -40,7 +63,7 @@ export class MutationScheduler {
     const priorTab = this.tabTails.get(tabId) ?? Promise.resolve();
     const result = priorGlobal.then(() => Promise.all([priorTask, priorTab])).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-        throw new NotStartedError("paused", "AgentTab paused before this mutation was dispatched");
+        throw this.notStarted("AgentTab paused before this mutation was dispatched");
       }
       if ((this.generations.get(tabId) ?? 0) !== generation) {
         const reason = this.generationReasons.get(tabId) ?? {
@@ -57,15 +80,13 @@ export class MutationScheduler {
   }
 
   enqueueGlobal<T>(work: Work<T>): Promise<T> {
-    if (!this.accepting) {
-      return Promise.reject(new NotStartedError("paused", "AgentTab is paused"));
-    }
+    if (!this.accepting) return Promise.reject(this.notStarted());
     const admissionEpoch = this.admissionEpoch;
     const priorGlobal = this.globalTail;
     const priorTabs = [...this.tabTails.values()];
     const result = priorGlobal.then(() => Promise.all(priorTabs)).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-        throw new NotStartedError("paused", "AgentTab paused before this global mutation was dispatched");
+        throw this.notStarted("AgentTab paused before this global mutation was dispatched");
       }
       return work();
     });
@@ -78,15 +99,13 @@ export class MutationScheduler {
   }
 
   readAfterWrites<T>(tabId: number | undefined, work: Work<T>): Promise<T> {
-    if (!this.accepting) {
-      return Promise.reject(new NotStartedError("paused", "AgentTab is paused"));
-    }
+    if (!this.accepting) return Promise.reject(this.notStarted());
     const admissionEpoch = this.admissionEpoch;
     const priorGlobal = this.globalTail;
     if (tabId === undefined) {
       const result = priorGlobal.then(async () => {
         if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-          throw new NotStartedError("paused", "AgentTab paused before this observation was dispatched");
+          throw this.notStarted("AgentTab paused before this observation was dispatched");
         }
         return work();
       });
@@ -101,7 +120,7 @@ export class MutationScheduler {
     const priorTab = this.tabTails.get(tabId) ?? Promise.resolve();
     const result = priorGlobal.then(() => priorTab).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-        throw new NotStartedError("paused", "AgentTab paused before this observation was dispatched");
+        throw this.notStarted("AgentTab paused before this observation was dispatched");
       }
       return work();
     });
@@ -126,21 +145,47 @@ export class MutationScheduler {
     this.generations.set(tabId, (this.generations.get(tabId) ?? 0) + 1);
   }
 
-  disconnect(): void {
+  revokePermissions(): void {
+    this.permissionsAvailable = false;
     this.accepting = false;
     this.admissionEpoch += 1;
   }
 
+  restorePermissions(): void {
+    this.permissionsAvailable = true;
+    this.accepting = this.lifecycleAccepting;
+  }
+
+  disconnect(): void {
+    this.accepting = false;
+    this.lifecycleAccepting = false;
+    this.admissionEpoch += 1;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab connection is unavailable",
+    };
+  }
+
   async pause(): Promise<void> {
     this.accepting = false;
+    this.lifecycleAccepting = false;
     this.admissionEpoch += 1;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab is paused",
+    };
     while (this.pending.size > 0) {
       await Promise.allSettled([...this.pending]);
     }
   }
 
   resume(): void {
-    this.accepting = true;
+    this.lifecycleAccepting = true;
+    this.accepting = this.permissionsAvailable;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab is paused",
+    };
   }
 
   private rememberTabTail<T>(taskId: string | undefined, tabId: number, result: Promise<T>): void {
