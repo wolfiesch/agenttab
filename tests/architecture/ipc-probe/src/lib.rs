@@ -479,11 +479,10 @@ mod unix_probe {
         let path = scratch.path().join("run/agenttab.sock");
         std::fs::create_dir(path.parent().unwrap()).unwrap();
         let stale_listener = UnixListener::bind(&path).unwrap();
-        let stale_inode = std::fs::symlink_metadata(&path).unwrap().ino();
         drop(stale_listener);
 
         let replacement = bind_user_socket(&path, uid).unwrap();
-        assert_ne!(std::fs::symlink_metadata(&path).unwrap().ino(), stale_inode);
+        assert!(StdUnixStream::connect(&path).is_ok());
         drop(replacement);
     }
 }
