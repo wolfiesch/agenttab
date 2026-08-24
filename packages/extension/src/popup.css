@@ -180,6 +180,24 @@ input[type="checkbox"] { flex: none; width: 17px; height: 17px; margin: 0; accen
 /* developer */
 .developer { border-left: 3px solid var(--violet); padding-left: calc(var(--gutter) - 3px); }
 
+/* staged review */
+.reviews { border-left: 3px solid var(--amber); padding-left: calc(var(--gutter) - 3px); }
+.review-list {
+  display: grid;
+  gap: var(--step-2);
+  margin: var(--step-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+.review {
+  display: grid;
+  gap: var(--step-1);
+  padding-top: var(--step-2);
+  border-top: 1px solid var(--line-soft);
+}
+.review:first-child { padding-top: 0; border-top: 0; }
+.review-actions { display: flex; justify-content: flex-end; gap: var(--step-1); }
+
 /* tasks */
 .tasks {
   display: grid;

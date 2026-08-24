@@ -88,7 +88,7 @@ A violation is denied with the error `policy denied: egress not allowed` and a `
 
 **What it cannot see, and therefore does not cover.** This is a real limitation, not an omission - do not read an egress allowlist as a claim that the browser can only talk to the listed hosts:
 
-- **In-page navigation the agent triggers indirectly.** `click`, `press`, `type`, `fill`, and `drag` can follow a link or submit a form to any host. The destination lives in page markup the host never parses, so the host cannot know it. Such actions remain governed by site policy against the tab's live origin only.
+- **In-page navigation the agent triggers indirectly.** `click`, `type`, `fill`, and `drag` can follow a link or submit a form to any host. The destination lives in page markup the host never parses, so the host cannot know it. Such actions remain governed by site policy against the tab's live origin only.
 - **Script-issued requests.** `executeScript` and `executeScriptCDP` can `fetch()` anywhere; the URL is inside the script body. These actions are confirmation-gated in the example policy precisely because they are unbounded.
 - **Resource loads a page makes on its own.** Subresources, XHR, `fetch`, WebSockets, and beacons issued by a page the agent merely opened are the browser's normal behavior and are invisible to the host.
 - **Uploads.** `uploadFile` and the `githubAttach*` helpers post to the tab's own origin, which site policy already governs, so they are not separately egress-checked.

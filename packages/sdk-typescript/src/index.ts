@@ -23,7 +23,6 @@ export type BrowserAction =
   | { kind: "click"; ref: string }
   | { kind: "type" | "fill"; ref: string; text: string }
   | { kind: "select"; ref: string; value: string }
-  | { kind: "press"; key: string }
   | { kind: "scroll"; delta_x: number; delta_y: number; ref?: string }
   | { kind: "drag"; ref: string; target_ref: string }
   | { kind: "navigate"; url: string }

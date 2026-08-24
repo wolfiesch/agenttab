@@ -13,13 +13,14 @@ import {
 import { existsSync } from "node:fs";
 import { arch as currentArch, homedir, platform as currentPlatform, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { inflateRawSync } from "node:zlib";
 import { AgentTabClient } from "../../sdk-typescript/src/index";
 import identityJson from "../../../config/identity.json" with { type: "json" };
 import trustJson from "../../../config/release-trust.json" with { type: "json" };
 import migrationJson from "../../../config/migration-v1.json" with { type: "json" };
 import { planClientConfigs } from "./configs";
 import { applyTransaction, type PlannedFile, type TransactionResult } from "./transaction";
+import { fileURLToPath } from "node:url";
 
 const identity = identityJson as {
   product: string;
@@ -212,6 +213,10 @@ export function targetTriple(platform: NodeJS.Platform = currentPlatform(), arch
   return target;
 }
 
+function hostAssetName(version: string, target: string, platform: NodeJS.Platform): string {
+  return `agenttab-host-v${version}-${target}.${platform === "win32" ? "zip" : "tar.gz"}`;
+}
+
 async function fetchBytes(url: string, development: boolean): Promise<Buffer> {
   if (url.startsWith("file:")) {
     if (!development) throw new Error("file URLs are allowed only for a development install");
@@ -240,6 +245,162 @@ function validateAssetUrl(asset: ArtifactEntry, version: string, development: bo
   if (asset.url !== expected) throw new Error(`artifact URL must be the immutable release asset ${expected}`);
 }
 
+const ZIP_END_OF_CENTRAL_DIRECTORY = 0x0605_4b50;
+const ZIP_CENTRAL_DIRECTORY_FILE = 0x0201_4b50;
+const ZIP_LOCAL_FILE = 0x0403_4b50;
+const ZIP_UTF8_FLAG = 0x0800;
+const MAX_HOST_EXECUTABLE_BYTES = 256 * 1024 * 1024;
+const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ ((value & 1) * 0xedb8_8320);
+  return value >>> 0;
+});
+
+function zipError(message: string): Error {
+  return new Error(`host ZIP ${message}`);
+}
+
+function zipUInt16(bytes: Buffer, offset: number): number {
+  if (offset < 0 || offset + 2 > bytes.byteLength) throw zipError("is truncated");
+  return bytes.readUInt16LE(offset);
+}
+
+function zipUInt32(bytes: Buffer, offset: number): number {
+  if (offset < 0 || offset + 4 > bytes.byteLength) throw zipError("is truncated");
+  return bytes.readUInt32LE(offset);
+}
+
+function crc32(bytes: Buffer): number {
+  let value = 0xffff_ffff;
+  for (const byte of bytes) value = CRC32_TABLE[(value ^ byte) & 0xff] ^ (value >>> 8);
+  return (value ^ 0xffff_ffff) >>> 0;
+}
+
+function zipMemberName(bytes: Buffer): string {
+  const name = bytes.toString("utf8");
+  if (!Buffer.from(name, "utf8").equals(bytes)) throw zipError("contains a non-UTF-8 member name");
+  if (
+    name.length === 0 ||
+    name.includes("\0") ||
+    name.startsWith("/") ||
+    name.startsWith("\\") ||
+    /^[A-Za-z]:/.test(name) ||
+    name.split(/[\\/]/).some((part) => part.length === 0 || part === "." || part === "..")
+  ) {
+    throw zipError("contains an unsafe member path");
+  }
+  return name;
+}
+
+function assertZipRegularFile(creator: number, attributes: number): void {
+  if (creator === 3 || creator === 19) {
+    const fileType = (attributes >>> 16) & 0o170000;
+    if (fileType !== 0o100000) throw zipError("member is not a regular file");
+    return;
+  }
+  if ((attributes & 0x10) !== 0) throw zipError("member is a directory");
+}
+
+function zipEndOfCentralDirectory(archive: Buffer): number {
+  const minimumOffset = Math.max(0, archive.byteLength - 0xffff - 22);
+  for (let offset = archive.byteLength - 22; offset >= minimumOffset; offset -= 1) {
+    if (zipUInt32(archive, offset) !== ZIP_END_OF_CENTRAL_DIRECTORY) continue;
+    const commentLength = zipUInt16(archive, offset + 20);
+    if (offset + 22 + commentLength === archive.byteLength) return offset;
+  }
+  throw zipError("is missing its end-of-central-directory record");
+}
+
+function extractWindowsZipHost(archive: Buffer, binaryName: string): Buffer {
+  const endOffset = zipEndOfCentralDirectory(archive);
+  const disk = zipUInt16(archive, endOffset + 4);
+  const centralDirectoryDisk = zipUInt16(archive, endOffset + 6);
+  const entriesOnDisk = zipUInt16(archive, endOffset + 8);
+  const entries = zipUInt16(archive, endOffset + 10);
+  const centralDirectorySize = zipUInt32(archive, endOffset + 12);
+  const centralDirectoryOffset = zipUInt32(archive, endOffset + 16);
+  if (
+    disk !== 0 ||
+    centralDirectoryDisk !== 0 ||
+    entriesOnDisk !== 1 ||
+    entries !== 1
+  ) {
+    throw zipError(`must contain exactly ${binaryName}`);
+  }
+  if (centralDirectoryOffset + centralDirectorySize !== endOffset) {
+    throw zipError("has an invalid central directory");
+  }
+  const centralOffset = centralDirectoryOffset;
+  if (zipUInt32(archive, centralOffset) !== ZIP_CENTRAL_DIRECTORY_FILE) {
+    throw zipError("has an invalid central-directory member");
+  }
+
+  const flags = zipUInt16(archive, centralOffset + 8);
+  const method = zipUInt16(archive, centralOffset + 10);
+  const expectedCrc = zipUInt32(archive, centralOffset + 16);
+  const compressedSize = zipUInt32(archive, centralOffset + 20);
+  const uncompressedSize = zipUInt32(archive, centralOffset + 24);
+  const nameLength = zipUInt16(archive, centralOffset + 28);
+  const extraLength = zipUInt16(archive, centralOffset + 30);
+  const memberCommentLength = zipUInt16(archive, centralOffset + 32);
+  const memberDisk = zipUInt16(archive, centralOffset + 34);
+  const creator = zipUInt16(archive, centralOffset + 4) >>> 8;
+  const attributes = zipUInt32(archive, centralOffset + 38);
+  const localOffset = zipUInt32(archive, centralOffset + 42);
+  const centralEnd = centralOffset + 46 + nameLength + extraLength + memberCommentLength;
+  if (centralEnd !== endOffset || memberDisk !== 0) throw zipError("has an invalid central-directory member");
+  if ((flags & ~ZIP_UTF8_FLAG) !== 0 || (method !== 0 && method !== 8)) {
+    throw zipError("uses unsupported encryption, streaming, or compression");
+  }
+  if (uncompressedSize === 0 || uncompressedSize > MAX_HOST_EXECUTABLE_BYTES) {
+    throw zipError("has an invalid executable size");
+  }
+
+  const nameBytes = archive.subarray(centralOffset + 46, centralOffset + 46 + nameLength);
+  const name = zipMemberName(nameBytes);
+  if (name !== binaryName) throw zipError(`must contain exactly ${binaryName}`);
+  assertZipRegularFile(creator, attributes);
+  if (localOffset !== 0 || zipUInt32(archive, localOffset) !== ZIP_LOCAL_FILE) {
+    throw zipError("has an invalid local member");
+  }
+
+  const localFlags = zipUInt16(archive, localOffset + 6);
+  const localMethod = zipUInt16(archive, localOffset + 8);
+  const localCrc = zipUInt32(archive, localOffset + 14);
+  const localCompressedSize = zipUInt32(archive, localOffset + 18);
+  const localUncompressedSize = zipUInt32(archive, localOffset + 22);
+  const localNameLength = zipUInt16(archive, localOffset + 26);
+  const localExtraLength = zipUInt16(archive, localOffset + 28);
+  const localName = archive.subarray(localOffset + 30, localOffset + 30 + localNameLength);
+  const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+  const dataEnd = dataStart + compressedSize;
+  if (
+    localFlags !== flags ||
+    localMethod !== method ||
+    localCrc !== expectedCrc ||
+    localCompressedSize !== compressedSize ||
+    localUncompressedSize !== uncompressedSize ||
+    !localName.equals(nameBytes) ||
+    dataEnd !== centralOffset
+  ) {
+    throw zipError("has inconsistent local-member metadata");
+  }
+
+  let executable: Buffer;
+  try {
+    const data = archive.subarray(dataStart, dataEnd);
+    executable = method === 0
+      ? Buffer.from(data)
+      : inflateRawSync(data, { maxOutputLength: uncompressedSize });
+  } catch {
+    throw zipError("contains invalid compressed executable data");
+  }
+  if (executable.byteLength !== uncompressedSize || crc32(executable) !== expectedCrc) {
+    throw zipError("contains an invalid executable payload");
+  }
+  return executable;
+}
+
 async function readJsonOptional<T>(path: string): Promise<T | null> {
   try {
     return JSON.parse(await readFile(path, "utf8")) as T;
@@ -252,13 +413,26 @@ async function readJsonOptional<T>(path: string): Promise<T | null> {
 async function extractHost(archive: Buffer, stateDir: string, platform: NodeJS.Platform): Promise<{ bytes: Buffer; tempDir: string }> {
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const tempDir = await mkdtemp(join(stateDir, ".install-"));
+  const binaryName = platform === "win32" ? "agenttab-host.exe" : "agenttab-host";
+  if (platform === "win32") {
+    try {
+      const hostPath = join(tempDir, binaryName);
+      const bytes = extractWindowsZipHost(archive, binaryName);
+      await writeFile(hostPath, bytes, { mode: 0o700 });
+      await chmod(hostPath, 0o755);
+      return { bytes, tempDir };
+    } catch (error) {
+      await rm(tempDir, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
   const archivePath = join(tempDir, "host.tar.gz");
   await writeFile(archivePath, archive, { mode: 0o600 });
   const listing = execFileSync("tar", ["-tzf", archivePath], { encoding: "utf8" })
     .split(/\r?\n/)
     .filter(Boolean)
     .map((name) => name.replace(/^\.\//, ""));
-  const binaryName = platform === "win32" ? "agenttab-host.exe" : "agenttab-host";
   if (listing.length !== 1 || listing[0] !== binaryName) {
     throw new Error(`host archive must contain exactly ${binaryName}`);
   }
@@ -290,7 +464,11 @@ async function verifyPlatformSignature(
   if (platform === "win32") {
     if (entry.platformSignature !== "authenticode") throw new Error("Windows host must declare Authenticode");
     const command = `$s=Get-AuthenticodeSignature -LiteralPath ${quotePowerShell(hostPath)}; if ($s.Status -ne 'Valid') { throw $s.Status }`;
-    execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], { stdio: "pipe" });
+    execFileSync(
+      "powershell.exe",
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+      { stdio: "pipe", env: { ...process.env } },
+    );
     return;
   }
   if (entry.platformSignature !== "signed_manifest") throw new Error("Linux host must be covered by the signed artifact manifest");
@@ -525,7 +703,7 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
   ]);
   const manifest = verifySignedManifest(manifestBytes, signatureBytes, publicKeyPem);
   validateManifestIdentity(manifest, version);
-  const assetName = `agenttab-host-v${version}-${target}.tar.gz`;
+  const assetName = hostAssetName(version, target, platform);
   const asset = manifest.assets.find((entry) => entry.kind === "host" && entry.target === target && entry.name === assetName);
   if (!asset) throw new Error(`artifact manifest has no exact host asset ${assetName}`);
   validateAssetUrl(asset, version, development);

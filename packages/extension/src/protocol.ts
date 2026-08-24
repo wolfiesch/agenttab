@@ -11,7 +11,9 @@ export type NativeMethod =
   | "browser_tabs"
   | "browser_handoff"
   | "browser_commit"
-  | "browser_developer";
+  | "browser_developer"
+  | "commit_review_bind"
+  | "commit_review_abandon";
 
 const CORE_METHODS: Record<NativeMethod, true> = {
   browser_open: true,
@@ -22,6 +24,8 @@ const CORE_METHODS: Record<NativeMethod, true> = {
   browser_handoff: true,
   browser_commit: true,
   browser_developer: true,
+  commit_review_bind: true,
+  commit_review_abandon: true,
 };
 
 const NATIVE_EVENTS: Record<NativeEventName, true> = {
@@ -32,6 +36,9 @@ const NATIVE_EVENTS: Record<NativeEventName, true> = {
   pause_changed: true,
   handoff_changed: true,
   commit_expired: true,
+  commit_abandoned: true,
+  popup_commit_approved: true,
+  popup_commit_abandoned: true,
   extension_disconnected: true,
 };
 
@@ -43,6 +50,9 @@ export type NativeEventName =
   | "pause_changed"
   | "handoff_changed"
   | "commit_expired"
+  | "commit_abandoned"
+  | "popup_commit_approved"
+  | "popup_commit_abandoned"
   | "extension_disconnected";
 
 export type Outcome =
@@ -84,8 +94,11 @@ export interface NativeEventAck {
   protocol: typeof NATIVE_PROTOCOL;
   version: typeof PROTOCOL_VERSION;
   kind: "event_ack";
-  event: "handoff_changed";
+  event: "handoff_changed" | "popup_commit_approved" | "popup_commit_abandoned";
   event_id: string;
+  outcome?: Outcome;
+  result?: Record<string, unknown>;
+  error?: RpcError;
 }
 
 export interface NativeReady {
@@ -94,6 +107,7 @@ export interface NativeReady {
   kind: "ready";
   host_version: string;
   state: "ready" | "paused";
+  discard_staged_tokens?: string[];
 }
 
 export type NativeInboundMessage = NativeDispatchCommand | NativeReady | NativeEventAck;
@@ -104,6 +118,11 @@ export interface RpcError {
   details?: Record<string, unknown>;
 }
 
+export interface StagedDialog {
+  generation: number;
+  fingerprint: string;
+}
+
 export interface StagedCommit {
   native_token: string;
   task_id: string;
@@ -112,9 +131,13 @@ export interface StagedCommit {
   effect: string;
   fingerprint: string;
   expires_at_ms: number;
+  review_handle?: string;
   action: Record<string, unknown>;
   preview: Record<string, unknown>;
+  dialog?: StagedDialog;
 }
+
+export type PublicStagedCommit = Omit<StagedCommit, "action" | "preview" | "dialog">;
 
 export interface NativeResponse {
   protocol: typeof NATIVE_PROTOCOL;
@@ -124,7 +147,7 @@ export interface NativeResponse {
   outcome: Outcome;
   result?: unknown;
   error?: RpcError;
-  staged?: Omit<StagedCommit, "action" | "preview">;
+  staged?: PublicStagedCommit;
 }
 
 export interface NativeTab {
@@ -279,9 +302,7 @@ function assertAction(value: unknown): Record<string, unknown> {
     case "set_viewport":
       commandError("set_viewport is unavailable in Standard mode");
     case "press":
-      assertExactObject(action, ["kind", "key"], [], "press action");
-      assertBoundedString(action.key, "press.key", 1, 128);
-      return action;
+      commandError("press is unavailable in Standard mode because it has no identifiable target");
     default:
       commandError(`Unsupported standard action: ${action.kind}`);
   }
@@ -364,6 +385,21 @@ function assertDeveloperParams(value: unknown): Record<string, unknown> {
   return params;
 }
 
+function assertCommitReviewParams(
+  value: unknown,
+  method: "commit_review_bind" | "commit_review_abandon",
+): Record<string, unknown> {
+  const params = method === "commit_review_bind"
+    ? assertExactObject(value, ["native_token", "review_handle", "tab_id"], [], `${method} parameters`)
+    : assertExactObject(value, ["native_token", "tab_id"], [], `${method} parameters`);
+  assertBoundedString(params.native_token, "native_token", 16, 256);
+  assertTabId(params.tab_id);
+  if (method === "commit_review_bind") {
+    assertBoundedString(params.review_handle, "review_handle", 16, 256);
+  }
+  return params;
+}
+
 function validateParams(method: NativeMethod, value: unknown): Record<string, unknown> {
   switch (method) {
     case "browser_open": {
@@ -405,6 +441,9 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
     }
     case "browser_developer":
       return assertDeveloperParams(value);
+    case "commit_review_bind":
+    case "commit_review_abandon":
+      return assertCommitReviewParams(value, method);
   }
 }
 
@@ -468,25 +507,68 @@ export function parseInboundNativeMessage(value: unknown): NativeInboundMessage 
   if (value.kind === "close_task") return parseCloseTask(value);
   if (value.kind === "event_ack") {
     if (
-      !hasOnlyKeys(value, ["protocol", "version", "kind", "event", "event_id"]) ||
-      value.event !== "handoff_changed" ||
+      !hasOnlyKeys(
+        value,
+        ["protocol", "version", "kind", "event", "event_id"],
+        ["outcome", "result", "error"],
+      ) ||
+      (value.event !== "handoff_changed" &&
+        value.event !== "popup_commit_approved" &&
+        value.event !== "popup_commit_abandoned") ||
       !isBoundedString(value.event_id, 16, 256)
     ) {
       throw new Error("native event acknowledgement is invalid");
+    }
+    if (value.event === "handoff_changed") {
+      if (value.outcome !== undefined || value.result !== undefined || value.error !== undefined) {
+        throw new Error("handoff acknowledgement must not contain a result");
+      }
+      return {
+        protocol: NATIVE_PROTOCOL,
+        version: PROTOCOL_VERSION,
+        kind: "event_ack",
+        event: "handoff_changed",
+        event_id: value.event_id,
+      };
+    }
+    if (
+      (value.outcome !== "completed" && value.outcome !== "not_started" && value.outcome !== "unknown") ||
+      (value.outcome === "completed"
+        ? !isRecord(value.result) || value.error !== undefined
+        : !isRecord(value.error) || value.result !== undefined) ||
+      (isRecord(value.error) &&
+        (!isBoundedString(value.error.code, 1, 128) || !isBoundedString(value.error.message, 1, 2_000)))
+    ) {
+      throw new Error("popup commit acknowledgement is invalid");
     }
     return {
       protocol: NATIVE_PROTOCOL,
       version: PROTOCOL_VERSION,
       kind: "event_ack",
-      event: "handoff_changed",
+      event: value.event,
       event_id: value.event_id,
+      outcome: value.outcome,
+      ...(isRecord(value.result) ? { result: value.result } : {}),
+      ...(isRecord(value.error)
+        ? {
+          error: {
+            code: value.error.code as string,
+            message: value.error.message as string,
+            ...(typeof value.error.recovery === "string" ? { recovery: value.error.recovery } : {}),
+            ...(isRecord(value.error.details) ? { details: value.error.details } : {}),
+          },
+        }
+        : {}),
     };
   }
   if (
     value.kind !== "ready" ||
-    !hasOnlyKeys(value, ["protocol", "version", "kind", "host_version", "state"]) ||
+    !hasOnlyKeys(value, ["protocol", "version", "kind", "host_version", "state"], ["discard_staged_tokens"]) ||
     !isBoundedString(value.host_version, 1, 128) ||
-    (value.state !== "ready" && value.state !== "paused")
+    (value.state !== "ready" && value.state !== "paused") ||
+    (value.discard_staged_tokens !== undefined &&
+      (!Array.isArray(value.discard_staged_tokens) ||
+        !value.discard_staged_tokens.every((token) => isBoundedString(token, 16, 256))))
   ) {
     throw new Error("native ready message is invalid");
   }
@@ -496,6 +578,9 @@ export function parseInboundNativeMessage(value: unknown): NativeInboundMessage 
     kind: "ready",
     host_version: value.host_version,
     state: value.state,
+    ...(value.discard_staged_tokens === undefined
+      ? {}
+      : { discard_staged_tokens: [...value.discard_staged_tokens] as string[] }),
   };
 }
 export function completed(requestId: string, result: unknown): NativeResponse {
@@ -525,7 +610,7 @@ export function commitRequired(
   result: unknown,
   staged: StagedCommit,
 ): NativeResponse {
-  const { action: _action, preview: _preview, ...publicStaged } = staged;
+  const { action: _action, preview: _preview, dialog: _dialog, ...publicStaged } = staged;
   return {
     protocol: NATIVE_PROTOCOL,
     version: PROTOCOL_VERSION,
@@ -560,7 +645,7 @@ export function nativeHello(
   inventory: NativeTab[],
   paused: boolean,
   handoff: NativeHandoff,
-  stagedCommits: Array<Omit<StagedCommit, "action" | "preview">>,
+  stagedCommits: PublicStagedCommit[],
 ) {
   return {
     protocol: NATIVE_PROTOCOL,
@@ -599,9 +684,23 @@ export function nativeEvent(event: string, payload: Record<string, unknown>, eve
     case "handoff_changed":
       assertNativeHandoff(payload);
       break;
-    case "commit_expired": {
+    case "commit_expired":
+    case "commit_abandoned": {
       const eventPayload = assertExactObject(payload, ["native_token"], [], "commit event payload");
       assertBoundedString(eventPayload.native_token, "native_token", 16, 256);
+      break;
+    }
+    case "popup_commit_approved":
+    case "popup_commit_abandoned": {
+      const eventPayload = assertExactObject(
+        payload,
+        ["review_handle", "task_id", "tab_id"],
+        [],
+        "popup commit event payload",
+      );
+      assertBoundedString(eventPayload.review_handle, "review_handle", 16, 256);
+      assertUuid(eventPayload.task_id, "task_id");
+      assertTabId(eventPayload.tab_id);
       break;
     }
     case "extension_disconnected": {
@@ -611,6 +710,12 @@ export function nativeEvent(event: string, payload: Record<string, unknown>, eve
     }
   }
   if (eventId !== undefined) assertBoundedString(eventId, "event_id", 16, 256);
+  if (
+    (event === "popup_commit_approved" || event === "popup_commit_abandoned") &&
+    eventId === undefined
+  ) {
+    commandError("popup commit events require an event_id");
+  }
   return {
     protocol: NATIVE_PROTOCOL,
     version: PROTOCOL_VERSION,
@@ -654,6 +759,20 @@ function assertNativeHandoff(value: unknown): asserts value is NativeHandoff {
 export function randomToken(byteLength = 32): string {
   const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+/** UUIDv7 for host-side popup-approval idempotency records. */
+export function randomUuidV7(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let timestamp = Date.now();
+  for (let index = 5; index >= 0; index -= 1) {
+    bytes[index] = timestamp & 0xff;
+    timestamp = Math.floor(timestamp / 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function canonicalize(value: unknown): unknown {

@@ -17,6 +17,14 @@ describe("AgentTab MCP surface", () => {
     expect(listedTools(false).some((tool) => tool.name === DEVELOPER_TOOL.name)).toBe(false);
   });
 
+  test("browser_act advertises no press action", () => {
+    const actionTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_act")!;
+    expect(actionTool.inputSchema).not.toHaveProperty("$defs.press");
+    expect(actionTool.inputSchema).not.toMatchObject({
+      $defs: { action: { oneOf: expect.arrayContaining([{ $ref: "#/$defs/press" }]) } },
+    });
+  });
+
   test("developer mode adds only browser_developer", () => {
     expect(listedTools(true).map((tool) => tool.name)).toEqual([
       ...STANDARD_TOOLS.map((tool) => tool.name),

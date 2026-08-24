@@ -98,6 +98,7 @@ let permissionRequests: Array<Record<string, unknown>>;
 let permissionRequestResult: boolean;
 let popupMessageListeners: PopupMessageListener[];
 let permissionRemovedListeners: PermissionRemovedListener[];
+let debuggerEventListeners: Array<(...args: unknown[]) => void>;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -119,6 +120,16 @@ async function waitForCondition(predicate: () => boolean): Promise<void> {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
   throw new Error("condition did not settle within the bounded wait");
+}
+
+function emitDebuggerEvent(
+  tabId: number,
+  method: string,
+  params: Record<string, unknown> = {},
+): void {
+  for (const listener of debuggerEventListeners) {
+    listener({ tabId }, method, clone(params));
+  }
 }
 
 function installChromeMock(): void {
@@ -146,7 +157,11 @@ function installChromeMock(): void {
   permissionRequestResult = true;
   popupMessageListeners = [];
   permissionRemovedListeners = [];
-  const listeners = { detach: [] as Array<(...args: unknown[]) => void>, event: [] as Array<(...args: unknown[]) => void> };
+  debuggerEventListeners = [];
+  const listeners = {
+    detach: [] as Array<(...args: unknown[]) => void>,
+    event: debuggerEventListeners,
+  };
   const createTab = (url = "about:blank", active = false, windowId = 1): MockTab => {
     const tab = { id: nextTabId++, windowId, groupId: -1, active, url, status: "complete" };
     tabStore.set(tab.id, tab);
@@ -1394,6 +1409,46 @@ describe("native bridge transport", () => {
     expect(alarmCreates.at(-1)?.when).toBeLessThanOrEqual(Date.now() + 1_000);
   });
 
+
+  test("sends a popup approval by opaque review handle and requires a host acknowledgment", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const port = new MockNativePort();
+    nativePort = port;
+    const bridge = new NativeBridge(scheduler, ownership, async () => {
+      throw new Error("command handler must not run");
+    });
+    await bridge.connect();
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+    await waitForCondition(() => scheduler.isAccepting());
+
+    const approval = bridge.approvePopupCommit("review-handle-opaque", TASK_A, 44);
+    const event = port.posted.at(-1) as Record<string, unknown>;
+    expect(event).toMatchObject({
+      kind: "event",
+      event: "popup_commit_approved",
+      payload: { review_handle: "review-handle-opaque", task_id: TASK_A, tab_id: 44 },
+    });
+    expect(JSON.stringify(event)).not.toContain("native_token");
+    const eventId = event.event_id;
+    if (typeof eventId !== "string") throw new Error("popup approval event id is missing");
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "event_ack",
+      event: "popup_commit_approved",
+      event_id: eventId,
+      outcome: "completed",
+      result: { receipt_id: "receipt-popup-approval" },
+    });
+    await expect(approval).resolves.toEqual({ receipt_id: "receipt-popup-approval" });
+  });
   test("disconnects on a malformed ready frame", async () => {
     const scheduler = new MutationScheduler();
     const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
@@ -1456,6 +1511,31 @@ describe("consequential action staging", () => {
     await runtime.detach(7);
     expect(events).toEqual([]);
   });
+  test("abandoning a popup review clears its private native stage", async () => {
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(7);
+    const prepared = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    const nativeToken = prepared.staged?.native_token;
+    if (typeof nativeToken !== "string") throw new Error("consequential action did not stage");
+
+    await runtime.bindReview(TASK_A, {
+      native_token: nativeToken,
+      review_handle: "popup-review-handle",
+      tab_id: 7,
+    });
+    expect(await runtime.reviewBinding("popup-review-handle")).toEqual({
+      task_id: TASK_A,
+      tab_id: 7,
+    });
+    expect(await runtime.abandonReview("popup-review-handle")).toBe(true);
+    await expect(runtime.stagedTabId(TASK_A, nativeToken)).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+  });
   test("preserves a concurrent human tab selection during a task click", async () => {
     tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
@@ -1476,6 +1556,122 @@ describe("consequential action staging", () => {
   });
 
 
+
+  test("rejects dialog acceptance staging when no JavaScript dialog is open", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(12);
+
+    await expect(runtime.act(TASK_A, 12, pageRevision, [{ kind: "dialog", decision: "accept" }])).rejects
+      .toMatchObject({ code: "invalid_request" });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
+
+  test("accepts a staged dialog only while the same dialog remains open", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(13);
+    await runtime.snapshot(13, { mode: "accessibility" });
+    emitDebuggerEvent(13, "Page.javascriptDialogOpening", {
+      type: "prompt",
+      message: "Enter the confirmation phrase",
+      defaultPrompt: "draft",
+    });
+
+    const prepared = await runtime.act(TASK_A, 13, pageRevision, [
+      { kind: "dialog", decision: "accept", prompt_text: "confirmed" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+    expect(prepared.staged?.dialog).toMatchObject({ generation: 1, fingerprint: expect.any(String) });
+
+    await expect(runtime.commit(TASK_A, { native_token: token })).resolves.toMatchObject({
+      actions: [{ kind: "dialog", completed: true }],
+    });
+    expect(
+      debuggerCommands.findLast(({ method }) => method === "Page.handleJavaScriptDialog"),
+    ).toMatchObject({
+      params: { accept: true, promptText: "confirmed" },
+    });
+  });
+
+  test("invalidates a staged dialog token when the dialog is replaced", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(14);
+    await runtime.snapshot(14, { mode: "accessibility" });
+    emitDebuggerEvent(14, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "First confirmation",
+    });
+    const prepared = await runtime.act(TASK_A, 14, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+
+    emitDebuggerEvent(14, "Page.javascriptDialogClosed");
+    emitDebuggerEvent(14, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Replacement confirmation",
+    });
+    await waitForCondition(() => persisted[STATE_KEY] !== undefined);
+    await waitForCondition(() => {
+      const state = persisted[STATE_KEY] as { stagedCommits?: Record<string, unknown> };
+      return state.stagedCommits?.[token] === undefined;
+    });
+
+    await expect(runtime.commit(TASK_A, { native_token: token })).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
+
+  test("invalidates a staged dialog token when page revision changes", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(15);
+    await runtime.snapshot(15, { mode: "accessibility" });
+    emitDebuggerEvent(15, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Navigate away?",
+    });
+    const prepared = await runtime.act(TASK_A, 15, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+
+    await revisions.markNavigation(15);
+    expect((await readState()).stagedCommits[token]).toBeUndefined();
+    await expect(runtime.commit(TASK_A, { native_token: token })).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
+
+  test("invalidates a staged dialog token when its document identity changes", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const pageRevision = await revisions.ensure(16);
+    await runtime.snapshot(16, { mode: "accessibility" });
+    emitDebuggerEvent(16, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Replace document?",
+    });
+    const prepared = await runtime.act(TASK_A, 16, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+
+    await revisions.observeDocument(16, "backend:replacement", "replacement-loader");
+    expect((await readState()).stagedCommits[token]).toBeUndefined();
+    await expect(runtime.commit(TASK_A, { native_token: token })).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
   test("rejects and deletes an expired staged token", async () => {
     const revisions = new RevisionTracker();
     const events: string[] = [];
@@ -1714,6 +1910,23 @@ describe("extension entrypoint admission boundaries", () => {
     expect(debuggerCommands).toHaveLength(deniedBeforePermission);
     expect(await sendPopupMessage({ kind: "resume" })).toEqual({ paused: false });
 
+    const press = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6240",
+      TASK_A,
+      "browser_act",
+      {
+        tab_id: 100,
+        expected_page_revision: 1,
+        actions: [{ kind: "press", ref: "r1-22", key: "Enter" }],
+      },
+    );
+    expect(press).toMatchObject({
+      outcome: "not_started",
+      error: { code: "invalid_request" },
+    });
+    expect(debuggerCommands).toHaveLength(deniedBeforePermission);
+
+
     const staleRevision = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6224",
       TASK_A,
@@ -1811,7 +2024,7 @@ describe("extension entrypoint admission boundaries", () => {
         actions: [
           { kind: "scroll", delta_x: 3, delta_y: 4 },
           { kind: "click", ref: "r1-22" },
-          { kind: "press", key: "Enter" },
+          { kind: "type", ref: "r1-22", text: "after staged click" },
         ],
       },
     );

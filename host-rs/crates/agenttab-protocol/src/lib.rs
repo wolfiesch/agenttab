@@ -398,10 +398,6 @@ pub enum BrowserAction {
         r#ref: String,
         value: String,
     },
-    Press {
-        r#ref: String,
-        key: String,
-    },
     Scroll {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
@@ -654,10 +650,6 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
         BrowserAction::Select { r#ref, value } => {
             require_ref(method, r#ref)?;
             require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "value")
-        }
-        BrowserAction::Press { r#ref, key } => {
-            require_ref(method, r#ref)?;
-            require_len(method, key, 1, 128, "key")
         }
         BrowserAction::Scroll {
             r#ref,
@@ -1281,6 +1273,9 @@ pub enum NativeEventPayload {
     Pause(NativePauseEvent),
     Handoff(NativeHandoff),
     CommitExpired(NativeCommitExpiredEvent),
+    CommitAbandoned(NativeCommitExpiredEvent),
+    PopupCommitApproved(NativePopupCommitEvent),
+    PopupCommitAbandoned(NativePopupCommitEvent),
     ExtensionDisconnected(NativeDisconnectEvent),
 }
 
@@ -1311,6 +1306,14 @@ pub struct NativeCommitExpiredEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct NativePopupCommitEvent {
+    pub review_handle: String,
+    pub task_id: Uuid,
+    pub tab_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NativeDisconnectEvent {
     pub reason: String,
 }
@@ -1324,9 +1327,16 @@ impl NativeEvent {
                 version: event.version,
             });
         }
-        if event.event_id.is_some() && !matches!(event.event, NativeEventName::HandoffChanged) {
+        if event.event_id.is_some()
+            && !matches!(
+                event.event,
+                NativeEventName::HandoffChanged
+                    | NativeEventName::PopupCommitApproved
+                    | NativeEventName::PopupCommitAbandoned
+            )
+        {
             return Err(ProtocolError::InvalidNativeMessage(
-                "event_id is only supported for handoff_changed".into(),
+                "event_id is only supported for acknowledged native events".into(),
             ));
         }
         let payload = match event.event {
@@ -1345,6 +1355,15 @@ impl NativeEvent {
                 NativeEventPayload::Handoff(decode_native_event_payload(event.payload.clone())?)
             }
             NativeEventName::CommitExpired => NativeEventPayload::CommitExpired(
+                decode_native_event_payload(event.payload.clone())?,
+            ),
+            NativeEventName::CommitAbandoned => NativeEventPayload::CommitAbandoned(
+                decode_native_event_payload(event.payload.clone())?,
+            ),
+            NativeEventName::PopupCommitApproved => NativeEventPayload::PopupCommitApproved(
+                decode_native_event_payload(event.payload.clone())?,
+            ),
+            NativeEventName::PopupCommitAbandoned => NativeEventPayload::PopupCommitAbandoned(
                 decode_native_event_payload(event.payload.clone())?,
             ),
             NativeEventName::ExtensionDisconnected => NativeEventPayload::ExtensionDisconnected(
@@ -1369,10 +1388,27 @@ impl NativeEvent {
                 }
             }
             NativeEventPayload::CommitExpired(event)
+            | NativeEventPayload::CommitAbandoned(event)
                 if !(16..=256).contains(&event.native_token.chars().count()) =>
             {
                 return Err(ProtocolError::InvalidNativeMessage(
-                    "expired native_token must contain 16 to 256 characters".into(),
+                    "native staged token must contain 16 to 256 characters".into(),
+                ));
+            }
+            NativeEventPayload::PopupCommitApproved(popup)
+            | NativeEventPayload::PopupCommitAbandoned(popup)
+                if !(16..=256).contains(&popup.review_handle.chars().count())
+                    || popup.tab_id == 0
+                    || event
+                        .event_id
+                        .as_deref()
+                        .and_then(|event_id| Uuid::parse_str(event_id).ok())
+                        .filter(|event_id| event_id.get_version_num() == 7)
+                        .is_none() =>
+            {
+                return Err(ProtocolError::InvalidNativeMessage(
+                    "popup commit event must bind a review handle, task tab, and UUIDv7 event_id"
+                        .into(),
                 ));
             }
             NativeEventPayload::ExtensionDisconnected(event) if event.reason.is_empty() => {
@@ -1409,6 +1445,9 @@ pub enum NativeEventName {
     PauseChanged,
     HandoffChanged,
     CommitExpired,
+    CommitAbandoned,
+    PopupCommitApproved,
+    PopupCommitAbandoned,
     ExtensionDisconnected,
 }
 
@@ -1462,6 +1501,33 @@ pub fn native_event_ack(event: NativeEventName, event_id: &str) -> Value {
         "event": event,
         "event_id": event_id,
     })
+}
+
+pub fn native_event_ack_result(
+    event: NativeEventName,
+    event_id: &str,
+    outcome: Outcome,
+    result: Option<Value>,
+    error: Option<RpcError>,
+) -> Value {
+    let mut value = native_event_ack(event, event_id);
+    let object = value
+        .as_object_mut()
+        .expect("native event acknowledgement is always an object");
+    object.insert(
+        "outcome".into(),
+        serde_json::to_value(outcome).expect("outcome serializes"),
+    );
+    if let Some(result) = result {
+        object.insert("result".into(), result);
+    }
+    if let Some(error) = error {
+        object.insert(
+            "error".into(),
+            serde_json::to_value(error).expect("error serializes"),
+        );
+    }
+    value
 }
 
 pub fn native_ready(state: RuntimeState) -> Value {
@@ -1601,6 +1667,16 @@ mod tests {
         });
         assert!(RpcRequest::parse(unknown_action_field).is_err());
     }
+    #[test]
+    fn standard_actions_reject_press() {
+        let press = json!({
+            "tab_id": 7,
+            "expected_page_revision": 11,
+            "actions": [{"kind": "press", "ref": "e4", "key": "Enter"}]
+        });
+        assert!(RpcRequest::parse(request("browser_act", press, true)).is_err());
+    }
+
     #[test]
     fn runtime_constraints_match_action_schema_boundaries() {
         let history = request(
@@ -1778,6 +1854,12 @@ mod tests {
             action_schema.pointer("/$defs/upload_file/properties/files/items/maxLength"),
             Some(&json!(MAX_UPLOAD_PATH_CHARS))
         );
+        assert!(action_schema.pointer("/$defs/press").is_none());
+        assert!(!action_schema["$defs"]["action"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == &json!({"$ref": "#/$defs/press"})));
     }
 
     #[test]
@@ -1903,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_ids_are_reserved_for_handoff_events() {
+    fn acknowledgement_ids_are_rejected_for_unacknowledged_events() {
         assert!(matches!(
             NativeEvent::parse(json!({
                 "protocol": NATIVE_PROTOCOL,
@@ -1913,6 +1995,48 @@ mod tests {
                 "event_id": "not-allowed",
                 "payload": {"paused": true}
             })),
+            Err(ProtocolError::InvalidNativeMessage(_))
+        ));
+    }
+
+    #[test]
+    fn popup_commit_events_require_a_uuidv7_event_id_and_typed_binding() {
+        let task_id = Uuid::now_v7();
+        let valid = json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "event",
+            "event": "popup_commit_approved",
+            "event_id": Uuid::now_v7(),
+            "payload": {
+                "review_handle": "review-handle-000",
+                "task_id": task_id,
+                "tab_id": 3,
+            }
+        });
+        assert!(matches!(
+            NativeEvent::parse(valid),
+            Ok((_, NativeEventPayload::PopupCommitApproved(NativePopupCommitEvent {
+                task_id: parsed_task_id,
+                tab_id: 3,
+                ..
+            }))) if parsed_task_id == task_id
+        ));
+
+        let invalid = json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "event",
+            "event": "popup_commit_approved",
+            "event_id": Uuid::new_v4(),
+            "payload": {
+                "review_handle": "review-handle-000",
+                "task_id": task_id,
+                "tab_id": 3,
+            }
+        });
+        assert!(matches!(
+            NativeEvent::parse(invalid),
             Err(ProtocolError::InvalidNativeMessage(_))
         ));
     }

@@ -106,6 +106,16 @@
       "properties": { "native_token": { "type": "string", "minLength": 16 } },
       "additionalProperties": false
     },
+    "popup_commit_payload": {
+      "type": "object",
+      "required": ["review_handle", "task_id", "tab_id"],
+      "properties": {
+        "review_handle": { "type": "string", "minLength": 16, "maxLength": 256 },
+        "task_id": { "type": "string", "format": "uuid" },
+        "tab_id": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
     "disconnect_payload": {
       "type": "object",
       "required": ["reason"],
@@ -228,13 +238,43 @@
       "allOf": [
         { "$ref": "#/$defs/base" },
         {
-          "type": "object",
           "required": ["kind", "event", "event_id"],
           "properties": {
             "protocol": {}, "version": {}, "kind": { "const": "event_ack" },
-            "event": { "const": "handoff_changed" },
-            "event_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+            "event": { "enum": ["handoff_changed", "popup_commit_approved", "popup_commit_abandoned"] },
+            "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "outcome": { "enum": ["completed", "not_started", "unknown"] },
+            "result": { "type": "object" },
+            "error": { "$ref": "#/$defs/rpc_error" }
           },
+          "allOf": [
+            {
+              "if": { "properties": { "event": { "const": "handoff_changed" } } },
+              "then": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["outcome"] },
+                    { "required": ["result"] },
+                    { "required": ["error"] }
+                  ]
+                }
+              },
+              "else": {
+                "oneOf": [
+                  {
+                    "required": ["outcome", "result"],
+                    "properties": { "outcome": { "const": "completed" } },
+                    "not": { "required": ["error"] }
+                  },
+                  {
+                    "required": ["outcome", "error"],
+                    "properties": { "outcome": { "enum": ["not_started", "unknown"] } },
+                    "not": { "required": ["result"] }
+                  }
+                ]
+              }
+            }
+          ],
           "additionalProperties": false
         }
       ]
@@ -256,6 +296,9 @@
                 "pause_changed",
                 "handoff_changed",
                 "commit_expired",
+                "commit_abandoned",
+                "popup_commit_approved",
+                "popup_commit_abandoned",
                 "extension_disconnected"
               ]
             },
@@ -299,12 +342,27 @@
               "then": { "properties": { "payload": { "$ref": "#/$defs/commit_expired_payload" } } }
             },
             {
+              "if": { "properties": { "event": { "enum": ["commit_expired", "commit_abandoned"] } } },
+              "then": { "properties": { "payload": { "$ref": "#/$defs/commit_expired_payload" } } }
+            },
+            {
+              "if": { "properties": { "event": { "enum": ["popup_commit_approved", "popup_commit_abandoned"] } } },
+              "then": {
+                "properties": { "payload": { "$ref": "#/$defs/popup_commit_payload" } },
+                "required": ["event_id"]
+              }
+            },
+            {
               "if": { "properties": { "event": { "const": "extension_disconnected" } } },
               "then": { "properties": { "payload": { "$ref": "#/$defs/disconnect_payload" } } }
             },
             {
               "if": { "required": ["event_id"] },
-              "then": { "properties": { "event": { "const": "handoff_changed" } } }
+              "then": {
+                "properties": {
+                  "event": { "enum": ["handoff_changed", "popup_commit_approved", "popup_commit_abandoned"] }
+                }
+              }
             }
           ],
           "additionalProperties": false

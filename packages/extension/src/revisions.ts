@@ -1,6 +1,14 @@
 import { mutateState, readState } from "./storage";
 
+type RevisionChangeListener = (tabId: number, pageRevision: number) => void | Promise<void>;
+
 export class RevisionTracker {
+  private readonly changeListeners = new Set<RevisionChangeListener>();
+
+  onChange(listener: RevisionChangeListener): () => void {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
+  }
   async ensure(tabId: number): Promise<number> {
     return mutateState((state) => {
       const key = String(tabId);
@@ -17,13 +25,15 @@ export class RevisionTracker {
   }
 
   async markNavigation(tabId: number): Promise<number> {
-    return mutateState((state) => {
+    const pageRevision = await mutateState((state) => {
       const key = String(tabId);
       const existing = state.revisions[key];
       const next = Math.max((existing?.current ?? 0) + 1, (existing?.floor ?? 0) + 1, 1);
       state.revisions[key] = { floor: next, current: next };
       return next;
     });
+    await this.publishChange(tabId, pageRevision);
+    return pageRevision;
   }
 
   async observeDocument(
@@ -31,7 +41,7 @@ export class RevisionTracker {
     documentId: string | undefined,
     loaderId: string | undefined,
   ): Promise<number> {
-    return mutateState((state) => {
+    const observed = await mutateState((state) => {
       const key = String(tabId);
       const existing = state.revisions[key];
       if (!existing) {
@@ -41,17 +51,17 @@ export class RevisionTracker {
           ...(documentId !== undefined ? { documentId } : {}),
           ...(loaderId !== undefined ? { loaderId } : {}),
         };
-        return 1;
+        return { pageRevision: 1, changed: false };
       }
       const changed =
         (documentId !== undefined && existing.documentId !== undefined && documentId !== existing.documentId) ||
         (loaderId !== undefined && existing.loaderId !== undefined && loaderId !== existing.loaderId);
-      const current = changed
+      const pageRevision = changed
         ? Math.max(existing.current + 1, existing.floor + 1)
         : existing.current;
       state.revisions[key] = {
-        floor: Math.max(existing.floor, current),
-        current,
+        floor: Math.max(existing.floor, pageRevision),
+        current: pageRevision,
         ...(documentId !== undefined
           ? { documentId }
           : existing.documentId !== undefined ? { documentId: existing.documentId } : {}),
@@ -59,8 +69,10 @@ export class RevisionTracker {
           ? { loaderId }
           : existing.loaderId !== undefined ? { loaderId: existing.loaderId } : {}),
       };
-      return current;
+      return { pageRevision, changed };
     });
+    if (observed.changed) await this.publishChange(tabId, observed.pageRevision);
+    return observed.pageRevision;
   }
 
   async assertExpected(tabId: number, expected: unknown): Promise<number> {
@@ -80,11 +92,19 @@ export class RevisionTracker {
   }
 
   async remove(tabId: number): Promise<void> {
-    await mutateState((state) => {
+    const pageRevision = await mutateState((state) => {
       const key = String(tabId);
       const existing = state.revisions[key];
       const next = Math.max((existing?.current ?? 0) + 1, (existing?.floor ?? 0) + 1, 1);
       state.revisions[key] = { floor: next, current: next };
+      return next;
     });
+    await this.publishChange(tabId, pageRevision);
+  }
+
+  private async publishChange(tabId: number, pageRevision: number): Promise<void> {
+    for (const listener of this.changeListeners) {
+      await listener(tabId, pageRevision);
+    }
   }
 }

@@ -161,10 +161,6 @@ function assertAction(value) {
       return action;
     case "set_viewport":
       commandError("set_viewport is unavailable in Standard mode");
-    case "press":
-      assertExactObject(action, ["kind", "key"], [], "press action");
-      assertBoundedString(action.key, "press.key", 1, 128);
-      return action;
     default:
       commandError(`Unsupported standard action: ${action.kind}`);
   }
@@ -1201,11 +1197,6 @@ class StandardBrowserRuntime {
         ...typeof action.prompt_text === "string" ? { promptText: action.prompt_text } : {}
       });
       return { kind, completed: true };
-    }
-    if (kind === "press") {
-      throw Object.assign(new Error("press is unavailable in Standard mode because it has no identifiable target"), {
-        code: "invalid_request"
-      });
     }
     if (kind === "scroll" && action.ref === undefined) {
       await chrome.scripting.executeScript({
@@ -2285,7 +2276,7 @@ class OwnershipLedger {
         });
       }
       await this.grant(ownedParent.taskId, childTabId, ownedParent.name);
-    } catch {}
+    } catch { }
   }
   async revokeIfMovedNow(tabId) {
     const state = await readState();
@@ -2345,7 +2336,7 @@ class OwnershipLedger {
       try {
         await chrome.tabs.remove(tabId);
         closedTabIds.push(tabId);
-      } catch {}
+      } catch { }
     }
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();

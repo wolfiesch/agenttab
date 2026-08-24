@@ -166,6 +166,15 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
   const params = command.params;
   const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer";
   try {
+    if (command.method === "commit_review_bind") {
+      return completed(command.request_id, await browser.bindReview(command.task_id, params));
+    }
+    if (command.method === "commit_review_abandon") {
+      return completed(
+        command.request_id,
+        await browser.abandonNativeStage(command.task_id, params.native_token, params.tab_id),
+      );
+    }
     if ((await readState()).handoff.active) {
       throw Object.assign(new Error("Automation is disabled while credential handoff is active"), {
         code: "handoff_blackout",
@@ -293,6 +302,13 @@ nativeBridge = new NativeBridge(
   dispatch,
   (event, eventId) => void handoff.acknowledgeEvent(event, eventId),
   () => handoff.restore(),
+  async (nativeTokens) => {
+    if (nativeTokens.length > 0) {
+      await browser.discardNativeStages(nativeTokens);
+      return;
+    }
+    await browser.abandonAllStages();
+  },
 );
 
 let startup: Promise<void> | null = null;
@@ -385,6 +401,15 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
         tab_count: task.tabIds.length,
         focus_tab_id: task.tabIds[0] ?? null,
       })),
+      reviews: Object.values(state.stagedCommits)
+        .filter((staged) => typeof staged.review_handle === "string")
+        .map((staged) => ({
+          review_handle: staged.review_handle,
+          task_id: staged.task_id,
+          tab_id: staged.tab_id,
+          effect: staged.effect,
+          expires_at_ms: staged.expires_at_ms,
+        })),
     };
   }
   if (message.kind === "focus_task" && typeof message.task_id === "string") {
@@ -416,6 +441,30 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
   }
   if (message.kind === "handoff_finish" && typeof message.completed === "boolean") {
     return handoff.finish(message.completed);
+  }
+  if (
+    (message.kind === "approve_popup_commit" || message.kind === "abandon_popup_commit") &&
+    typeof message.review_handle === "string"
+  ) {
+    const binding = await browser.reviewBinding(message.review_handle);
+    const bridge = nativeBridge;
+    if (!bridge) {
+      throw Object.assign(new Error("AgentTab host is disconnected; the staged action was not approved"), {
+        code: "extension_disconnected",
+      });
+    }
+    try {
+      const result = message.kind === "approve_popup_commit"
+        ? await bridge.approvePopupCommit(message.review_handle, binding.task_id, binding.tab_id)
+        : await bridge.abandonPopupCommit(message.review_handle, binding.task_id, binding.tab_id);
+      await browser.abandonReview(message.review_handle);
+      return result;
+    } catch (error) {
+      if (isRecord(error) && error.acknowledged === true) {
+        await browser.abandonReview(message.review_handle);
+      }
+      throw error;
+    }
   }
   if (message.kind === "close_task" && typeof message.task_id === "string") {
     await ownership.closeTask(message.task_id);

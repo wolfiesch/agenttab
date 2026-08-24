@@ -148,7 +148,6 @@ chrome-bridge clickAt <tabId> <x> <y>
 chrome-bridge type <tabId> <selector> <text>
 chrome-bridge hover <tabId> <selector>
 chrome-bridge scroll <tabId> <deltaX> <deltaY> [selector]
-chrome-bridge press <tabId> <keySpec>
 chrome-bridge drag <tabId> <fromSelector> <toSelector>
 chrome-bridge fill <tabId> <selector> <text>
 chrome-bridge select <tabId> <selector> <value>

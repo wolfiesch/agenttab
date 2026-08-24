@@ -13,6 +13,14 @@ interface TaskView {
   color: string | null;
 }
 
+interface ReviewView {
+  reviewHandle: string;
+  taskId: string;
+  tabId: number;
+  effect: string;
+  expiresAtMs: number;
+}
+
 interface UiState {
   automationEnabled: boolean;
   paused: boolean;
@@ -20,6 +28,7 @@ interface UiState {
   pointer: boolean | null;
   handoffPrompt: string | null;
   tasks: TaskView[];
+  reviews: ReviewView[];
 }
 
 /** Chrome's dark tab-group palette, so a popup row matches its group strip. */
@@ -83,6 +92,9 @@ const taskError = element("task-error", HTMLParagraphElement);
 const pointerToggle = element("pointer", HTMLInputElement);
 const pointerDetail = element("pointer-detail", HTMLElement);
 const settingsError = element("settings-error", HTMLParagraphElement);
+const reviews = element("reviews", HTMLElement);
+const reviewList = element("review-list", HTMLUListElement);
+const reviewError = element("review-error", HTMLParagraphElement);
 
 let current: UiState | null = null;
 let pending = false;
@@ -135,6 +147,25 @@ function parseTask(value: Record<string, unknown>): TaskView | null {
   };
 }
 
+function parseReview(value: Record<string, unknown>): ReviewView | null {
+  if (
+    typeof value.review_handle !== "string" ||
+    typeof value.task_id !== "string" ||
+    typeof value.tab_id !== "number" ||
+    typeof value.effect !== "string" ||
+    typeof value.expires_at_ms !== "number"
+  ) {
+    return null;
+  }
+  return {
+    reviewHandle: value.review_handle,
+    taskId: value.task_id,
+    tabId: value.tab_id,
+    effect: value.effect,
+    expiresAtMs: value.expires_at_ms,
+  };
+}
+
 async function load(): Promise<UiState> {
   const response = await send({ kind: "get_ui_state" });
   const handoff = isRecord(response.handoff) ? response.handoff : null;
@@ -152,6 +183,12 @@ async function load(): Promise<UiState> {
         .filter(isRecord)
         .map(parseTask)
         .filter((task): task is TaskView => task !== null)
+      : [],
+    reviews: Array.isArray(response.reviews)
+      ? response.reviews
+        .filter(isRecord)
+        .map(parseReview)
+        .filter((review): review is ReviewView => review !== null)
       : [],
   };
 }
@@ -268,6 +305,38 @@ function renderTask(task: TaskView, developerMode: boolean): HTMLLIElement {
   return row;
 }
 
+function renderReview(review: ReviewView): HTMLLIElement {
+  const row = document.createElement("li");
+  row.className = "review";
+  const effect = document.createElement("strong");
+  effect.textContent = review.effect;
+  const expiry = document.createElement("small");
+  const seconds = Math.max(0, Math.ceil((review.expiresAtMs - Date.now()) / 1_000));
+  expiry.textContent = seconds === 1 ? "Expires in 1 second" : `Expires in ${seconds} seconds`;
+  const actions = document.createElement("div");
+  actions.className = "review-actions";
+  const abandon = document.createElement("button");
+  abandon.type = "button";
+  abandon.className = "quiet";
+  abandon.textContent = "Decline";
+  abandon.addEventListener("click", () => {
+    void guard(reviewError, async () => {
+      await send({ kind: "abandon_popup_commit", review_handle: review.reviewHandle });
+    });
+  });
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.textContent = "Approve";
+  approve.addEventListener("click", () => {
+    void guard(reviewError, async () => {
+      await send({ kind: "approve_popup_commit", review_handle: review.reviewHandle });
+    });
+  });
+  actions.append(abandon, approve);
+  row.append(effect, expiry, actions);
+  return row;
+}
+
 function render(state: UiState): void {
   const phase = lifecycle(state);
   document.body.dataset.state = phase;
@@ -296,6 +365,10 @@ function render(state: UiState): void {
     handoffShown = false;
     hide(handoffError);
   }
+
+  reviews.hidden = state.reviews.length === 0;
+  reviewList.replaceChildren(...state.reviews.map(renderReview));
+  if (state.reviews.length === 0) hide(reviewError);
 
   pointerToggle.disabled = state.pointer === null;
   pointerToggle.checked = state.pointer === true;

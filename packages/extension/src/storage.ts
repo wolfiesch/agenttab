@@ -186,6 +186,8 @@ function parseState(value: unknown): ExtensionState | null {
   const stagedCommits: Record<string, StagedCommit> = {};
   for (const [token, candidate] of Object.entries(commitsValue)) {
     const commit = objectValue(candidate);
+    const dialog =
+      commit?.dialog === undefined ? undefined : objectValue(commit.dialog);
     if (
       !commit ||
       commit.native_token !== token ||
@@ -197,6 +199,15 @@ function parseState(value: unknown): ExtensionState | null {
       typeof commit.fingerprint !== "string" ||
       commit.fingerprint.length < 32 ||
       !finiteInteger(commit.expires_at_ms) ||
+      (commit.review_handle !== undefined &&
+        (typeof commit.review_handle !== "string" ||
+          commit.review_handle.length < 16 ||
+          commit.review_handle.length > 256)) ||
+      (commit.dialog !== undefined &&
+        (!dialog ||
+          !finiteInteger(dialog.generation, 1) ||
+          typeof dialog.fingerprint !== "string" ||
+          dialog.fingerprint.length < 32)) ||
       !objectValue(commit.action) ||
       !objectValue(commit.preview)
     ) {

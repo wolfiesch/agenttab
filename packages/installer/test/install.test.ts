@@ -4,8 +4,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { deflateRawSync } from "node:zlib";
 import {
   detectLegacy,
   install,
@@ -57,17 +58,24 @@ async function runtimeAssets(root: string): Promise<RuntimeAssets> {
   };
 }
 
-async function signedFixture(root: string, version = "2.0.0-rc.1") {
-  const target = targetTriple();
-  const assetName = `agenttab-host-v${version}-${target}.tar.gz`;
-  const source = join(root, "source");
-  await mkdir(source, { recursive: true });
-  const binaryName = process.platform === "win32" ? "agenttab-host.exe" : "agenttab-host";
-  await copyFile(systemExecutable(), join(source, binaryName));
-  await chmod(join(source, binaryName), 0o755);
+async function signedArchiveFixture(
+  root: string,
+  {
+    archive,
+    assetName,
+    platformSignature: signatureType,
+    target,
+    version = "2.0.0-rc.1",
+  }: {
+    archive: Buffer;
+    assetName: string;
+    platformSignature: "apple_code_signing" | "authenticode" | "signed_manifest";
+    target: string;
+    version?: string;
+  },
+) {
   const archivePath = join(root, assetName);
-  execFileSync("tar", ["-czf", archivePath, "-C", source, binaryName]);
-  const archive = await readFile(archivePath);
+  await writeFile(archivePath, archive);
   const manifest = {
     schemaVersion: 1,
     repository: "wolfiesch/agenttab",
@@ -79,7 +87,7 @@ async function signedFixture(root: string, version = "2.0.0-rc.1") {
       target,
       sha256: sha256(archive),
       bytes: archive.byteLength,
-      platformSignature: platformSignature(),
+      platformSignature: signatureType,
       url: pathToFileURL(archivePath).href,
     }],
   };
@@ -97,6 +105,111 @@ async function signedFixture(root: string, version = "2.0.0-rc.1") {
     signatureUrl: pathToFileURL(signaturePath).href,
     publicKeyPem: publicKey.export({ type: "spki", format: "pem" }).toString(),
   };
+}
+
+interface ZipFixtureEntry {
+  name: string;
+  bytes: Buffer;
+  mode?: number;
+}
+
+function crc32(bytes: Buffer): number {
+  let value = 0xffff_ffff;
+  for (const byte of bytes) {
+    value ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ ((value & 1) * 0xedb8_8320);
+  }
+  return (value ^ 0xffff_ffff) >>> 0;
+}
+
+function zipArchive(entries: ZipFixtureEntry[]): Buffer {
+  const locals: Buffer[] = [];
+  const centralDirectory: Buffer[] = [];
+  let localOffset = 0;
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name, "utf8");
+    const compressed = deflateRawSync(entry.bytes);
+    const crc = crc32(entry.bytes);
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x0403_4b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(compressed.byteLength, 18);
+    local.writeUInt32LE(entry.bytes.byteLength, 22);
+    local.writeUInt16LE(name.byteLength, 26);
+    locals.push(local, name, compressed);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x0201_4b50, 0);
+    central.writeUInt16LE((3 << 8) | 20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(8, 10);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(compressed.byteLength, 20);
+    central.writeUInt32LE(entry.bytes.byteLength, 24);
+    central.writeUInt16LE(name.byteLength, 28);
+    central.writeUInt32LE(((entry.mode ?? 0o100755) << 16) >>> 0, 38);
+    central.writeUInt32LE(localOffset, 42);
+    centralDirectory.push(central, name);
+    localOffset += local.byteLength + name.byteLength + compressed.byteLength;
+  }
+
+  const directory = Buffer.concat(centralDirectory);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x0605_4b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(directory.byteLength, 12);
+  end.writeUInt32LE(localOffset, 16);
+  return Buffer.concat([...locals, directory, end]);
+}
+
+async function signedWindowsZipFixture(root: string, archive: Buffer) {
+  const version = "2.0.0-rc.1";
+  const target = targetTriple("win32", "x64");
+  return signedArchiveFixture(root, {
+    archive,
+    assetName: `agenttab-host-v${version}-${target}.zip`,
+    platformSignature: "authenticode",
+    target,
+    version,
+  });
+}
+
+async function addPowerShellShim(root: string): Promise<() => void> {
+  if (process.platform === "win32") return () => undefined;
+  const bin = join(root, "bin");
+  await mkdir(bin, { recursive: true });
+  const shim = join(bin, "powershell.exe");
+  await writeFile(shim, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  const previous = process.env.PATH;
+  process.env.PATH = previous ? `${bin}${delimiter}${previous}` : bin;
+  return () => {
+    if (previous === undefined) delete process.env.PATH;
+    else process.env.PATH = previous;
+  };
+}
+
+async function signedFixture(root: string, version = "2.0.0-rc.1") {
+  const target = targetTriple();
+  const assetName = `agenttab-host-v${version}-${target}.tar.gz`;
+  const source = join(root, "source");
+  await mkdir(source, { recursive: true });
+  const binaryName = process.platform === "win32" ? "agenttab-host.exe" : "agenttab-host";
+  await copyFile(systemExecutable(), join(source, binaryName));
+  await chmod(join(source, binaryName), 0o755);
+  const archivePath = join(root, assetName);
+  execFileSync("tar", ["-czf", archivePath, "-C", source, binaryName]);
+  return signedArchiveFixture(root, {
+    archive: await readFile(archivePath),
+    assetName,
+    platformSignature: platformSignature(),
+    target,
+    version,
+  });
 }
 
 describe("release trust", () => {
@@ -117,6 +230,98 @@ describe("release trust", () => {
     expect(targetTriple("win32", "arm64")).toBe("aarch64-pc-windows-msvc");
     expect(targetTriple("win32", "x64")).toBe("x86_64-pc-windows-msvc");
     expect(() => targetTriple("freebsd", "x64")).toThrow("does not publish");
+  });
+});
+
+describe("Windows host archives", () => {
+  test("selects the Windows ZIP contract and safely extracts the expected executable", async () => {
+    const root = await temporaryRoot();
+    const executable = process.platform === "win32"
+      ? await readFile(systemExecutable())
+      : Buffer.from("AgentTab Windows host fixture");
+    const fixture = await signedWindowsZipFixture(root, zipArchive([{
+      name: "agenttab-host.exe",
+      bytes: executable,
+    }]));
+    const restorePowerShell = await addPowerShellShim(root);
+    try {
+      const result = await install({
+        version: "2.0.0-rc.1",
+        development: true,
+        manifestUrl: fixture.manifestUrl,
+        signatureUrl: fixture.signatureUrl,
+        publicKeyPem: fixture.publicKeyPem,
+        home: join(root, "home"),
+        stateDir: join(root, "state"),
+        platform: "win32",
+        arch: "x64",
+        runtimeAssets: await runtimeAssets(root),
+        dryRun: true,
+        skipReadiness: true,
+        openBrowser: false,
+        print: () => undefined,
+      });
+      expect(result.target).toBe("x86_64-pc-windows-msvc");
+      expect(result.transaction.changed).toEqual([]);
+    } finally {
+      restorePowerShell();
+    }
+  });
+
+  test("requires the published ZIP asset for Windows", async () => {
+    const root = await temporaryRoot();
+    const version = "2.0.0-rc.1";
+    const target = targetTriple("win32", "x64");
+    const fixture = await signedArchiveFixture(root, {
+      archive: Buffer.from("not a ZIP"),
+      assetName: `agenttab-host-v${version}-${target}.tar.gz`,
+      platformSignature: "authenticode",
+      target,
+      version,
+    });
+    await expect(install({
+      version,
+      development: true,
+      manifestUrl: fixture.manifestUrl,
+      signatureUrl: fixture.signatureUrl,
+      publicKeyPem: fixture.publicKeyPem,
+      platform: "win32",
+      arch: "x64",
+      dryRun: true,
+      skipReadiness: true,
+      openBrowser: false,
+      print: () => undefined,
+    })).rejects.toThrow(`agenttab-host-v${version}-${target}.zip`);
+  });
+
+  test("rejects malformed, absolute, traversing, symlink, and multi-member ZIPs", async () => {
+    const archives = [
+      Buffer.from("not a ZIP"),
+      zipArchive([{ name: "/agenttab-host.exe", bytes: Buffer.from("host") }]),
+      zipArchive([{ name: "../agenttab-host.exe", bytes: Buffer.from("host") }]),
+      zipArchive([{ name: "agenttab-host.exe", bytes: Buffer.from("host"), mode: 0o120777 }]),
+      zipArchive([
+        { name: "agenttab-host.exe", bytes: Buffer.from("host") },
+        { name: "unexpected.txt", bytes: Buffer.from("unexpected") },
+      ]),
+    ];
+    for (const archive of archives) {
+      const root = await temporaryRoot();
+      const fixture = await signedWindowsZipFixture(root, archive);
+      await expect(install({
+        version: "2.0.0-rc.1",
+        development: true,
+        manifestUrl: fixture.manifestUrl,
+        signatureUrl: fixture.signatureUrl,
+        publicKeyPem: fixture.publicKeyPem,
+        platform: "win32",
+        arch: "x64",
+        dryRun: true,
+        skipReadiness: true,
+        openBrowser: false,
+        print: () => undefined,
+      })).rejects.toThrow("host ZIP");
+    }
   });
 });
 

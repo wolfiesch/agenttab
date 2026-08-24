@@ -1,17 +1,23 @@
 import { RevisionTracker } from "./revisions";
 import { isRecord } from "./type-guards";
-import { randomToken, sha256Hex, type StagedCommit } from "./protocol";
+import { randomToken, sha256Hex, type StagedCommit, type StagedDialog } from "./protocol";
 import { mutateState, readState } from "./storage";
 
 const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
+
+interface JavaScriptDialog {
+  generation: number;
+  fingerprint: Promise<string>;
+}
 
 interface DebugSession {
   attached: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
   inflight: Set<string>;
   lastNetworkActivity: number;
-  dialogOpen: boolean;
+  dialogGeneration: number;
+  dialog?: JavaScriptDialog;
 }
 
 interface AxValue {
@@ -43,6 +49,17 @@ export interface ActionExecution {
   staged?: StagedCommit;
 }
 
+interface PreparedDialog {
+  binding: StagedDialog;
+  live: JavaScriptDialog;
+}
+
+interface StagedConsequence {
+  effect: string;
+  target: Record<string, unknown>;
+  dialog?: PreparedDialog;
+}
+
 
 
 export class StandardBrowserRuntime {
@@ -54,7 +71,9 @@ export class StandardBrowserRuntime {
     private readonly emit: EventSink,
   ) {
     chrome.debugger.onDetach.addListener((source: { tabId?: number }) => {
-      if (source.tabId !== undefined) this.sessions.delete(source.tabId);
+      if (source.tabId === undefined) return;
+      this.sessions.delete(source.tabId);
+      void this.invalidateStagedDialogs(source.tabId);
     });
     chrome.debugger.onEvent.addListener(
       (source, method: string, rawParams?: object) => {
@@ -72,18 +91,31 @@ export class StandardBrowserRuntime {
           session.inflight.delete(params.requestId);
           session.lastNetworkActivity = Date.now();
         } else if (method === "Page.javascriptDialogOpening") {
-          session.dialogOpen = true;
+          session.dialogGeneration += 1;
+          session.dialog = {
+            generation: session.dialogGeneration,
+            fingerprint: sha256Hex({
+              type: typeof params.type === "string" ? params.type : null,
+              message: typeof params.message === "string" ? params.message : null,
+              default_prompt: typeof params.defaultPrompt === "string" ? params.defaultPrompt : null,
+            }),
+          };
+          void this.invalidateStagedDialogs(source.tabId);
         } else if (method === "Page.javascriptDialogClosed") {
-          session.dialogOpen = false;
+          session.dialogGeneration += 1;
+          session.dialog = undefined;
+          void this.invalidateStagedDialogs(source.tabId);
         }
       },
     );
+    this.revisions.onChange((tabId) => this.invalidateStagedDialogs(tabId));
   }
 
   async detach(tabId: number): Promise<void> {
     const session = this.sessions.get(tabId);
     if (session?.idleTimer) clearTimeout(session.idleTimer);
     this.sessions.delete(tabId);
+    await this.invalidateStagedDialogs(tabId);
     if (session?.attached) await chrome.debugger.detach({ tabId }).catch(() => undefined);
   }
   async scrubForHandoff(): Promise<void> {
@@ -200,8 +232,17 @@ export class StandardBrowserRuntime {
             target: stagedConsequence.target,
             ...(typeof action.ref === "string" ? { ref: action.ref } : {}),
           },
+          ...(stagedConsequence.dialog !== undefined ? { dialog: stagedConsequence.dialog.binding } : {}),
         };
         await mutateState((state) => {
+          if (
+            stagedConsequence.dialog !== undefined &&
+            this.sessions.get(tabId)?.dialog !== stagedConsequence.dialog.live
+          ) {
+            throw Object.assign(new Error("JavaScript dialog changed before it could be staged"), {
+              code: "invalid_request",
+            });
+          }
           state.stagedCommits[staged.native_token] = staged;
         });
         return {
@@ -223,6 +264,97 @@ export class StandardBrowserRuntime {
         actions: completedActions,
       },
     };
+  }
+
+  async bindReview(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const nativeToken = params.native_token;
+    const reviewHandle = params.review_handle;
+    const tabId = params.tab_id;
+    if (
+      typeof nativeToken !== "string" ||
+      typeof reviewHandle !== "string" ||
+      !Number.isInteger(tabId)
+    ) {
+      throw Object.assign(new Error("Commit review binding is malformed"), { code: "invalid_request" });
+    }
+    const bound = await mutateState((state) => {
+      const staged = state.stagedCommits[nativeToken];
+      if (
+        !staged ||
+        staged.task_id !== taskId ||
+        staged.tab_id !== tabId ||
+        staged.review_handle !== undefined
+      ) {
+        return false;
+      }
+      staged.review_handle = reviewHandle;
+      return true;
+    });
+    if (!bound) {
+      throw Object.assign(new Error("Commit review binding does not match a staged operation"), {
+        code: "invalid_staged_token",
+      });
+    }
+    return { review_bound: true };
+  }
+
+  async reviewBinding(reviewHandle: string): Promise<{ task_id: string; tab_id: number }> {
+    const staged = Object.values((await readState()).stagedCommits).find(
+      (candidate) => candidate.review_handle === reviewHandle,
+    );
+    if (!staged) {
+      throw Object.assign(new Error("Commit review is no longer available"), {
+        code: "invalid_staged_token",
+      });
+    }
+    return { task_id: staged.task_id, tab_id: staged.tab_id };
+  }
+
+  async abandonReview(reviewHandle: string): Promise<boolean> {
+    return mutateState((state) => {
+      const entry = Object.entries(state.stagedCommits).find(
+        ([, staged]) => staged.review_handle === reviewHandle,
+      );
+      if (!entry) return false;
+      delete state.stagedCommits[entry[0]];
+      return true;
+    });
+  }
+
+  async abandonNativeStage(
+    taskId: string,
+    nativeToken: unknown,
+    tabId: unknown,
+  ): Promise<Record<string, unknown>> {
+    if (typeof nativeToken !== "string" || !Number.isInteger(tabId)) {
+      throw Object.assign(new Error("Commit stage cleanup is malformed"), { code: "invalid_request" });
+    }
+    const abandoned = await mutateState((state) => {
+      const staged = state.stagedCommits[nativeToken];
+      if (!staged || staged.task_id !== taskId || staged.tab_id !== tabId) return false;
+      delete state.stagedCommits[nativeToken];
+      return true;
+    });
+    if (!abandoned) {
+      throw Object.assign(new Error("Commit stage is invalid, used, or belongs to another task"), {
+        code: "invalid_staged_token",
+      });
+    }
+    return { abandoned: true };
+  }
+
+  async discardNativeStages(nativeTokens: readonly string[]): Promise<void> {
+    if (nativeTokens.length === 0) return;
+    const tokens = new Set(nativeTokens);
+    await mutateState((state) => {
+      for (const token of tokens) delete state.stagedCommits[token];
+    });
+  }
+
+  async abandonAllStages(): Promise<void> {
+    await mutateState((state) => {
+      state.stagedCommits = {};
+    });
   }
 
   async stagedTabId(taskId: string, nativeToken: unknown): Promise<number> {
@@ -291,7 +423,9 @@ export class StandardBrowserRuntime {
     await mutateState((state) => {
       delete state.stagedCommits[String(nativeToken)];
     });
-    const result = await this.performAction(staged.tab_id, staged.page_revision, action);
+    const result = action.kind === "dialog" && action.decision === "accept"
+      ? await this.acceptStagedDialog(staged.tab_id, action, staged.dialog)
+      : await this.performAction(staged.tab_id, staged.page_revision, action);
     return {
       tab_id: staged.tab_id,
       page_revision: await this.revisions.current(staged.tab_id),
@@ -460,7 +594,7 @@ export class StandardBrowserRuntime {
     tabId: number,
     pageRevision: number,
     action: Record<string, unknown>,
-  ): Promise<{ effect: string; target: Record<string, unknown> } | null> {
+  ): Promise<StagedConsequence | null> {
     if (action.kind === "close") {
       return {
         effect: "Close an AgentTab-owned browser tab",
@@ -480,6 +614,7 @@ export class StandardBrowserRuntime {
       return {
         effect: "Accept a browser confirmation dialog",
         target: { kind: action.kind },
+        dialog: await this.stageDialog(tabId),
       };
     }
     if (action.kind !== "click") return null;
@@ -515,6 +650,70 @@ export class StandardBrowserRuntime {
     target: Record<string, unknown>,
   ): Promise<string> {
     return sha256Hex({ task_id: taskId, tab_id: tabId, page_revision: pageRevision, action, target });
+  }
+
+  private async stageDialog(tabId: number): Promise<PreparedDialog> {
+    await this.ensureAttached(tabId);
+    const dialog = this.sessions.get(tabId)?.dialog;
+    if (!dialog) {
+      throw Object.assign(new Error("Accepting a dialog requires an open JavaScript dialog"), {
+        code: "invalid_request",
+      });
+    }
+    const fingerprint = await dialog.fingerprint;
+    if (this.sessions.get(tabId)?.dialog !== dialog) {
+      throw Object.assign(new Error("JavaScript dialog changed before it could be staged"), {
+        code: "invalid_request",
+      });
+    }
+    return { binding: { generation: dialog.generation, fingerprint }, live: dialog };
+  }
+
+  private async acceptStagedDialog(
+    tabId: number,
+    action: Record<string, unknown>,
+    stagedDialog: StagedDialog | undefined,
+  ): Promise<Record<string, unknown>> {
+    if (!stagedDialog) {
+      throw Object.assign(new Error("Staged dialog binding is missing"), { code: "staged_commit_mismatch" });
+    }
+    await this.ensureAttached(tabId);
+    const dialog = this.sessions.get(tabId)?.dialog;
+    if (!dialog || dialog.generation !== stagedDialog.generation) {
+      throw Object.assign(new Error("The staged JavaScript dialog is no longer open"), {
+        code: "staged_commit_mismatch",
+      });
+    }
+    const fingerprint = await dialog.fingerprint;
+    if (
+      fingerprint !== stagedDialog.fingerprint ||
+      this.sessions.get(tabId)?.dialog !== dialog ||
+      dialog.generation !== stagedDialog.generation
+    ) {
+      throw Object.assign(new Error("The staged JavaScript dialog changed before Commit"), {
+        code: "staged_commit_mismatch",
+      });
+    }
+    await chrome.debugger.sendCommand(
+      { tabId },
+      "Page.handleJavaScriptDialog",
+      {
+        accept: true,
+        ...(typeof action.prompt_text === "string" ? { promptText: action.prompt_text } : {}),
+      },
+    );
+    return { kind: "dialog", completed: true };
+  }
+
+  private async invalidateStagedDialogs(tabId: number): Promise<void> {
+    await mutateState((state) => {
+      for (const [token, staged] of Object.entries(state.stagedCommits)) {
+        const action = staged.action.action;
+        if (staged.tab_id === tabId && isRecord(action) && action.kind === "dialog") {
+          delete state.stagedCommits[token];
+        }
+      }
+    });
   }
 
   private async targetDescriptor(
@@ -577,16 +776,16 @@ export class StandardBrowserRuntime {
       });
     }
     if (kind === "dialog") {
+      if (action.decision === "accept") {
+        throw Object.assign(new Error("Accepting a dialog requires a staged Commit"), {
+          code: "invalid_request",
+        });
+      }
       await this.send(tabId, "Page.handleJavaScriptDialog", {
-        accept: action.decision === "accept",
+        accept: false,
         ...(typeof action.prompt_text === "string" ? { promptText: action.prompt_text } : {}),
       });
       return { kind, completed: true };
-    }
-    if (kind === "press") {
-      throw Object.assign(new Error("press is unavailable in Standard mode because it has no identifiable target"), {
-        code: "invalid_request",
-      });
     }
     if (kind === "scroll" && action.ref === undefined) {
       await chrome.scripting.executeScript({
@@ -803,7 +1002,12 @@ export class StandardBrowserRuntime {
   private async ensureAttached(tabId: number): Promise<void> {
     let session = this.sessions.get(tabId);
     if (!session) {
-      session = { attached: false, inflight: new Set(), lastNetworkActivity: Date.now(), dialogOpen: false };
+      session = {
+        attached: false,
+        inflight: new Set(),
+        lastNetworkActivity: Date.now(),
+        dialogGeneration: 0,
+      };
       this.sessions.set(tabId, session);
     }
     if (!session.attached) {

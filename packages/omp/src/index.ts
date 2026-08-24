@@ -73,7 +73,6 @@ const DEFINITIONS: ReadonlyArray<{
           z.object({ kind: z.literal("type"), ref, text: z.string().max(1_048_576) }).strict(),
           z.object({ kind: z.literal("fill"), ref, text: z.string().max(1_048_576) }).strict(),
           z.object({ kind: z.literal("select"), ref, value: z.string().max(65_536) }).strict(),
-          z.object({ kind: z.literal("press"), key: z.string().min(1).max(128) }).strict(),
           z.object({
             kind: z.literal("scroll"),
             ref: ref.optional(),

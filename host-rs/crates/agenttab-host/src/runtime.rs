@@ -3,14 +3,14 @@ use crate::guardrails::{GuardrailLoadError, Guardrails};
 use crate::handoff::HandoffState;
 use crate::journal::{BeginDecision, Journal, JournalError};
 use crate::lifecycle::Lifecycle;
-use crate::native::{NativeError, NativeEventSink, NativeTransport};
+use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTransport};
 use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
     BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams,
     ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload, NativeHandoff,
-    NativeStagedCommit, NativeTab, Outcome, RpcError, RpcMethod, RpcRequest, RpcResponse,
-    TaskBinding, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    NativePopupCommitEvent, NativeResponse, NativeStagedCommit, NativeTab, Outcome, RpcError,
+    RpcMethod, RpcRequest, RpcResponse, TaskBinding, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -38,6 +38,7 @@ pub enum RuntimeBuildError {
 struct JournalNativeEventSink {
     journal: Arc<Journal>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
+    runtime: Mutex<Weak<Runtime>>,
 }
 impl JournalNativeEventSink {
     fn cleanup_uploads(paths: Vec<PathBuf>) -> Result<(), String> {
@@ -67,29 +68,72 @@ impl NativeEventSink for JournalNativeEventSink {
             .map_err(|error| error.to_string())
     }
 
-    fn handle(&self, payload: &NativeEventPayload, event_id: Option<&str>) -> Result<(), String> {
-        if let NativeEventPayload::CommitExpired(event) = payload {
-            let removed_uploads = self
-                .journal
-                .expire_staged_commit(&event.native_token)
-                .map_err(|error| error.to_string())?;
-            return Self::cleanup_uploads(removed_uploads);
-        }
-        let result = match payload {
+    fn handle(
+        &self,
+        payload: &NativeEventPayload,
+        event_id: Option<&str>,
+    ) -> Result<NativeEventResult, String> {
+        match payload {
+            NativeEventPayload::CommitExpired(event)
+            | NativeEventPayload::CommitAbandoned(event) => {
+                let removed_uploads = self
+                    .journal
+                    .expire_staged_commit(&event.native_token)
+                    .map_err(|error| error.to_string())?;
+                Self::cleanup_uploads(removed_uploads)?;
+                Ok(NativeEventResult::completed(json!({ "cleared": true })))
+            }
+            NativeEventPayload::PopupCommitApproved(event) => {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .upgrade()
+                    .ok_or("runtime is unavailable")?;
+                Ok(runtime.commit_popup_review(
+                    event,
+                    event_id.ok_or("popup approval is missing its idempotency event_id")?,
+                ))
+            }
+            NativeEventPayload::PopupCommitAbandoned(event) => {
+                let runtime = self
+                    .runtime
+                    .lock()
+                    .upgrade()
+                    .ok_or("runtime is unavailable")?;
+                Ok(runtime.abandon_popup_review(
+                    event,
+                    event_id.ok_or("popup abandonment is missing its idempotency event_id")?,
+                ))
+            }
             NativeEventPayload::Inventory(event) => {
                 replace_inventory_urls(&self.tab_urls, &event.inventory);
-                self.journal.reconcile_inventory(&event.inventory)
+                self.journal
+                    .reconcile_inventory(&event.inventory)
+                    .map_err(|error| error.to_string())?;
+                Ok(NativeEventResult::completed(json!({})))
             }
-            NativeEventPayload::TaskTabs(event) => self
-                .journal
-                .update_task_tab_count(event.task_id, event.tab_count),
+            NativeEventPayload::TaskTabs(event) => {
+                self.journal
+                    .update_task_tab_count(event.task_id, event.tab_count)
+                    .map_err(|error| error.to_string())?;
+                Ok(NativeEventResult::completed(json!({})))
+            }
             NativeEventPayload::Handoff(handoff) => {
-                self.journal.apply_handoff_event(handoff, event_id)
+                self.journal
+                    .apply_handoff_event(handoff, event_id)
+                    .map_err(|error| error.to_string())?;
+                Ok(NativeEventResult::completed(json!({})))
             }
-            NativeEventPayload::Pause(_) | NativeEventPayload::ExtensionDisconnected(_) => Ok(()),
-            NativeEventPayload::CommitExpired(_) => unreachable!("handled above"),
-        };
-        result.map_err(|error| error.to_string())
+            NativeEventPayload::Pause(_) => Ok(NativeEventResult::completed(json!({}))),
+            NativeEventPayload::ExtensionDisconnected(_) => {
+                let paths = self
+                    .journal
+                    .abandon_all_staged_commits()
+                    .map_err(|error| error.to_string())?;
+                Self::cleanup_uploads(paths)?;
+                Ok(NativeEventResult::completed(json!({})))
+            }
+        }
     }
 }
 
@@ -134,16 +178,18 @@ impl Runtime {
             handoff.restore(true);
         }
         let tab_urls = Arc::new(RwLock::new(HashMap::new()));
-        native.set_event_sink(Arc::new(JournalNativeEventSink {
+        let sink = Arc::new(JournalNativeEventSink {
             journal: journal.clone(),
             tab_urls: tab_urls.clone(),
-        }));
+            runtime: Mutex::new(Weak::new()),
+        });
+        native.set_event_sink(sink.clone());
         let guardrails = Arc::new(Guardrails::load(&paths.policy_file)?);
         let audit = Arc::new(AuditLog::open(
             &paths.audit_log,
             guardrails.audit_enabled(),
         )?);
-        Ok(Arc::new(Self {
+        let runtime = Arc::new(Self {
             lifecycle,
             journal,
             guardrails,
@@ -154,7 +200,9 @@ impl Runtime {
             global_gate: RwLock::new(()),
             tab_urls,
             upload_staging_dir: paths.upload_staging_dir.clone(),
-        }))
+        });
+        *sink.runtime.lock() = Arc::downgrade(&runtime);
+        Ok(runtime)
     }
 
     #[cfg(test)]
@@ -174,6 +222,284 @@ impl Runtime {
         ConnectionContext::negotiate(init, &self.journal, self.lifecycle.state())
     }
 
+    fn commit_popup_review(
+        &self,
+        event: &NativePopupCommitEvent,
+        event_id: &str,
+    ) -> NativeEventResult {
+        let key = match Uuid::parse_str(event_id) {
+            Ok(key) => key,
+            Err(_) => {
+                return NativeEventResult::failure(
+                    Outcome::NotStarted,
+                    RpcError::new("invalid_request", "popup approval event_id is not a UUID"),
+                )
+            }
+        };
+        let params = json!({
+            "popup_event": "approved",
+            "review_handle": event.review_handle,
+            "tab_id": event.tab_id,
+        });
+        let input_hash = request_hash(RpcMethod::BrowserCommit, &params);
+        match self.journal.lookup_mutation(
+            event.task_id,
+            key,
+            RpcMethod::BrowserCommit,
+            &input_hash,
+        ) {
+            Ok(Some(decision)) => {
+                return native_event_result(existing_mutation_response(event_id, decision));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return NativeEventResult::failure(Outcome::NotStarted, journal_rpc_error(error));
+            }
+        }
+        match self
+            .journal
+            .begin_mutation(event.task_id, key, RpcMethod::BrowserCommit, &input_hash)
+        {
+            Ok(BeginDecision::Dispatch) => {}
+            Ok(decision) => {
+                return native_event_result(existing_mutation_response(event_id, decision))
+            }
+            Err(error) => {
+                return NativeEventResult::failure(Outcome::NotStarted, journal_rpc_error(error));
+            }
+        }
+
+        let started_at_ms = now_ms();
+        let started = Instant::now();
+        let mut response = match self.journal.consume_popup_staged_commit(
+            event.task_id,
+            event.tab_id,
+            &event.review_handle,
+        ) {
+            Ok(staged) => {
+                let cleanup_failure = |error: RpcError| {
+                    let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
+                    let finish = self.journal.finish_staged_commit(&staged.native_token);
+                    match (cleanup, finish) {
+                        (Ok(()), Ok(())) => {
+                            RpcResponse::failure(event_id, Outcome::NotStarted, error)
+                        }
+                        (Err(error), _) => RpcResponse::failure(event_id, Outcome::Unknown, error),
+                        (_, Err(error)) => RpcResponse::failure(
+                            event_id,
+                            Outcome::Unknown,
+                            journal_rpc_error(error),
+                        ),
+                    }
+                };
+                let preflight_error = self
+                    .lifecycle
+                    .gate(RpcMethod::BrowserCommit)
+                    .err()
+                    .or_else(|| self.handoff_blackout_error())
+                    .or_else(|| {
+                        self.journal
+                            .verify_task_tab(event.task_id, event.tab_id, None)
+                            .map_err(journal_rpc_error)
+                            .err()
+                    });
+                if let Some(error) = preflight_error {
+                    cleanup_failure(error)
+                } else {
+                    let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
+                    if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
+                        cleanup_failure(error)
+                    } else {
+                        let native = self.native.dispatch(
+                            Uuid::nil(),
+                            event.task_id,
+                            &RpcMethod::BrowserCommit.to_string(),
+                            json!({ "native_token": staged.native_token.clone() }),
+                            self.guardrails.native_origin_policy(staged.tab_id),
+                            dispatch_timeout(&MethodParams::Commit(BrowserCommitParams {
+                                staged_token: String::new(),
+                            })),
+                        );
+                        let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
+                        let finish = self.journal.finish_staged_commit(&staged.native_token);
+                        match (cleanup, finish, native) {
+                            (Err(error), _, _) => {
+                                RpcResponse::failure(event_id, Outcome::Unknown, error)
+                            }
+                            (_, Err(error), _) => RpcResponse::failure(
+                                event_id,
+                                Outcome::Unknown,
+                                journal_rpc_error(error),
+                            ),
+                            (Ok(()), Ok(()), Err(error)) => native_failure(event_id, error),
+                            (Ok(()), Ok(()), Ok(native)) => match (native.result, native.error) {
+                                (Some(mut result), None) => {
+                                    self.guardrails.redact(&mut result);
+                                    RpcResponse::success(event_id, native.outcome, result)
+                                }
+                                (None, Some(error)) => RpcResponse::failure(
+                                    event_id,
+                                    native.outcome,
+                                    self.guardrails.redact_error(error),
+                                ),
+                                _ => RpcResponse::failure(
+                                    event_id,
+                                    Outcome::Unknown,
+                                    RpcError::new(
+                                        "invalid_native_response",
+                                        "Extension response did not contain exactly one result branch",
+                                    ),
+                                ),
+                            },
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let rpc_error = journal_rpc_error(error);
+                match self.journal.abandon_popup_staged_commit(
+                    event.task_id,
+                    event.tab_id,
+                    &event.review_handle,
+                ) {
+                    Ok(paths) => match Guardrails::cleanup_staged_uploads(&paths) {
+                        Ok(()) => RpcResponse::failure(event_id, Outcome::NotStarted, rpc_error),
+                        Err(cleanup_error) => {
+                            RpcResponse::failure(event_id, Outcome::Unknown, cleanup_error)
+                        }
+                    },
+                    Err(_) => RpcResponse::failure(event_id, Outcome::NotStarted, rpc_error),
+                }
+            }
+        };
+        if let Err(error) = self.audit.record(AuditEntry {
+            connection_id: Uuid::nil(),
+            task_id: Some(event.task_id),
+            started_at_ms,
+            request_id: event_id,
+            method: RpcMethod::BrowserCommit,
+            params: &params,
+            outcome: response.outcome,
+            result: response.result.as_ref(),
+            error: response.error.as_ref(),
+            duration_ms: started.elapsed().as_millis(),
+            replayed: false,
+        }) {
+            response = self.audit_failure(event_id, error);
+        }
+        if let Err(error) = self
+            .journal
+            .complete_mutation(event.task_id, key, &response.value())
+        {
+            response = RpcResponse::failure(
+                event_id,
+                Outcome::Unknown,
+                RpcError::new(
+                    "journal_completion_failed",
+                    format!("Popup approval may have run but its result was not durable: {error}"),
+                ),
+            );
+        }
+        native_event_result(response)
+    }
+
+    fn abandon_popup_review(
+        &self,
+        event: &NativePopupCommitEvent,
+        event_id: &str,
+    ) -> NativeEventResult {
+        let key = match Uuid::parse_str(event_id) {
+            Ok(key) => key,
+            Err(_) => {
+                return NativeEventResult::failure(
+                    Outcome::NotStarted,
+                    RpcError::new(
+                        "invalid_request",
+                        "popup abandonment event_id is not a UUID",
+                    ),
+                )
+            }
+        };
+        let params = json!({
+            "popup_event": "abandoned",
+            "review_handle": event.review_handle,
+            "tab_id": event.tab_id,
+        });
+        let input_hash = request_hash(RpcMethod::BrowserCommit, &params);
+        match self.journal.lookup_mutation(
+            event.task_id,
+            key,
+            RpcMethod::BrowserCommit,
+            &input_hash,
+        ) {
+            Ok(Some(decision)) => {
+                return native_event_result(existing_mutation_response(event_id, decision));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return NativeEventResult::failure(Outcome::NotStarted, journal_rpc_error(error));
+            }
+        }
+        match self
+            .journal
+            .begin_mutation(event.task_id, key, RpcMethod::BrowserCommit, &input_hash)
+        {
+            Ok(BeginDecision::Dispatch) => {}
+            Ok(decision) => {
+                return native_event_result(existing_mutation_response(event_id, decision))
+            }
+            Err(error) => {
+                return NativeEventResult::failure(Outcome::NotStarted, journal_rpc_error(error));
+            }
+        }
+
+        let started_at_ms = now_ms();
+        let started = Instant::now();
+        let mut response = match self.journal.abandon_popup_staged_commit(
+            event.task_id,
+            event.tab_id,
+            &event.review_handle,
+        ) {
+            Ok(paths) => match Guardrails::cleanup_staged_uploads(&paths) {
+                Ok(()) => {
+                    RpcResponse::success(event_id, Outcome::Completed, json!({ "abandoned": true }))
+                }
+                Err(error) => RpcResponse::failure(event_id, Outcome::Unknown, error),
+            },
+            Err(error) => {
+                RpcResponse::failure(event_id, Outcome::NotStarted, journal_rpc_error(error))
+            }
+        };
+        if let Err(error) = self.audit.record(AuditEntry {
+            connection_id: Uuid::nil(),
+            task_id: Some(event.task_id),
+            started_at_ms,
+            request_id: event_id,
+            method: RpcMethod::BrowserCommit,
+            params: &params,
+            outcome: response.outcome,
+            result: response.result.as_ref(),
+            error: response.error.as_ref(),
+            duration_ms: started.elapsed().as_millis(),
+            replayed: false,
+        }) {
+            response = self.audit_failure(event_id, error);
+        }
+        if let Err(error) = self
+            .journal
+            .complete_mutation(event.task_id, key, &response.value())
+        {
+            response = RpcResponse::failure(
+                event_id,
+                Outcome::Unknown,
+                RpcError::new(
+                    "journal_completion_failed",
+                    format!("Popup abandonment may have completed but its result was not durable: {error}"),
+                ),
+            );
+        }
+        native_event_result(response)
+    }
     pub fn acknowledge_connection(
         &self,
         connection: &ConnectionContext,
@@ -647,33 +973,48 @@ impl Runtime {
         }
 
         let mut committed_uploads = Vec::new();
-        if let MethodParams::Commit(BrowserCommitParams { staged_token }) = params {
-            let staged = match self.journal.consume_staged_commit(task_id, staged_token) {
-                Ok(staged) => staged,
-                Err(error) => {
-                    return RpcResponse::failure(
-                        request_id,
-                        Outcome::NotStarted,
-                        journal_rpc_error(error),
-                    )
+        let mut committed_native_token = None;
+        let origin_policy =
+            if let MethodParams::Commit(BrowserCommitParams { staged_token }) = params {
+                let staged = match self.journal.consume_staged_commit(task_id, staged_token) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        return RpcResponse::failure(
+                            request_id,
+                            Outcome::NotStarted,
+                            journal_rpc_error(error),
+                        )
+                    }
+                };
+                let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
+                if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
+                    let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
+                    let finish = self.journal.finish_staged_commit(&staged.native_token);
+                    return match (cleanup, finish) {
+                        (Ok(()), Ok(())) => {
+                            RpcResponse::failure(request_id, Outcome::NotStarted, error)
+                        }
+                        (Err(cleanup_error), _) => {
+                            RpcResponse::failure(request_id, Outcome::Unknown, cleanup_error)
+                        }
+                        (_, Err(journal_error)) => RpcResponse::failure(
+                            request_id,
+                            Outcome::Unknown,
+                            journal_rpc_error(journal_error),
+                        ),
+                    };
                 }
+                let origin_policy = self.guardrails.native_origin_policy(staged.tab_id);
+                committed_native_token = Some(staged.native_token.clone());
+                params_value = json!({"native_token": staged.native_token});
+                committed_uploads = staged.upload_paths;
+                origin_policy
+            } else {
+                params_value
+                    .get("tab_id")
+                    .and_then(Value::as_u64)
+                    .and_then(|tab_id| self.guardrails.native_origin_policy(tab_id))
             };
-            let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
-            if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
-                if let Err(cleanup_error) = Guardrails::cleanup_staged_uploads(&staged.upload_paths)
-                {
-                    return RpcResponse::failure(request_id, Outcome::Unknown, cleanup_error);
-                }
-                return RpcResponse::failure(request_id, Outcome::NotStarted, error);
-            }
-            params_value = json!({"native_token": staged.native_token});
-            committed_uploads = staged.upload_paths;
-        }
-
-        let origin_policy = params_value
-            .get("tab_id")
-            .and_then(Value::as_u64)
-            .and_then(|tab_id| self.guardrails.native_origin_policy(tab_id));
         let staged_uploads =
             match self
                 .guardrails
@@ -693,6 +1034,16 @@ impl Runtime {
         if let Err(error) = Guardrails::cleanup_staged_uploads(&committed_uploads) {
             let _ = Guardrails::cleanup_staged_uploads(&staged_uploads);
             return RpcResponse::failure(request_id, Outcome::Unknown, error);
+        }
+        if let Some(native_token) = committed_native_token {
+            if let Err(error) = self.journal.finish_staged_commit(&native_token) {
+                let _ = Guardrails::cleanup_staged_uploads(&staged_uploads);
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::Unknown,
+                    journal_rpc_error(error),
+                );
+            }
         }
         let native = match native_result {
             Ok(response) => response,
@@ -734,18 +1085,64 @@ impl Runtime {
             }
             let staged = native.staged.expect("validated staged response");
             return match self.journal.store_staged_commit(&staged, &staged_uploads) {
-                Ok(staged_token) => RpcResponse::success(
-                    request_id,
-                    Outcome::CommitRequired,
-                    json!({
-                        "staged_token": staged_token,
-                        "tab_id": staged.tab_id,
-                        "page_revision": staged.page_revision,
-                        "effect": staged.effect,
-                        "fingerprint": staged.fingerprint,
-                        "expires_at_ms": staged.expires_at_ms,
-                    }),
-                ),
+                Ok(handles) => {
+                    let binding = self.native.dispatch(
+                        connection_id,
+                        task_id,
+                        "commit_review_bind",
+                        json!({
+                            "native_token": staged.native_token,
+                            "review_handle": handles.review_handle,
+                            "tab_id": staged.tab_id,
+                        }),
+                        None,
+                        timeout,
+                    );
+                    if !matches!(
+                        binding,
+                        Ok(NativeResponse {
+                            outcome: Outcome::Completed,
+                            error: None,
+                            ..
+                        })
+                    ) {
+                        if let Ok(paths) = self.journal.abandon_popup_staged_commit(
+                            task_id,
+                            staged.tab_id,
+                            &handles.review_handle,
+                        ) {
+                            let _ = Guardrails::cleanup_staged_uploads(&paths);
+                        }
+                        let _ = self.native.dispatch(
+                            connection_id,
+                            task_id,
+                            "commit_review_abandon",
+                            json!({ "native_token": staged.native_token, "tab_id": staged.tab_id }),
+                            None,
+                            timeout,
+                        );
+                        return RpcResponse::failure(
+                            request_id,
+                            Outcome::Unknown,
+                            RpcError::new(
+                                "commit_review_binding_failed",
+                                "Host could not durably bind the extension stage to the popup review",
+                            ),
+                        );
+                    }
+                    RpcResponse::success(
+                        request_id,
+                        Outcome::CommitRequired,
+                        json!({
+                            "staged_token": handles.staged_token,
+                            "tab_id": staged.tab_id,
+                            "page_revision": staged.page_revision,
+                            "effect": staged.effect,
+                            "fingerprint": staged.fingerprint,
+                            "expires_at_ms": staged.expires_at_ms,
+                        }),
+                    )
+                }
                 Err(error) => {
                     if let Err(cleanup_error) = Guardrails::cleanup_staged_uploads(&staged_uploads)
                     {
@@ -888,6 +1285,20 @@ fn existing_mutation_response(request_id: &str, decision: BeginDecision) -> RpcR
             RpcError::new(
                 "journal_corrupt",
                 "Mutation lookup returned a new-dispatch decision",
+            ),
+        ),
+    }
+}
+
+fn native_event_result(response: RpcResponse) -> NativeEventResult {
+    match (response.result, response.error) {
+        (Some(result), None) => NativeEventResult::completed(result),
+        (None, Some(error)) => NativeEventResult::failure(response.outcome, error),
+        _ => NativeEventResult::failure(
+            Outcome::Unknown,
+            RpcError::new(
+                "invalid_native_response",
+                "Host popup approval did not produce exactly one response branch",
             ),
         ),
     }
@@ -1039,9 +1450,11 @@ mod tests {
         staged: Mutex<bool>,
         sensitive_error: bool,
         close_task_error: bool,
-
+        current_commit_origin: Mutex<Option<String>>,
+        executed_commits: AtomicUsize,
         origin_policies: Mutex<Vec<Option<NativeOriginPolicy>>>,
         last_params: Mutex<Option<Value>>,
+        last_act_params: Mutex<Option<Value>>,
         closed_tasks: Mutex<Vec<Uuid>>,
     }
 
@@ -1052,8 +1465,11 @@ mod tests {
                 staged: Mutex::new(false),
                 sensitive_error: false,
                 close_task_error: false,
+                current_commit_origin: Mutex::new(None),
+                executed_commits: AtomicUsize::new(0),
                 origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
+                last_act_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
             })
         }
@@ -1064,9 +1480,12 @@ mod tests {
                 staged: Mutex::new(false),
                 sensitive_error: true,
                 close_task_error: false,
+                current_commit_origin: Mutex::new(None),
+                executed_commits: AtomicUsize::new(0),
                 origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
+                last_act_params: Mutex::new(None),
             })
         }
 
@@ -1076,8 +1495,11 @@ mod tests {
                 staged: Mutex::new(true),
                 sensitive_error: false,
                 close_task_error: false,
+                current_commit_origin: Mutex::new(None),
+                executed_commits: AtomicUsize::new(0),
                 origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
+                last_act_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
             })
         }
@@ -1088,8 +1510,11 @@ mod tests {
                 staged: Mutex::new(false),
                 sensitive_error: false,
                 close_task_error: true,
+                current_commit_origin: Mutex::new(None),
+                executed_commits: AtomicUsize::new(0),
                 origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
+                last_act_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
             })
         }
@@ -1104,8 +1529,11 @@ mod tests {
             origin_policy: Option<NativeOriginPolicy>,
             _timeout: Duration,
         ) -> Result<agenttab_protocol::NativeResponse, NativeError> {
-            *self.last_params.lock() = Some(params);
-            self.origin_policies.lock().push(origin_policy);
+            *self.last_params.lock() = Some(params.clone());
+            if method == "browser_act" {
+                *self.last_act_params.lock() = Some(params.clone());
+            }
+            self.origin_policies.lock().push(origin_policy.clone());
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.sensitive_error {
                 let mut error = RpcError::new(
@@ -1144,6 +1572,34 @@ mod tests {
                         expires_at_ms: current_time_ms() + 60_000,
                     }),
                 });
+            }
+            if method == "browser_commit" {
+                // This fixture models the extension's just-in-time origin recheck.
+                let is_denied_current_origin = self.current_commit_origin.lock().as_deref()
+                    == Some("https://private.example.com/path")
+                    && origin_policy.as_ref().is_some_and(|policy| {
+                        policy.tab_id == 3
+                            && policy
+                                .denied_origins
+                                .iter()
+                                .any(|pattern| pattern == "*.example.com")
+                    });
+                if is_denied_current_origin {
+                    return Ok(NativeResponse {
+                        protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                        version: PROTOCOL_VERSION,
+                        kind: NativeResponseKind::Response,
+                        request_id: Uuid::new_v4(),
+                        outcome: Outcome::NotStarted,
+                        result: None,
+                        error: Some(RpcError::new(
+                            "origin_denied",
+                            "The current tab origin is denied by managed policy",
+                        )),
+                        staged: None,
+                    });
+                }
+                self.executed_commits.fetch_add(1, Ordering::Relaxed);
             }
             Ok(NativeResponse {
                 protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
@@ -1562,6 +2018,83 @@ mod tests {
         assert_eq!(allowed["outcome"], "completed");
         assert_eq!(native.calls.load(Ordering::Relaxed), 1);
     }
+    #[test]
+    fn commit_rechecks_staged_tab_policy_after_navigation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
+        paths.prepare().unwrap();
+        std::fs::write(
+            &paths.policy_file,
+            r#"{"denied_origins":["*.example.com"]}"#,
+        )
+        .unwrap();
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+        let native = FakeNative::staging();
+        let runtime = Runtime::for_test(
+            &paths,
+            lifecycle,
+            native.clone(),
+            Arc::new(HandoffState::default()),
+        );
+        let (connection, _) = runtime
+            .connect(ConnectionInit {
+                protocol: RPC_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: ConnectKind::Connect,
+                conversation_id: None,
+                resume_capability: None,
+            })
+            .unwrap();
+        own_tab(&runtime, &connection, 7);
+
+        let staged = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "stage",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_act",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "actions": [{"kind": "click", "ref": "e9"}]
+                }
+            }),
+        );
+        assert_eq!(staged["outcome"], "commit_required");
+
+        *native.staged.lock() = false;
+        // The host's last inventory URL remains allowed; native sees the navigation that
+        // happened before Commit execution and must recheck the forwarded tab policy.
+        *native.current_commit_origin.lock() = Some("https://private.example.com/path".into());
+        let committed = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "commit",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_commit",
+                "params": {"staged_token": staged["result"]["staged_token"]}
+            }),
+        );
+
+        let expected_policy = Some(NativeOriginPolicy {
+            tab_id: 3,
+            allowed_origins: Vec::new(),
+            denied_origins: vec!["*.example.com".into()],
+        });
+        assert_eq!(committed["outcome"], "not_started");
+        assert_eq!(committed["error"]["code"], "origin_denied");
+        assert_eq!(
+            native.origin_policies.lock().as_slice(),
+            &[expected_policy.clone(), None, expected_policy],
+        );
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn handoff_timeout_keeps_global_blackout_active() {
@@ -1624,6 +2157,140 @@ mod tests {
         assert_eq!(response["outcome"], "not_started");
         assert_eq!(response["error"]["code"], "handoff_declined");
         assert!(!runtime.handoff.is_active());
+    }
+
+    #[test]
+    fn popup_review_uses_host_authorization_receipt_and_executes_once() {
+        let native = FakeNative::staging();
+        let (temp, runtime, connection) = connected_runtime(native.clone());
+        let task_id = own_tab(&runtime, &connection, 7);
+        let stage = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "stage-popup",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_act",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "actions": [{"kind": "click", "ref": "e9"}]
+                }
+            }),
+        );
+        assert_eq!(stage["outcome"], "commit_required");
+        let review_handle = native.last_params.lock().as_ref().unwrap()["review_handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(review_handle, "native-token-123456");
+        *native.staged.lock() = false;
+        let event = NativePopupCommitEvent {
+            review_handle,
+            task_id,
+            tab_id: 3,
+        };
+        let event_id = Uuid::now_v7().to_string();
+
+        let approved = runtime.commit_popup_review(&event, &event_id);
+        assert!(!approved.result.as_ref().unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .contains("123-45-6789"));
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            native.last_params.lock().as_ref(),
+            Some(&json!({"native_token": "native-token-123456"})),
+        );
+        let audit = std::fs::read_to_string(temp.path().join("agenttab/audit.jsonl")).unwrap();
+        assert!(audit.contains("\"method\":\"browser_commit\""));
+        assert!(audit.contains(&event_id));
+        assert!(!audit.contains(&event.review_handle));
+
+        let replayed = runtime.commit_popup_review(&event, &event_id);
+        assert_eq!(replayed.outcome, Outcome::Completed);
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
+        assert!(runtime
+            .journal
+            .consume_popup_staged_commit(task_id, 3, &event.review_handle)
+            .is_err());
+    }
+    #[test]
+    fn popup_review_rejects_mismatched_or_unknown_handles_without_execution() {
+        let native = FakeNative::staging();
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let task_id = own_tab(&runtime, &connection, 7);
+        let stage = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "stage-popup-rejection",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_act",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "actions": [{"kind": "click", "ref": "e9"}]
+                }
+            }),
+        );
+        assert_eq!(stage["outcome"], "commit_required");
+        let review_handle = native.last_params.lock().as_ref().unwrap()["review_handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        *native.staged.lock() = false;
+
+        let mismatched = runtime.commit_popup_review(
+            &NativePopupCommitEvent {
+                review_handle: review_handle.clone(),
+                task_id,
+                tab_id: 4,
+            },
+            &Uuid::now_v7().to_string(),
+        );
+        assert_eq!(mismatched.outcome, Outcome::NotStarted);
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 0);
+        let foreign_task = runtime.commit_popup_review(
+            &NativePopupCommitEvent {
+                review_handle: review_handle.clone(),
+                task_id: Uuid::now_v7(),
+                tab_id: 3,
+            },
+            &Uuid::now_v7().to_string(),
+        );
+        assert_eq!(foreign_task.outcome, Outcome::NotStarted);
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 0);
+
+        let approved_event = NativePopupCommitEvent {
+            review_handle: review_handle.clone(),
+            task_id,
+            tab_id: 3,
+        };
+        let approved_event_id = Uuid::now_v7().to_string();
+        assert_eq!(
+            runtime
+                .commit_popup_review(&approved_event, &approved_event_id)
+                .outcome,
+            Outcome::Completed
+        );
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
+
+        let unknown = runtime.commit_popup_review(
+            &NativePopupCommitEvent {
+                review_handle: "missing-review-handle".into(),
+                task_id,
+                tab_id: 3,
+            },
+            &Uuid::now_v7().to_string(),
+        );
+        assert_eq!(unknown.outcome, Outcome::NotStarted);
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
+        let conflicting_intent = runtime.abandon_popup_review(&approved_event, &approved_event_id);
+        assert_eq!(conflicting_intent.outcome, Outcome::NotStarted);
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1697,7 +2364,7 @@ mod tests {
             }),
         );
         assert_eq!(stage["outcome"], "commit_required");
-        let staged_path = native.last_params.lock().as_ref().unwrap()["actions"][0]["files"][0]
+        let staged_path = native.last_act_params.lock().as_ref().unwrap()["actions"][0]["files"][0]
             .as_str()
             .unwrap()
             .to_string();
@@ -1723,6 +2390,118 @@ mod tests {
         assert!(!std::path::Path::new(&staged_path).exists());
     }
 
+    #[test]
+    fn popup_review_reconciles_staged_uploads_after_success_abandon_and_failed_revalidation() {
+        let native = FakeNative::staging();
+        let (_temp, runtime, connection, upload_root) =
+            connected_runtime_with_upload_root(native.clone());
+        let task_id = own_tab(&runtime, &connection, 7);
+        let sink = JournalNativeEventSink {
+            journal: runtime.journal.clone(),
+            tab_urls: runtime.tab_urls.clone(),
+            runtime: Mutex::new(Arc::downgrade(&runtime)),
+        };
+        let stage_upload = |request_id: &str, contents: &[u8]| {
+            let source = upload_root.join(format!("{request_id}.txt"));
+            std::fs::write(&source, contents).unwrap();
+            let stage = runtime.handle(
+                &connection,
+                json!({
+                    "protocol": RPC_PROTOCOL,
+                    "version": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "idempotency_key": Uuid::now_v7(),
+                    "method": "browser_act",
+                    "params": {
+                        "tab_id": 3,
+                        "expected_page_revision": 7,
+                        "actions": [{
+                            "kind": "upload_file",
+                            "ref": "e9",
+                            "files": [source],
+                        }]
+                    }
+                }),
+            );
+            assert_eq!(stage["outcome"], "commit_required");
+            let staged_path = native.last_act_params.lock().as_ref().unwrap()["actions"][0]
+                ["files"][0]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let review_handle = native.last_params.lock().as_ref().unwrap()["review_handle"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            (review_handle, staged_path)
+        };
+
+        let (success_handle, success_path) = stage_upload("popup-success", b"success");
+        *native.staged.lock() = false;
+        let success = sink
+            .handle(
+                &NativeEventPayload::PopupCommitApproved(NativePopupCommitEvent {
+                    review_handle: success_handle.clone(),
+                    task_id,
+                    tab_id: 3,
+                }),
+                Some(&Uuid::now_v7().to_string()),
+            )
+            .unwrap();
+        assert_eq!(success.outcome, Outcome::Completed);
+        assert!(!std::path::Path::new(&success_path).exists());
+        assert!(runtime
+            .journal
+            .abandon_popup_staged_commit(task_id, 3, &success_handle)
+            .is_err());
+
+        *native.staged.lock() = true;
+        let (abandon_handle, abandon_path) = stage_upload("popup-abandon", b"abandon");
+        let abandon_event = NativePopupCommitEvent {
+            review_handle: abandon_handle.clone(),
+            task_id,
+            tab_id: 3,
+        };
+        let abandon_event_id = Uuid::now_v7().to_string();
+        let abandoned = sink
+            .handle(
+                &NativeEventPayload::PopupCommitAbandoned(abandon_event.clone()),
+                Some(&abandon_event_id),
+            )
+            .unwrap();
+        assert_eq!(abandoned.outcome, Outcome::Completed);
+        assert!(!std::path::Path::new(&abandon_path).exists());
+        let abandoned_retry = sink
+            .handle(
+                &NativeEventPayload::PopupCommitAbandoned(abandon_event),
+                Some(&abandon_event_id),
+            )
+            .unwrap();
+        assert_eq!(abandoned_retry.outcome, Outcome::Completed);
+        assert!(runtime
+            .journal
+            .abandon_popup_staged_commit(task_id, 3, &abandon_handle)
+            .is_err());
+
+        let (failure_handle, failure_path) = stage_upload("popup-revalidation-failure", b"failure");
+        runtime.lifecycle.set_paused(true);
+        let failed = sink
+            .handle(
+                &NativeEventPayload::PopupCommitApproved(NativePopupCommitEvent {
+                    review_handle: failure_handle.clone(),
+                    task_id,
+                    tab_id: 3,
+                }),
+                Some(&Uuid::now_v7().to_string()),
+            )
+            .unwrap();
+        assert_eq!(failed.outcome, Outcome::NotStarted);
+        assert!(!std::path::Path::new(&failure_path).exists());
+        assert!(runtime
+            .journal
+            .abandon_popup_staged_commit(task_id, 3, &failure_handle)
+            .is_err());
+    }
     fn current_time_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

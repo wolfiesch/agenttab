@@ -134,8 +134,8 @@ export async function applyTransaction(
         backups.push(file.backupPath);
       }
       await rename(file.stagedPath, file.path);
-      await syncDirectory(dirname(file.path));
       applied.push(file);
+      await syncDirectory(dirname(file.path));
       if (options.failAfter !== undefined && applied.length === options.failAfter) {
         throw new Error(`Injected transaction failure after ${applied.length} files`);
       }
