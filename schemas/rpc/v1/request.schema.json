@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/request.schema.json",
+  "title": "AgentTab Core RPC v1 request",
+  "type": "object",
+  "required": ["protocol", "version", "request_id", "method", "params"],
+  "properties": {
+    "protocol": { "const": "agenttab.rpc" },
+    "version": { "const": 1 },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "method": {
+      "enum": [
+        "browser_open",
+        "browser_snapshot",
+        "browser_act",
+        "browser_wait",
+        "browser_tabs",
+        "browser_handoff",
+        "browser_commit",
+        "browser_developer",
+        "agenttab.status"
+      ]
+    },
+    "params": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "enum": ["browser_open", "browser_act", "browser_handoff", "browser_commit", "browser_developer"]
+          }
+        },
+        "required": ["method"]
+      },
+      "then": { "required": ["idempotency_key"] }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_open" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-open.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_snapshot" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-snapshot.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_act" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-act.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_wait" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-wait.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_tabs" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-tabs.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_handoff" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-handoff.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_commit" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-commit.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "agenttab.status" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "status.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_developer" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-developer.schema.json" } } }
+    }
+  ],
+  "additionalProperties": false
+}

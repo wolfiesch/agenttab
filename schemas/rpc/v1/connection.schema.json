@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/connection.schema.json",
+  "title": "AgentTab Core RPC v1 connection negotiation",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["protocol", "version", "kind"],
+      "properties": {
+        "protocol": { "const": "agenttab.rpc" },
+        "version": { "const": 1 },
+        "kind": { "const": "connect" },
+        "conversation_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["protocol", "version", "kind", "connection_id", "resumed", "state"],
+      "properties": {
+        "protocol": { "const": "agenttab.rpc" },
+        "version": { "const": 1 },
+        "kind": { "const": "connected" },
+        "connection_id": { "type": "string", "format": "uuid" },
+        "resumed": { "type": "boolean" },
+        "task_id": { "type": "string", "format": "uuid" },
+        "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 },
+        "state": { "enum": ["starting", "reconciling", "ready", "paused", "terminal"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "resumed": { "const": true } },
+            "required": ["resumed"]
+          },
+          "then": {
+            "required": ["task_id", "resume_capability"]
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

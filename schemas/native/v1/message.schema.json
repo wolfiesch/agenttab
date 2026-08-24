@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/native/v1/message.schema.json",
+  "title": "AgentTab native bridge protocol v1",
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["protocol", "version", "kind"],
+      "properties": {
+        "protocol": { "const": "agenttab.native" },
+        "version": { "const": 1 },
+        "kind": { "type": "string" }
+      }
+    },
+    "tab": {
+      "type": "object",
+      "required": ["tab_id", "window_id", "group_id", "url", "page_revision"],
+      "properties": {
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "window_id": { "type": "integer", "minimum": 0 },
+        "group_id": { "type": ["integer", "null"] },
+        "url": { "type": "string" },
+        "page_revision": { "type": "integer", "minimum": 0 },
+        "task_id": { "type": ["string", "null"], "format": "uuid" }
+      },
+      "additionalProperties": false
+    },
+    "handoff": {
+      "type": "object",
+      "required": ["active"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "task_id": { "type": "string", "format": "uuid" },
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "started_at_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "staged": {
+      "type": "object",
+      "required": ["native_token", "task_id", "tab_id", "page_revision", "effect", "fingerprint", "expires_at_ms"],
+      "properties": {
+        "native_token": { "type": "string", "minLength": 16 },
+        "task_id": { "type": "string", "format": "uuid" },
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "page_revision": { "type": "integer", "minimum": 0 },
+        "effect": { "type": "string", "minLength": 1 },
+        "fingerprint": { "type": "string", "minLength": 32 },
+        "expires_at_ms": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "rpc_error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "recovery": { "type": "string" },
+        "details": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "origin_policy": {
+      "type": "object",
+      "required": ["tab_id", "allowed_origins", "denied_origins"],
+      "properties": {
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "allowed_origins": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "denied_origins": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "inventory_payload": {
+      "type": "object",
+      "required": ["inventory"],
+      "properties": {
+        "inventory": { "type": "array", "items": { "$ref": "#/$defs/tab" } }
+      },
+      "additionalProperties": false
+    },
+    "task_tabs_payload": {
+      "type": "object",
+      "required": ["task_id", "tab_count"],
+      "properties": {
+        "task_id": { "type": "string", "format": "uuid" },
+        "tab_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "pause_payload": {
+      "type": "object",
+      "required": ["paused"],
+      "properties": { "paused": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "commit_expired_payload": {
+      "type": "object",
+      "required": ["native_token"],
+      "properties": { "native_token": { "type": "string", "minLength": 16 } },
+      "additionalProperties": false
+    },
+    "disconnect_payload": {
+      "type": "object",
+      "required": ["reason"],
+      "properties": { "reason": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "extension_version", "inventory", "paused", "handoff", "staged_commits"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "hello" },
+            "extension_version": { "type": "string", "minLength": 1 },
+            "inventory": { "type": "array", "items": { "$ref": "#/$defs/tab" } },
+            "paused": { "type": "boolean" },
+            "handoff": { "$ref": "#/$defs/handoff" },
+            "staged_commits": { "type": "array", "items": { "$ref": "#/$defs/staged" } }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "host_version", "state"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "ready" },
+            "host_version": { "type": "string", "minLength": 1 },
+            "state": { "enum": ["ready", "paused"] }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "request_id", "connection_id", "task_id", "method", "params"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "command" },
+            "request_id": { "type": "string", "format": "uuid" },
+            "connection_id": { "type": "string", "format": "uuid" },
+            "task_id": { "type": "string", "format": "uuid" },
+            "method": { "type": "string", "minLength": 1 },
+            "params": { "type": "object" },
+            "origin_policy": { "$ref": "#/$defs/origin_policy" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "request_id", "task_id"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "close_task" },
+            "request_id": { "type": "string", "format": "uuid" },
+            "task_id": { "type": "string", "format": "uuid" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "request_id", "outcome"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "response" },
+            "request_id": { "type": "string", "format": "uuid" },
+            "outcome": { "enum": ["completed", "not_started", "unknown", "needs_user", "commit_required"] },
+            "result": {},
+            "error": { "$ref": "#/$defs/rpc_error" },
+            "staged": { "$ref": "#/$defs/staged" }
+          },
+          "oneOf": [
+            { "required": ["result"], "not": { "required": ["error"] } },
+            { "required": ["error"], "not": { "required": ["result"] } }
+          ],
+          "allOf": [
+            {
+              "if": { "properties": { "outcome": { "enum": ["completed", "needs_user", "commit_required"] } } },
+              "then": {
+                "required": ["result"],
+                "not": { "required": ["error"] }
+              }
+            },
+            {
+              "if": { "properties": { "outcome": { "enum": ["not_started", "unknown"] } } },
+              "then": {
+                "required": ["error"],
+                "not": { "required": ["result"] }
+              }
+            },
+            {
+              "if": { "properties": { "outcome": { "const": "commit_required" } } },
+              "then": { "required": ["staged"] },
+              "else": { "not": { "required": ["staged"] } }
+            }
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "event", "payload"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "event" },
+            "event": {
+              "enum": [
+                "inventory",
+                "ownership_revoked",
+                "tab_removed",
+                "group_membership_changed",
+                "pause_changed",
+                "handoff_changed",
+                "commit_expired",
+                "extension_disconnected"
+              ]
+            },
+            "payload": { "type": "object" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "event": { "const": "inventory" } } },
+              "then": { "properties": { "payload": { "$ref": "#/$defs/inventory_payload" } } }
+            },
+            {
+              "if": { "properties": { "event": { "enum": ["ownership_revoked", "tab_removed", "group_membership_changed"] } } },
+              "then": { "properties": { "payload": { "$ref": "#/$defs/task_tabs_payload" } } }
+            },
+            {
+              "if": { "properties": { "event": { "const": "pause_changed" } } },
+              "then": { "properties": { "payload": { "$ref": "#/$defs/pause_payload" } } }
+            },
+            {
+              "if": { "properties": { "event": { "const": "handoff_changed" } } },
+              "then": { "properties": { "payload": { "$ref": "#/$defs/handoff" } } }
+            },
+            {
+              "if": { "properties": { "event": { "const": "commit_expired" } } },
+              "then": { "properties": { "payload": { "$ref": "#/$defs/commit_expired_payload" } } }
+            },
+            {
+              "if": { "properties": { "event": { "const": "extension_disconnected" } } },
+              "then": { "properties": { "payload": { "$ref": "#/$defs/disconnect_payload" } } }
+            }
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": ["kind", "reason", "pending_outcome"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "disconnect_recovery" },
+            "reason": { "type": "string", "minLength": 1 },
+            "pending_outcome": { "const": "unknown" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-commit.schema.json",
+  "title": "browser_commit parameters",
+  "type": "object",
+  "required": ["staged_token"],
+  "properties": {
+    "staged_token": { "type": "string", "minLength": 32, "maxLength": 256 }
+  },
+  "additionalProperties": false
+}

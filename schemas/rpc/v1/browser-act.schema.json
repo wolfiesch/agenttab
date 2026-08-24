@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-act.schema.json",
+  "title": "browser_act parameters",
+  "$defs": {
+    "ref": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "url": { "type": "string", "maxLength": 2048, "pattern": "^(https?://|about:)[^\\s]+$" },
+    "action": {
+      "oneOf": [
+        { "$ref": "#/$defs/click" },
+        { "$ref": "#/$defs/type" },
+        { "$ref": "#/$defs/fill" },
+        { "$ref": "#/$defs/select" },
+        { "$ref": "#/$defs/press" },
+        { "$ref": "#/$defs/scroll" },
+        { "$ref": "#/$defs/drag" },
+        { "$ref": "#/$defs/navigate" },
+        { "$ref": "#/$defs/history" },
+        { "$ref": "#/$defs/reload" },
+        { "$ref": "#/$defs/close" },
+        { "$ref": "#/$defs/dialog" },
+        { "$ref": "#/$defs/upload_file" }
+      ]
+    },
+    "click": {
+      "type": "object",
+      "required": ["kind", "ref"],
+      "properties": { "kind": { "const": "click" }, "ref": { "$ref": "#/$defs/ref" } },
+      "additionalProperties": false
+    },
+    "type": {
+      "type": "object",
+      "required": ["kind", "ref", "text"],
+      "properties": {
+        "kind": { "const": "type" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "text": { "type": "string", "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "fill": {
+      "type": "object",
+      "required": ["kind", "ref", "text"],
+      "properties": {
+        "kind": { "const": "fill" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "text": { "type": "string", "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "select": {
+      "type": "object",
+      "required": ["kind", "ref", "value"],
+      "properties": {
+        "kind": { "const": "select" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "value": { "type": "string", "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "press": {
+      "type": "object",
+      "required": ["kind", "ref", "key"],
+      "properties": {
+        "kind": { "const": "press" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
+      "additionalProperties": false
+    },
+    "scroll": {
+      "type": "object",
+      "required": ["kind", "delta_x", "delta_y"],
+      "properties": {
+        "kind": { "const": "scroll" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "delta_x": { "type": "integer", "minimum": -100000, "maximum": 100000 },
+        "delta_y": { "type": "integer", "minimum": -100000, "maximum": 100000 }
+      },
+      "additionalProperties": false
+    },
+    "drag": {
+      "type": "object",
+      "required": ["kind", "ref", "target_ref"],
+      "properties": {
+        "kind": { "const": "drag" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "target_ref": { "$ref": "#/$defs/ref" }
+      },
+      "additionalProperties": false
+    },
+    "navigate": {
+      "type": "object",
+      "required": ["kind", "url"],
+      "properties": { "kind": { "const": "navigate" }, "url": { "$ref": "#/$defs/url" } },
+      "additionalProperties": false
+    },
+    "history": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "enum": ["go_back", "go_forward"] } },
+      "additionalProperties": false
+    },
+    "reload": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "const": "reload" }, "bypass_cache": { "type": "boolean", "default": false } },
+      "additionalProperties": false
+    },
+    "close": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "const": "close" } },
+      "additionalProperties": false
+    },
+    "dialog": {
+      "type": "object",
+      "required": ["kind", "decision"],
+      "properties": {
+        "kind": { "const": "dialog" },
+        "decision": { "enum": ["accept", "dismiss"] },
+        "prompt_text": { "type": "string", "maxLength": 2048 }
+      },
+      "additionalProperties": false
+    },
+    "upload_file": {
+      "type": "object",
+      "required": ["kind", "ref", "files"],
+      "properties": {
+        "kind": { "const": "upload_file" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["tab_id", "expected_page_revision", "actions"],
+  "properties": {
+    "tab_id": { "type": "integer", "minimum": 0 },
+    "expected_page_revision": { "type": "integer", "minimum": 0 },
+    "actions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/action" }
+    }
+  },
+  "additionalProperties": false
+}
