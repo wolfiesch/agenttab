@@ -590,9 +590,9 @@ impl Journal {
         }
         let host_token = generate_capability();
         let token_hash = capability_hash(&host_token);
-        let upload_paths_json = serde_json::to_string(upload_paths)?;
         let page_revision = sqlite_u64(staged.page_revision)?;
         let tab_id = sqlite_u64(staged.tab_id)?;
+        let upload_paths_json = serde_json::to_string(upload_paths)?;
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current_revision: Option<i64> = transaction
@@ -699,16 +699,20 @@ impl Journal {
             transaction.commit()?;
             return Err(JournalError::StaleStagedCommit);
         }
+        let task_id = Uuid::parse_str(&stored_task)?;
+        let tab_id = sqlite_to_u64(tab_id)?;
+        let page_revision = sqlite_to_u64(page_revision)?;
+        let upload_paths = serde_json::from_str(&upload_paths_json)?;
         transaction.commit()?;
         Ok(StagedRecord {
-            task_id: Uuid::parse_str(&stored_task)?,
+            task_id,
             native_token,
-            tab_id: sqlite_to_u64(tab_id)?,
-            page_revision: sqlite_to_u64(page_revision)?,
+            tab_id,
+            page_revision,
             effect,
             fingerprint,
             expires_at_ms,
-            upload_paths: serde_json::from_str(&upload_paths_json)?,
+            upload_paths,
         })
     }
 
@@ -1180,7 +1184,7 @@ mod tests {
 
         let key_at = |timestamp_ms: i64| {
             let mut bytes = *Uuid::now_v7().as_bytes();
-            bytes[..6].copy_from_slice(&timestamp_ms.to_be_bytes()[2..]);
+            bytes[..6].copy_from_slice(&(timestamp_ms as u64).to_be_bytes()[2..]);
             Uuid::from_bytes(bytes)
         };
         let expired = key_at(now_ms() - IDEMPOTENCY_RETENTION_MS - 1);
@@ -1240,9 +1244,12 @@ mod tests {
             Err(JournalError::InvalidStagedToken)
         ));
         assert_eq!(
-            journal.reconcile_staged_commits(&[]).unwrap(),
+            journal
+                .reconcile_staged_commits(std::slice::from_ref(&staged))
+                .unwrap(),
             vec![upload_path],
         );
+        assert!(journal.reconcile_staged_commits(&[]).unwrap().is_empty());
     }
     #[test]
     fn ownership_and_revision_floor_reject_stale_task_operations_and_commits() {
