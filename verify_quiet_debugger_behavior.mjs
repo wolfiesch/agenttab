@@ -249,6 +249,7 @@ export function createHarness({ sessions = {}, tabs = {}, preferences = {}, reco
   const source = fs.readFileSync(BACKGROUND, 'utf8') + `
     globalThis.__bridgeTest = {
       observeTab,
+      dispatchAction,
       findTaskSessionForTab,
       closeTaskSession,
       getTaskSessions,
@@ -557,6 +558,17 @@ async function testReconnectBackoffResetsOnlyAfterHostAcknowledges() {
 }
 
 
+async function testPingRuntimeInstanceIsPrivateAndStable() {
+  const harness = createHarness();
+  assert.equal(await harness.api.dispatchAction('ping', {}, null), 'pong');
+  assert.equal(await harness.api.dispatchAction('ping', { runtimeInstance: false }, null), 'pong');
+  const first = await harness.api.dispatchAction('ping', { runtimeInstance: true }, null);
+  const second = await harness.api.dispatchAction('ping', { runtimeInstance: true }, null);
+  assert.match(first, /^source:session-/);
+  assert.equal(second, first);
+}
+
+
 const tests = [
   testCompactObserveUsesBrowserAccessibility,
   testAcquireWaitsForDetach,
@@ -572,6 +584,7 @@ const tests = [
   testFramedClickInsideActiveModalIsAllowed,
   testPointerRenderingDoesNotDelayFocusedClick,
   testReconnectBackoffResetsOnlyAfterHostAcknowledges,
+  testPingRuntimeInstanceIsPrivateAndStable,
 ];
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
