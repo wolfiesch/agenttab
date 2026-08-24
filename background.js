@@ -62,6 +62,20 @@ function assertTabId(value, field = "tab_id") {
     commandError(`${field} must be a non-negative integer`);
   return value;
 }
+function assertOriginPatterns(value, field) {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string" && entry.length > 0)) {
+    commandError(`${field} must be an array of non-empty strings`);
+  }
+  return [...value];
+}
+function assertOriginPolicy(value) {
+  const policy = assertExactObject(value, ["tab_id", "allowed_origins", "denied_origins"], [], "origin_policy");
+  return {
+    tab_id: assertTabId(policy.tab_id, "origin_policy.tab_id"),
+    allowed_origins: assertOriginPatterns(policy.allowed_origins, "origin_policy.allowed_origins"),
+    denied_origins: assertOriginPatterns(policy.denied_origins, "origin_policy.denied_origins")
+  };
+}
 function assertRevision(value) {
   if (!isIntegerInRange(value, 0)) {
     commandError("expected_page_revision must be a non-negative integer");
@@ -286,7 +300,7 @@ function validateParams(method, value) {
 function parseCommand(value) {
   if (!isRecord(value))
     throw new Error("native command must be an object");
-  if (!hasOnlyKeys(value, ["protocol", "version", "kind", "request_id", "connection_id", "task_id", "method", "params"])) {
+  if (!hasOnlyKeys(value, ["protocol", "version", "kind", "request_id", "connection_id", "task_id", "method", "params"], ["origin_policy"])) {
     throw new Error("native command contains unknown fields");
   }
   if (value.protocol !== NATIVE_PROTOCOL || value.version !== PROTOCOL_VERSION || value.kind !== "command") {
@@ -298,6 +312,7 @@ function parseCommand(value) {
   if (typeof value.method !== "string" || !Object.hasOwn(CORE_METHODS, value.method)) {
     throw new Error("native command method is unsupported");
   }
+  const originPolicy = value.origin_policy === undefined ? undefined : assertOriginPolicy(value.origin_policy);
   return {
     protocol: NATIVE_PROTOCOL,
     version: PROTOCOL_VERSION,
@@ -306,7 +321,23 @@ function parseCommand(value) {
     connection_id: value.connection_id,
     task_id: value.task_id,
     method: value.method,
-    params: validateParams(value.method, value.params)
+    params: validateParams(value.method, value.params),
+    ...originPolicy === undefined ? {} : { origin_policy: originPolicy }
+  };
+}
+function parseCloseTask(value) {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["protocol", "version", "kind", "request_id", "task_id"])) {
+    commandError("native close_task contains missing or unknown fields");
+  }
+  if (value.protocol !== NATIVE_PROTOCOL || value.version !== PROTOCOL_VERSION || value.kind !== "close_task") {
+    commandError("native close_task protocol or version mismatch");
+  }
+  return {
+    protocol: NATIVE_PROTOCOL,
+    version: PROTOCOL_VERSION,
+    kind: "close_task",
+    request_id: assertUuid(value.request_id, "request_id"),
+    task_id: assertUuid(value.task_id, "task_id")
   };
 }
 function parseInboundNativeMessage(value) {
@@ -315,6 +346,8 @@ function parseInboundNativeMessage(value) {
   }
   if (value.kind === "command")
     return parseCommand(value);
+  if (value.kind === "close_task")
+    return parseCloseTask(value);
   if (value.kind === "event_ack") {
     if (!hasOnlyKeys(value, ["protocol", "version", "kind", "event", "event_id"]) || value.event !== "handoff_changed" || !isBoundedString(value.event_id, 16, 256)) {
       throw new Error("native event acknowledgement is invalid");
@@ -767,14 +800,21 @@ class StandardBrowserRuntime {
     }
     const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
     const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
+    const before = await this.pageIdentity(tabId);
+    const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
     const result = typeof params.root_ref === "string" ? await this.send(tabId, "Accessibility.getPartialAXTree", {
-      backendNodeId: this.backendNodeId(await this.revisions.current(tabId), params.root_ref),
+      backendNodeId: this.backendNodeId(pageRevision, params.root_ref),
       fetchRelatives: true
     }) : await this.send(tabId, "Accessibility.getFullAXTree", { depth: maxDepth });
+    const after = await this.pageIdentity(tabId);
+    if (before.documentId !== after.documentId || before.loaderId !== after.loaderId) {
+      const currentPageRevision = await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
+      throw Object.assign(new Error("Page changed while capturing the accessibility tree"), {
+        code: "stale_revision",
+        currentPageRevision
+      });
+    }
     const nodes = Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : [];
-    const frameTree = await this.send(tabId, "Page.getFrameTree", {});
-    const loaderId = this.frameLoaderId(frameTree);
-    const pageRevision = await this.revisions.observeDocument(tabId, undefined, loaderId);
     const encoded = nodes.slice(0, maxNodes).map((node) => ({
       ...node.backendDOMNodeId ? { ref: `r${pageRevision}-${node.backendDOMNodeId}` } : {},
       role: typeof node.role?.value === "string" ? node.role.value : "unknown",
@@ -930,15 +970,20 @@ class StandardBrowserRuntime {
       this.emit("commit_expired", { native_token: nativeToken });
     }
   }
-  async wait(tabId, params) {
+  async wait(tabId, params, revalidate) {
     if (!isRecord(params.condition) || typeof params.condition.kind !== "string") {
       throw Object.assign(new Error("browser_wait requires a condition"), { code: "invalid_request" });
     }
     const condition = params.condition;
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30000;
-    const deadline = Date.now() + timeoutMs;
+    const waitStartedAtMs = Date.now();
+    const deadline = waitStartedAtMs + timeoutMs;
     do {
-      const matched = await this.conditionMatched(tabId, condition);
+      if (revalidate)
+        await revalidate();
+      const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
+      if (revalidate)
+        await revalidate();
       if (matched) {
         return {
           tab_id: tabId,
@@ -990,6 +1035,8 @@ class StandardBrowserRuntime {
     };
   }
   async screenshot(tabId, params) {
+    const before = await this.pageIdentity(tabId);
+    const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
     const capture = {
       format: "png",
       fromSurface: true,
@@ -1036,9 +1083,17 @@ class StandardBrowserRuntime {
       }
     }
     const result = await this.send(tabId, "Page.captureScreenshot", capture);
+    const after = await this.pageIdentity(tabId);
+    const currentPageRevision = await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
+    if (before.documentId !== after.documentId || before.loaderId !== after.loaderId || currentPageRevision !== pageRevision) {
+      throw Object.assign(new Error("Page changed while the screenshot was captured"), {
+        code: "stale_revision",
+        currentPageRevision
+      });
+    }
     return {
       tab_id: tabId,
-      page_revision: await this.revisions.current(tabId),
+      page_revision: pageRevision,
       mode: "screenshot",
       data: result.data,
       encoding: "base64",
@@ -1166,9 +1221,11 @@ class StandardBrowserRuntime {
       try {
         await this.callOnNode(tabId, backendNodeId, "function(){this.click()}", [], true);
       } finally {
-        if (Number.isInteger(activeTab?.id) && Number.isInteger(activeTab?.windowId)) {
-          const current = await chrome.tabs.get(activeTab.id).catch(() => null);
-          if (current?.windowId === activeTab.windowId) {
+        const [currentActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        const actionOwnsFocusChange = currentActiveTab?.id !== activeTab?.id && (currentActiveTab?.id === tabId || currentActiveTab?.openerTabId === tabId);
+        if (actionOwnsFocusChange && Number.isInteger(activeTab?.id) && Number.isInteger(activeTab?.windowId)) {
+          const original = await chrome.tabs.get(activeTab.id).catch(() => null);
+          if (original?.windowId === activeTab.windowId) {
             await chrome.tabs.update(activeTab.id, { active: true }).catch(() => {
               return;
             });
@@ -1179,9 +1236,9 @@ class StandardBrowserRuntime {
         }
       }
     } else if (kind === "type") {
-      await this.callOnNode(tabId, backendNodeId, "function(value){this.focus();if(this.isContentEditable){this.textContent=(this.textContent||'')+value}else{const current=String(this.value||'');const start=Number.isInteger(this.selectionStart)?this.selectionStart:current.length;const end=Number.isInteger(this.selectionEnd)?this.selectionEnd:start;this.value=current.slice(0,start)+value+current.slice(end);if(typeof this.setSelectionRange==='function'){const position=start+value.length;this.setSelectionRange(position,position)}}this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}", [{ value: String(action.text ?? "") }]);
+      await this.callOnNode(tabId, backendNodeId, "function(value){const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);if(type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))){return {agenttab_sensitive_field:true}}this.focus();if(this.isContentEditable){this.textContent=(this.textContent||'')+value}else{const current=String(this.value||'');const start=Number.isInteger(this.selectionStart)?this.selectionStart:current.length;const end=Number.isInteger(this.selectionEnd)?this.selectionEnd:start;this.value=current.slice(0,start)+value+current.slice(end);if(typeof this.setSelectionRange==='function'){const position=start+value.length;this.setSelectionRange(position,position)}}this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}", [{ value: String(action.text ?? "") }]);
     } else if (kind === "fill") {
-      await this.callOnNode(tabId, backendNodeId, "function(value){this.focus();this.value=value;this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));this.dispatchEvent(new Event('change',{bubbles:true}))}", [{ value: String(action.text ?? "") }]);
+      await this.callOnNode(tabId, backendNodeId, "function(value){const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);if(type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))){return {agenttab_sensitive_field:true}}this.focus();this.value=value;this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));this.dispatchEvent(new Event('change',{bubbles:true}))}", [{ value: String(action.text ?? "") }]);
     } else if (kind === "select") {
       await this.callOnNode(tabId, backendNodeId, "function(value){this.value=value;this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}))}", [{ value: String(action.value ?? "") }]);
     } else if (kind === "scroll") {
@@ -1207,7 +1264,7 @@ class StandardBrowserRuntime {
     }
     return { kind, completed: true };
   }
-  async conditionMatched(tabId, condition) {
+  async conditionMatched(tabId, condition, waitStartedAtMs) {
     const kind = condition.kind;
     if (kind === "load")
       return (await chrome.tabs.get(tabId)).status === "complete";
@@ -1228,7 +1285,8 @@ class StandardBrowserRuntime {
     }
     if (kind === "download") {
       const downloads = await chrome.downloads.search({ state: "complete", limit: 1, orderBy: ["-endTime"] });
-      return downloads.length > 0 && Date.now() - new Date(downloads[0].endTime ?? 0).getTime() < 5000;
+      const completedAtMs = Date.parse(downloads[0]?.endTime ?? "");
+      return Number.isFinite(completedAtMs) && completedAtMs >= waitStartedAtMs;
     }
     throw Object.assign(new Error(`Unsupported wait condition: ${String(kind)}`), {
       code: "invalid_request"
@@ -1257,6 +1315,12 @@ class StandardBrowserRuntime {
         returnByValue: true,
         userGesture
       });
+      if (isRecord(invoked.result) && isRecord(invoked.result.value) && invoked.result.value.agenttab_sensitive_field === true) {
+        throw Object.assign(new Error("Sensitive fields require a human Your Turn handoff"), {
+          code: "sensitive_field_requires_handoff",
+          recovery: "Start browser_handoff for this tab and let the human enter the sensitive value."
+        });
+      }
       if (isRecord(invoked.exceptionDetails)) {
         const text = typeof invoked.exceptionDetails.text === "string" ? invoked.exceptionDetails.text : "Page action raised an exception";
         throw Object.assign(new Error(text), { code: "action_failed" });
@@ -1281,6 +1345,22 @@ class StandardBrowserRuntime {
     return {
       x: (points[0] + points[2] + points[4] + points[6]) / 4,
       y: (points[1] + points[3] + points[5] + points[7]) / 4
+    };
+  }
+  async pageIdentity(tabId) {
+    const document2 = await this.send(tabId, "DOM.getDocument", { depth: 0 });
+    const frameTree = await this.send(tabId, "Page.getFrameTree", {});
+    const root = isRecord(document2.root) ? document2.root : null;
+    const documentId = typeof root?.backendNodeId === "number" ? `backend:${root.backendNodeId}` : typeof root?.nodeId === "number" ? `frontend:${root.nodeId}` : undefined;
+    const loaderId = this.frameLoaderId(frameTree);
+    if (documentId === undefined && loaderId === undefined) {
+      throw Object.assign(new Error("Could not identify the page document"), {
+        code: "snapshot_failed"
+      });
+    }
+    return {
+      ...documentId !== undefined ? { documentId } : {},
+      ...loaderId !== undefined ? { loaderId } : {}
     };
   }
   frameLoaderId(result) {
@@ -1331,7 +1411,13 @@ class NotStartedError extends Error {
 
 class MutationScheduler {
   accepting = true;
+  lifecycleAccepting = true;
+  permissionsAvailable = true;
   admissionEpoch = 0;
+  admissionFailure = {
+    code: "paused",
+    message: "AgentTab is paused"
+  };
   tabTails = new Map;
   taskTails = new Map;
   globalTail = Promise.resolve();
@@ -1339,17 +1425,28 @@ class MutationScheduler {
   generationReasons = new Map;
   pending = new Set;
   setInitialPaused(paused) {
-    this.accepting = !paused;
-    if (paused)
-      this.admissionEpoch += 1;
+    if (!paused)
+      return;
+    this.accepting = false;
+    this.lifecycleAccepting = false;
+    this.admissionEpoch += 1;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab is paused"
+    };
   }
   isAccepting() {
     return this.accepting;
   }
-  enqueueTab(taskId, tabId, work) {
-    if (!this.accepting) {
-      return Promise.reject(new NotStartedError("paused", "AgentTab is paused"));
+  notStarted(message) {
+    if (!this.permissionsAvailable) {
+      return new NotStartedError("permissions_required", "AgentTab automation permissions have not been enabled");
     }
+    return new NotStartedError(this.admissionFailure.code, message ?? this.admissionFailure.message);
+  }
+  enqueueTab(taskId, tabId, work) {
+    if (!this.accepting)
+      return Promise.reject(this.notStarted());
     const admissionEpoch = this.admissionEpoch;
     const generation = this.generations.get(tabId) ?? 0;
     const priorGlobal = this.globalTail;
@@ -1357,7 +1454,7 @@ class MutationScheduler {
     const priorTab = this.tabTails.get(tabId) ?? Promise.resolve();
     const result = priorGlobal.then(() => Promise.all([priorTask, priorTab])).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-        throw new NotStartedError("paused", "AgentTab paused before this mutation was dispatched");
+        throw this.notStarted("AgentTab paused before this mutation was dispatched");
       }
       if ((this.generations.get(tabId) ?? 0) !== generation) {
         const reason = this.generationReasons.get(tabId) ?? {
@@ -1373,15 +1470,14 @@ class MutationScheduler {
     return result;
   }
   enqueueGlobal(work) {
-    if (!this.accepting) {
-      return Promise.reject(new NotStartedError("paused", "AgentTab is paused"));
-    }
+    if (!this.accepting)
+      return Promise.reject(this.notStarted());
     const admissionEpoch = this.admissionEpoch;
     const priorGlobal = this.globalTail;
     const priorTabs = [...this.tabTails.values()];
     const result = priorGlobal.then(() => Promise.all(priorTabs)).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-        throw new NotStartedError("paused", "AgentTab paused before this global mutation was dispatched");
+        throw this.notStarted("AgentTab paused before this global mutation was dispatched");
       }
       return work();
     });
@@ -1394,15 +1490,14 @@ class MutationScheduler {
     return result;
   }
   readAfterWrites(tabId, work) {
-    if (!this.accepting) {
-      return Promise.reject(new NotStartedError("paused", "AgentTab is paused"));
-    }
+    if (!this.accepting)
+      return Promise.reject(this.notStarted());
     const admissionEpoch = this.admissionEpoch;
     const priorGlobal = this.globalTail;
     if (tabId === undefined) {
       const result2 = priorGlobal.then(async () => {
         if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-          throw new NotStartedError("paused", "AgentTab paused before this observation was dispatched");
+          throw this.notStarted("AgentTab paused before this observation was dispatched");
         }
         return work();
       });
@@ -1417,7 +1512,7 @@ class MutationScheduler {
     const priorTab = this.tabTails.get(tabId) ?? Promise.resolve();
     const result = priorGlobal.then(() => priorTab).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-        throw new NotStartedError("paused", "AgentTab paused before this observation was dispatched");
+        throw this.notStarted("AgentTab paused before this observation was dispatched");
       }
       return work();
     });
@@ -1439,19 +1534,43 @@ class MutationScheduler {
     });
     this.generations.set(tabId, (this.generations.get(tabId) ?? 0) + 1);
   }
-  disconnect() {
+  revokePermissions() {
+    this.permissionsAvailable = false;
     this.accepting = false;
     this.admissionEpoch += 1;
   }
+  restorePermissions() {
+    this.permissionsAvailable = true;
+    this.accepting = this.lifecycleAccepting;
+  }
+  disconnect() {
+    this.accepting = false;
+    this.lifecycleAccepting = false;
+    this.admissionEpoch += 1;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab connection is unavailable"
+    };
+  }
   async pause() {
     this.accepting = false;
+    this.lifecycleAccepting = false;
     this.admissionEpoch += 1;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab is paused"
+    };
     while (this.pending.size > 0) {
       await Promise.allSettled([...this.pending]);
     }
   }
   resume() {
-    this.accepting = true;
+    this.lifecycleAccepting = true;
+    this.accepting = this.permissionsAvailable;
+    this.admissionFailure = {
+      code: "paused",
+      message: "AgentTab is paused"
+    };
   }
   rememberTabTail(taskId, tabId, result) {
     const tail = result.then(() => {
@@ -1501,8 +1620,8 @@ class HandoffController {
   restore() {
     return this.serialize(() => this.restoreNow());
   }
-  begin(taskId, params) {
-    return this.serialize(() => this.beginNow(taskId, params));
+  begin(taskId, params, originGuard) {
+    return this.serialize(() => this.beginNow(taskId, params, originGuard));
   }
   finish(completed2) {
     return this.serialize(() => this.finishNow(completed2));
@@ -1537,7 +1656,7 @@ class HandoffController {
       when: restored.handoff.startedAtMs + restored.handoff.timeoutMs
     });
   }
-  async beginNow(taskId, params) {
+  async beginNow(taskId, params, originGuard) {
     const tabId = params.tab_id;
     const timeoutMs = params.timeout_ms === undefined ? DEFAULT_TIMEOUT_MS : params.timeout_ms;
     if (!Number.isInteger(tabId) || typeof params.prompt !== "string" || !isRecord(params.completion) || !Number.isInteger(timeoutMs) || Number(timeoutMs) < 1) {
@@ -1585,6 +1704,8 @@ class HandoffController {
       await barrier;
       await this.ownership.assertOwned(taskId, numericTabId);
       await this.revisions.assertExpected(numericTabId, next.expectedRevision);
+      if (originGuard)
+        await originGuard();
       await this.ownership.setTaskState(taskId, "needs_user");
       chrome.alarms.create(HANDOFF_ALARM, { when: startedAt + next.timeoutMs });
       const tab = await chrome.tabs.update(numericTabId, { active: true });
@@ -2074,7 +2195,18 @@ class OwnershipLedger {
     }
     const url = typeof params.url === "string" ? params.url : "about:blank";
     const active = params.background === false;
-    const tab = await this.createTabInUsableWindow(url, active);
+    const existingTask = (await readState()).tasks[taskId];
+    let taskWindowId;
+    if (existingTask && existingTask.groupId !== null) {
+      for (const tabId of existingTask.tabIds) {
+        const candidate = await chrome.tabs.get(tabId).catch(() => null);
+        if (candidate?.groupId === existingTask.groupId && Number.isInteger(candidate.windowId)) {
+          taskWindowId = candidate.windowId;
+          break;
+        }
+      }
+    }
+    const tab = await this.createTabInUsableWindow(url, active, taskWindowId);
     const createdTabId = tab.id;
     if (createdTabId === undefined)
       throw new Error("Chrome did not return a created tab ID");
@@ -2112,36 +2244,26 @@ class OwnershipLedger {
   }
   async adoptOwnedChildNow(tab) {
     const childTabId = tab.id;
-    if (typeof childTabId !== "number" || !Number.isInteger(childTabId))
-      return;
-    const state = await readState();
     const openerTabId = tab.openerTabId;
-    let parentTask = typeof openerTabId === "number" && Number.isInteger(openerTabId) ? Object.values(state.tasks).find((task) => task.tabIds.includes(openerTabId)) : undefined;
-    if (!parentTask && typeof tab.groupId === "number" && tab.groupId !== NO_GROUP) {
-      parentTask = Object.values(state.tasks).find((task) => task.groupId === tab.groupId);
+    if (typeof childTabId !== "number" || !Number.isInteger(childTabId) || typeof openerTabId !== "number" || !Number.isInteger(openerTabId)) {
+      return;
     }
+    const state = await readState();
+    const parentTask = Object.values(state.tasks).find((task) => task.tabIds.includes(openerTabId));
     if (!parentTask)
       return;
-    let ownedParent = null;
-    let ownedParentTabId = null;
-    const candidateParentTabIds = typeof openerTabId === "number" && parentTask.tabIds.includes(openerTabId) ? [openerTabId] : parentTask.tabIds;
-    for (const candidateTabId of candidateParentTabIds) {
-      try {
-        ownedParent = await this.assertOwnedNow(parentTask.taskId, candidateTabId);
-        ownedParentTabId = candidateTabId;
-        break;
-      } catch {}
-    }
-    if (!ownedParent || ownedParentTabId === null)
-      return;
+    let ownedParent;
     try {
-      const parent = await chrome.tabs.get(ownedParentTabId).catch(() => null);
+      ownedParent = await this.assertOwnedNow(parentTask.taskId, openerTabId);
+    } catch {
+      return;
+    }
+    try {
+      const parent = await chrome.tabs.get(openerTabId).catch(() => null);
       const child = await chrome.tabs.get(childTabId).catch(() => null);
-      if (!parent || !child) {
-        if (child)
-          await chrome.tabs.remove(childTabId).catch(() => {
-            return;
-          });
+      if (!parent || !child)
+        return;
+      if (child.groupId !== undefined && child.groupId !== NO_GROUP && child.groupId !== ownedParent.groupId) {
         return;
       }
       if (Number.isInteger(parent.windowId) && Number.isInteger(child.windowId) && parent.windowId !== child.windowId) {
@@ -2163,11 +2285,7 @@ class OwnershipLedger {
         });
       }
       await this.grant(ownedParent.taskId, childTabId, ownedParent.name);
-    } catch {
-      await chrome.tabs.remove(childTabId).catch(() => {
-        return;
-      });
-    }
+    } catch {}
   }
   async revokeIfMovedNow(tabId) {
     const state = await readState();
@@ -2205,7 +2323,7 @@ class OwnershipLedger {
   async closeTaskNow(taskId) {
     const existing = (await readState()).tasks[taskId];
     if (!existing)
-      return;
+      return [];
     for (const tabId of existing.tabIds)
       this.scheduler.revokeTab(tabId);
     const tabIds = await mutateState((state) => {
@@ -2222,12 +2340,16 @@ class OwnershipLedger {
     });
     for (const tabId of tabIds)
       await this.revisions.remove(tabId);
-    if (tabIds.length > 0)
-      await chrome.tabs.remove(tabIds).catch(() => {
-        return;
-      });
+    const closedTabIds = [];
+    for (const tabId of tabIds) {
+      try {
+        await chrome.tabs.remove(tabId);
+        closedTabIds.push(tabId);
+      } catch {}
+    }
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
+    return closedTabIds;
   }
   async grant(taskId, tabId, name) {
     const before = await chrome.tabs.get(tabId);
@@ -2308,7 +2430,10 @@ class OwnershipLedger {
     });
     await this.emitInventory();
   }
-  async createTabInUsableWindow(url, active) {
+  async createTabInUsableWindow(url, active, preferredWindowId) {
+    if (preferredWindowId !== undefined) {
+      return chrome.tabs.create({ windowId: preferredWindowId, url, active });
+    }
     const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
     const noSplit = chrome.tabs.SPLIT_VIEW_ID_NONE ?? NO_GROUP;
     const usable = windows.map((window2) => ({
@@ -2326,12 +2451,15 @@ class OwnershipLedger {
   }
   async tabResult(tabId) {
     const tab = await chrome.tabs.get(tabId);
+    const state = await readState();
+    const owner = Object.values(state.tasks).find((task) => task.tabIds.includes(tabId));
     return {
       tab_id: tabId,
       window_id: tab.windowId,
       group_id: tab.groupId,
       url: tab.url ?? "",
-      page_revision: await this.revisions.current(tabId)
+      page_revision: await this.revisions.current(tabId),
+      tab_count: owner?.tabIds.length ?? 0
     };
   }
   async emitInventory() {
@@ -2420,6 +2548,8 @@ class RevisionTracker {
 }
 
 // src/background.ts
+var RUNTIME_INSTANCE_ID = crypto.randomUUID();
+var automationRevocationGeneration = 0;
 var PRE_DISPATCH_ERRORS = {
   invalid_request: true,
   ownership_denied: true,
@@ -2435,7 +2565,13 @@ var PRE_DISPATCH_ERRORS = {
   staged_commit_expired: true,
   staged_commit_mismatch: true,
   handoff_in_progress: true,
-  handoff_blackout: true
+  handoff_blackout: true,
+  origin_denied: true,
+  origin_not_allowed: true,
+  origin_unavailable: true,
+  origin_policy_mismatch: true,
+  scheme_denied: true,
+  sensitive_field_requires_handoff: true
 };
 var scheduler = new MutationScheduler;
 var revisions = new RevisionTracker;
@@ -2451,7 +2587,11 @@ browser = new StandardBrowserRuntime(revisions, async (tabId) => {
 var handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber(() => browser.scrubForHandoff());
 async function automationEnabled() {
-  return chrome.permissions.contains({ permissions: ["scripting"] });
+  const [scripting, debuggerPermission] = await Promise.all([
+    chrome.permissions.contains({ permissions: ["scripting"] }),
+    chrome.permissions.contains({ permissions: ["debugger"] })
+  ]);
+  return scripting && debuggerPermission;
 }
 function tabId(params) {
   if (!Number.isInteger(params.tab_id) || Number(params.tab_id) < 0) {
@@ -2460,6 +2600,55 @@ function tabId(params) {
     });
   }
   return Number(params.tab_id);
+}
+function originMatches(pattern, url) {
+  if (pattern === url.origin)
+    return true;
+  if (!pattern.startsWith("*."))
+    return false;
+  const suffix = pattern.slice(2);
+  return url.hostname !== suffix && url.hostname.endsWith(`.${suffix}`);
+}
+async function assertCurrentOrigin(tabId2, policy) {
+  if (policy === undefined)
+    return;
+  if (policy.tab_id !== tabId2) {
+    throw Object.assign(new Error("origin_policy.tab_id does not match the command target"), {
+      code: "origin_policy_mismatch"
+    });
+  }
+  const tab = await chrome.tabs.get(tabId2);
+  const rawUrl = tab.pendingUrl ?? tab.url;
+  if (typeof rawUrl !== "string") {
+    throw Object.assign(new Error("AgentTab cannot determine the target tab's current origin"), {
+      code: "origin_unavailable"
+    });
+  }
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw Object.assign(new Error("AgentTab cannot determine the target tab's current origin"), {
+      code: "origin_unavailable"
+    });
+  }
+  if (url.protocol === "about:")
+    return;
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw Object.assign(new Error(`AgentTab Standard mode does not allow ${url.protocol.slice(0, -1)} URLs`), {
+      code: "scheme_denied"
+    });
+  }
+  if (policy.denied_origins.some((pattern) => originMatches(pattern, url))) {
+    throw Object.assign(new Error(`AgentTab policy denies ${url.origin}`), {
+      code: "origin_denied"
+    });
+  }
+  if (policy.allowed_origins.length > 0 && !policy.allowed_origins.some((pattern) => originMatches(pattern, url))) {
+    throw Object.assign(new Error(`AgentTab policy does not allow ${url.origin}`), {
+      code: "origin_not_allowed"
+    });
+  }
 }
 function errorCode(error) {
   return isRecord(error) && typeof error.code === "string" ? error.code : "native_action_failed";
@@ -2476,6 +2665,17 @@ function errorOutcome(error, mutating, code) {
   return mutating && !PRE_DISPATCH_ERRORS[code] ? "unknown" : "not_started";
 }
 async function dispatch(command) {
+  if (command.kind === "close_task") {
+    try {
+      const closedTabIds = await ownership.closeTask(command.task_id);
+      return completed(command.request_id, {
+        task_id: command.task_id,
+        closed_tab_ids: closedTabIds
+      });
+    } catch (error) {
+      return failed(command.request_id, errorCode(error), error instanceof Error ? error.message : String(error), "unknown");
+    }
+  }
   const params = command.params;
   const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer";
   try {
@@ -2502,14 +2702,15 @@ async function dispatch(command) {
     }
     if (command.method === "browser_handoff") {
       if (!scheduler.isAccepting() || (await readState()).paused) {
-        throw new NotStartedError("paused", "AgentTab is paused");
+        throw scheduler.notStarted("AgentTab is paused");
       }
-      return needsUser(command.request_id, await handoff.begin(command.task_id, params));
+      return needsUser(command.request_id, await handoff.begin(command.task_id, params, () => assertCurrentOrigin(tabId(params), command.origin_policy)));
     }
     if (command.method === "browser_commit") {
       const targetTabId2 = await browser.stagedTabId(command.task_id, params.native_token);
       const result = await scheduler.enqueueTab(command.task_id, targetTabId2, async () => {
         await ownership.assertOwned(command.task_id, targetTabId2);
+        await assertCurrentOrigin(targetTabId2, command.origin_policy);
         return browser.commit(command.task_id, params);
       });
       return completed(command.request_id, result);
@@ -2531,6 +2732,7 @@ async function dispatch(command) {
       delete cdpParams.tab_id;
       const result = await scheduler.enqueueTab(command.task_id, targetTabId2, async () => {
         await ownership.assertOwned(command.task_id, targetTabId2);
+        await assertCurrentOrigin(targetTabId2, command.origin_policy);
         return browser.developer(targetTabId2, action, cdpParams);
       });
       return completed(command.request_id, result);
@@ -2538,14 +2740,29 @@ async function dispatch(command) {
     const targetTabId = tabId(params);
     if (command.method === "browser_snapshot" || command.method === "browser_wait") {
       const result = await scheduler.readAfterWrites(targetTabId, async () => {
-        await ownership.assertOwned(command.task_id, targetTabId);
-        return command.method === "browser_snapshot" ? browser.snapshot(targetTabId, params) : browser.wait(targetTabId, params);
+        if (command.method === "browser_snapshot") {
+          await ownership.assertOwned(command.task_id, targetTabId);
+          await assertCurrentOrigin(targetTabId, command.origin_policy);
+          return browser.snapshot(targetTabId, params);
+        }
+        const revalidate = async () => {
+          if (!scheduler.isAccepting()) {
+            throw scheduler.notStarted("AgentTab stopped the active browser wait");
+          }
+          await ownership.assertOwned(command.task_id, targetTabId);
+          await assertCurrentOrigin(targetTabId, command.origin_policy);
+          if (!scheduler.isAccepting()) {
+            throw scheduler.notStarted("AgentTab stopped the active browser wait");
+          }
+        };
+        return browser.wait(targetTabId, params, revalidate);
       });
       return completed(command.request_id, result);
     }
     if (command.method === "browser_act") {
       const execution = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
         await ownership.assertOwned(command.task_id, targetTabId);
+        await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
       });
       if (execution.staged) {
@@ -2569,6 +2786,8 @@ function start() {
   startup = (async () => {
     const state = await readState();
     scheduler.setInitialPaused(state.paused || state.handoff.active);
+    if (!await automationEnabled())
+      scheduler.revokePermissions();
     await ownership.reconcile();
     await browser.expireCommits();
     await handoff.restore();
@@ -2606,6 +2825,23 @@ chrome.tabs.onDetached.addListener(() => void start().then(() => ownership.recon
 chrome.tabGroups.onRemoved.addListener(() => void start().then(() => ownership.reconcile()));
 chrome.runtime.onStartup.addListener(() => void start());
 chrome.runtime.onInstalled.addListener(() => void start());
+chrome.permissions.onRemoved.addListener((permissions) => {
+  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
+    return;
+  }
+  scheduler.revokePermissions();
+  automationRevocationGeneration += 1;
+  start().then(() => browser.scrubForHandoff());
+});
+chrome.permissions.onAdded.addListener((permissions) => {
+  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
+    return;
+  }
+  automationEnabled().then((enabled) => {
+    if (enabled)
+      scheduler.restorePermissions();
+  });
+});
 chrome.alarms.onAlarm.addListener((alarm) => {
   start().then(async () => {
     if (alarm.name === RECONNECT_ALARM)
@@ -2618,6 +2854,11 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 async function handlePopupMessage(message) {
   if (message.kind === "wake")
     return { ready: true };
+  if (message.kind === "runtime_instance")
+    return { runtime_instance: RUNTIME_INSTANCE_ID };
+  if (message.kind === "automation_revocation_state") {
+    return { generation: automationRevocationGeneration };
+  }
   if (message.kind === "get_ui_state") {
     const state = await readState();
     return {

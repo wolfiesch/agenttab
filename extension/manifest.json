@@ -12,11 +12,11 @@
     "tabGroups",
     "storage",
     "alarms",
-    "downloads",
-    "debugger"
+    "downloads"
   ],
   "optional_permissions": [
-    "scripting"
+    "scripting",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>"

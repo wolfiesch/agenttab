@@ -512,17 +512,21 @@ function reload() {
 }
 enableButton.addEventListener("click", () => {
   guard(permissionError, async () => {
-    const granted = await chrome.permissions.request({ permissions: ["scripting"] });
+    const granted = await chrome.permissions.request({ permissions: ["scripting", "debugger"] });
     if (!granted) {
-      throw new Error("Chrome denied the scripting permission. AgentTab stays installed and disabled until you enable it here.");
+      throw new Error("Chrome denied AgentTab automation. AgentTab stays installed and disabled until you enable it here.");
     }
   });
 });
 disableButton.addEventListener("click", () => {
   guard(settingsError, async () => {
-    await chrome.permissions.remove({ permissions: ["scripting"] });
-    if (await chrome.permissions.contains({ permissions: ["scripting"] })) {
-      throw new Error("Chrome kept the scripting permission. Disable AgentTab from chrome://extensions, then try again.");
+    await chrome.permissions.remove({ permissions: ["scripting", "debugger"] });
+    const [scripting, debuggerPermission] = await Promise.all([
+      chrome.permissions.contains({ permissions: ["scripting"] }),
+      chrome.permissions.contains({ permissions: ["debugger"] })
+    ]);
+    if (scripting || debuggerPermission) {
+      throw new Error("Chrome kept an automation permission. Disable AgentTab from chrome://extensions, then try again.");
     }
   });
 });
