@@ -50,6 +50,22 @@
       },
       "additionalProperties": false
     },
+    "origin_policy": {
+      "type": "object",
+      "required": ["tab_id", "allowed_origins", "denied_origins"],
+      "properties": {
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "allowed_origins": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "denied_origins": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
     "inventory_payload": {
       "type": "object",
       "required": ["inventory"],
@@ -132,7 +148,8 @@
             "connection_id": { "type": "string", "format": "uuid" },
             "task_id": { "type": "string", "format": "uuid" },
             "method": { "type": "string", "minLength": 1 },
-            "params": { "type": "object" }
+            "params": { "type": "object" },
+            "origin_policy": { "$ref": "#/$defs/origin_policy" }
           },
           "additionalProperties": false
         }

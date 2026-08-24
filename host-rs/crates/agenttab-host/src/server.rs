@@ -518,6 +518,10 @@ where
         let _ = runtime.disconnect(&connection);
         return Err(error);
     }
+    if let Err(error) = runtime.acknowledge_connection(&connection) {
+        let _ = runtime.disconnect(&connection);
+        return Err(io::Error::other(error.to_string()));
+    }
 
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (response_sender, mut response_receiver) = mpsc::channel::<Value>(CONNECTION_QUEUE);
@@ -748,6 +752,7 @@ mod tests {
             _task_id: Uuid,
             _method: &str,
             _params: Value,
+            _origin_policy: Option<agenttab_protocol::NativeOriginPolicy>,
             _timeout: Duration,
         ) -> Result<NativeResponse, NativeError> {
             Err(NativeError::Disconnected)

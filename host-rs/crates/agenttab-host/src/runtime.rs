@@ -157,6 +157,13 @@ impl Runtime {
         ConnectionContext::negotiate(init, &self.journal, self.lifecycle.state())
     }
 
+    pub fn acknowledge_connection(
+        &self,
+        connection: &ConnectionContext,
+    ) -> Result<(), JournalError> {
+        connection.acknowledge_resume_capability(&self.journal)
+    }
+
     pub fn handle(&self, connection: &Arc<ConnectionContext>, raw: Value) -> Value {
         let fallback_request_id = raw
             .get("request_id")
@@ -280,21 +287,24 @@ impl Runtime {
                 .attach_new_capability(connection, cancelled_response(request.request_id))
                 .value();
         }
-        if let Err(error) = self.lifecycle.gate(request.method) {
-            let response =
-                RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
-            return self.audited_value(
-                connection,
-                Some(task_id),
-                &request,
-                &params_value,
-                response,
-                started_at_ms,
-                started,
-                false,
-                true,
-            );
-        }
+        let _lifecycle_admission = match self.lifecycle.admit(request.method) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let response =
+                    RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
+                return self.audited_value(
+                    connection,
+                    Some(task_id),
+                    &request,
+                    &params_value,
+                    response,
+                    started_at_ms,
+                    started,
+                    false,
+                    true,
+                );
+            }
+        };
         if let Some(error) = self.handoff_blackout_error() {
             let response =
                 RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
@@ -590,11 +600,16 @@ impl Runtime {
             });
         }
 
+        let origin_policy = params_value
+            .get("tab_id")
+            .and_then(Value::as_u64)
+            .and_then(|tab_id| self.guardrails.native_origin_policy(tab_id));
         let native = self.native.dispatch(
             connection_id,
             task_id,
             &method.to_string(),
             params_value,
+            origin_policy,
             timeout,
         );
         let native = match native {
@@ -834,7 +849,8 @@ fn enforce_response_limit(response: RpcResponse) -> RpcResponse {
 mod tests {
     use super::*;
     use agenttab_protocol::{
-        ConnectKind, NativeResponse, NativeResponseKind, NativeStagedCommit, RPC_PROTOCOL,
+        ConnectKind, NativeOriginPolicy, NativeResponse, NativeResponseKind, NativeStagedCommit,
+        RPC_PROTOCOL,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -845,6 +861,7 @@ mod tests {
         calls: AtomicUsize,
         staged: Mutex<bool>,
         sensitive_error: bool,
+        origin_policies: Mutex<Vec<Option<NativeOriginPolicy>>>,
     }
 
     impl FakeNative {
@@ -853,6 +870,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: false,
+                origin_policies: Mutex::new(Vec::new()),
             })
         }
 
@@ -861,6 +879,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: true,
+                origin_policies: Mutex::new(Vec::new()),
             })
         }
 
@@ -869,6 +888,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(true),
                 sensitive_error: false,
+                origin_policies: Mutex::new(Vec::new()),
             })
         }
     }
@@ -880,8 +900,10 @@ mod tests {
             task_id: Uuid,
             method: &str,
             _params: Value,
+            origin_policy: Option<NativeOriginPolicy>,
             _timeout: Duration,
         ) -> Result<agenttab_protocol::NativeResponse, NativeError> {
+            self.origin_policies.lock().push(origin_policy);
             self.calls.fetch_add(1, Ordering::Relaxed);
             if self.sensitive_error {
                 let mut error = RpcError::new(
@@ -944,6 +966,7 @@ mod tests {
             _task_id: Uuid,
             _method: &str,
             _params: Value,
+            _origin_policy: Option<NativeOriginPolicy>,
             _timeout: Duration,
         ) -> Result<NativeResponse, NativeError> {
             Err(NativeError::Timeout)
@@ -1138,6 +1161,14 @@ mod tests {
             .write()
             .insert(3, "https://allowed.test/path".into());
         let allowed = runtime.handle(&connection, snapshot("allowed"));
+        assert_eq!(
+            native.origin_policies.lock().as_slice(),
+            &[Some(NativeOriginPolicy {
+                tab_id: 3,
+                allowed_origins: Vec::new(),
+                denied_origins: vec!["*.example.com".into()],
+            })]
+        );
         assert_eq!(allowed["outcome"], "completed");
         assert_eq!(native.calls.load(Ordering::Relaxed), 1);
     }

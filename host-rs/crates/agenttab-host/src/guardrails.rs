@@ -1,4 +1,6 @@
-use agenttab_protocol::{BrowserAction, BrowserOpenParams, MethodParams, RpcError, RpcMethod};
+use agenttab_protocol::{
+    BrowserAction, BrowserOpenParams, MethodParams, NativeOriginPolicy, RpcError, RpcMethod,
+};
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::Value;
@@ -154,6 +156,14 @@ impl Guardrails {
             .with_recovery("Wait for reconciliation and retry the operation.")
         })?;
         self.authorize_url(tab_url)
+    }
+
+    pub fn native_origin_policy(&self, tab_id: u64) -> Option<NativeOriginPolicy> {
+        self.has_origin_constraints().then(|| NativeOriginPolicy {
+            tab_id,
+            allowed_origins: self.policy.allowed_origins.clone(),
+            denied_origins: self.policy.denied_origins.clone(),
+        })
     }
 
     fn has_origin_constraints(&self) -> bool {

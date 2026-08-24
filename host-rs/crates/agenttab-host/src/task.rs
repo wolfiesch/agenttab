@@ -11,6 +11,7 @@ use uuid::Uuid;
 struct ConnectionTaskState {
     lease: Option<TaskLease>,
     capability_pending: bool,
+    resume_rotation_pending: bool,
 }
 
 #[derive(Debug)]
@@ -50,6 +51,7 @@ impl ConnectionContext {
             task: Mutex::new(ConnectionTaskState {
                 lease: resumed_lease,
                 capability_pending: false,
+                resume_rotation_pending: resumed,
             }),
             cancelled: AtomicBool::new(false),
         });
@@ -75,6 +77,17 @@ impl ConnectionContext {
         }
         state.capability_pending = false;
         Ok(state.lease.clone())
+    }
+
+    pub fn acknowledge_resume_capability(&self, journal: &Journal) -> Result<(), JournalError> {
+        let mut state = self.task.lock();
+        if !state.resume_rotation_pending {
+            return Ok(());
+        }
+        let lease = state.lease.as_ref().ok_or(JournalError::MissingTask)?;
+        journal.acknowledge_resume_capability(lease.task_id, &lease.resume_capability)?;
+        state.resume_rotation_pending = false;
+        Ok(())
     }
 
     pub fn task_id(&self) -> Result<Option<Uuid>, JournalError> {
@@ -125,7 +138,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&temp.path().join("state.sqlite3")).unwrap());
         let created = journal.create_task(None).unwrap();
-        let (_, ack) = ConnectionContext::negotiate(
+        let (connection, ack) = ConnectionContext::negotiate(
             init(Some(created.resume_capability.clone())),
             &journal,
             RuntimeState::Ready,
@@ -134,5 +147,12 @@ mod tests {
         assert!(ack.resumed);
         assert_eq!(ack.task_id, Some(created.task_id));
         assert_ne!(ack.resume_capability.unwrap(), created.resume_capability);
+        connection
+            .acknowledge_resume_capability(&journal)
+            .unwrap();
+        assert!(journal
+            .resume_task(&created.resume_capability)
+            .unwrap()
+            .is_none());
     }
 }

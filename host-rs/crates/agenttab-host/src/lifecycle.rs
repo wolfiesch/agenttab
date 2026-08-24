@@ -3,6 +3,11 @@ use parking_lot::{Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Debug)]
+pub struct Admission<'a> {
+    lifecycle: &'a Lifecycle,
+}
+
+#[derive(Debug)]
 pub struct Lifecycle {
     state: Mutex<StateData>,
     changed: Condvar,
@@ -12,6 +17,7 @@ pub struct Lifecycle {
 struct StateData {
     state: RuntimeState,
     terminal_reason: Option<String>,
+    active_admissions: usize,
 }
 
 impl Default for Lifecycle {
@@ -20,6 +26,7 @@ impl Default for Lifecycle {
             state: Mutex::new(StateData {
                 state: RuntimeState::Starting,
                 terminal_reason: None,
+                active_admissions: 0,
             }),
             changed: Condvar::new(),
         }
@@ -47,16 +54,14 @@ impl Lifecycle {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        let current = self.state();
-        if matches!(current, RuntimeState::Ready | RuntimeState::Paused) {
-            self.transition(
-                if paused {
-                    RuntimeState::Paused
-                } else {
-                    RuntimeState::Ready
-                },
-                None,
-            );
+        let mut data = self.state.lock();
+        if matches!(data.state, RuntimeState::Ready | RuntimeState::Paused) {
+            data.state = if paused {
+                RuntimeState::Paused
+            } else {
+                RuntimeState::Ready
+            };
+            self.changed.notify_all();
         }
     }
 
@@ -71,30 +76,14 @@ impl Lifecycle {
     }
 
     pub fn gate(&self, method: RpcMethod) -> Result<(), RpcError> {
-        match self.state() {
-            RuntimeState::Ready => Ok(()),
-            RuntimeState::Paused => Err(RpcError::new(
-                "automation_paused",
-                "AgentTab is paused in Chrome",
-            )
-            .with_recovery("Resume AgentTab from the extension popup, then retry.")),
-            RuntimeState::Starting | RuntimeState::Reconciling => Err(RpcError::new(
-                "runtime_not_ready",
-                format!("AgentTab is not ready for {method}"),
-            )
-            .with_recovery("Wait for the extension handshake and task reconciliation to finish.")),
-            RuntimeState::Terminal => {
-                let reason = self
-                    .state
-                    .lock()
-                    .terminal_reason
-                    .clone()
-                    .unwrap_or_else(|| "terminal protocol failure".into());
-                Err(RpcError::new("runtime_terminal", reason).with_recovery(
-                    "Update AgentTab so the host and extension use the same protocol version.",
-                ))
-            }
-        }
+        gate_state(&self.state.lock(), method)
+    }
+
+    pub fn admit(&self, method: RpcMethod) -> Result<Admission<'_>, RpcError> {
+        let mut data = self.state.lock();
+        gate_state(&data, method)?;
+        data.active_admissions += 1;
+        Ok(Admission { lifecycle: self })
     }
 
     pub fn wait_until_ready(&self, timeout: Duration) -> RuntimeState {
@@ -122,6 +111,39 @@ impl Lifecycle {
     }
 }
 
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        let mut data = self.lifecycle.state.lock();
+        debug_assert!(data.active_admissions > 0);
+        data.active_admissions = data.active_admissions.saturating_sub(1);
+        self.lifecycle.changed.notify_all();
+    }
+}
+
+fn gate_state(data: &StateData, method: RpcMethod) -> Result<(), RpcError> {
+    match data.state {
+        RuntimeState::Ready => Ok(()),
+        RuntimeState::Paused => Err(
+            RpcError::new("automation_paused", "AgentTab is paused in Chrome")
+                .with_recovery("Resume AgentTab from the extension popup, then retry."),
+        ),
+        RuntimeState::Starting | RuntimeState::Reconciling => Err(RpcError::new(
+            "runtime_not_ready",
+            format!("AgentTab is not ready for {method}"),
+        )
+        .with_recovery("Wait for the extension handshake and task reconciliation to finish.")),
+        RuntimeState::Terminal => Err(RpcError::new(
+            "runtime_terminal",
+            data.terminal_reason
+                .clone()
+                .unwrap_or_else(|| "terminal protocol failure".into()),
+        )
+        .with_recovery(
+            "Update AgentTab so the host and extension use the same protocol version.",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +168,18 @@ mod tests {
         lifecycle.complete_reconciliation(true);
         let error = lifecycle.gate(RpcMethod::BrowserSnapshot).unwrap_err();
         assert_eq!(error.code, "automation_paused");
+    }
+
+    #[test]
+    fn pause_and_admission_have_one_linearization_point() {
+        let lifecycle = Lifecycle::default();
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+
+        let admitted = lifecycle.admit(RpcMethod::BrowserAct).unwrap();
+        lifecycle.set_paused(true);
+        let error = lifecycle.admit(RpcMethod::BrowserSnapshot).unwrap_err();
+        assert_eq!(error.code, "automation_paused");
+        drop(admitted);
     }
 }

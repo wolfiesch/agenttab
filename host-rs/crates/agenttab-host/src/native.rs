@@ -2,9 +2,9 @@ use crate::handoff::HandoffState;
 use crate::lifecycle::Lifecycle;
 use agenttab_protocol::{
     native_command, native_ready, read_frame, write_frame, NativeDisconnectRecovery, NativeEvent,
-    NativeEventPayload, NativeHello, NativeResponse, NativeStagedCommit, NativeTab, ProtocolError,
-    RuntimeState, EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL,
-    PROTOCOL_VERSION,
+    NativeEventPayload, NativeHello, NativeOriginPolicy, NativeResponse, NativeStagedCommit,
+    NativeTab, ProtocolError, RuntimeState, EXTENSION_TO_HOST_MAX_BYTES,
+    HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -46,6 +46,7 @@ pub trait NativeTransport: Send + Sync {
         task_id: Uuid,
         method: &str,
         params: Value,
+        origin_policy: Option<NativeOriginPolicy>,
         timeout: Duration,
     ) -> Result<NativeResponse, NativeError>;
     fn cancel_connection(&self, _connection_id: Uuid) {}
@@ -228,6 +229,7 @@ impl NativeTransport for StdioNative {
         task_id: Uuid,
         method: &str,
         params: Value,
+        origin_policy: Option<NativeOriginPolicy>,
         timeout: Duration,
     ) -> Result<NativeResponse, NativeError> {
         if self.disconnected.load(Ordering::Acquire) {
@@ -244,6 +246,7 @@ impl NativeTransport for StdioNative {
             task_id,
             method,
             params,
+            origin_policy.as_ref(),
         )) {
             self.pending.lock().remove(&request_id);
             return Err(NativeError::Transport(error.to_string()));
@@ -289,6 +292,7 @@ impl NativeTransport for StdioNative {
                 task_id,
                 "cancel_connection",
                 serde_json::json!({}),
+                None,
             ));
         }
     }

@@ -1199,14 +1199,23 @@ pub enum NativeEventName {
     ExtensionDisconnected,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeOriginPolicy {
+    pub tab_id: u64,
+    pub allowed_origins: Vec<String>,
+    pub denied_origins: Vec<String>,
+}
+
 pub fn native_command(
     request_id: Uuid,
     connection_id: Uuid,
     task_id: Uuid,
     method: &str,
     params: Value,
+    origin_policy: Option<&NativeOriginPolicy>,
 ) -> Value {
-    serde_json::json!({
+    let mut command = serde_json::json!({
         "protocol": NATIVE_PROTOCOL,
         "version": PROTOCOL_VERSION,
         "kind": "command",
@@ -1215,7 +1224,11 @@ pub fn native_command(
         "task_id": task_id,
         "method": method,
         "params": params,
-    })
+    });
+    if let Some(origin_policy) = origin_policy {
+        command["origin_policy"] = serde_json::json!(origin_policy);
+    }
+    command
 }
 
 pub fn native_ready(state: RuntimeState) -> Value {

@@ -90,6 +90,7 @@ impl Journal {
              CREATE TABLE IF NOT EXISTS tasks (
                  task_id TEXT PRIMARY KEY,
                  resume_hash BLOB NOT NULL UNIQUE,
+                 previous_resume_hash BLOB,
                  state TEXT NOT NULL CHECK (state IN ('active', 'closed')),
                  conversation_id TEXT,
                  active_connections INTEGER NOT NULL DEFAULT 0 CHECK (active_connections >= 0),
@@ -138,6 +139,7 @@ impl Journal {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&connection, "tasks", "closed_at_ms", "INTEGER")?;
+        ensure_column(&connection, "tasks", "previous_resume_hash", "BLOB")?;
         connection.execute("UPDATE tasks SET active_connections = 0", [])?;
         cleanup_expired_tasks(&connection, now_ms())?;
         #[cfg(unix)]
@@ -183,7 +185,8 @@ impl Journal {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task_id: Option<String> = transaction
             .query_row(
-                "SELECT task_id FROM tasks WHERE resume_hash = ?1 AND state = 'active'",
+                "SELECT task_id FROM tasks
+                 WHERE (resume_hash = ?1 OR previous_resume_hash = ?1) AND state = 'active'",
                 params![old_hash.as_slice()],
                 |row| row.get(0),
             )
@@ -194,17 +197,39 @@ impl Journal {
         };
         transaction.execute(
             "UPDATE tasks
-             SET resume_hash = ?1,
+             SET previous_resume_hash = ?1,
+                 resume_hash = ?2,
                  active_connections = active_connections + 1,
-                 updated_at_ms = ?2
-             WHERE task_id = ?3 AND state = 'active'",
-            params![next_hash.as_slice(), now, task_id],
+                 updated_at_ms = ?3
+             WHERE task_id = ?4 AND state = 'active'",
+            params![
+                old_hash.as_slice(),
+                next_hash.as_slice(),
+                now,
+                task_id
+            ],
         )?;
         transaction.commit()?;
         Ok(Some(TaskLease {
             task_id: Uuid::parse_str(&task_id)?,
             resume_capability: next_capability,
         }))
+    }
+
+    pub fn acknowledge_resume_capability(
+        &self,
+        task_id: Uuid,
+        capability: &str,
+    ) -> Result<(), JournalError> {
+        let capability_hash = capability_hash(capability);
+        let connection = self.connection.lock();
+        connection.execute(
+            "UPDATE tasks
+             SET previous_resume_hash = NULL, updated_at_ms = ?1
+             WHERE task_id = ?2 AND resume_hash = ?3 AND state = 'active'",
+            params![now_ms(), task_id.to_string(), capability_hash.as_slice()],
+        )?;
+        Ok(())
     }
 
     pub fn detach_connection(&self, task_id: Uuid) -> Result<(), JournalError> {
@@ -569,16 +594,27 @@ mod tests {
     }
 
     #[test]
-    fn resume_capabilities_are_hashed_and_rotated_once() {
+    fn resume_capability_rotation_keeps_the_prior_token_until_delivery_ack() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_journal(&temp);
         let created = journal.create_task(Some("conversation")).unwrap();
-        let resumed = journal
+        let undelivered = journal
             .resume_task(&created.resume_capability)
             .unwrap()
             .unwrap();
-        assert_eq!(created.task_id, resumed.task_id);
-        assert_ne!(created.resume_capability, resumed.resume_capability);
+        assert_eq!(created.task_id, undelivered.task_id);
+        assert_ne!(
+            created.resume_capability,
+            undelivered.resume_capability
+        );
+
+        let delivered = journal
+            .resume_task(&created.resume_capability)
+            .unwrap()
+            .expect("the prior capability remains valid before delivery acknowledgment");
+        journal
+            .acknowledge_resume_capability(delivered.task_id, &delivered.resume_capability)
+            .unwrap();
         assert!(journal
             .resume_task(&created.resume_capability)
             .unwrap()
