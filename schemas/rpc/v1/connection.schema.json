@@ -28,6 +28,17 @@
         "resume_capability": { "type": "string", "minLength": 32 },
         "state": { "enum": ["starting", "reconciling", "ready", "paused", "terminal"] }
       },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "resumed": { "const": true } },
+            "required": ["resumed"]
+          },
+          "then": {
+            "required": ["task_id", "resume_capability"]
+          }
+        }
+      ],
       "additionalProperties": false
     }
   ]

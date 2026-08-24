@@ -529,12 +529,19 @@ where
     let writer_connection = connection.clone();
     let writer = tokio::spawn(async move {
         while let Some(response) = response_receiver.recv().await {
+            let carries_capability = response_carries_new_capability(&response);
             if write_frame_async(&mut writer, &response, HOST_TO_CLIENT_MAX_BYTES)
                 .await
                 .is_err()
             {
+                if carries_capability {
+                    writer_connection.finish_new_capability_delivery(false);
+                }
                 let _ = writer_runtime.disconnect(&writer_connection);
                 break;
+            }
+            if carries_capability {
+                writer_connection.finish_new_capability_delivery(true);
             }
         }
     });
@@ -578,6 +585,7 @@ where
         let request_runtime = runtime.clone();
         let request_connection = connection.clone();
         let request_responses = response_sender.clone();
+        let delivery_connection = connection.clone();
         requests.spawn(async move {
             let _permit = permit;
             let response = tokio::task::spawn_blocking(move || {
@@ -586,18 +594,28 @@ where
             })
             .await;
             if let Ok(response) = response {
-                let _ = request_responses.send(response).await;
+                let carries_capability = response_carries_new_capability(&response);
+                if request_responses.send(response).await.is_err() && carries_capability {
+                    delivery_connection.finish_new_capability_delivery(false);
+                }
             }
         });
         while requests.try_join_next().is_some() {}
     }
-    let _ = runtime.disconnect(&connection);
     requests.abort_all();
     while requests.join_next().await.is_some() {}
     drop(response_sender);
     writer.abort();
     let _ = writer.await;
+    let _ = runtime.disconnect(&connection);
     Ok(())
+}
+
+fn response_carries_new_capability(response: &Value) -> bool {
+    response
+        .pointer("/task/resume_capability")
+        .and_then(Value::as_str)
+        .is_some()
 }
 
 async fn read_frame_async<R: AsyncRead + Unpin>(

@@ -182,7 +182,20 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
     missing_state = dict(connected)
     missing_state.pop("state")
     expect_invalid(connection_validator, missing_state, "connected state")
-    return len(requests) + 6
+    resumed_without_binding = dict(connected, resumed=True)
+    expect_invalid(
+        connection_validator,
+        resumed_without_binding,
+        "resumed connection task binding",
+    )
+    connection_validator.validate(
+        dict(
+            resumed_without_binding,
+            task_id="018f47a0-7b10-7abc-8def-0123456789ac",
+            resume_capability="r" * 32,
+        )
+    )
+    return len(requests) + 8
 
 
 def main() -> int:

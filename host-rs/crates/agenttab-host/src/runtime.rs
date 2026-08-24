@@ -168,6 +168,7 @@ impl Runtime {
         let fallback_request_id = raw
             .get("request_id")
             .and_then(Value::as_str)
+            .filter(|request_id| !request_id.is_empty() && request_id.len() <= 128)
             .unwrap_or("invalid-request")
             .to_string();
         let (request, params) = match RpcRequest::parse(raw) {
@@ -458,7 +459,9 @@ impl Runtime {
             return Ok(());
         }
         self.native.cancel_connection(connection.connection_id);
-        if let Some(task_id) = connection.task_id()? {
+        if let Some(task_id) = connection.undelivered_new_task_id() {
+            self.journal.close_task(task_id)?;
+        } else if let Some(task_id) = connection.task_id()? {
             self.journal.detach_connection(task_id)?;
         }
         Ok(())
@@ -616,6 +619,9 @@ impl Runtime {
             Ok(response) => response,
             Err(error) => return native_failure(request_id, error),
         };
+        if method == RpcMethod::BrowserHandoff && native.outcome == Outcome::NotStarted {
+            self.handoff.restore(false);
+        }
         if native.outcome == Outcome::CommitRequired {
             let Some(staged) = native.staged else {
                 return RpcResponse::failure(
@@ -692,7 +698,7 @@ impl Runtime {
         mut response: RpcResponse,
     ) -> RpcResponse {
         if response.task.is_none() {
-            let new_lease = connection.take_new_capability().ok().flatten();
+            let new_lease = connection.reserve_new_capability().ok().flatten();
             let task_id = new_lease
                 .as_ref()
                 .map(|lease| lease.task_id)
@@ -972,6 +978,34 @@ mod tests {
             Err(NativeError::Timeout)
         }
     }
+    #[derive(Debug)]
+    struct RejectedHandoffNative;
+
+    impl NativeTransport for RejectedHandoffNative {
+        fn dispatch(
+            &self,
+            _connection_id: Uuid,
+            _task_id: Uuid,
+            _method: &str,
+            _params: Value,
+            _origin_policy: Option<NativeOriginPolicy>,
+            _timeout: Duration,
+        ) -> Result<NativeResponse, NativeError> {
+            Ok(NativeResponse {
+                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: NativeResponseKind::Response,
+                request_id: Uuid::new_v4(),
+                outcome: Outcome::NotStarted,
+                result: None,
+                error: Some(RpcError::new(
+                    "handoff_declined",
+                    "The handoff did not start",
+                )),
+                staged: None,
+            })
+        }
+    }
 
     fn connected_runtime(
         native: Arc<dyn NativeTransport>,
@@ -993,6 +1027,45 @@ mod tests {
             })
             .unwrap();
         (temp, runtime, connection)
+    }
+    #[test]
+    fn invalid_request_uses_a_schema_valid_fallback_id() {
+        let (_temp, runtime, connection) = connected_runtime(FakeNative::normal());
+        let response = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "x".repeat(129),
+                "method": "unknown",
+                "params": {}
+            }),
+        );
+        assert_eq!(response["request_id"], "invalid-request");
+        assert_eq!(response["error"]["code"], "invalid_request");
+    }
+
+    #[test]
+    fn disconnect_closes_a_task_whose_capability_was_not_delivered() {
+        let (_temp, runtime, connection) = connected_runtime(FakeNative::normal());
+        let response = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "tabs",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+        let capability = response["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        runtime.disconnect(&connection).unwrap();
+
+        assert!(runtime.journal.resume_task(&capability).unwrap().is_none());
     }
 
     #[test]
@@ -1208,6 +1281,30 @@ mod tests {
         );
         assert_eq!(blocked["error"]["code"], "handoff_blackout");
         runtime.handoff.restore(false);
+    }
+    #[test]
+    fn rejected_handoff_releases_global_blackout() {
+        let (_temp, runtime, connection) = connected_runtime(Arc::new(RejectedHandoffNative));
+        let response = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "handoff-rejected",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_handoff",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "prompt": "Complete sign-in",
+                    "completion": {"kind": "manual_done"},
+                    "timeout_ms": 1000
+                }
+            }),
+        );
+        assert_eq!(response["outcome"], "not_started");
+        assert_eq!(response["error"]["code"], "handoff_declined");
+        assert!(!runtime.handoff.is_active());
     }
 
     #[test]

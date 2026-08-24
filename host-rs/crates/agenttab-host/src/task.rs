@@ -11,6 +11,7 @@ use uuid::Uuid;
 struct ConnectionTaskState {
     lease: Option<TaskLease>,
     capability_pending: bool,
+    capability_in_flight: bool,
     resume_rotation_pending: bool,
 }
 
@@ -51,6 +52,7 @@ impl ConnectionContext {
             task: Mutex::new(ConnectionTaskState {
                 lease: resumed_lease,
                 capability_pending: false,
+                capability_in_flight: false,
                 resume_rotation_pending: resumed,
             }),
             cancelled: AtomicBool::new(false),
@@ -70,13 +72,32 @@ impl ConnectionContext {
         Ok(task_id)
     }
 
-    pub fn take_new_capability(&self) -> Result<Option<TaskLease>, JournalError> {
+    pub fn reserve_new_capability(&self) -> Result<Option<TaskLease>, JournalError> {
         let mut state = self.task.lock();
-        if !state.capability_pending {
+        if !state.capability_pending || state.capability_in_flight {
             return Ok(None);
         }
-        state.capability_pending = false;
+        state.capability_in_flight = true;
         Ok(state.lease.clone())
+    }
+
+    pub fn finish_new_capability_delivery(&self, delivered: bool) {
+        let mut state = self.task.lock();
+        if !state.capability_in_flight {
+            return;
+        }
+        if delivered {
+            state.capability_pending = false;
+        }
+        state.capability_in_flight = false;
+    }
+
+    pub fn undelivered_new_task_id(&self) -> Option<Uuid> {
+        let state = self.task.lock();
+        state
+            .capability_pending
+            .then(|| state.lease.as_ref().map(|lease| lease.task_id))
+            .flatten()
     }
 
     pub fn acknowledge_resume_capability(&self, journal: &Journal) -> Result<(), JournalError> {
@@ -120,17 +141,26 @@ mod tests {
     }
 
     #[test]
-    fn task_is_created_lazily_and_capability_is_returned_once() {
+    fn task_capability_remains_pending_until_delivery_succeeds() {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&temp.path().join("state.sqlite3")).unwrap());
         let (connection, ack) =
             ConnectionContext::negotiate(init(None), &journal, RuntimeState::Starting).unwrap();
         assert!(!ack.resumed);
         assert!(ack.task_id.is_none());
-        let first = connection.ensure_task(&journal).unwrap();
-        assert_eq!(connection.ensure_task(&journal).unwrap(), first);
-        assert!(connection.take_new_capability().unwrap().is_some());
-        assert!(connection.take_new_capability().unwrap().is_none());
+        let task_id = connection.ensure_task(&journal).unwrap();
+        assert_eq!(connection.ensure_task(&journal).unwrap(), task_id);
+
+        let first = connection.reserve_new_capability().unwrap().unwrap();
+        assert_eq!(first.task_id, task_id);
+        assert!(connection.reserve_new_capability().unwrap().is_none());
+        assert_eq!(connection.undelivered_new_task_id(), Some(task_id));
+
+        connection.finish_new_capability_delivery(false);
+        assert!(connection.reserve_new_capability().unwrap().is_some());
+        connection.finish_new_capability_delivery(true);
+        assert!(connection.reserve_new_capability().unwrap().is_none());
+        assert_eq!(connection.undelivered_new_task_id(), None);
     }
 
     #[test]
@@ -147,9 +177,7 @@ mod tests {
         assert!(ack.resumed);
         assert_eq!(ack.task_id, Some(created.task_id));
         assert_ne!(ack.resume_capability.unwrap(), created.resume_capability);
-        connection
-            .acknowledge_resume_capability(&journal)
-            .unwrap();
+        connection.acknowledge_resume_capability(&journal).unwrap();
         assert!(journal
             .resume_task(&created.resume_capability)
             .unwrap()
