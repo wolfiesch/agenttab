@@ -2488,6 +2488,15 @@ def cmd_insert_rich_text(args):
     })
 
 
+def cmd_ping(args):
+    if len(args) == 2:
+        return send_command("ping")
+    if len(args) == 3 and args[2] == "--runtime-instance":
+        return send_command("ping", {"runtimeInstance": True})
+    print("Usage: chrome-bridge ping [--runtime-instance]", file=sys.stderr)
+    return 2
+
+
 def print_usage():
     print("Usage:")
     print("  chrome-bridge <command> [arguments]")
@@ -2495,7 +2504,7 @@ def print_usage():
     print("  chrome-bridge <command> --help")
     print("")
     print("Common commands:")
-    print("  ping                              Check bridge health")
+    print("  ping [--runtime-instance]         Check bridge health")
     print("  ready [timeoutMs] [pollMs]        Wait once for endpoint, backend, and extension readiness")
     print("  doctor                            Diagnose install drift and live bridge state")
     print("  getTabs                           List open tabs")
@@ -2683,7 +2692,7 @@ COMMAND_HELP = {
 # above cover commands with non-obvious safety or selector behavior; every
 # command still gets a useful ``<command> --help`` response.
 COMMAND_USAGES = {
-    "ping": "chrome-bridge ping",
+    "ping": "chrome-bridge ping [--runtime-instance]",
     "navigate": "chrome-bridge navigate <url> [--foreground]",
     "getTabs": "chrome-bridge getTabs",
     "getCookies": "chrome-bridge getCookies <domain>",
@@ -2803,7 +2812,7 @@ def main():
     if action == "doctor":
         sys.exit(cmd_doctor())
     if action == "ping":
-        sys.exit(send_command("ping"))
+        sys.exit(cmd_ping(args))
     elif action == "ready":
         sys.exit(cmd_ready(args))
     elif action == "navigate":

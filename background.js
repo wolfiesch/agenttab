@@ -10,6 +10,8 @@ const TASK_SESSIONS_KEY = "chromeBridgeTaskSessions";
 const BRIDGE_PREFERENCES_KEY = "chromeBridgePreferences";
 const TASK_DEBUGGER_IDLE_MS = 30000;
 const TASK_GROUP_COLORS = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
+const PERMISSION_GATE_BUILD_ID = "source";
+const RUNTIME_INSTANCE_ID = `${PERMISSION_GATE_BUILD_ID}:${crypto.randomUUID()}`;
 const TASK_GROUP_STATES = {
   working: { symbol: "✦", label: "Working", prefix: "" },
   needs_user: { symbol: "↗", label: "Needs your help", prefix: "Review needed: " },
@@ -459,7 +461,7 @@ async function dispatchAction(action, payload, dlp) {
         result = await runBatch(payload.steps, payload.tabId, payload.stopOnError, dlp);
         break;
       case "ping":
-        result = "pong";
+        result = payload?.runtimeInstance === true ? RUNTIME_INSTANCE_ID : "pong";
         break;
       case "navigate":
         result = await navigateToUrl(payload.url, payload.active);
