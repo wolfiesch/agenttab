@@ -1,13 +1,15 @@
-use crate::runtime::Runtime;
+use crate::runtime::{request_lock_scope, RequestLockScope, Runtime};
 use agenttab_protocol::{
-    ConnectionInit, Outcome, RpcError, RpcResponse, CLIENT_TO_HOST_MAX_BYTES,
+    ConnectionInit, Outcome, RpcError, RpcMethod, RpcResponse, CLIENT_TO_HOST_MAX_BYTES,
     HOST_TO_CLIENT_MAX_BYTES,
 };
 #[cfg(all(test, unix))]
 use agenttab_protocol::{PROTOCOL_VERSION, RPC_PROTOCOL};
 #[cfg(unix)]
 use fs2::FileExt;
+use parking_lot::{Condvar, Mutex};
 use serde_json::Value;
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -436,6 +438,64 @@ fn sid_for_windows_process(process: windows_sys::Win32::Foundation::HANDLE) -> i
     result
 }
 
+#[derive(Debug, Default)]
+struct OrderedQueue {
+    state: Mutex<OrderedQueueState>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct OrderedQueueState {
+    issued: u64,
+    serving: u64,
+}
+
+impl OrderedQueue {
+    fn issue(&self) -> u64 {
+        let mut state = self.state.lock();
+        let ticket = state.issued;
+        state.issued = state
+            .issued
+            .checked_add(1)
+            .expect("connection request ticket overflow");
+        ticket
+    }
+
+    fn wait_turn(&self, ticket: u64) -> OrderedQueueGuard<'_> {
+        let mut state = self.state.lock();
+        while state.serving != ticket {
+            self.ready.wait(&mut state);
+        }
+        OrderedQueueGuard { queue: self }
+    }
+}
+
+struct OrderedQueueGuard<'a> {
+    queue: &'a OrderedQueue,
+}
+
+impl Drop for OrderedQueueGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.queue.state.lock();
+        state.serving = state
+            .serving
+            .checked_add(1)
+            .expect("connection request ticket overflow");
+        self.queue.ready.notify_all();
+    }
+}
+
+fn request_queue_scope(request: &Value) -> RequestLockScope {
+    let Some(method) = request
+        .get("method")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<RpcMethod>(value).ok())
+    else {
+        return RequestLockScope::Global;
+    };
+    request_lock_scope(method, request.get("params").unwrap_or(&Value::Null))
+}
+
 async fn handle_connection<S>(runtime: Arc<Runtime>, mut stream: S) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -476,6 +536,7 @@ where
     });
 
     let request_permits = Arc::new(Semaphore::new(CONNECTION_QUEUE));
+    let mut request_queues = HashMap::<RequestLockScope, Arc<OrderedQueue>>::new();
     let mut requests = JoinSet::new();
     loop {
         let request = match read_frame_async(&mut reader, CLIENT_TO_HOST_MAX_BYTES).await {
@@ -504,15 +565,22 @@ where
             }
             continue;
         };
+        request_queues.retain(|_, queue| Arc::strong_count(queue) > 1);
+        let queue = request_queues
+            .entry(request_queue_scope(&request))
+            .or_insert_with(|| Arc::new(OrderedQueue::default()))
+            .clone();
+        let ticket = queue.issue();
         let request_runtime = runtime.clone();
         let request_connection = connection.clone();
         let request_responses = response_sender.clone();
         requests.spawn(async move {
             let _permit = permit;
-            let runtime = request_runtime.clone();
-            let connection = request_connection.clone();
-            let response =
-                tokio::task::spawn_blocking(move || runtime.handle(&connection, request)).await;
+            let response = tokio::task::spawn_blocking(move || {
+                let _turn = queue.wait_turn(ticket);
+                request_runtime.handle(&request_connection, request)
+            })
+            .await;
             if let Ok(response) = response {
                 let _ = request_responses.send(response).await;
             }
@@ -569,6 +637,39 @@ async fn write_frame_async<W: AsyncWrite + Unpin>(
         .await?;
     writer.write_all(&payload).await?;
     writer.flush().await
+}
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn ordered_queue_runs_workers_in_issue_order() {
+        let queue = Arc::new(OrderedQueue::default());
+        let first_ticket = queue.issue();
+        let second_ticket = queue.issue();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+
+        let second_queue = queue.clone();
+        let second_order = order.clone();
+        let second = std::thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let _turn = second_queue.wait_turn(second_ticket);
+            second_order.lock().push(second_ticket);
+        });
+        started_receiver.recv().unwrap();
+
+        let first_queue = queue.clone();
+        let first_order = order.clone();
+        let first = std::thread::spawn(move || {
+            let _turn = first_queue.wait_turn(first_ticket);
+            first_order.lock().push(first_ticket);
+        });
+
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(*order.lock(), vec![first_ticket, second_ticket]);
+    }
 }
 
 #[cfg(unix)]

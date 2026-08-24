@@ -211,15 +211,7 @@ impl Runtime {
             .lifecycle
             .gate(request.method)
             .err()
-            .or_else(|| {
-                self.handoff.is_active().then(|| {
-                    RpcError::new(
-                        "handoff_blackout",
-                        "Automation is disabled while credential handoff is active",
-                    )
-                    .with_recovery("Wait for the human to finish or cancel the active handoff.")
-                })
-            })
+            .or_else(|| self.handoff_blackout_error())
             .or_else(|| self.guardrails.authorize(request.method, &params).err())
             .or_else(|| {
                 let tab_id = params_value.get("tab_id").and_then(Value::as_u64)?;
@@ -289,6 +281,21 @@ impl Runtime {
                 .value();
         }
         if let Err(error) = self.lifecycle.gate(request.method) {
+            let response =
+                RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
+            return self.audited_value(
+                connection,
+                Some(task_id),
+                &request,
+                &params_value,
+                response,
+                started_at_ms,
+                started,
+                false,
+                true,
+            );
+        }
+        if let Some(error) = self.handoff_blackout_error() {
             let response =
                 RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
             return self.audited_value(
@@ -532,6 +539,16 @@ impl Runtime {
         )
     }
 
+    fn handoff_blackout_error(&self) -> Option<RpcError> {
+        self.handoff.is_active().then(|| {
+            RpcError::new(
+                "handoff_blackout",
+                "Automation is disabled while credential handoff is active",
+            )
+            .with_recovery("Wait for the human to finish or cancel the active handoff.")
+        })
+    }
+
     fn dispatch(
         &self,
         connection_id: Uuid,
@@ -722,16 +739,29 @@ fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
         RpcError::new(code, error.to_string()).with_recovery(recovery),
     )
 }
-fn request_lock_key(task_id: Uuid, method: RpcMethod, params: &Value) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RequestLockScope {
+    Global,
+    Tab(u64),
+}
+
+pub(crate) fn request_lock_scope(method: RpcMethod, params: &Value) -> RequestLockScope {
     if matches!(
         method,
         RpcMethod::BrowserSnapshot | RpcMethod::BrowserAct | RpcMethod::BrowserWait
     ) {
         if let Some(tab_id) = params.get("tab_id").and_then(Value::as_u64) {
-            return format!("{task_id}:tab:{tab_id}");
+            return RequestLockScope::Tab(tab_id);
         }
     }
-    format!("{task_id}:global")
+    RequestLockScope::Global
+}
+
+fn request_lock_key(task_id: Uuid, method: RpcMethod, params: &Value) -> String {
+    match request_lock_scope(method, params) {
+        RequestLockScope::Global => format!("{task_id}:global"),
+        RequestLockScope::Tab(tab_id) => format!("{task_id}:tab:{tab_id}"),
+    }
 }
 
 fn journal_rpc_error(error: JournalError) -> RpcError {

@@ -170,17 +170,19 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
     connection_validator.validate(
         {"protocol": "agenttab.rpc", "version": 1, "kind": "connect"}
     )
-    connection_validator.validate(
-        {
-            "protocol": "agenttab.rpc",
-            "version": 1,
-            "kind": "connected",
-            "connection_id": "018f47a0-7b10-7abc-8def-0123456789ab",
-            "resumed": False,
-            "state": "ready",
-        }
-    )
-    return len(requests) + 5
+    connected = {
+        "protocol": "agenttab.rpc",
+        "version": 1,
+        "kind": "connected",
+        "connection_id": "018f47a0-7b10-7abc-8def-0123456789ab",
+        "resumed": False,
+        "state": "ready",
+    }
+    connection_validator.validate(connected)
+    missing_state = dict(connected)
+    missing_state.pop("state")
+    expect_invalid(connection_validator, missing_state, "connected state")
+    return len(requests) + 6
 
 
 def main() -> int:
