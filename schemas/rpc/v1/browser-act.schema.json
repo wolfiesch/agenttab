@@ -17,10 +17,8 @@
         { "$ref": "#/$defs/navigate" },
         { "$ref": "#/$defs/history" },
         { "$ref": "#/$defs/reload" },
-        { "$ref": "#/$defs/focus" },
         { "$ref": "#/$defs/close" },
         { "$ref": "#/$defs/dialog" },
-        { "$ref": "#/$defs/set_viewport" },
         { "$ref": "#/$defs/upload_file" }
       ]
     },
@@ -62,8 +60,12 @@
     },
     "press": {
       "type": "object",
-      "required": ["kind", "key"],
-      "properties": { "kind": { "const": "press" }, "key": { "type": "string", "minLength": 1, "maxLength": 128 } },
+      "required": ["kind", "ref", "key"],
+      "properties": {
+        "kind": { "const": "press" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "key": { "type": "string", "minLength": 1, "maxLength": 128 }
+      },
       "additionalProperties": false
     },
     "scroll": {
@@ -105,12 +107,6 @@
       "properties": { "kind": { "const": "reload" }, "bypass_cache": { "type": "boolean", "default": false } },
       "additionalProperties": false
     },
-    "focus": {
-      "type": "object",
-      "required": ["kind"],
-      "properties": { "kind": { "const": "focus" } },
-      "additionalProperties": false
-    },
     "close": {
       "type": "object",
       "required": ["kind"],
@@ -124,17 +120,6 @@
         "kind": { "const": "dialog" },
         "decision": { "enum": ["accept", "dismiss"] },
         "prompt_text": { "type": "string", "maxLength": 2048 }
-      },
-      "additionalProperties": false
-    },
-    "set_viewport": {
-      "type": "object",
-      "required": ["kind", "width", "height"],
-      "properties": {
-        "kind": { "const": "set_viewport" },
-        "width": { "type": "integer", "minimum": 1, "maximum": 16384 },
-        "height": { "type": "integer", "minimum": 1, "maximum": 16384 },
-        "scale": { "type": "number", "exclusiveMinimum": 0, "maximum": 8 }
       },
       "additionalProperties": false
     },

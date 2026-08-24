@@ -171,6 +171,21 @@
         { "$ref": "#/$defs/base" },
         {
           "type": "object",
+          "required": ["kind", "request_id", "task_id"],
+          "properties": {
+            "protocol": {}, "version": {}, "kind": { "const": "close_task" },
+            "request_id": { "type": "string", "format": "uuid" },
+            "task_id": { "type": "string", "format": "uuid" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
           "required": ["kind", "request_id", "outcome"],
           "properties": {
             "protocol": {}, "version": {}, "kind": { "const": "response" },

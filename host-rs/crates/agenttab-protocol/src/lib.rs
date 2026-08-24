@@ -215,11 +215,24 @@ pub struct RpcRequest {
 impl RpcRequest {
     pub fn parse(value: Value) -> Result<(Self, MethodParams), ProtocolError> {
         validate_serialized_request_limit(&value)?;
+        let explicit_null_idempotency = value.get("idempotency_key").is_some_and(Value::is_null);
         let request: Self = serde_json::from_value(value)?;
         if request.protocol != RPC_PROTOCOL || request.version != PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: request.protocol.clone(),
                 version: request.version,
+            });
+        }
+        if explicit_null_idempotency {
+            return Err(ProtocolError::InvalidParamConstraint {
+                method: request.method,
+                message: "idempotency_key must be omitted rather than null".into(),
+            });
+        }
+        if request.method != RpcMethod::BrowserDeveloper && contains_null(&request.params) {
+            return Err(ProtocolError::InvalidParamConstraint {
+                method: request.method,
+                message: "explicit null is not valid in Standard RPC parameters".into(),
             });
         }
         if request.request_id.is_empty() || request.request_id.chars().count() > 128 {
@@ -247,6 +260,15 @@ fn validate_serialized_request_limit(value: &Value) -> Result<(), ProtocolError>
         });
     }
     Ok(())
+}
+
+fn contains_null(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(values) => values.iter().any(contains_null),
+        Value::Object(values) => values.values().any(contains_null),
+        _ => false,
+    }
 }
 
 fn decode_params<T: DeserializeOwned>(method: RpcMethod, value: Value) -> Result<T, ProtocolError> {
@@ -377,6 +399,7 @@ pub enum BrowserAction {
         value: String,
     },
     Press {
+        r#ref: String,
         key: String,
     },
     Scroll {
@@ -398,18 +421,11 @@ pub enum BrowserAction {
         #[serde(default)]
         bypass_cache: bool,
     },
-    Focus,
     Close,
     Dialog {
         decision: DialogDecision,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_text: Option<String>,
-    },
-    SetViewport {
-        width: u32,
-        height: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        scale: Option<f64>,
     },
     UploadFile {
         r#ref: String,
@@ -639,7 +655,10 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             require_ref(method, r#ref)?;
             require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "value")
         }
-        BrowserAction::Press { key } => require_len(method, key, 1, 128, "key"),
+        BrowserAction::Press { r#ref, key } => {
+            require_ref(method, r#ref)?;
+            require_len(method, key, 1, 128, "key")
+        }
         BrowserAction::Scroll {
             r#ref,
             delta_x,
@@ -672,25 +691,6 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             }
             Ok(())
         }
-        BrowserAction::SetViewport {
-            width,
-            height,
-            scale,
-        } => {
-            require(
-                method,
-                (1..=16_384).contains(width) && (1..=16_384).contains(height),
-                "viewport width and height must be between 1 and 16384",
-            )?;
-            if let Some(value) = scale {
-                require(
-                    method,
-                    value.is_finite() && *value > 0.0 && *value <= 8.0,
-                    "viewport scale must be greater than 0 and at most 8",
-                )?;
-            }
-            Ok(())
-        }
         BrowserAction::UploadFile { r#ref, files } => {
             require_ref(method, r#ref)?;
             require(
@@ -706,7 +706,6 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
         BrowserAction::GoBack
         | BrowserAction::GoForward
         | BrowserAction::Reload { .. }
-        | BrowserAction::Focus
         | BrowserAction::Close => Ok(()),
     }
 }
@@ -1095,6 +1094,35 @@ pub enum NativeDisconnectRecoveryKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct NativeCloseTask {
+    pub protocol: String,
+    pub version: u16,
+    pub kind: NativeCloseTaskKind,
+    pub request_id: Uuid,
+    pub task_id: Uuid,
+}
+
+impl NativeCloseTask {
+    pub fn parse(value: Value) -> Result<Self, ProtocolError> {
+        let command: Self = serde_json::from_value(value)?;
+        if command.protocol != NATIVE_PROTOCOL || command.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedProtocol {
+                protocol: command.protocol.clone(),
+                version: command.version,
+            });
+        }
+        Ok(command)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeCloseTaskKind {
+    CloseTask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NativeResponse {
     pub protocol: String,
     pub version: u16,
@@ -1349,6 +1377,16 @@ pub fn native_command(
     command
 }
 
+pub fn native_close_task(request_id: Uuid, task_id: Uuid) -> Value {
+    serde_json::json!({
+        "protocol": NATIVE_PROTOCOL,
+        "version": PROTOCOL_VERSION,
+        "kind": "close_task",
+        "request_id": request_id,
+        "task_id": task_id,
+    })
+}
+
 pub fn native_ready(state: RuntimeState) -> Value {
     serde_json::json!({
         "protocol": NATIVE_PROTOCOL,
@@ -1426,6 +1464,31 @@ mod tests {
             RpcRequest::parse(wrong_key),
             Err(ProtocolError::InvalidIdempotencyKey)
         ));
+    }
+
+    #[test]
+    fn standard_requests_reject_explicit_nulls_that_schemas_reject() {
+        let mut envelope = request("browser_tabs", json!({}), false);
+        envelope["idempotency_key"] = Value::Null;
+        assert!(matches!(
+            RpcRequest::parse(envelope),
+            Err(ProtocolError::InvalidParamConstraint { .. })
+        ));
+
+        assert!(matches!(
+            RpcRequest::parse(request(
+                "browser_snapshot",
+                json!({"mode": "text", "tab_id": 7, "selector": null}),
+                false,
+            )),
+            Err(ProtocolError::InvalidParamConstraint { .. })
+        ));
+        assert!(RpcRequest::parse(request(
+            "browser_developer",
+            json!({"action": "Runtime.evaluate", "params": {"returnByValue": null}}),
+            true,
+        ))
+        .is_ok());
     }
 
     #[test]
@@ -1666,6 +1729,20 @@ mod tests {
             }))
             .is_err());
         }
+    }
+
+    #[test]
+    fn native_close_task_is_strict_and_versioned() {
+        let request_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let message = native_close_task(request_id, task_id);
+        let parsed = NativeCloseTask::parse(message.clone()).unwrap();
+        assert_eq!(parsed.request_id, request_id);
+        assert_eq!(parsed.task_id, task_id);
+
+        let mut unknown = message;
+        unknown["unexpected"] = json!(true);
+        assert!(NativeCloseTask::parse(unknown).is_err());
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use crate::handoff::HandoffState;
 use crate::lifecycle::Lifecycle;
 use agenttab_protocol::{
-    native_command, native_ready, read_frame, write_frame, NativeDisconnectRecovery, NativeEvent,
-    NativeEventPayload, NativeHello, NativeOriginPolicy, NativeResponse, NativeStagedCommit,
-    NativeTab, ProtocolError, RuntimeState, EXTENSION_TO_HOST_MAX_BYTES,
-    HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, PROTOCOL_VERSION,
+    native_close_task, native_command, native_ready, read_frame, write_frame,
+    NativeDisconnectRecovery, NativeEvent, NativeEventPayload, NativeHello, NativeOriginPolicy,
+    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ProtocolError, RuntimeState,
+    EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -49,6 +49,11 @@ pub trait NativeTransport: Send + Sync {
         origin_policy: Option<NativeOriginPolicy>,
         timeout: Duration,
     ) -> Result<NativeResponse, NativeError>;
+    fn close_task(&self, _task_id: Uuid, _timeout: Duration) -> Result<(), NativeError> {
+        Err(NativeError::Protocol(
+            "native close_task lifecycle command is unsupported".into(),
+        ))
+    }
     fn cancel_connection(&self, _connection_id: Uuid) {}
     fn set_event_sink(&self, _sink: Arc<dyn NativeEventSink>) {}
 }
@@ -259,6 +264,48 @@ impl NativeTransport for StdioNative {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(NativeError::Disconnected),
         }
+    }
+
+    fn close_task(&self, task_id: Uuid, timeout: Duration) -> Result<(), NativeError> {
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(NativeError::Disconnected);
+        }
+        let request_id = Uuid::new_v4();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.pending
+            .lock()
+            .insert(request_id, (Uuid::nil(), task_id, sender));
+        if let Err(error) = self.write_value(&native_close_task(request_id, task_id)) {
+            self.pending.lock().remove(&request_id);
+            return Err(NativeError::Transport(error.to_string()));
+        }
+        let response = match receiver.recv_timeout(timeout) {
+            Ok(result) => result?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.pending.lock().remove(&request_id);
+                return Err(NativeError::Timeout);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(NativeError::Disconnected),
+        };
+        let result = response.result.as_ref().and_then(Value::as_object);
+        let expected_task_id = task_id.to_string();
+        let closed_tab_ids_are_valid = result
+            .and_then(|value| value.get("closed_tab_ids"))
+            .and_then(Value::as_array)
+            .is_some_and(|tab_ids| tab_ids.iter().all(Value::is_u64));
+        if response.outcome != Outcome::Completed
+            || result.is_none_or(|value| {
+                value.len() != 2
+                    || value.get("task_id").and_then(Value::as_str)
+                        != Some(expected_task_id.as_str())
+                    || !closed_tab_ids_are_valid
+            })
+        {
+            return Err(NativeError::Protocol(
+                "native close_task cleanup was not confirmed by the extension".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn cancel_connection(&self, connection_id: Uuid) {

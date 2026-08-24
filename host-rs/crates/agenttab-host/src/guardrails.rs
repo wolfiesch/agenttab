@@ -428,6 +428,45 @@ impl Guardrails {
                 format!("Cannot inspect upload file: {error}"),
             )
         })?;
+        let resolved = path.canonicalize().map_err(|error| {
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Upload file changed while it was being opened: {error}"),
+            )
+        })?;
+        if resolved != canonical {
+            return Err(RpcError::new(
+                "upload_file_changed",
+                "Upload file changed while it was being opened",
+            )
+            .with_recovery("Retry after the source path stops changing."));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let resolved_metadata = fs::metadata(&resolved).map_err(|error| {
+                RpcError::new(
+                    "upload_file_unavailable",
+                    format!("Cannot revalidate upload file: {error}"),
+                )
+            })?;
+            if metadata.dev() != resolved_metadata.dev()
+                || metadata.ino() != resolved_metadata.ino()
+            {
+                return Err(RpcError::new(
+                    "upload_file_changed",
+                    "Upload file changed while it was being opened",
+                )
+                .with_recovery("Retry after the source path stops changing."));
+            }
+            if metadata.nlink() != 1 {
+                return Err(RpcError::new(
+                    "upload_file_hardlinked",
+                    "Upload files with multiple hard links are not allowed",
+                )
+                .with_recovery("Copy the file into an allowed upload directory, then retry."));
+            }
+        }
         if !metadata.is_file() {
             return Err(RpcError::new(
                 "upload_file_invalid",
@@ -593,7 +632,7 @@ mod tests {
         fs::write(&replacement, b"replacement bytes").unwrap();
         symlink(&original, &link).unwrap();
         let guardrails = Guardrails::from_policy(Policy {
-            dlp_allowed_roots: vec![allowed_root],
+            dlp_allowed_roots: vec![allowed_root.clone()],
             dlp_max_file_bytes: 1024,
             ..Policy::default()
         })
@@ -621,5 +660,21 @@ mod tests {
         assert_eq!(fs::read(&staged_path).unwrap(), b"authorized bytes");
         Guardrails::cleanup_staged_uploads(&staged).unwrap();
         assert!(!std::path::Path::new(&staged_path).exists());
+
+        let hardlink = allowed_root.join("hardlink.txt");
+        fs::hard_link(&original, &hardlink).unwrap();
+        let hardlinked = MethodParams::Act(agenttab_protocol::BrowserActParams {
+            tab_id: 7,
+            expected_page_revision: 1,
+            actions: vec![BrowserAction::UploadFile {
+                r#ref: "e1".into(),
+                files: vec![hardlink.display().to_string()],
+            }],
+        });
+        let mut serialized = hardlinked.value();
+        let error = guardrails
+            .stage_uploads(&hardlinked, &mut serialized, &staging_directory)
+            .unwrap_err();
+        assert_eq!(error.code, "upload_file_hardlinked");
     }
 }

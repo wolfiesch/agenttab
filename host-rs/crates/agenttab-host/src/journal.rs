@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
@@ -47,6 +47,8 @@ pub enum JournalError {
     MissingTask,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("native task cleanup failed: {0}")]
+    NativeTaskCleanup(String),
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +73,10 @@ pub struct StagedRecord {
     pub effect: String,
     pub fingerprint: String,
     pub expires_at_ms: i64,
+    pub upload_paths: Vec<PathBuf>,
 }
+
+type StagedCommitRow = (String, String, i64, i64, String, String, i64, String);
 
 #[derive(Debug)]
 pub struct Journal {
@@ -125,6 +130,7 @@ impl Journal {
                  fingerprint TEXT NOT NULL,
                  expires_at_ms INTEGER NOT NULL,
                  used INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)),
+                 upload_paths_json TEXT NOT NULL DEFAULT '[]',
                  FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
              );",
         )?;
@@ -142,6 +148,12 @@ impl Journal {
         )?;
         ensure_column(&connection, "tasks", "closed_at_ms", "INTEGER")?;
         ensure_column(&connection, "tasks", "pending_resume_hash", "BLOB")?;
+        ensure_column(
+            &connection,
+            "staged_commits",
+            "upload_paths_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         connection.execute(
             "UPDATE tasks SET active_connections = 0, pending_resume_hash = NULL",
             [],
@@ -398,7 +410,11 @@ impl Journal {
         Ok(())
     }
 
-    pub fn store_staged_commit(&self, staged: &NativeStagedCommit) -> Result<String, JournalError> {
+    pub fn store_staged_commit(
+        &self,
+        staged: &NativeStagedCommit,
+        upload_paths: &[PathBuf],
+    ) -> Result<String, JournalError> {
         let now = now_ms();
         if staged.expires_at_ms <= now
             || staged.expires_at_ms > now.saturating_add(MAX_STAGE_LIFETIME_MS)
@@ -407,12 +423,13 @@ impl Journal {
         }
         let host_token = generate_capability();
         let token_hash = capability_hash(&host_token);
+        let upload_paths_json = serde_json::to_string(upload_paths)?;
         let connection = self.connection.lock();
         connection.execute(
             "INSERT INTO staged_commits(
                  token_hash, task_id, native_token, tab_id, page_revision,
-                 effect, fingerprint, expires_at_ms, used
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+                 effect, fingerprint, expires_at_ms, used, upload_paths_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
             params![
                 token_hash.as_slice(),
                 staged.task_id.to_string(),
@@ -421,7 +438,8 @@ impl Journal {
                 staged.page_revision as i64,
                 staged.effect,
                 staged.fingerprint,
-                staged.expires_at_ms
+                staged.expires_at_ms,
+                upload_paths_json,
             ],
         )?;
         Ok(host_token)
@@ -436,13 +454,10 @@ impl Journal {
         let now = now_ms();
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM staged_commits WHERE expires_at_ms < ?1 OR used = 1",
-            params![now],
-        )?;
-        let record: Option<(String, String, i64, i64, String, String, i64)> = transaction
+        let record: Option<StagedCommitRow> = transaction
             .query_row(
-                "SELECT task_id, native_token, tab_id, page_revision, effect, fingerprint, expires_at_ms
+                "SELECT task_id, native_token, tab_id, page_revision, effect, fingerprint,
+                        expires_at_ms, upload_paths_json
                  FROM staged_commits
                  WHERE token_hash = ?1 AND task_id = ?2 AND used = 0 AND expires_at_ms >= ?3",
                 params![token_hash.as_slice(), task_id.to_string(), now],
@@ -455,6 +470,7 @@ impl Journal {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
                     ))
                 },
             )
@@ -467,6 +483,7 @@ impl Journal {
             effect,
             fingerprint,
             expires_at_ms,
+            upload_paths_json,
         )) = record
         else {
             transaction.rollback()?;
@@ -489,13 +506,14 @@ impl Journal {
             effect,
             fingerprint,
             expires_at_ms,
+            upload_paths: serde_json::from_str(&upload_paths_json)?,
         })
     }
 
     pub fn reconcile_staged_commits(
         &self,
         staged_commits: &[NativeStagedCommit],
-    ) -> Result<(), JournalError> {
+    ) -> Result<Vec<PathBuf>, JournalError> {
         let now = now_ms();
         let active_tokens = staged_commits
             .iter()
@@ -504,19 +522,26 @@ impl Journal {
             .collect::<std::collections::HashSet<_>>();
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM staged_commits WHERE expires_at_ms < ?1 OR used = 1",
-            params![now],
-        )?;
-        let persisted_tokens = {
-            let mut statement = transaction.prepare("SELECT native_token FROM staged_commits")?;
-            let tokens = statement
-                .query_map([], |row| row.get::<_, String>(0))?
+        let persisted = {
+            let mut statement = transaction.prepare(
+                "SELECT native_token, upload_paths_json, expires_at_ms, used FROM staged_commits",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
-            tokens
+            rows
         };
-        for native_token in persisted_tokens {
-            if !active_tokens.contains(native_token.as_str()) {
+        let mut removed_uploads = Vec::new();
+        for (native_token, upload_paths_json, expires_at_ms, used) in persisted {
+            if used || expires_at_ms < now || !active_tokens.contains(native_token.as_str()) {
+                removed_uploads.extend(serde_json::from_str::<Vec<PathBuf>>(&upload_paths_json)?);
                 transaction.execute(
                     "DELETE FROM staged_commits WHERE native_token = ?1",
                     params![native_token],
@@ -524,16 +549,29 @@ impl Journal {
             }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(removed_uploads)
     }
 
-    pub fn expire_staged_commit(&self, native_token: &str) -> Result<(), JournalError> {
-        let connection = self.connection.lock();
-        connection.execute(
+    pub fn expire_staged_commit(&self, native_token: &str) -> Result<Vec<PathBuf>, JournalError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let upload_paths_json: Option<String> = transaction
+            .query_row(
+                "SELECT upload_paths_json FROM staged_commits WHERE native_token = ?1",
+                params![native_token],
+                |row| row.get(0),
+            )
+            .optional()?;
+        transaction.execute(
             "DELETE FROM staged_commits WHERE native_token = ?1",
             params![native_token],
         )?;
-        Ok(())
+        transaction.commit()?;
+        upload_paths_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map(|paths| paths.unwrap_or_default())
+            .map_err(JournalError::from)
     }
 }
 
@@ -862,24 +900,32 @@ mod tests {
         let mut invalid = staged.clone();
         invalid.expires_at_ms = now_ms() - 1;
         assert!(matches!(
-            journal.store_staged_commit(&invalid),
+            journal.store_staged_commit(&invalid, &[]),
             Err(JournalError::InvalidStagedExpiry)
         ));
         invalid.expires_at_ms = now_ms() + MAX_STAGE_LIFETIME_MS + 1_000;
         assert!(matches!(
-            journal.store_staged_commit(&invalid),
+            journal.store_staged_commit(&invalid, &[]),
             Err(JournalError::InvalidStagedExpiry)
         ));
-        let token = journal.store_staged_commit(&staged).unwrap();
+        let upload_path = PathBuf::from("/private/upload-staging/fixture.upload");
+        let token = journal
+            .store_staged_commit(&staged, std::slice::from_ref(&upload_path))
+            .unwrap();
         assert!(matches!(
             journal.consume_staged_commit(other.task_id, &token),
             Err(JournalError::InvalidStagedToken)
         ));
         let consumed = journal.consume_staged_commit(task.task_id, &token).unwrap();
         assert_eq!(consumed.native_token, staged.native_token);
+        assert_eq!(consumed.upload_paths, vec![upload_path.clone()]);
         assert!(matches!(
             journal.consume_staged_commit(task.task_id, &token),
             Err(JournalError::InvalidStagedToken)
         ));
+        assert_eq!(
+            journal.reconcile_staged_commits(&[]).unwrap(),
+            vec![upload_path],
+        );
     }
 }
