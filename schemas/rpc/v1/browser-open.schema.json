@@ -8,7 +8,7 @@
       "required": ["mode"],
       "properties": {
         "mode": { "const": "create" },
-        "url": { "type": "string", "pattern": "^(https?://|about:)[^\\s]+$" },
+        "url": { "type": "string", "maxLength": 2048, "pattern": "^(https?://|about:)[^\\s]+$" },
         "background": { "type": "boolean", "default": true }
       },
       "additionalProperties": false

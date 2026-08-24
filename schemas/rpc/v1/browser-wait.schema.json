@@ -16,7 +16,7 @@
           "required": ["kind", "value"],
           "properties": {
             "kind": { "enum": ["url", "text", "selector"] },
-            "value": { "type": "string", "minLength": 1, "maxLength": 65536 }
+            "value": { "type": "string", "minLength": 1, "maxLength": 2048 }
           },
           "additionalProperties": false
         }

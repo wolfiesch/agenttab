@@ -11,7 +11,7 @@
         "version": { "const": 1 },
         "kind": { "const": "connect" },
         "conversation_id": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "resume_capability": { "type": "string", "minLength": 32 }
+        "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 }
       },
       "additionalProperties": false
     },
@@ -25,7 +25,7 @@
         "connection_id": { "type": "string", "format": "uuid" },
         "resumed": { "type": "boolean" },
         "task_id": { "type": "string", "format": "uuid" },
-        "resume_capability": { "type": "string", "minLength": 32 },
+        "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 },
         "state": { "enum": ["starting", "reconciling", "ready", "paused", "terminal"] }
       },
       "allOf": [

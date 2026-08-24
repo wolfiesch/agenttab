@@ -2,11 +2,36 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agenttab.dev/schemas/rpc/v1/browser-developer.schema.json",
   "title": "browser_developer parameters",
+  "$defs": {
+    "scalar": {
+      "oneOf": [
+        { "type": "string", "maxLength": 512 },
+        { "type": "number" },
+        { "type": "boolean" },
+        { "type": "null" }
+      ]
+    },
+    "value": {
+      "oneOf": [
+        { "$ref": "#/$defs/scalar" },
+        {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/scalar" }
+        }
+      ]
+    }
+  },
   "type": "object",
   "required": ["action", "params"],
   "properties": {
     "action": { "type": "string", "minLength": 1, "maxLength": 128 },
-    "params": { "type": "object" }
+    "params": {
+      "type": "object",
+      "maxProperties": 16,
+      "propertyNames": { "type": "string", "minLength": 1, "maxLength": 64 },
+      "additionalProperties": { "$ref": "#/$defs/value" }
+    }
   },
   "additionalProperties": false
 }

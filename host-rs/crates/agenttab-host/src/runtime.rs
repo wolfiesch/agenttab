@@ -15,6 +15,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -97,6 +98,7 @@ pub struct Runtime {
     task_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     global_gate: RwLock<()>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
+    upload_staging_dir: PathBuf,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -137,6 +139,7 @@ impl Runtime {
             task_locks: Mutex::new(HashMap::new()),
             global_gate: RwLock::new(()),
             tab_urls,
+            upload_staging_dir: paths.upload_staging_dir.clone(),
         }))
     }
 
@@ -458,13 +461,14 @@ impl Runtime {
         if !connection.cancel() {
             return Ok(());
         }
+        let rollback = connection.rollback_resume_capability(&self.journal);
         self.native.cancel_connection(connection.connection_id);
         if let Some(task_id) = connection.undelivered_new_task_id() {
             self.journal.close_task(task_id)?;
         } else if let Some(task_id) = connection.task_id()? {
             self.journal.detach_connection(task_id)?;
         }
-        Ok(())
+        rollback
     }
 
     fn status_response(&self, request: &RpcRequest, connection: &ConnectionContext) -> RpcResponse {
@@ -607,7 +611,15 @@ impl Runtime {
             .get("tab_id")
             .and_then(Value::as_u64)
             .and_then(|tab_id| self.guardrails.native_origin_policy(tab_id));
-        let native = self.native.dispatch(
+        let staged_uploads =
+            match self
+                .guardrails
+                .stage_uploads(params, &mut params_value, &self.upload_staging_dir)
+            {
+                Ok(staged_uploads) => staged_uploads,
+                Err(error) => return RpcResponse::failure(request_id, Outcome::NotStarted, error),
+            };
+        let native_result = self.native.dispatch(
             connection_id,
             task_id,
             &method.to_string(),
@@ -615,7 +627,10 @@ impl Runtime {
             origin_policy,
             timeout,
         );
-        let native = match native {
+        if let Err(error) = Guardrails::cleanup_staged_uploads(&staged_uploads) {
+            return RpcResponse::failure(request_id, Outcome::Unknown, error);
+        }
+        let native = match native_result {
             Ok(response) => response,
             Err(error) => return native_failure(request_id, error),
         };

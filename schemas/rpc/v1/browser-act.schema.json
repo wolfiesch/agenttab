@@ -4,7 +4,7 @@
   "title": "browser_act parameters",
   "$defs": {
     "ref": { "type": "string", "minLength": 1, "maxLength": 256 },
-    "url": { "type": "string", "pattern": "^(https?://|about:)[^\\s]+$" },
+    "url": { "type": "string", "maxLength": 2048, "pattern": "^(https?://|about:)[^\\s]+$" },
     "action": {
       "oneOf": [
         { "$ref": "#/$defs/click" },
@@ -36,7 +36,7 @@
       "properties": {
         "kind": { "const": "type" },
         "ref": { "$ref": "#/$defs/ref" },
-        "text": { "type": "string", "maxLength": 1048576 }
+        "text": { "type": "string", "maxLength": 2048 }
       },
       "additionalProperties": false
     },
@@ -46,7 +46,7 @@
       "properties": {
         "kind": { "const": "fill" },
         "ref": { "$ref": "#/$defs/ref" },
-        "text": { "type": "string", "maxLength": 1048576 }
+        "text": { "type": "string", "maxLength": 2048 }
       },
       "additionalProperties": false
     },
@@ -56,7 +56,7 @@
       "properties": {
         "kind": { "const": "select" },
         "ref": { "$ref": "#/$defs/ref" },
-        "value": { "type": "string", "maxLength": 65536 }
+        "value": { "type": "string", "maxLength": 2048 }
       },
       "additionalProperties": false
     },
@@ -123,7 +123,7 @@
       "properties": {
         "kind": { "const": "dialog" },
         "decision": { "enum": ["accept", "dismiss"] },
-        "prompt_text": { "type": "string", "maxLength": 65536 }
+        "prompt_text": { "type": "string", "maxLength": 2048 }
       },
       "additionalProperties": false
     },
@@ -147,8 +147,8 @@
         "files": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 32,
-          "items": { "type": "string", "minLength": 1 }
+          "maxItems": 4,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 }
         }
       },
       "additionalProperties": false

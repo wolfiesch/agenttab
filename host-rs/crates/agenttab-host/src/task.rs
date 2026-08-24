@@ -111,6 +111,17 @@ impl ConnectionContext {
         Ok(())
     }
 
+    pub fn rollback_resume_capability(&self, journal: &Journal) -> Result<(), JournalError> {
+        let mut state = self.task.lock();
+        if !state.resume_rotation_pending {
+            return Ok(());
+        }
+        let lease = state.lease.as_ref().ok_or(JournalError::MissingTask)?;
+        journal.rollback_resume_capability(lease.task_id, &lease.resume_capability)?;
+        state.resume_rotation_pending = false;
+        Ok(())
+    }
+
     pub fn task_id(&self) -> Result<Option<Uuid>, JournalError> {
         let state = self.task.lock();
         Ok(state.lease.as_ref().map(|lease| lease.task_id))

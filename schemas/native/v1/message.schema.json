@@ -50,6 +50,17 @@
       },
       "additionalProperties": false
     },
+    "rpc_error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "recovery": { "type": "string" },
+        "details": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
     "origin_policy": {
       "type": "object",
       "required": ["tab_id", "allowed_origins", "denied_origins"],
@@ -166,7 +177,7 @@
             "request_id": { "type": "string", "format": "uuid" },
             "outcome": { "enum": ["completed", "not_started", "unknown", "needs_user", "commit_required"] },
             "result": {},
-            "error": { "type": "object" },
+            "error": { "$ref": "#/$defs/rpc_error" },
             "staged": { "$ref": "#/$defs/staged" }
           },
           "oneOf": [

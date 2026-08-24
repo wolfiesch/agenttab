@@ -9,6 +9,7 @@ pub struct AgentTabPaths {
     pub state_db: PathBuf,
     pub audit_log: PathBuf,
     pub policy_file: PathBuf,
+    pub upload_staging_dir: PathBuf,
     pub run_dir: PathBuf,
     pub lock_file: PathBuf,
     #[cfg(unix)]
@@ -57,6 +58,7 @@ impl AgentTabPaths {
             state_db: root.join("state.sqlite3"),
             audit_log: root.join("audit.jsonl"),
             policy_file: root.join("policy.json"),
+            upload_staging_dir: root.join("upload-staging"),
             lock_file: run_dir.join("host.lock"),
             #[cfg(unix)]
             socket_file: run_dir.join("agenttab.sock"),
@@ -68,6 +70,7 @@ impl AgentTabPaths {
     pub fn prepare(&self) -> io::Result<()> {
         create_private_directory(&self.root)?;
         create_private_directory(&self.run_dir)?;
+        create_private_directory(&self.upload_staging_dir)?;
         Ok(())
     }
 }
@@ -122,12 +125,21 @@ mod tests {
         let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
         paths.prepare().unwrap();
         assert_eq!(paths.state_db, paths.root.join("state.sqlite3"));
+        assert_eq!(paths.upload_staging_dir, paths.root.join("upload-staging"));
         assert_eq!(paths.lock_file, paths.run_dir.join("host.lock"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
                 fs::metadata(&paths.root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&paths.upload_staging_dir)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o700
             );
         }

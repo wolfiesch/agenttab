@@ -41,6 +41,8 @@ pub enum JournalError {
     InvalidStagedToken,
     #[error("staged commit expiry must be in the future and no more than five minutes away")]
     InvalidStagedExpiry,
+    #[error("resume capability rotation was not pending for this task")]
+    ResumeRotationLost,
     #[error("task is closed or missing")]
     MissingTask,
     #[error("I/O error: {0}")]
@@ -90,7 +92,7 @@ impl Journal {
              CREATE TABLE IF NOT EXISTS tasks (
                  task_id TEXT PRIMARY KEY,
                  resume_hash BLOB NOT NULL UNIQUE,
-                 previous_resume_hash BLOB,
+                 pending_resume_hash BLOB,
                  state TEXT NOT NULL CHECK (state IN ('active', 'closed')),
                  conversation_id TEXT,
                  active_connections INTEGER NOT NULL DEFAULT 0 CHECK (active_connections >= 0),
@@ -139,8 +141,11 @@ impl Journal {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&connection, "tasks", "closed_at_ms", "INTEGER")?;
-        ensure_column(&connection, "tasks", "previous_resume_hash", "BLOB")?;
-        connection.execute("UPDATE tasks SET active_connections = 0", [])?;
+        ensure_column(&connection, "tasks", "pending_resume_hash", "BLOB")?;
+        connection.execute(
+            "UPDATE tasks SET active_connections = 0, pending_resume_hash = NULL",
+            [],
+        )?;
         cleanup_expired_tasks(&connection, now_ms())?;
         #[cfg(unix)]
         {
@@ -186,7 +191,7 @@ impl Journal {
         let task_id: Option<String> = transaction
             .query_row(
                 "SELECT task_id FROM tasks
-                 WHERE (resume_hash = ?1 OR previous_resume_hash = ?1) AND state = 'active'",
+                 WHERE resume_hash = ?1 AND pending_resume_hash IS NULL AND state = 'active'",
                 params![old_hash.as_slice()],
                 |row| row.get(0),
             )
@@ -195,20 +200,21 @@ impl Journal {
             transaction.rollback()?;
             return Ok(None);
         };
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE tasks
-             SET previous_resume_hash = ?1,
-                 resume_hash = ?2,
+             SET pending_resume_hash = ?1,
                  active_connections = active_connections + 1,
-                 updated_at_ms = ?3
-             WHERE task_id = ?4 AND state = 'active'",
-            params![
-                old_hash.as_slice(),
-                next_hash.as_slice(),
-                now,
-                task_id
-            ],
+                 updated_at_ms = ?2
+             WHERE task_id = ?3
+               AND resume_hash = ?4
+               AND pending_resume_hash IS NULL
+               AND state = 'active'",
+            params![next_hash.as_slice(), now, task_id, old_hash.as_slice(),],
         )?;
+        if updated != 1 {
+            transaction.rollback()?;
+            return Err(JournalError::ResumeRotationLost);
+        }
         transaction.commit()?;
         Ok(Some(TaskLease {
             task_id: Uuid::parse_str(&task_id)?,
@@ -223,12 +229,36 @@ impl Journal {
     ) -> Result<(), JournalError> {
         let capability_hash = capability_hash(capability);
         let connection = self.connection.lock();
-        connection.execute(
+        let updated = connection.execute(
             "UPDATE tasks
-             SET previous_resume_hash = NULL, updated_at_ms = ?1
-             WHERE task_id = ?2 AND resume_hash = ?3 AND state = 'active'",
+             SET resume_hash = pending_resume_hash,
+                 pending_resume_hash = NULL,
+                 updated_at_ms = ?1
+             WHERE task_id = ?2 AND pending_resume_hash = ?3 AND state = 'active'",
             params![now_ms(), task_id.to_string(), capability_hash.as_slice()],
         )?;
+        if updated != 1 {
+            return Err(JournalError::ResumeRotationLost);
+        }
+        Ok(())
+    }
+
+    pub fn rollback_resume_capability(
+        &self,
+        task_id: Uuid,
+        capability: &str,
+    ) -> Result<(), JournalError> {
+        let capability_hash = capability_hash(capability);
+        let connection = self.connection.lock();
+        let updated = connection.execute(
+            "UPDATE tasks
+             SET pending_resume_hash = NULL, updated_at_ms = ?1
+             WHERE task_id = ?2 AND pending_resume_hash = ?3 AND state = 'active'",
+            params![now_ms(), task_id.to_string(), capability_hash.as_slice()],
+        )?;
+        if updated != 1 {
+            return Err(JournalError::ResumeRotationLost);
+        }
         Ok(())
     }
 
@@ -594,24 +624,32 @@ mod tests {
     }
 
     #[test]
-    fn resume_capability_rotation_keeps_the_prior_token_until_delivery_ack() {
+    fn resume_capability_rotation_allows_one_pending_successor_and_rolls_back_failed_delivery() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_journal(&temp);
         let created = journal.create_task(Some("conversation")).unwrap();
-        let undelivered = journal
+        let pending = journal
             .resume_task(&created.resume_capability)
             .unwrap()
             .unwrap();
-        assert_eq!(created.task_id, undelivered.task_id);
-        assert_ne!(
-            created.resume_capability,
-            undelivered.resume_capability
-        );
+        assert_eq!(created.task_id, pending.task_id);
+        assert_ne!(created.resume_capability, pending.resume_capability);
+        assert!(journal
+            .resume_task(&created.resume_capability)
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            journal.acknowledge_resume_capability(created.task_id, &created.resume_capability),
+            Err(JournalError::ResumeRotationLost)
+        ));
 
+        journal
+            .rollback_resume_capability(pending.task_id, &pending.resume_capability)
+            .unwrap();
         let delivered = journal
             .resume_task(&created.resume_capability)
             .unwrap()
-            .expect("the prior capability remains valid before delivery acknowledgment");
+            .expect("the prior capability is retryable after failed delivery");
         journal
             .acknowledge_resume_capability(delivered.task_id, &delivered.resume_capability)
             .unwrap();

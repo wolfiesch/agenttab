@@ -4,10 +4,12 @@ use agenttab_protocol::{
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::Value;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_DLP_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -256,25 +258,145 @@ impl Guardrails {
         Ok(())
     }
 
+    pub(crate) fn stage_uploads(
+        &self,
+        params: &MethodParams,
+        params_value: &mut Value,
+        staging_directory: &Path,
+    ) -> Result<Vec<PathBuf>, RpcError> {
+        let MethodParams::Act(action_params) = params else {
+            return Ok(Vec::new());
+        };
+        let action_values = params_value
+            .get_mut("actions")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                RpcError::new("invalid_request", "Upload actions were not serializable")
+            })?;
+        let mut staged_paths = Vec::new();
+        let result = (|| {
+            for (action, action_value) in action_params.actions.iter().zip(action_values.iter_mut())
+            {
+                let BrowserAction::UploadFile { files, .. } = action else {
+                    continue;
+                };
+                let staged_values = action_value
+                    .get_mut("files")
+                    .and_then(Value::as_array_mut)
+                    .ok_or_else(|| {
+                        RpcError::new("invalid_request", "Upload files were not serializable")
+                    })?;
+                if staged_values.len() != files.len() {
+                    return Err(RpcError::new(
+                        "invalid_request",
+                        "Upload file count changed during serialization",
+                    ));
+                }
+                for (source, staged_value) in files.iter().zip(staged_values.iter_mut()) {
+                    let staged_path = self.stage_file(Path::new(source), staging_directory)?;
+                    *staged_value = Value::String(staged_path.display().to_string());
+                    staged_paths.push(staged_path);
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(staged_paths),
+            Err(error) => match Self::cleanup_staged_uploads(&staged_paths) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(cleanup_error),
+            },
+        }
+    }
+
+    pub(crate) fn cleanup_staged_uploads(paths: &[PathBuf]) -> Result<(), RpcError> {
+        let mut first_error = None;
+        for path in paths {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            None => Ok(()),
+            Some(error) => Err(RpcError::new(
+                "upload_staging_cleanup_failed",
+                format!("Cannot remove every AgentTab upload staging file: {error}"),
+            )
+            .with_recovery(
+                "Remove the private AgentTab upload staging directory before retrying.",
+            )),
+        }
+    }
+
     fn authorize_file(&self, path: &Path) -> Result<(), RpcError> {
+        self.open_authorized_file(path).map(|_| ())
+    }
+
+    fn stage_file(&self, path: &Path, staging_directory: &Path) -> Result<PathBuf, RpcError> {
+        let mut source = self.open_authorized_file(path)?;
+        let staging_directory = staging_directory.canonicalize().map_err(|error| {
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Cannot resolve private upload staging directory: {error}"),
+            )
+        })?;
+        let staged_path = staging_directory.join(format!("{}.upload", Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut staged = options.open(&staged_path).map_err(|error| {
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Cannot create private upload staging file: {error}"),
+            )
+        })?;
+        let copied = io::copy(
+            &mut source
+                .by_ref()
+                .take(self.policy.dlp_max_file_bytes.saturating_add(1)),
+            &mut staged,
+        )
+        .map_err(|error| {
+            let _ = fs::remove_file(&staged_path);
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Cannot stage upload file: {error}"),
+            )
+        })?;
+        if copied > self.policy.dlp_max_file_bytes {
+            let _ = fs::remove_file(&staged_path);
+            return Err(RpcError::new(
+                "upload_file_too_large",
+                format!(
+                    "Upload file exceeds policy limit of {} bytes",
+                    self.policy.dlp_max_file_bytes
+                ),
+            ));
+        }
+        staged.sync_all().map_err(|error| {
+            let _ = fs::remove_file(&staged_path);
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Cannot finalize staged upload file: {error}"),
+            )
+        })?;
+        Ok(staged_path)
+    }
+
+    fn open_authorized_file(&self, path: &Path) -> Result<File, RpcError> {
         let canonical = path.canonicalize().map_err(|error| {
             RpcError::new(
                 "upload_file_unavailable",
                 format!("Cannot resolve upload file: {error}"),
             )
         })?;
-        let metadata = fs::metadata(&canonical).map_err(|error| {
-            RpcError::new(
-                "upload_file_unavailable",
-                format!("Cannot inspect upload file: {error}"),
-            )
-        })?;
-        if !metadata.is_file() {
-            return Err(RpcError::new(
-                "upload_file_invalid",
-                "Upload target must be a regular file",
-            ));
-        }
         let allowed = self.policy.dlp_allowed_roots.iter().any(|root| {
             root.canonicalize()
                 .map(|allowed_root| canonical.starts_with(allowed_root))
@@ -287,6 +409,31 @@ impl Guardrails {
             )
             .with_recovery("Add a narrow user-owned directory to dlp_allowed_roots."));
         }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&canonical).map_err(|error| {
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Cannot open upload file: {error}"),
+            )
+        })?;
+        let metadata = file.metadata().map_err(|error| {
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Cannot inspect upload file: {error}"),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(RpcError::new(
+                "upload_file_invalid",
+                "Upload target must be a regular file",
+            ));
+        }
         if metadata.len() > self.policy.dlp_max_file_bytes {
             return Err(RpcError::new(
                 "upload_file_too_large",
@@ -297,7 +444,7 @@ impl Guardrails {
                 ),
             ));
         }
-        Ok(())
+        Ok(file)
     }
 }
 
@@ -428,5 +575,51 @@ mod tests {
         assert!(!error.message.contains("123-45-6789"));
         assert!(!error.recovery.unwrap().contains("abcdefghijklmnop"));
         assert_eq!(error.details.unwrap()["password"], "[REDACTED]");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn upload_staging_binds_authorized_bytes_across_replacement_and_symlink_races() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let allowed_root = temp.path().join("allowed");
+        let staging_directory = temp.path().join("staging");
+        fs::create_dir(&allowed_root).unwrap();
+        fs::create_dir(&staging_directory).unwrap();
+        let original = allowed_root.join("original.txt");
+        let replacement = allowed_root.join("replacement.txt");
+        let link = allowed_root.join("upload.txt");
+        fs::write(&original, b"authorized bytes").unwrap();
+        fs::write(&replacement, b"replacement bytes").unwrap();
+        symlink(&original, &link).unwrap();
+        let guardrails = Guardrails::from_policy(Policy {
+            dlp_allowed_roots: vec![allowed_root],
+            dlp_max_file_bytes: 1024,
+            ..Policy::default()
+        })
+        .unwrap();
+        let params = MethodParams::Act(agenttab_protocol::BrowserActParams {
+            tab_id: 7,
+            expected_page_revision: 1,
+            actions: vec![BrowserAction::UploadFile {
+                r#ref: "e1".into(),
+                files: vec![link.display().to_string()],
+            }],
+        });
+        let mut serialized = params.value();
+        let staged = guardrails
+            .stage_uploads(&params, &mut serialized, &staging_directory)
+            .unwrap();
+        let staged_path = serialized["actions"][0]["files"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(staged_path, link.display().to_string());
+        fs::write(&original, b"replaced in place").unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&replacement, &link).unwrap();
+        assert_eq!(fs::read(&staged_path).unwrap(), b"authorized bytes");
+        Guardrails::cleanup_staged_uploads(&staged).unwrap();
+        assert!(!std::path::Path::new(&staged_path).exists());
     }
 }

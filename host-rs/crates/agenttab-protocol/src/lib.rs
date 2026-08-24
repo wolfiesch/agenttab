@@ -7,10 +7,28 @@ use uuid::Uuid;
 pub const RPC_PROTOCOL: &str = "agenttab.rpc";
 pub const NATIVE_PROTOCOL: &str = "agenttab.native";
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const CLIENT_TO_HOST_MAX_BYTES: usize = 64 * 1024;
+pub const CLIENT_TO_HOST_MAX_BYTES: usize = 1024 * 1024;
 pub const HOST_TO_CLIENT_MAX_BYTES: usize = 1024 * 1024;
 pub const HOST_TO_EXTENSION_MAX_BYTES: usize = 1024 * 1024;
 pub const EXTENSION_TO_HOST_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+const MAX_URL_CHARS: usize = 2_048;
+const MAX_SELECTOR_CHARS: usize = 2_048;
+const MAX_REF_CHARS: usize = 256;
+const MAX_ACTIONS: usize = 64;
+const MAX_ACTION_TEXT_CHARS: usize = 2_048;
+const MAX_ACTION_VALUE_CHARS: usize = 2_048;
+const MAX_UPLOAD_FILES: usize = 4;
+const MAX_UPLOAD_PATH_CHARS: usize = 512;
+const MAX_WAIT_CONDITION_CHARS: usize = 2_048;
+const MAX_HANDOFF_PROMPT_CHARS: usize = 2_000;
+const MAX_HANDOFF_COMPLETION_CHARS: usize = 2_048;
+const MAX_STAGED_TOKEN_CHARS: usize = 256;
+const MAX_RESUME_CAPABILITY_CHARS: usize = 64;
+const MAX_DEVELOPER_PARAMS: usize = 16;
+const MAX_DEVELOPER_PARAM_KEY_CHARS: usize = 64;
+const MAX_DEVELOPER_VALUE_CHARS: usize = 512;
+const MAX_DEVELOPER_ARRAY_ITEMS: usize = 16;
 
 pub const RPC_SCHEMA_ASSETS: &[(&str, &str)] = &[
     (
@@ -196,6 +214,7 @@ pub struct RpcRequest {
 
 impl RpcRequest {
     pub fn parse(value: Value) -> Result<(Self, MethodParams), ProtocolError> {
+        validate_serialized_request_limit(&value)?;
         let request: Self = serde_json::from_value(value)?;
         if request.protocol != RPC_PROTOCOL || request.version != PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
@@ -217,6 +236,17 @@ impl RpcRequest {
         let params = MethodParams::parse(request.method, request.params.clone())?;
         Ok((request, params))
     }
+}
+
+fn validate_serialized_request_limit(value: &Value) -> Result<(), ProtocolError> {
+    let encoded = serde_json::to_vec(value)?;
+    if encoded.len() > CLIENT_TO_HOST_MAX_BYTES {
+        return Err(ProtocolError::Oversize {
+            declared: encoded.len(),
+            limit: CLIENT_TO_HOST_MAX_BYTES,
+        });
+    }
+    Ok(())
 }
 
 fn decode_params<T: DeserializeOwned>(method: RpcMethod, value: Value) -> Result<T, ProtocolError> {
@@ -462,6 +492,7 @@ impl MethodParams {
     fn validate(&self, method: RpcMethod) -> Result<(), ProtocolError> {
         match self {
             Self::Open(BrowserOpenParams::Create { url: Some(url), .. }) => {
+                require_len(method, url, 1, MAX_URL_CHARS, "url")?;
                 require(
                     method,
                     valid_url(url),
@@ -475,7 +506,7 @@ impl MethodParams {
                 ..
             }) => {
                 if let Some(value) = root_ref {
-                    require_len(method, value, 1, usize::MAX, "root_ref")?;
+                    require_len(method, value, 1, MAX_REF_CHARS, "root_ref")?;
                 }
                 if let Some(value) = max_depth {
                     require(
@@ -503,7 +534,7 @@ impl MethodParams {
                 ..
             }) => {
                 if let Some(value) = selector {
-                    require_len(method, value, 1, usize::MAX, "selector")?;
+                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
                 }
                 if let Some(value) = max_bytes {
                     require(
@@ -515,14 +546,14 @@ impl MethodParams {
             }
             Self::Snapshot(BrowserSnapshotParams::Screenshot { selector, .. }) => {
                 if let Some(value) = selector {
-                    require_len(method, value, 1, usize::MAX, "selector")?;
+                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
                 }
             }
             Self::Act(params) => {
                 require(
                     method,
-                    (1..=64).contains(&params.actions.len()),
-                    "actions must contain 1 to 64 items",
+                    (1..=MAX_ACTIONS).contains(&params.actions.len()),
+                    format!("actions must contain 1 to {MAX_ACTIONS} items"),
                 )?;
                 for action in &params.actions {
                     validate_action(method, action)?;
@@ -538,13 +569,25 @@ impl MethodParams {
                     WaitCondition::Url { value }
                     | WaitCondition::Text { value }
                     | WaitCondition::Selector { value } => {
-                        require_len(method, value, 1, 65_536, "condition.value")?;
+                        require_len(
+                            method,
+                            value,
+                            1,
+                            MAX_WAIT_CONDITION_CHARS,
+                            "condition.value",
+                        )?;
                     }
                     WaitCondition::Load | WaitCondition::NetworkIdle | WaitCondition::Download => {}
                 }
             }
             Self::Handoff(params) => {
-                require_len(method, &params.prompt, 1, 2_000, "prompt")?;
+                require_len(
+                    method,
+                    &params.prompt,
+                    1,
+                    MAX_HANDOFF_PROMPT_CHARS,
+                    "prompt",
+                )?;
                 require(
                     method,
                     (1_000..=900_000).contains(&params.timeout_ms),
@@ -552,16 +595,29 @@ impl MethodParams {
                 )?;
                 match &params.completion {
                     HandoffCompletion::Url { value } | HandoffCompletion::Selector { value } => {
-                        require_len(method, value, 1, 65_536, "completion.value")?;
+                        require_len(
+                            method,
+                            value,
+                            1,
+                            MAX_HANDOFF_COMPLETION_CHARS,
+                            "completion.value",
+                        )?;
                     }
                     HandoffCompletion::Navigation | HandoffCompletion::ManualDone => {}
                 }
             }
             Self::Commit(params) => {
-                require_len(method, &params.staged_token, 32, 256, "staged_token")?;
+                require_len(
+                    method,
+                    &params.staged_token,
+                    32,
+                    MAX_STAGED_TOKEN_CHARS,
+                    "staged_token",
+                )?;
             }
             Self::Developer(params) => {
                 require_len(method, &params.action, 1, 128, "action")?;
+                validate_developer_params(method, &params.params)?;
             }
             Self::Open(BrowserOpenParams::Create { url: None, .. })
             | Self::Open(BrowserOpenParams::AdoptActive)
@@ -577,11 +633,11 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
         BrowserAction::Click { r#ref } => require_ref(method, r#ref),
         BrowserAction::Type { r#ref, text } | BrowserAction::Fill { r#ref, text } => {
             require_ref(method, r#ref)?;
-            require_len(method, text, 0, 1_048_576, "text")
+            require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
         }
         BrowserAction::Select { r#ref, value } => {
             require_ref(method, r#ref)?;
-            require_len(method, value, 0, 65_536, "value")
+            require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "value")
         }
         BrowserAction::Press { key } => require_len(method, key, 1, 128, "key"),
         BrowserAction::Scroll {
@@ -602,14 +658,17 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             require_ref(method, r#ref)?;
             require_ref(method, target_ref)
         }
-        BrowserAction::Navigate { url } => require(
-            method,
-            valid_url(url),
-            "url must use http, https, or about without whitespace",
-        ),
+        BrowserAction::Navigate { url } => {
+            require_len(method, url, 1, MAX_URL_CHARS, "url")?;
+            require(
+                method,
+                valid_url(url),
+                "url must use http, https, or about without whitespace",
+            )
+        }
         BrowserAction::Dialog { prompt_text, .. } => {
             if let Some(value) = prompt_text {
-                require_len(method, value, 0, 65_536, "prompt_text")?;
+                require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "prompt_text")?;
             }
             Ok(())
         }
@@ -636,11 +695,11 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             require_ref(method, r#ref)?;
             require(
                 method,
-                (1..=32).contains(&files.len()),
-                "files must contain 1 to 32 paths",
+                (1..=MAX_UPLOAD_FILES).contains(&files.len()),
+                format!("files must contain 1 to {MAX_UPLOAD_FILES} paths"),
             )?;
             for file in files {
-                require_len(method, file, 1, usize::MAX, "file path")?;
+                require_len(method, file, 1, MAX_UPLOAD_PATH_CHARS, "file path")?;
             }
             Ok(())
         }
@@ -652,10 +711,63 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
     }
 }
 
-fn require_ref(method: RpcMethod, value: &str) -> Result<(), ProtocolError> {
-    require_len(method, value, 1, 256, "ref")
+fn validate_developer_params(
+    method: RpcMethod,
+    params: &Map<String, Value>,
+) -> Result<(), ProtocolError> {
+    require(
+        method,
+        params.len() <= MAX_DEVELOPER_PARAMS,
+        format!("params must contain at most {MAX_DEVELOPER_PARAMS} entries"),
+    )?;
+    for (key, value) in params {
+        require_len(method, key, 1, MAX_DEVELOPER_PARAM_KEY_CHARS, "params key")?;
+        match value {
+            Value::String(value) => {
+                require_len(method, value, 0, MAX_DEVELOPER_VALUE_CHARS, "params string")?;
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            Value::Array(values) => {
+                require(
+                    method,
+                    values.len() <= MAX_DEVELOPER_ARRAY_ITEMS,
+                    format!("params arrays must contain at most {MAX_DEVELOPER_ARRAY_ITEMS} items"),
+                )?;
+                for value in values {
+                    match value {
+                        Value::String(value) => {
+                            require_len(
+                                method,
+                                value,
+                                0,
+                                MAX_DEVELOPER_VALUE_CHARS,
+                                "params array string",
+                            )?;
+                        }
+                        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+                        Value::Array(_) | Value::Object(_) => {
+                            return Err(ProtocolError::InvalidParamConstraint {
+                                method,
+                                message: "params arrays may contain only scalar values".into(),
+                            });
+                        }
+                    }
+                }
+            }
+            Value::Object(_) => {
+                return Err(ProtocolError::InvalidParamConstraint {
+                    method,
+                    message: "params values must be scalars or arrays of scalars".into(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
+fn require_ref(method: RpcMethod, value: &str) -> Result<(), ProtocolError> {
+    require_len(method, value, 1, MAX_REF_CHARS, "ref")
+}
 fn require_len(
     method: RpcMethod,
     value: &str,
@@ -807,6 +919,7 @@ pub struct ConnectionInit {
 
 impl ConnectionInit {
     pub fn parse(value: Value) -> Result<Self, ProtocolError> {
+        validate_serialized_request_limit(&value)?;
         let message: Self = serde_json::from_value(value)?;
         if message.protocol != RPC_PROTOCOL || message.version != PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
@@ -823,14 +936,12 @@ impl ConnectionInit {
                 "conversation_id must contain 1 to 256 characters".into(),
             ));
         }
-        if message
-            .resume_capability
-            .as_deref()
-            .is_some_and(|value| value.chars().count() < 32)
-        {
-            return Err(ProtocolError::InvalidConnection(
-                "resume_capability must contain at least 32 characters".into(),
-            ));
+        if message.resume_capability.as_deref().is_some_and(|value| {
+            !(32..=MAX_RESUME_CAPABILITY_CHARS).contains(&value.chars().count())
+        }) {
+            return Err(ProtocolError::InvalidConnection(format!(
+                "resume_capability must contain 32 to {MAX_RESUME_CAPABILITY_CHARS} characters"
+            )));
         }
         Ok(message)
     }
@@ -1000,6 +1111,13 @@ pub struct NativeResponse {
 
 impl NativeResponse {
     pub fn parse(value: Value) -> Result<Self, ProtocolError> {
+        if value.pointer("/error/recovery").is_some_and(Value::is_null)
+            || value.pointer("/error/details").is_some_and(Value::is_null)
+        {
+            return Err(ProtocolError::InvalidNativeMessage(
+                "native error recovery and details must be omitted or non-null".into(),
+            ));
+        }
         let response: Self = serde_json::from_value(value)?;
         if response.protocol != NATIVE_PROTOCOL || response.version != PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
@@ -1442,6 +1560,112 @@ mod tests {
             })),
             Err(ProtocolError::InvalidConnection(_))
         ));
+    }
+
+    #[test]
+    fn maximum_schema_bound_requests_fit_the_one_megabyte_client_frame() {
+        let escaped = |count| "\0".repeat(count);
+        let request_id = escaped(128);
+        let ref_value = escaped(MAX_REF_CHARS);
+        let action_cases = [
+            json!({"kind": "type", "ref": ref_value, "text": escaped(MAX_ACTION_TEXT_CHARS)}),
+            json!({"kind": "fill", "ref": escaped(MAX_REF_CHARS), "text": escaped(MAX_ACTION_TEXT_CHARS)}),
+            json!({"kind": "select", "ref": escaped(MAX_REF_CHARS), "value": escaped(MAX_ACTION_VALUE_CHARS)}),
+            json!({"kind": "dialog", "decision": "accept", "prompt_text": escaped(MAX_ACTION_VALUE_CHARS)}),
+            json!({
+                "kind": "upload_file",
+                "ref": escaped(MAX_REF_CHARS),
+                "files": vec![escaped(MAX_UPLOAD_PATH_CHARS); MAX_UPLOAD_FILES]
+            }),
+            json!({"kind": "navigate", "url": format!("https://{}", escaped(MAX_URL_CHARS - 8))}),
+            json!({"kind": "drag", "ref": escaped(MAX_REF_CHARS), "target_ref": escaped(MAX_REF_CHARS)}),
+        ];
+        for action in action_cases {
+            let mut value = request(
+                "browser_act",
+                json!({
+                    "tab_id": u64::MAX,
+                    "expected_page_revision": u64::MAX,
+                    "actions": vec![action; MAX_ACTIONS],
+                }),
+                true,
+            );
+            value["request_id"] = json!(request_id.clone());
+            assert!(
+                serde_json::to_vec(&value).unwrap().len() <= CLIENT_TO_HOST_MAX_BYTES,
+                "schema-valid request exceeded the client frame"
+            );
+            assert!(RpcRequest::parse(value).is_ok());
+        }
+
+        let developer_params = (0..MAX_DEVELOPER_PARAMS)
+            .map(|index| {
+                (
+                    escaped(MAX_DEVELOPER_PARAM_KEY_CHARS - 2) + &format!("{index:02}"),
+                    json!(vec![
+                        escaped(MAX_DEVELOPER_VALUE_CHARS);
+                        MAX_DEVELOPER_ARRAY_ITEMS
+                    ]),
+                )
+            })
+            .collect::<Map<_, _>>();
+        let mut developer = request(
+            "browser_developer",
+            json!({
+                "action": escaped(128),
+                "params": developer_params,
+            }),
+            true,
+        );
+        developer["request_id"] = json!(request_id);
+        assert!(serde_json::to_vec(&developer).unwrap().len() <= CLIENT_TO_HOST_MAX_BYTES);
+        assert!(RpcRequest::parse(developer).is_ok());
+
+        let action_schema = RPC_SCHEMA_ASSETS
+            .iter()
+            .find_map(|(name, schema)| (*name == "browser_act").then_some(schema))
+            .unwrap();
+        let action_schema: Value = serde_json::from_str(action_schema).unwrap();
+        assert_eq!(
+            action_schema.pointer("/$defs/type/properties/text/maxLength"),
+            Some(&json!(MAX_ACTION_TEXT_CHARS))
+        );
+        assert_eq!(
+            action_schema.pointer("/$defs/upload_file/properties/files/maxItems"),
+            Some(&json!(MAX_UPLOAD_FILES))
+        );
+        assert_eq!(
+            action_schema.pointer("/$defs/upload_file/properties/files/items/maxLength"),
+            Some(&json!(MAX_UPLOAD_PATH_CHARS))
+        );
+    }
+
+    #[test]
+    fn native_error_schema_and_parser_reject_empty_or_unknown_error_fields() {
+        let native_schema: Value = serde_json::from_str(NATIVE_SCHEMA).unwrap();
+        let error_schema = native_schema.pointer("/$defs/rpc_error").unwrap();
+        assert_eq!(error_schema["required"], json!(["code", "message"]));
+        assert_eq!(error_schema["properties"]["code"]["minLength"], json!(1));
+        assert_eq!(error_schema["properties"]["message"]["minLength"], json!(1));
+        assert_eq!(error_schema["additionalProperties"], json!(false));
+
+        for error in [
+            json!({"code": "", "message": "failed"}),
+            json!({"code": "failed", "message": ""}),
+            json!({"code": "failed", "message": "failed", "recovery": null}),
+            json!({"code": "failed", "message": "failed", "details": null}),
+            json!({"code": "failed", "message": "failed", "extra": true}),
+        ] {
+            assert!(NativeResponse::parse(json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "response",
+                "request_id": Uuid::new_v4(),
+                "outcome": "not_started",
+                "error": error,
+            }))
+            .is_err());
+        }
     }
 
     #[test]
