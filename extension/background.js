@@ -829,6 +829,7 @@ class StandardBrowserRuntime {
   authorizeDebuggerUse;
   recordDebuggerCandidate;
   forgetDebuggerCandidate;
+  adoptOwnedChild;
   sessions = new Map;
   expectedDetaches = new Map;
   debuggerCandidates = new Set;
@@ -838,6 +839,8 @@ class StandardBrowserRuntime {
     return;
   }, forgetDebuggerCandidate = async () => {
     return;
+  }, adoptOwnedChild = async () => {
+    return;
   }) {
     this.revisions = revisions;
     this.closeTab = closeTab;
@@ -845,6 +848,7 @@ class StandardBrowserRuntime {
     this.authorizeDebuggerUse = authorizeDebuggerUse;
     this.recordDebuggerCandidate = recordDebuggerCandidate;
     this.forgetDebuggerCandidate = forgetDebuggerCandidate;
+    this.adoptOwnedChild = adoptOwnedChild;
     chrome.debugger.onDetach.addListener((source) => {
       if (source.tabId === undefined)
         return;
@@ -886,6 +890,12 @@ class StandardBrowserRuntime {
           })
         };
         this.invalidateStagedDialogs(source.tabId);
+      } else if (method === "Page.windowOpen") {
+        const pending = session.pendingWindowOpen;
+        session.pendingWindowOpen = undefined;
+        if (pending && pending.expiresAt >= Date.now() && typeof params.url === "string" && params.url.length > 0) {
+          this.adoptWindowOpenChild(source.tabId, params.url, pending);
+        }
       } else if (method === "Page.javascriptDialogClosed") {
         session.dialogGeneration += 1;
         session.dialog = undefined;
@@ -1569,7 +1579,19 @@ class StandardBrowserRuntime {
     }
     const backendNodeId = this.backendNodeId(pageRevision, action.ref);
     if (kind === "click") {
-      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      const [activeTab, existingTabs] = await Promise.all([
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab),
+        chrome.tabs.query({})
+      ]);
+      const session = this.sessions.get(tabId);
+      const pendingWindowOpen = {
+        existingTabIds: new Set(existingTabs.map((tab) => tab.id).filter((candidate) => Number.isInteger(candidate))),
+        activeTabId: Number.isInteger(activeTab?.id) ? activeTab.id : undefined,
+        activeWindowId: Number.isInteger(activeTab?.windowId) ? activeTab.windowId : undefined,
+        expiresAt: Date.now() + 1000
+      };
+      if (session)
+        session.pendingWindowOpen = pendingWindowOpen;
       try {
         await this.callOnNode(tabId, backendNodeId, "function(){this.click()}", [], true);
       } finally {
@@ -1586,6 +1608,11 @@ class StandardBrowserRuntime {
             });
           }
         }
+        setTimeout(() => {
+          if (session?.pendingWindowOpen === pendingWindowOpen) {
+            session.pendingWindowOpen = undefined;
+          }
+        }, 1000);
       }
     } else if (kind === "type") {
       await this.callOnNode(tabId, backendNodeId, "function(value){const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);if(type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))){return {agenttab_sensitive_field:true}}this.focus();if(this.isContentEditable){this.textContent=(this.textContent||'')+value}else{const current=String(this.value||'');const start=Number.isInteger(this.selectionStart)?this.selectionStart:current.length;const end=Number.isInteger(this.selectionEnd)?this.selectionEnd:start;this.value=current.slice(0,start)+value+current.slice(end);if(typeof this.setSelectionRange==='function'){const position=start+value.length;this.setSelectionRange(position,position)}}this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}", [{ value: String(action.text ?? "") }]);
@@ -1686,6 +1713,32 @@ class StandardBrowserRuntime {
         throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
       }
       throw error;
+    }
+  }
+  async adoptWindowOpenChild(parentTabId, openedUrl, pending) {
+    for (let attempt = 0;attempt < 10; attempt += 1) {
+      const tabs = await chrome.tabs.query({});
+      const candidates = tabs.filter((tab) => Number.isInteger(tab.id) && !pending.existingTabIds.has(tab.id) && (tab.url === openedUrl || tab.pendingUrl === openedUrl));
+      if (candidates.length === 1) {
+        const childTabId = candidates[0].id;
+        await this.adoptOwnedChild(parentTabId, childTabId);
+        const [currentActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (currentActiveTab?.id === childTabId && pending.activeTabId !== undefined && pending.activeWindowId !== undefined) {
+          const original = await chrome.tabs.get(pending.activeTabId).catch(() => null);
+          if (original?.windowId === pending.activeWindowId) {
+            await chrome.tabs.update(pending.activeTabId, { active: true }).catch(() => {
+              return;
+            });
+            await chrome.windows.update(pending.activeWindowId, { focused: true }).catch(() => {
+              return;
+            });
+          }
+        }
+        return;
+      }
+      if (candidates.length > 1)
+        return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
   async nodeCenter(tabId, backendNodeId) {
@@ -2569,8 +2622,8 @@ class OwnershipLedger {
   adoptActive(taskId) {
     return this.serialize(() => this.adoptActiveNow(taskId));
   }
-  adoptOwnedChild(tab) {
-    return this.serialize(() => this.adoptOwnedChildNow(tab));
+  adoptOwnedChild(tab, sourceTabId) {
+    return this.serialize(() => this.adoptOwnedChildNow(tab, sourceTabId));
   }
   revokeIfMoved(tabId) {
     return this.serialize(() => this.revokeIfMovedNow(tabId));
@@ -2767,9 +2820,9 @@ class OwnershipLedger {
     }
     return this.tabResult(tabId);
   }
-  async adoptOwnedChildNow(tab) {
+  async adoptOwnedChildNow(tab, sourceTabId) {
     const childTabId = tab.id;
-    const openerTabId = tab.openerTabId;
+    const openerTabId = sourceTabId ?? tab.openerTabId;
     if (typeof childTabId !== "number" || !Number.isInteger(childTabId) || typeof openerTabId !== "number" || !Number.isInteger(openerTabId)) {
       return;
     }
@@ -2788,7 +2841,7 @@ class OwnershipLedger {
       const child = await chrome.tabs.get(childTabId).catch(() => null);
       if (!parent || !child)
         return;
-      if (child.groupId !== undefined && child.groupId !== NO_GROUP && child.groupId !== ownedParent.groupId) {
+      if (sourceTabId === undefined && child.groupId !== undefined && child.groupId !== NO_GROUP && child.groupId !== ownedParent.groupId) {
         return;
       }
       if (Number.isInteger(parent.windowId) && Number.isInteger(child.windowId) && parent.windowId !== child.windowId) {
@@ -3153,7 +3206,11 @@ browser = new StandardBrowserRuntime(revisions, async (tabId) => {
   await ownership.revoke(tabId, "tab_removed");
   await browser.detach(tabId);
   await chrome.tabs.remove(tabId);
-}, emit, authorizeOwnedTab, recordDebuggerCandidate, forgetDebuggerCandidate);
+}, emit, authorizeOwnedTab, recordDebuggerCandidate, forgetDebuggerCandidate, async (parentTabId, childTabId) => {
+  const child = await chrome.tabs.get(childTabId).catch(() => null);
+  if (child)
+    await ownership.adoptOwnedChild(child, parentTabId);
+});
 var handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber(() => browser.scrubForHandoff());
 async function automationEnabled() {

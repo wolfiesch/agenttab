@@ -88,6 +88,10 @@ browser = new StandardBrowserRuntime(
   authorizeOwnedTab,
   recordDebuggerCandidate,
   forgetDebuggerCandidate,
+  async (parentTabId, childTabId) => {
+    const child = await chrome.tabs.get(childTabId).catch(() => null);
+    if (child) await ownership.adoptOwnedChild(child, parentTabId);
+  },
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber(() => browser.scrubForHandoff());

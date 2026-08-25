@@ -72,8 +72,8 @@ export class OwnershipLedger {
     return this.serialize(() => this.adoptActiveNow(taskId));
   }
 
-  adoptOwnedChild(tab: TabLike): Promise<void> {
-    return this.serialize(() => this.adoptOwnedChildNow(tab));
+  adoptOwnedChild(tab: TabLike, sourceTabId?: number): Promise<void> {
+    return this.serialize(() => this.adoptOwnedChildNow(tab, sourceTabId));
   }
 
   revokeIfMoved(tabId: number): Promise<boolean> {
@@ -282,9 +282,9 @@ export class OwnershipLedger {
     return this.tabResult(tabId);
   }
 
-  private async adoptOwnedChildNow(tab: TabLike): Promise<void> {
+  private async adoptOwnedChildNow(tab: TabLike, sourceTabId?: number): Promise<void> {
     const childTabId = tab.id;
-    const openerTabId = tab.openerTabId;
+    const openerTabId = sourceTabId ?? tab.openerTabId;
     if (
       typeof childTabId !== "number" ||
       !Number.isInteger(childTabId) ||
@@ -309,7 +309,12 @@ export class OwnershipLedger {
       const parent = (await chrome.tabs.get(openerTabId).catch(() => null)) as TabLike | null;
       const child = (await chrome.tabs.get(childTabId).catch(() => null)) as TabLike | null;
       if (!parent || !child) return;
-      if (child.groupId !== undefined && child.groupId !== NO_GROUP && child.groupId !== ownedParent.groupId) {
+      if (
+        sourceTabId === undefined &&
+        child.groupId !== undefined &&
+        child.groupId !== NO_GROUP &&
+        child.groupId !== ownedParent.groupId
+      ) {
         return;
       }
       if (

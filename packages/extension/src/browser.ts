@@ -11,6 +11,13 @@ interface JavaScriptDialog {
   fingerprint: Promise<string>;
 }
 
+interface PendingWindowOpen {
+  existingTabIds: Set<number>;
+  activeTabId?: number;
+  activeWindowId?: number;
+  expiresAt: number;
+}
+
 interface DebugSession {
   attached: boolean;
   attachPromise?: Promise<void>;
@@ -21,6 +28,7 @@ interface DebugSession {
   lastNetworkActivity: number;
   dialogGeneration: number;
   dialog?: JavaScriptDialog;
+  pendingWindowOpen?: PendingWindowOpen;
 }
 
 interface AxValue {
@@ -48,6 +56,7 @@ type CloseTab = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 type AuthorizeDebuggerUse = (tabId: number) => Promise<void>;
 type DebuggerLifecycle = (tabId: number) => Promise<void>;
+type AdoptOwnedChild = (parentTabId: number, childTabId: number) => Promise<void>;
 
 export interface ActionExecution {
   result?: Record<string, unknown>;
@@ -79,6 +88,7 @@ export class StandardBrowserRuntime {
     private readonly authorizeDebuggerUse: AuthorizeDebuggerUse = async () => undefined,
     private readonly recordDebuggerCandidate: DebuggerLifecycle = async () => undefined,
     private readonly forgetDebuggerCandidate: DebuggerLifecycle = async () => undefined,
+    private readonly adoptOwnedChild: AdoptOwnedChild = async () => undefined,
   ) {
     chrome.debugger.onDetach.addListener((source: { tabId?: number }) => {
       if (source.tabId === undefined) return;
@@ -119,6 +129,17 @@ export class StandardBrowserRuntime {
             }),
           };
           void this.invalidateStagedDialogs(source.tabId);
+        } else if (method === "Page.windowOpen") {
+          const pending = session.pendingWindowOpen;
+          session.pendingWindowOpen = undefined;
+          if (
+            pending &&
+            pending.expiresAt >= Date.now() &&
+            typeof params.url === "string" &&
+            params.url.length > 0
+          ) {
+            void this.adoptWindowOpenChild(source.tabId, params.url, pending);
+          }
         } else if (method === "Page.javascriptDialogClosed") {
           session.dialogGeneration += 1;
           session.dialog = undefined;
@@ -934,7 +955,22 @@ export class StandardBrowserRuntime {
     }
     const backendNodeId = this.backendNodeId(pageRevision, action.ref);
     if (kind === "click") {
-      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      const [activeTab, existingTabs] = await Promise.all([
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab),
+        chrome.tabs.query({}),
+      ]);
+      const session = this.sessions.get(tabId);
+      const pendingWindowOpen: PendingWindowOpen = {
+        existingTabIds: new Set(
+          existingTabs
+            .map((tab) => tab.id)
+            .filter((candidate): candidate is number => Number.isInteger(candidate)),
+        ),
+        activeTabId: Number.isInteger(activeTab?.id) ? activeTab.id : undefined,
+        activeWindowId: Number.isInteger(activeTab?.windowId) ? activeTab.windowId : undefined,
+        expiresAt: Date.now() + 1_000,
+      };
+      if (session) session.pendingWindowOpen = pendingWindowOpen;
       try {
         await this.callOnNode(tabId, backendNodeId, "function(){this.click()}", [], true);
       } finally {
@@ -953,6 +989,11 @@ export class StandardBrowserRuntime {
             await chrome.windows.update(activeTab.windowId as number, { focused: true }).catch(() => undefined);
           }
         }
+        setTimeout(() => {
+          if (session?.pendingWindowOpen === pendingWindowOpen) {
+            session.pendingWindowOpen = undefined;
+          }
+        }, 1_000);
       }
     } else if (kind === "type") {
       await this.callOnNode(
@@ -1077,6 +1118,7 @@ export class StandardBrowserRuntime {
           recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
         });
       }
+
       if (isRecord(invoked.exceptionDetails)) {
         const text =
           typeof invoked.exceptionDetails.text === "string"
@@ -1093,6 +1135,39 @@ export class StandardBrowserRuntime {
         throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
       }
       throw error;
+    }
+  }
+  private async adoptWindowOpenChild(
+    parentTabId: number,
+    openedUrl: string,
+    pending: PendingWindowOpen,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const tabs = await chrome.tabs.query({});
+      const candidates = tabs.filter((tab) =>
+        Number.isInteger(tab.id) &&
+        !pending.existingTabIds.has(tab.id as number) &&
+        (tab.url === openedUrl || tab.pendingUrl === openedUrl),
+      );
+      if (candidates.length === 1) {
+        const childTabId = candidates[0].id as number;
+        await this.adoptOwnedChild(parentTabId, childTabId);
+        const [currentActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (
+          currentActiveTab?.id === childTabId &&
+          pending.activeTabId !== undefined &&
+          pending.activeWindowId !== undefined
+        ) {
+          const original = await chrome.tabs.get(pending.activeTabId).catch(() => null);
+          if (original?.windowId === pending.activeWindowId) {
+            await chrome.tabs.update(pending.activeTabId, { active: true }).catch(() => undefined);
+            await chrome.windows.update(pending.activeWindowId, { focused: true }).catch(() => undefined);
+          }
+        }
+        return;
+      }
+      if (candidates.length > 1) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
   }
 

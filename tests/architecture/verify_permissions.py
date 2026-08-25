@@ -9,11 +9,13 @@ Chrome permissions.
 The explicit live mode runs only against a preloaded AgentTab candidate on the
 trusted macOS runner. It observes permission changes made by a human through
 the AgentTab UI; this probe never calls ``chrome.permissions.request`` or
-``chrome.permissions.remove``. Its only mutations are local fixture HTTP
-requests and task-owned tabs created through AgentTab Core RPC. Cleanup closes
-those tabs, restores the original optional-scripting state through a human UI
-checkpoint, and removes only the exact fixture download from an explicit test
-download directory.
+``chrome.permissions.remove``. Probe-initiated mutations are local fixture HTTP
+requests, task-owned tabs created through AgentTab Core RPC, a transient
+DevTools download route into the explicit test directory, a background AgentTab
+control page recreated after deliberate extension reloads, and the reviewed
+extension/host restart commands supplied by the operator. Cleanup closes
+task-owned tabs, restores the original optional-scripting state through the
+human UI checkpoint, and removes only the exact fixture download.
 """
 
 from __future__ import annotations
@@ -53,7 +55,6 @@ REQUIRED_PERMISSIONS = (
     "storage",
     "alarms",
     "downloads",
-    "debugger",
 )
 OPTIONAL_PERMISSIONS = ("scripting",)
 REMOVED_PERMISSIONS = (
@@ -514,7 +515,7 @@ class CoreRpcClient:
 
 
 class DevToolsSocket:
-    """A minimal, read-only DevTools client for fixed AgentTab inspection calls."""
+    """A minimal DevTools client for fixed AgentTab lifecycle operations."""
 
     def __init__(self, websocket_url: str, timeout_seconds: float) -> None:
         parsed = urlparse(websocket_url)
@@ -613,42 +614,54 @@ class DevToolsSocket:
                 raise GateFailure("Chrome DevTools returned a non-object frame")
             return value
 
-    def evaluate(self, expression: str, operation: str) -> dict[str, Any]:
+    def command(self, method: str, params: dict[str, Any], operation: str) -> dict[str, Any]:
         command_id = self._next_id
         self._next_id += 1
-        self._send_json({
-            "id": command_id,
-            "method": "Runtime.evaluate",
-            "params": {
+        self._send_json({"id": command_id, "method": method, "params": params})
+        while True:
+            try:
+                message = self._recv_json()
+            except (OSError, GateFailure) as error:
+                raise ChromeOperationFailure(f"Chrome DevTools {operation} connection failed") from error
+            if message.get("id") != command_id:
+                continue
+            if "error" in message:
+                raise ChromeOperationFailure(f"Chrome DevTools {operation} failed")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise ChromeOperationFailure(f"Chrome DevTools {operation} returned no object")
+            return result
+
+    def evaluate(self, expression: str, operation: str) -> dict[str, Any]:
+        result = self.command(
+            "Runtime.evaluate",
+            {
                 "expression": expression,
                 "awaitPromise": True,
                 "returnByValue": True,
                 "userGesture": False,
             },
-        })
-        while True:
-            message = self._recv_json()
-            if message.get("id") != command_id:
-                continue
-            result = message.get("result")
-            if not isinstance(result, dict) or "exceptionDetails" in result:
-                raise ChromeOperationFailure(f"Chrome DevTools Runtime.evaluate ({operation}) failed")
-            remote = result.get("result")
-            if not isinstance(remote, dict) or not isinstance(remote.get("value"), dict):
-                raise ChromeOperationFailure(f"Chrome DevTools Runtime.evaluate ({operation}) returned no object")
-            return remote["value"]
+            f"Runtime.evaluate ({operation})",
+        )
+        if "exceptionDetails" in result:
+            raise ChromeOperationFailure(f"Chrome DevTools Runtime.evaluate ({operation}) failed")
+        remote = result.get("result")
+        if not isinstance(remote, dict) or not isinstance(remote.get("value"), dict):
+            raise ChromeOperationFailure(f"Chrome DevTools Runtime.evaluate ({operation}) returned no object")
+        return remote["value"]
 
 
 class ChromeInspector:
-    """Use the candidate extension target for fixed, read-only Chrome API checks."""
+    """Use the candidate extension target for fixed lifecycle inspection and control-page recovery."""
 
     _READ_ONLY_STATE = """(async () => {
       const contains = (permission) => new Promise((resolve) =>
         chrome.permissions.contains({ permissions: [permission] }, resolve));
-      const [scripting, debuggerRequiredGranted, activeTabs, uiState] = await Promise.all([
+      const [scripting, debuggerRequiredGranted, activeTabs, inspectorTab, uiState] = await Promise.all([
         contains('scripting'),
         contains('debugger'),
         chrome.tabs.query({ active: true, lastFocusedWindow: true }),
+        chrome.tabs.getCurrent(),
         chrome.runtime.sendMessage({ kind: 'get_ui_state' }),
       ]);
       const targetState = await new Promise((resolve) => {
@@ -670,7 +683,10 @@ class ChromeInspector:
         active_tab_id: activeTabs[0]?.id ?? null,
         debugger_targets_available: targetState.available,
         debugger_attached_tab_ids: targetState.targets
-          .filter((target) => target.attached && Number.isInteger(target.tabId))
+          .filter((target) =>
+            target.attached &&
+            Number.isInteger(target.tabId) &&
+            target.tabId !== inspectorTab?.id)
           .map((target) => target.tabId),
         task_ids: tasks
           .map((task) => task?.task_id)
@@ -687,8 +703,9 @@ class ChromeInspector:
         self.debugging_url = debugging_url.rstrip("/")
         self.extension_id = extension_id
         self.timeout_seconds = timeout_seconds
+        self._download_channel: DevToolsSocket | None = None
 
-    def _candidate_websocket(self) -> str:
+    def _devtools_targets(self) -> list[dict[str, Any]]:
         try:
             request = Request(f"{self.debugging_url}/json/list", headers={"Accept": "application/json"})
             with urlopen(request, timeout=self.timeout_seconds) as response:
@@ -697,11 +714,12 @@ class ChromeInspector:
             raise ChromeOperationFailure("Chrome DevTools GET /json/list failed") from error
         if not isinstance(targets, list):
             raise ChromeOperationFailure("Chrome DevTools GET /json/list returned invalid targets")
+        return [target for target in targets if isinstance(target, dict)]
+
+    def _candidate_websockets(self) -> list[tuple[str, str]]:
         prefix = f"chrome-extension://{self.extension_id}/"
         candidates: list[tuple[str, str]] = []
-        for target in targets:
-            if not isinstance(target, dict):
-                continue
+        for target in self._devtools_targets():
             target_type = target.get("type")
             url = target.get("url")
             websocket = target.get("webSocketDebuggerUrl")
@@ -712,14 +730,60 @@ class ChromeInspector:
                 and isinstance(websocket, str)
             ):
                 candidates.append((target_type, websocket))
-        for preferred_type in ("service_worker", "page"):
-            for target_type, websocket in candidates:
-                if target_type == preferred_type:
-                    return websocket
-        raise ChromeOperationFailure("Chrome target discovery requires a live AgentTab extension target")
+        return candidates
 
-    def _evaluate(self, expression: str, operation: str) -> dict[str, Any]:
-        channel = DevToolsSocket(self._candidate_websocket(), self.timeout_seconds)
+    def _control_page_websockets(self) -> list[str]:
+        control_url = f"chrome-extension://{self.extension_id}/popup.html"
+        return [
+            target["webSocketDebuggerUrl"]
+            for target in self._devtools_targets()
+            if target.get("type") == "page"
+            and target.get("url") == control_url
+            and isinstance(target.get("webSocketDebuggerUrl"), str)
+        ]
+
+    def _target_websocket(self, target_id: str) -> str | None:
+        return next(
+            (
+                target["webSocketDebuggerUrl"]
+                for target in self._devtools_targets()
+                if target.get("id") == target_id and isinstance(target.get("webSocketDebuggerUrl"), str)
+            ),
+            None,
+        )
+
+    def _browser_websocket(self) -> str:
+        try:
+            request = Request(f"{self.debugging_url}/json/version", headers={"Accept": "application/json"})
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                version = json.load(response)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise ChromeOperationFailure("Chrome DevTools GET /json/version failed") from error
+        websocket = version.get("webSocketDebuggerUrl") if isinstance(version, dict) else None
+        if not isinstance(websocket, str):
+            raise ChromeOperationFailure("Chrome DevTools GET /json/version omitted the browser websocket")
+        return websocket
+
+    def _candidate_websocket(self, *, allow_service_worker: bool = False) -> str:
+        for websocket in self._control_page_websockets():
+            return websocket
+        if allow_service_worker:
+            for target_type, websocket in self._candidate_websockets():
+                if target_type == "service_worker":
+                    return websocket
+        raise ChromeOperationFailure("Chrome target discovery requires a live AgentTab extension page")
+
+    def _evaluate(
+        self,
+        expression: str,
+        operation: str,
+        *,
+        allow_service_worker: bool = False,
+    ) -> dict[str, Any]:
+        channel = DevToolsSocket(
+            self._candidate_websocket(allow_service_worker=allow_service_worker),
+            self.timeout_seconds,
+        )
         try:
             return channel.evaluate(expression, operation)
         finally:
@@ -837,6 +901,31 @@ class ChromeInspector:
         if result.get("matches") is not True or result.get("checked_count") != len(file_digests):
             raise ChromeOperationFailure("loaded AgentTab files differ from --candidate-dir")
 
+    def configure_download_directory(self, download_dir: Path) -> None:
+        if self._download_channel is not None:
+            self._download_channel.close()
+            self._download_channel = None
+        channel = DevToolsSocket(self._browser_websocket(), self.timeout_seconds)
+        try:
+            channel.command(
+                "Browser.setDownloadBehavior",
+                {
+                    "behavior": "allow",
+                    "downloadPath": os.fspath(download_dir),
+                    "eventsEnabled": True,
+                },
+                "fixture download routing",
+            )
+        except BaseException:
+            channel.close()
+            raise
+        self._download_channel = channel
+
+    def close(self) -> None:
+        if self._download_channel is not None:
+            self._download_channel.close()
+            self._download_channel = None
+
     def close_task(self, task_id: str) -> None:
         encoded_task_id = json.dumps(task_id)
         result = self._evaluate(
@@ -847,12 +936,141 @@ class ChromeInspector:
             raise ChromeOperationFailure("AgentTab task cleanup was not accepted")
 
     def request_reload(self) -> None:
+        selection_before_reload = self.selection()
+        previous_websockets = {websocket for _, websocket in self._candidate_websockets()}
+        if not previous_websockets:
+            raise ChromeOperationFailure("AgentTab reload requires a live extension target")
         result = self._evaluate(
             "(() => { setTimeout(() => chrome.runtime.reload(), 0); return { scheduled: true }; })()",
             "candidate-reload",
+            allow_service_worker=True,
         )
         if result.get("scheduled") is not True:
             raise ChromeOperationFailure("Chrome DevTools candidate reload was not scheduled")
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            current_websockets = {websocket for _, websocket in self._candidate_websockets()}
+            if previous_websockets.isdisjoint(current_websockets):
+                break
+            if time.monotonic() >= deadline:
+                raise ChromeOperationFailure("AgentTab extension targets did not unload during reload")
+            time.sleep(0.1)
+        self.create_background_extension_page(restore_selection=selection_before_reload)
+
+    def create_background_extension_page(
+        self,
+        *,
+        restore_selection: tuple[int, int] | None = None,
+    ) -> None:
+        if self._control_page_websockets():
+            self._wait_for_background_extension_page()
+            if restore_selection is not None:
+                self.restore_selection(restore_selection)
+            return
+        browser_channel = DevToolsSocket(self._browser_websocket(), self.timeout_seconds)
+        try:
+            created = browser_channel.command(
+                "Target.createTarget",
+                {
+                    "url": f"chrome-extension://{self.extension_id}/popup.html?control-bootstrap=1",
+                    "background": True,
+                },
+                "extension control bootstrap creation",
+            )
+        finally:
+            browser_channel.close()
+        bootstrap_target_id = created.get("targetId")
+        if not isinstance(bootstrap_target_id, str):
+            raise ChromeOperationFailure("Chrome DevTools did not create the extension control bootstrap")
+        deadline = time.monotonic() + self.timeout_seconds
+        result: dict[str, Any] | None = None
+        try:
+            while True:
+                bootstrap_websocket = self._target_websocket(bootstrap_target_id)
+                if bootstrap_websocket is not None:
+                    try:
+                        channel = DevToolsSocket(bootstrap_websocket, self.timeout_seconds)
+                        try:
+                            result = channel.evaluate(
+                                """(async () => {
+                                  const controlTab = await chrome.tabs.create({
+                                    url: chrome.runtime.getURL('popup.html'),
+                                    active: false,
+                                  });
+                                  return {
+                                    ready: Number.isInteger(controlTab?.id),
+                                    active: Boolean(controlTab?.active),
+                                    group_id: controlTab?.groupId,
+                                    has_opener: Number.isInteger(controlTab?.openerTabId),
+                                  };
+                                })()""",
+                                "background extension page creation",
+                            )
+                        finally:
+                            channel.close()
+                        break
+                    except (OSError, GateFailure):
+                        pass
+                if time.monotonic() >= deadline:
+                    raise ChromeOperationFailure("AgentTab extension control bootstrap did not become ready")
+                time.sleep(0.1)
+        finally:
+            browser_channel = DevToolsSocket(self._browser_websocket(), self.timeout_seconds)
+            try:
+                browser_channel.command(
+                    "Target.closeTarget",
+                    {"targetId": bootstrap_target_id},
+                    "extension control bootstrap cleanup",
+                )
+            finally:
+                browser_channel.close()
+        if (
+            result is None
+            or result.get("ready") is not True
+            or result.get("active") is not False
+            or result.get("group_id") != -1
+            or result.get("has_opener") is not False
+        ):
+            raise ChromeOperationFailure("AgentTab background extension page was not created ungrouped and inactive")
+        self._wait_for_background_extension_page()
+        if restore_selection is not None:
+            self.restore_selection(restore_selection)
+
+    def restore_selection(self, selection: tuple[int, int]) -> None:
+        window_id, tab_id = selection
+        result = self._evaluate(
+            f"""(async () => {{
+              await chrome.windows.update({window_id}, {{ focused: true }});
+              await chrome.tabs.update({tab_id}, {{ active: true }});
+              const [active] = await chrome.tabs.query({{ active: true, lastFocusedWindow: true }});
+              return {{ window_id: active?.windowId, tab_id: active?.id }};
+            }})()""",
+            "active selection restoration",
+        )
+        if result.get("window_id") != window_id or result.get("tab_id") != tab_id:
+            raise ChromeOperationFailure("AgentTab could not restore the active Chrome window and tab")
+
+    def _wait_for_background_extension_page(self) -> None:
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            for websocket in self._control_page_websockets():
+                try:
+                    channel = DevToolsSocket(websocket, self.timeout_seconds)
+                    try:
+                        result = channel.evaluate(
+                            "({ ready: document.readyState === 'complete' })",
+                            "background extension page readiness",
+                        )
+                    finally:
+                        channel.close()
+                    if result.get("ready") is True:
+                        time.sleep(0.1)
+                        return
+                except (OSError, GateFailure):
+                    continue
+            if time.monotonic() >= deadline:
+                raise ChromeOperationFailure("AgentTab background extension page did not become ready")
+            time.sleep(0.1)
 
 
 class LifecycleFixture(http.server.ThreadingHTTPServer):
@@ -1365,6 +1583,7 @@ class LiveLifecycleProbe:
                 raise GateFailure("fixture download cleanup could not remove its exact file") from error
 
     def run_one(self, run_number: int, fixture: LifecycleFixture) -> dict[str, Any]:
+        self.inspector.configure_download_directory(self.download_dir)
         fixture.download_filename = f"agenttab-permission-probe-{uuid.uuid4().hex}.txt"
         initial_state = self.inspector.state()
         run_start_permissions = initial_state["scripting"]
@@ -1384,17 +1603,24 @@ class LiveLifecycleProbe:
         self.connect()
         self.status("initial lifecycle status")
         selection_before = self.inspector.selection()
-        tab_id, _ = self.open_tab(fixture.base_url, "browser_open background task")
-        self.inspector.assert_selection_unchanged(selection_before, "browser_open background task")
-        self.assert_scripting_denied(tab_id, "browser_snapshot text while scripting denied")
-        self.assert_raw_cdp_denied(tab_id)
+        response, _ = self.client.call(
+            "browser_open",
+            {"mode": "create", "url": fixture.base_url, "background": True},
+            mutation=True,
+        )
+        require_denied("browser_open while scripting denied", response, {"permissions_required"})
+        self.inspector.assert_selection_unchanged(selection_before, "browser_open permission denial")
+        self.inspector.assert_no_debugger_attachments("initial automation denial")
 
         self.prompt(
             f"run {run_number}: optional automation grant",
             "Choose Enable AgentTab automation. Chrome grants only optional scripting; the required debugger grant remains installed.",
         )
         self.inspector.assert_permission_model(True, "grant observation")
-        self.snapshot(tab_id, "text", "browser_snapshot text after automation grant")
+        selection_before = self.inspector.selection()
+        tab_id, _ = self.open_tab(fixture.base_url, "browser_open background task")
+        self.inspector.assert_selection_unchanged(selection_before, "browser_open background task")
+        self.assert_raw_cdp_denied(tab_id)
         revision = self.assert_debugger_lifecycle(tab_id)
         self.assert_popup_and_download(tab_id, revision, fixture)
         self.assert_stale_ref(tab_id, revision, fixture)
@@ -1483,6 +1709,7 @@ class LiveLifecycleProbe:
         )
         self.reconnect_until_ready("Resume agents")
 
+        selection_before_extension_disable = self.inspector.selection()
         self.prompt(
             f"run {run_number}: extension disable recovery",
             "In chrome://extensions, disable AgentTab. Do not change any other extension or Chrome setting.",
@@ -1493,7 +1720,10 @@ class LiveLifecycleProbe:
         self.assert_core_unavailable("AgentTab disable")
         self.prompt(
             f"run {run_number}: extension restore",
-            "Re-enable AgentTab in chrome://extensions, then open or reload its wake page without changing permissions.",
+            "Re-enable AgentTab in chrome://extensions without changing permissions.",
+        )
+        self.inspector.create_background_extension_page(
+            restore_selection=selection_before_extension_disable,
         )
         self.reconnect_until_ready("AgentTab re-enable")
         self.inspector.assert_permission_model(True, "post-disable re-enable")
@@ -1518,6 +1748,7 @@ class LiveLifecycleProbe:
                     "transactional cleanup preparation",
                     "Ensure AgentTab is enabled, agents are resumed, and any active handoff is complete.",
                 )
+                self.inspector.create_background_extension_page()
                 self.reconnect_until_ready("transactional cleanup preparation")
                 self.close_owned_tabs()
             if fixture_filename:
@@ -1540,6 +1771,7 @@ class LiveLifecycleProbe:
                 )
         finally:
             self.client.close()
+            self.inspector.close()
 
 
 def verify_live(args: argparse.Namespace) -> dict[str, Any]:
@@ -1595,11 +1827,11 @@ def verify_live(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def print_live_prerequisites() -> None:
-    print("Live lifecycle prerequisites (the probe refuses to supply or alter them):")
+    print("Live lifecycle prerequisites (the operator must supply them before the probe begins):")
     print("  1. A disposable trusted macOS Chrome profile has the exact packages/extension/dist AgentTab candidate loaded.")
-    print("  2. Chrome was started with a loopback remote-debugging endpoint and the candidate extension target is live.")
+    print("  2. Chrome was started with a loopback remote-debugging endpoint and an AgentTab extension page is open.")
     print("  3. The AgentTab Rust host is READY on a current-user 0600 Unix socket; no TCP token endpoint is accepted.")
-    print("  4. --download-dir already exists, is disposable, and is Chrome's configured download directory for that profile.")
+    print("  4. --download-dir already exists and is disposable; the probe temporarily routes Chrome downloads there.")
     print("  5. An operator can perform the prompted AgentTab/Chrome UI permission, pause, disable, and restore steps.")
     print("  6. --host-restart-command is the runner's reviewed Rust-host restart argv encoded as JSON; it is never shell-evaluated.")
     print("")

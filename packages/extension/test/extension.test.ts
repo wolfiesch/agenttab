@@ -1516,6 +1516,35 @@ describe("ownership and task isolation", () => {
     expect(removedTabIds).toEqual([]);
   });
 
+  test("adopts a debugger-correlated popup despite Chrome's wrong opener and inherited group", async () => {
+    await seedTask(TASK_A, [21]);
+    tabStore.set(99, {
+      id: 99,
+      windowId: 1,
+      groupId: 9,
+      active: true,
+      url: "chrome-extension://agenttab/popup.html",
+    });
+    tabStore.set(22, {
+      id: 22,
+      windowId: 1,
+      groupId: 9,
+      active: false,
+      openerTabId: 99,
+      url: "https://example.test/child",
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    await ownership.adoptOwnedChild(tabStore.get(22) ?? {}, 21);
+
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21, 22]);
+    expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 5, active: false });
+  });
+
   test("preserves a child in a foreign tab group despite its owned opener", async () => {
     await seedTask(TASK_A, [21]);
     tabStore.set(22, {
@@ -1980,7 +2009,53 @@ describe("consequential action staging", () => {
     expect(focusedWindowUpdates).toEqual([]);
   });
 
+  test("correlates a background popup with its task source when Chrome reports the active tab as opener", async () => {
+    const popupUrl = "https://example.test/popup";
+    tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    const adopted: Array<{ parentTabId: number; childTabId: number }> = [];
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Runtime.callFunctionOn" && params.functionDeclaration === "function(){this.click()}") {
+        for (const tab of tabStore.values()) {
+          if (tab.windowId === 1) tab.active = false;
+        }
+        tabStore.set(91, {
+          id: 91,
+          windowId: 1,
+          groupId: -1,
+          active: true,
+          openerTabId: 90,
+          url: popupUrl,
+        });
+        emitDebuggerEvent(7, "Page.windowOpen", { url: popupUrl, userGesture: true });
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+      async () => undefined,
+      async () => undefined,
+      async (parentTabId, childTabId) => {
+        adopted.push({ parentTabId, childTabId });
+      },
+    );
+    const pageRevision = await revisions.ensure(7);
+    const prepared = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
 
+    await runtime.commit(TASK_A, { native_token: prepared.staged?.native_token });
+    await waitForCondition(() => adopted.length === 1 && tabStore.get(90)?.active === true);
+
+    expect(adopted).toEqual([{ parentTabId: 7, childTabId: 91 }]);
+    expect(tabStore.get(90)?.active).toBe(true);
+    expect(tabStore.get(91)?.active).toBe(false);
+    expect(focusedWindowUpdates).toEqual([1]);
+  });
 
   test("rejects dialog acceptance staging when no JavaScript dialog is open", async () => {
     const revisions = new RevisionTracker();
