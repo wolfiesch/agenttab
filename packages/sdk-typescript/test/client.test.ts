@@ -241,7 +241,8 @@ test("durably stages and confirms resumed capability rotation before returning",
 });
 
 test("published SDK dist completes durable resume confirmation", async () => {
-  const published = await import("../dist/index.js");
+  const publishedEntry = new URL("../dist/index.js", import.meta.url);
+  const published = await import(publishedEntry.href);
   const stateDir = mkdtempSync(join(tmpdir(), "agenttab-sdk-dist-state-"));
   roots.push(stateDir);
   const store = published.createResumeCapabilityStore("mcp", {
