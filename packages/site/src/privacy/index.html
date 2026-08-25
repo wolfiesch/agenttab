@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="description" content="AgentTab privacy policy for its local browser runtime for AI agents.">
+    <title>Privacy | AgentTab</title>
+    <link rel="stylesheet" href="../styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell nav-shell">
+        <a class="brand" href="../" aria-label="AgentTab home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>AgentTab</span>
+        </a>
+        <nav aria-label="Primary navigation">
+          <a href="../#how-it-works">How it works</a>
+          <a href="../#trust">Trust boundary</a>
+          <a aria-current="page" href="./">Privacy</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main-content" class="privacy-page shell">
+      <article>
+        <header class="privacy-hero">
+          <p class="eyebrow">Privacy policy</p>
+          <h1>Private browser work should stay local.</h1>
+          <p class="privacy-lede">AgentTab is designed as a local browser runtime for AI agents. Its v2.0.0-rc.1 release candidate is unreleased. This policy describes the planned local behavior of v2 and is not an availability notice.</p>
+        </header>
+
+        <section class="policy-highlight" aria-labelledby="privacy-summary-title">
+          <h2 id="privacy-summary-title">The short version</h2>
+          <dl class="privacy-facts">
+            <div>
+              <dt>Where AgentTab runs</dt>
+              <dd>On your device, beside your signed-in Chrome profile.</dd>
+            </div>
+            <div>
+              <dt>Telemetry</dt>
+              <dd>None. AgentTab does not send analytics, diagnostics, or usage telemetry.</dd>
+            </div>
+            <div>
+              <dt>Data collection</dt>
+              <dd>AgentTab does not collect, sell, or share personal data.</dd>
+            </div>
+            <div>
+              <dt>Remote service</dt>
+              <dd>There is no remote AgentTab service.</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section aria-labelledby="local-title">
+          <h2 id="local-title">Local processing</h2>
+          <p>AgentTab connects a local runtime to your signed-in Chrome profile. Browser work and the task state needed to coordinate it remain on your device. AgentTab is not a proxy for your browser traffic and does not route browser data through an AgentTab-operated server.</p>
+          <p>The local runtime may retain task state or a local receipt needed to safely resume work or show its status. That information remains under your device and account controls.</p>
+        </section>
+
+        <section aria-labelledby="collection-title">
+          <h2 id="collection-title">No telemetry or data brokerage</h2>
+          <p>AgentTab does not collect personal data for analytics, advertising, profiling, or product telemetry. It does not sell or share personal data. It does not operate a remote AgentTab service that receives your browser content, credentials, cookies, storage, or task activity.</p>
+        </section>
+
+        <section aria-labelledby="third-party-title">
+          <h2 id="third-party-title">When an agent uses a website</h2>
+          <p>An agent can interact with a third-party site through the Chrome profile you choose to use. That site can receive information through the actions you direct, just as it can when you use the site yourself. Those sites have their own terms and privacy practices. AgentTab does not become the recipient of that site data or a middle layer for it.</p>
+        </section>
+
+        <section aria-labelledby="boundaries-title">
+          <h2 id="boundaries-title">Security boundaries and limits</h2>
+          <p>Task ownership limits agent execution and coordination to visible task workspaces. It is not cookie, identity, or browser-profile isolation. Standard mode does not provide raw cookies, storage, passwords, arbitrary JavaScript, raw Chrome DevTools Protocol access, or coordinate actions.</p>
+          <p>For passwords, passkeys, 2FA, CAPTCHAs, payment secrets, and other human-only input, AgentTab uses Your Turn handoff. During handoff, the agent is not allowed to observe or capture that interaction.</p>
+          <p>Commit stages recognizable sends, publishing, purchases, deletion, uploads, authorization, and permission grants for review. This is a best-effort safety measure. Prompt injection and page behavior can still create risks, and Commit cannot guarantee recognition of every external effect.</p>
+        </section>
+
+        <aside class="policy-note" aria-labelledby="policy-note-title">
+          <h2 id="policy-note-title">Use deliberate review</h2>
+          <p>Review the active website, the agent request, and every staged consequential action before proceeding. Do not treat a website label or a staged action as proof of the page's intent.</p>
+        </aside>
+
+        <p class="back-link"><a href="../"><span aria-hidden="true">←</span> Back to AgentTab</a></p>
+      </article>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-layout">
+        <a class="brand" href="../" aria-label="AgentTab home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>AgentTab</span>
+        </a>
+        <p>AgentTab v2.0.0-rc.1 is unreleased.</p>
+        <a aria-current="page" href="./">Privacy</a>
+      </div>
+    </footer>
+  </body>
+</html>

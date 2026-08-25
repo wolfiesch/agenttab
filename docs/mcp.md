@@ -1,170 +1,136 @@
-# MCP server
+# AgentTab MCP
 
-## MCP server
+AgentTab exposes a small local MCP adapter for task-owned browser work. v2 is currently unreleased source at `2.0.0-rc.1`. Neither `agenttab` nor `agenttab-mcp` is a public package today, so the configurations below describe the exact future and approved-local setup rather than a live install.
 
-`mcp/` exposes the bridge to MCP clients (Claude Desktop, Cursor, Cline) so an agent drives your real, logged-in Chrome profile through the standard Model Context Protocol. It is a pure client of the token-gated `127.0.0.1:9223` TCP API; the extension, wire protocol, and host are unchanged.
+The adapter is stdio only. Standard mode uses local AgentTab IPC behind the adapter, not TCP, a bearer token, a manual JSON protocol, a Python host, resources, prompts, or a legacy 67-tool surface.
 
-The server uses one serialized persistent TCP connection with the same newline-framed request contract as `test_client.py`. It reconnects only before sending; a timeout or disconnect after a send is never replayed.
+## Prerequisites
 
-### Tools
+Before starting the adapter, an approved local installation must have:
 
-The MCP server ships a grouped tool set. Legacy tab-scoped tools take an optional `tab_id`; omitting it targets the active tab. New workstreams should start with `browser_task_session_open`, which creates an owned task group, navigates it inactive, waits, and snapshots in one call. If task-session setup is policy-denied, repair the active policy and retry; do not fall back to an unowned shared-profile tab.
+1. An enabled AgentTab extension in Chrome 127 or later.
+2. Chrome's required `debugger` permission present from installation and the optional `scripting` permission granted from the AgentTab popup.
+3. A running `dev.agenttab.host` connected to the extension through Native Messaging.
+4. Local IPC readiness. Check it with `agenttab doctor --layer ipc` after the command is available.
 
-Read-only:
+The current installer plans supported client configurations transactionally. It stages an unpacked extension for prerelease testing and does not claim that a Chrome Web Store extension is live. See [Setup](setup.md).
 
-- `browser_ready` - one bounded readiness operation for the TCP endpoint, native backend, and extension. It replaces repeated `ping`/tab-list/policy probes and reports `ready`, `endpointStatus`, `backend`, `extension`, `attempts`, `elapsedMs`, and a short failure reason without page content
-- `browser_list_tabs`
-- `browser_task_session_list`
-- `browser_snapshot` (compact by default; filter by roles/name/limit or request full details). Every node carries a stable `ref` such as `e12` that any selector argument accepts as `ref=e12`; `diff=True` returns `added`/`removed`/`changed` against the previous snapshot of that tab with `baseEpoch`/`epoch`, and returns the full snapshot with `diffBase: true` when there is no baseline yet. `include_active_dialog=True` wraps the result with explicit active-modal context even if role filters omit the dialog
-- `browser_extract_text` - visible page text; `scan_prompt_injection=True` adds an `injectionScan` block (`risk`, bounded `matches`, `scannedChars`) without changing the existing fields
-- `browser_extract_structured` - extract schema-described fields as validated JSON. `schema` is a JSON Schema subset (`object`, `array`, `string`, `number`, `boolean`, plus `enum`, `required`, `properties`, `items`); anything outside it is rejected instead of ignored. Mapping is deterministic and heuristic (labels, headings, table headers, `dl` pairs, `aria-label`, `name` attributes, `Key: value` lines) with no model inference, `selector` scopes the read, unresolved optional fields are omitted, and missing required fields come back in `errors` alongside `data` and `schemaVersion`. Raw page text is never returned; extracted values are still untrusted page content
-- `browser_scan_prompt_injection` - heuristic posture scan for instruction-like page text aimed at an agent, its tools, its secrets, or its policy. Returns `risk` (`low`/`medium`/`high`), `matches` with `kind`, `severity`, and a 160-character snippet cap, and `scannedChars`; full page text is never returned. A hit is a warning, never a permission grant or denial by itself
-- `browser_console_messages` - buffered console entries for a monitored tab (start monitoring first via `browser_action` `startMonitoring`). Each entry carries a `stack` of raw generated frames (`url`, 0-based `lineNumber`/`columnNumber`, `functionName`); `resolve_source_maps=True` adds best-effort `originalLocation` (`source`, `name`, 0-based `lineNumber`/`columnNumber`) or a `sourceMapStatus` of `notFound`, `invalid`, `unmapped`, or `crossOriginRefused`. Only same-origin or inline maps are read and source text is never returned, but resolved `source` paths can expose a site's private build layout
-- `browser_screenshot` (returned inline as an image)
-- `browser_save_pdf` - print a tab to PDF on the background-safe debugger path, write it to a caller-supplied local path, and return only path, MIME type, and byte count (annotated read-only: the page is not mutated)
-- `browser_get_html`, `browser_lease_status`
-- `browser_policy_check` - ask the host what its policy would decide for an action/payload without forwarding it. The verdict includes `siteMode`: the per-site permission mode (`manual`/`auto`/`skip`, or null when no origin is known or no `siteModes` pattern matches) that the host folded into `confirmationRequired`, and `effectiveTier`: `read_only` or `mutating` for that exact action **and payload**
-- `browser_plan_preview` - preflight a list of up to 50 `{action, origin, payload}` steps against host policy in one call; returns a per-step verdict (`step`, `action`, `allowed`, `reason`, `confirmationRequired`, `redact`, `audit`, `originDependent`, `siteMode`, `effectiveTier`) and forwards nothing
-- `browser_wait_for` (`mode`: `load|selector|text|url`)
-- `browser_expect` (`mode`: `selector|text|url|schema`) - assert a deterministic postcondition. `selector` passes when the selector resolves (full locator grammar, including `ref=eN`), `text` when the page text contains `text`, `url` when the tab URL contains `url_substring`, and `schema` when structured extraction against `schema` reports no `missingRequired` errors. `negate=True` inverts the outcome, which is how absence is asserted, and the check polls until the condition holds or `timeout_ms` elapses (default 5000, capped at 60000). No model judges the outcome: the result is `mode`, `negate`, `passed`, `attempts`, `elapsedMs`, plus a short `reason` when it failed. The matched element, matched text, tab URL, and extracted values are never returned, so a failing assertion is not a back-door page read
-- `browser_trace_summary` / `browser_trace_tail` - read a local session trace artifact written by the host when policy sets `traceDir`. Summary returns event counts by action and decision, the time range, and duration totals; tail returns the most recent events (`ts`, `action`, `decision`, `reason`, `requestId`, `durationMs`, `targets`, `traceId`, `responseHash`, `snapshotHash`, `success`, plus `otelTraceId`/`otelSpanId` naming the exported span when the host's opt-in OpenTelemetry spans are enabled and `null` otherwise). Both are metadata only: a trace stores no payload, no response body, and no page content. `trace_dir` overrides the host's configured directory
+## Exact stdio setup
 
-Sensitive:
+The MCP server command is:
 
-- `browser_get_cookies`
-- `browser_session_status` - redacted auth/session probe (cookie names/counts + `loggedIn` per domain, never values)
-- `browser_search_history` - search the real profile's browsing history (url, title, `lastVisitTime`, `visitCount`; `max_results` capped at 100)
-- `browser_search_bookmarks` - search the real profile's bookmarks (id, title, url, parent folder path)
-- `browser_search_tabs` - search visible text across every open http/https tab; returns tab id, origin host, match count, and bounded snippets. Gated as sensitive because the snippets come from **every** tab of the real profile, including mail, docs, and consoles the agent was never pointed at
+```text
+agenttab mcp
+```
+The adapter implements MCP protocol version `2025-03-26` over newline-delimited JSON-RPC 2.0 on stdin and stdout. MCP clients manage that transport; do not send Core RPC frames to the stdio process by hand.
 
-Mutating:
 
-- `browser_navigate` - open an inactive but unowned tab in the shared Chrome profile. This legacy path has no automatic cleanup contract; retain the tab id and close it explicitly
-- `browser_navigate_and_snapshot` - create an unowned tab or reuse an explicitly supplied task session, wait for `load`, URL, or a selector, and return the tab id plus a compact accessibility snapshot in one request. URL waits require `url_substring`. The snapshot is withheld after a cross-origin redirect; the MCP failure message includes cleanup tab/window ids but omits the settled page URL, so observe the destination separately through the normal live-origin gate. Prefer `browser_task_session_open` for a new workstream
-- `browser_task_session_open` - preflights creation, navigation, and cleanup in one host-side policy plan before creating an owned task session, then navigates it in the background, waits, snapshots, and refreshes ownership metadata in one MCP call. A denied or confirmation-required preflight step returns actionable policy metadata without creating a session; invalid wait arguments also fail before session creation. A navigation failure closes the newly created session before returning the error
-- `browser_task_session_create`, `browser_task_session_navigate`, `browser_task_session_state`, `browser_task_session_close`. Tabs opened by a task-owned tab are adopted automatically through `openerTabId` and close with the session
-- `browser_click`, `browser_type`, `browser_fill`, `browser_hover` - selectors accept `ref=e12` from `browser_snapshot` alongside CSS and the `text=`/`aria=`/`label=`/`role=` prefixes. Refs are invalidated by navigation and by an extension service-worker restart; a stale ref fails with `error: staleRef` instead of matching a different element, so re-snapshot. `browser_click` blocks targets outside an active modal and reports immediate navigation, dialog, source-tab closure, and adopted child-tab effects after a bounded settle. In inactive tabs, HTTP(S) links with `target="_blank"` open explicitly in the background with their opener preserved, so the task session owns and later closes them.
-- `browser_click_at` - click raw viewport coordinates; no element is resolved, so nothing identifies the target in the audit log. Prefer `browser_click`; the sample policy confirmation-gates `clickAt`
-- `browser_scroll`, `browser_drag`
-- `browser_select`
-- `browser_insert_rich_text` - insert a constrained node tree into a contenteditable editor without arbitrary JavaScript. Text nodes contain only `text`; element nodes use an allowlisted `tag` (`p`, `br`, `strong`, `em`, `code`, `pre`, `ul`, `ol`, `li`, `a`, `h1` through `h3`, or `blockquote`) plus optional `children`. Only links accept another field, an absolute HTTP(S) or `mailto` `href`. Unknown fields, unsafe URLs, excessive depth, node count, and text length are rejected before the editor is changed
-- `browser_upload_file` (validates local paths before contacting Chrome)
-- `browser_github_attach_pr_body` (opens only the GitHub PR-body editor, attaches files, waits for CDN URLs, and saves)
-- `browser_tab_control` (`op`: `activate|close|reload|back|forward`), `browser_lease`, `browser_release`
-- `browser_window_control` (`op`: `list|create|focus|setState|close`) - `list` returns only window id/focus/state/type/tab count, never tab URLs or titles; `create` is unfocused unless `focused=True`; `close` is destructive and refuses to close the last remaining normal window
-- `browser_set_cpu_throttling`, `browser_set_network_conditions`, `browser_clear_network_conditions`, `browser_set_color_scheme`, `browser_set_user_agent`
-- `browser_start_screencast`, `browser_stop_screencast` - record a background tab through CDP `Page.startScreencast` without activating it. Frames buffer only in the extension service worker (a worker restart ends the recording) and the buffer is bounded at 600 frames or ~50MB, dropping and counting the oldest frames past either bound. Continuous capture of a real profile is high-exposure, so the example policy confirmation-gates `startScreencast`; drain with `browser_screencast_save` before stopping, because `browser_stop_screencast` discards whatever is still buffered
-- `browser_screencast_save` - drain the tab's buffered screencast frames to numbered image files plus a `frames.json` manifest in a caller-supplied directory, returning only directory, frame count, dropped count, byte total, manifest path, and `staleArtifactsRemoved`. It does not mutate the page, but it is **not** read-only: it consumes the extension's frame buffer (the frames are gone afterward) and writes local files, so it is annotated mutating and is dropped under `BRIDGE_MCP_READONLY=1`. The destination is created and validated before any frame is drained, and only artifacts a prior save wrote (`frame-*.png`, `frame-*.jpg`, `frames.json`, `screencast.mp4`) are removed first, so a shorter second save cannot present an earlier recording's frames as its own
-- `browser_cache_selectors` (`op`: `list|export|clear|import`) - inspect or manage the extension's semantic-selector resolution cache. An entry maps a `urlPattern` plus a `text=`/`label=`/`role=`/`aria=` selector to the CSS path that last resolved to that element; CSS selectors are never cached and an imported non-semantic entry is rejected. `clear` and `import` mutate that cache, so the tool is annotated mutating and is dropped under `BRIDGE_MCP_READONLY=1`. The CLI `chrome-bridge cache selectors` commands own the file-backed copy
-- `browser_wait_for_handoff` - pause automation, mark the task group as needing review, focus the real tab with a compact bottom card, and wait for a human to finish login/2FA/captcha before resuming
-- `browser_credential_handoff` - hand ONE field to the human so a password, passphrase, recovery code, or one-time code is typed straight into the page. Use it instead of `browser_fill` for anything secret. The tool focuses the tab, window, and the field named by `selector` (CSS, semantic, or `ref=eN`) and waits. The field value is never read, logged, measured, or returned: the injected probe reports only whether the field is empty, and the response carries `filled: true` with no value-derived datum, not even a character count. `mode` is `filled` (default; resolves on a short run of consecutive non-empty probes, which debounces a partially typed value) or `submitted` (resolves when the field's own form submits or the tab navigates). For the whole window the native host holds a handoff blackout over the tab, so every observation action is denied to every client, including this one.
-- `browser_resolve_cached_selector` - resolve a selector to a stable `ref=eN` plus a concrete CSS path. A cached resolution is served only when the cached CSS path and the original semantic selector resolve to the **same live DOM node** (compared by backend node id); if the page replaced the element the semantic selector names, the cached path is discarded and the semantic selector is re-resolved with `selfHealed: true`, even though the old path still resolves. Imported entries go through the same check. Returns element identity only, never element text or page content; `refresh=True` skips the cache, and frame/shadow selectors report `cacheable: false`
-- `browser_confirm_action` - resend an action with a host-issued confirmation token
-- `browser_confirm` - resume the exact pending action from only its host-issued token
-
-Sensitive and mutating (require `BRIDGE_MCP_ALLOW_SENSITIVE=1`, confirmation-gated by the example policy):
-
-- `browser_set_cookie` - write one cookie; the response reports name and domain only, never the value
-- `browser_delete_cookie` - remove one cookie; destructive, can sign the profile out of a site
-- `browser_set_storage_item`, `browser_remove_storage_item` - write or remove one `local`/`session` storage entry; responses echo scope and key only
-- `browser_clear_storage` - clear `local`, `session`, or `both` for the tab origin; destructive, reports removed key counts only
-- `browser_replay_workflow` - replay a recorded `{version, name, steps, policy}` workflow. **It reproduces real mutating actions**: every step runs through the normal host policy, lease, and confirmation gates, and a step whose live tab origin is not in `policy.requiredOrigins` is refused. Values recorded as `<redacted>` must be supplied in `bindings` keyed `step<N>.<field>`; the whole workflow is refused before any step runs when one is missing. Version 1 and version 2 files are both accepted; a version-2 step may carry an `expect` postcondition (same shape as `browser_expect` minus the tab) and a bounded `retry` (`max` clamped `0..5`, `delayMs` clamped `0..10000`), and a nested `expect` is origin-checked host-side like any other tab-scoped action. Returns per-step outcomes with `attempts`, `retried`, and `expectPassed`, the `retriedSteps`/`expectFailedSteps` totals, `selfHealed` flags, and the refreshed selector cache
-
-Escape hatch (sensitive):
-
-- `browser_action` - escape hatch for any raw bridge action (interception, geolocation, monitoring, console/network logs, `downloadUrl`, `storageState`, `executeScript`, `setViewport`, `handleDialog`, `batch`, ...). A `"dryRun": true` entry in `payload` is passed through to the host as the request-level dry-run flag: the host evaluates policy, lease, and confirmation state and returns `{dryRun, wouldForward, verdict}` without forwarding the action to Chrome.
-
-### Resources
-
-- `browser://tabs` - live tab list.
-- `browser://tab/{id}/state` - current state of a tab.
-
-### Scoping
-
-The server reads two env flags to scope the exposed surface:
-
-- `BRIDGE_MCP_READONLY=1` registers only the read-only tools, hiding navigate/click/type/upload, tab mutations, `browser_confirm_action`, `browser_action`, and the two local-side-effect tools `browser_screencast_save` and `browser_cache_selectors`.
-- `BRIDGE_MCP_ALLOW_SENSITIVE=1` is required to expose sensitive tools (`browser_get_cookies`, `browser_session_status`, `browser_search_history`, `browser_search_bookmarks`, `browser_search_tabs`, the cookie/storage write tools, `browser_replay_workflow`, and the raw `browser_action` escape hatch), which are hidden by default. The host policy remains the enforcement boundary even when this escape hatch is exposed.
-
-Tools carry `readOnly`/`destructive` annotations so clients can prompt appropriately. An MCP annotation is **static per tool**, so it cannot describe a call whose tier depends on its arguments: those annotations stay deliberately conservative and the authoritative tier is the `effectiveTier` the host computes per call. Two tools where the difference matters:
-
-- `browser_batch` is annotated mutating, but host-side a batch is `read_only` only when **every** step is; one mutating step makes the whole batch mutating, and under a `manual` origin that is what decides whether the batch needs a confirmation token. Typed batch steps include interaction/wait primitives plus `expect`, `observe`, `extractStructured`, `extractText`, and `getCurrentState`, so a deterministic action, assertion, and compact observation can stay in one outer call. Each `extractText` step is clamped to 20,000 characters, and `observe` with `diff: true` is rejected so a batch cannot consume the standalone diff baseline. Ask `browser_policy_check(action="batch", payload={...})` for the computed tier before a sensitive sequence.
-- `browser_batch` and `browser_replay_workflow` cannot carry a handoff. A composite whose steps include `waitForHandoff` or `credentialHandoff` is denied host-side as `batch step <n>: handoff not allowed in a composite` before anything is forwarded, because the composite's later steps run inside the extension and could observe the tab while the human is still typing. Call `browser_wait_for_handoff` / `browser_credential_handoff` on their own, then send the rest of the sequence.
-- `browser_screencast_save` is annotated mutating because it always sends `consume: true`. The underlying `screencastFrames` action is nominally read-only and escalates to `mutating` precisely because of that flag, which drains the tab's frame buffer irrecoverably.
-
-The full escalation table (`screencastFrames.consume`, `cacheSelectors.op`, `resolveCachedSelector.cache`) is in docs/security.md.
-
-MCP deliberately exposes **no policy-mutation and no scheduling tool**. Reading a verdict (`browser_policy_check`, `browser_plan_preview`) is safe; rewriting the file that produces verdicts is not something an agent should do through the same channel it is being governed by. Change per-site permission modes with `chrome-bridge policy site-mode <originPattern> manual|auto|skip [client]` / `chrome-bridge policy clear-site-mode <originPattern> [client]`, and register scheduled-workflow metadata with `chrome-bridge schedule workflow ... --at|--interval` (which starts nothing - see docs/security.md). Both edit local files under the human's control; the host stays the enforcement boundary either way. If you need the raw escape hatch for a host action, `browser_action` still forwards one action and is still fully policy-gated.
-
-The same applies to the egress allowlist. `egressAllowlist` bounds where an agent may make the browser send a new outbound request (`navigate`, `navigateTaskSession`, `navigateAndSnapshot`, `downloadUrl`, `setCookie`, and those actions nested in a `batch`/`replayWorkflow` step), and it is **CLI-managed only**: grant with `chrome-bridge policy allow-egress <pattern> [client]`, remove with `chrome-bridge policy clear-egress <pattern> [client]`. There is no MCP tool that edits it. What MCP does report is the resulting denial: `browser_policy_check` (and `browser_plan_preview`, per step) answers `allowed: false` with `reason: "egress not allowed"`, and a live call fails with `policy denied: egress not allowed` plus a `policyDenial` whose `kind` is `egress` and whose `targets` name the destination.
-
-The same applies to the DLP channel modes. `dlp` attaches `allow`/`audit`/`block` to a channel and is **CLI-managed only**: `chrome-bridge policy dlp <clipboard|upload|download|screenShare> allow|audit|block [client]`. There is no MCP tool that edits it. What MCP reports is the resolved mode: every `browser_policy_check` verdict (and every `browser_plan_preview` step) carries `dlp`, the mode for that action's channel, or `null` when the action belongs to no channel. A `block` answers `allowed: false` with `reason: "dlp blocked"`, and a live call fails with `policy denied: dlp blocked` plus a `policyDenial` whose `kind` is `dlp` and whose `dlpChannel` names the channel. The host enforces `upload` (`browser_upload_file`, `browser_github_attach_pr_body`), `download` (`downloadUrl` through `browser_action`), and `screenShare` (`browser_start_screencast`, `browser_screencast_save`), and it refuses before forwarding, so a blocked upload never reaches CDP `DOM.setFileInputFiles` and no file is opened. `clipboard` is declared but has **no chokepoint**: no bridge action reads or writes the clipboard and a page-driven copy never crosses the bridge, so a clipboard mode enforces nothing. See docs/security.md.
-
-### Efficient agent workflow
-
-1. Call `browser_ready` once when bridge state is unknown. Retry typed MCP tools after it succeeds; do not fall back to repeated CLI probes.
-2. Create one task session per workstream. Retain returned tab ids and pass them explicitly instead of repeatedly listing or activating tabs.
-3. Prefer `browser_navigate_and_snapshot` for a new page. Use compact snapshots and `ref=eN` selectors; re-snapshot only after navigation, an extension restart, or a stale-ref failure.
-4. Use `browser_batch` for known same-tab sequences. Put deterministic `expect` and compact observation/extraction steps in the same batch when their results are needed only at the end.
-5. Use `browser_insert_rich_text` for supported contenteditable editors. Keep `executeScript` and `executeScriptCDP` for unsupported page behavior; their confirmation boundary is unchanged.
-6. Activate a tab only for native UI visibility or human handoff. Background navigation, CDP input, snapshots, and screenshots do not need activation.
-
-### Register
-
-Copy `mcp/claude_desktop_config.example.json` into your MCP client config and set the absolute paths:
+After a local installer run, supported client configuration receives an absolute AgentTab wrapper command with the single argument `mcp`. For a manual configuration, use the following only when `agenttab` resolves to that installed wrapper in the client process environment:
 
 ```json
 {
   "mcpServers": {
-    "chrome-bridge": {
-      "command": "uvx",
-      "args": ["--from", "/ABSOLUTE/PATH/TO/chrome-bridge/mcp", "chrome-bridge-mcp"],
-      "env": {
-        "BRIDGE_REPO_ROOT": "/ABSOLUTE/PATH/TO/chrome-bridge",
-        "BRIDGE_PORT": "9223"
-      }
+    "agenttab": {
+      "command": "agenttab",
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-The server honors `BRIDGE_PORT`, `BRIDGE_TOKEN_FILE`, `BRIDGE_CONNECT_TIMEOUT_SECONDS`, `BRIDGE_MCP_RECONNECT_DELAY_MS`, `BRIDGE_MCP_READONLY`, and `BRIDGE_MCP_ALLOW_SENSITIVE`, and reads the same `bridge_token.txt`. Chrome with the loaded extension must be running and the native host registered (`./setup.sh` or `./setup-rs.sh`). Repo-local helpers are loaded from `BRIDGE_REPO_ROOT`, so packaged `uvx` launches do not need a separate `PYTHONPATH` entry.
+The installer recognizes and updates the existing JSON configuration locations for Claude Desktop, Cursor, Windsurf, and `~/.config/mcp/mcp.json` when the file or client directory exists and the configuration is valid. It adds the same `mcpServers.agenttab` entry and preserves other entries. A malformed file is skipped without mutation.
 
-If TCP connection setup fails before the host receives an action, MCP waits briefly and retries once. It deliberately does not replay timeouts or empty responses because a mutating action may already have run. If the MCP process itself is unavailable, the MCP client still owns restarting that process; the packaged-startup fix prevents the former sibling-import crash that caused this symptom while the CLI remained healthy.
+The package coordinate for the direct stdio binary is `agenttab-mcp`; its executable is `agenttab-mcp`, with no command-line options. The installer package coordinate and CLI are both `agenttab`. These names are reserved in the local release contract but are not evidence of public registry availability.
 
-### HTTP transport
+### Client examples
 
-By default the server speaks stdio. Set `BRIDGE_MCP_TRANSPORT=http` to serve over streamable HTTP instead, bound to `BRIDGE_MCP_HTTP_HOST` (default `127.0.0.1`) and `BRIDGE_MCP_HTTP_PORT` (default `8723`).
+The same `agenttab mcp` entry is the manual shape for Claude Desktop, Cursor, Windsurf, and another stdio-MCP client. Do not put a profile path, port, token, or `AGENTTAB_SOCKET` override in routine client configuration.
 
-#### Per-request bridge tokens
+For OMP, the private package coordinate is `@agenttab/omp`. The installer adds its local built extension path to OMP `config.yml` when that file or its parent exists and parses as valid YAML. The OMP adapter registers the same seven Standard tools. There is no OMP package publication claim or separate network endpoint.
 
-One HTTP endpoint can serve several agents, each with its own bridge identity. Every request may carry a named bridge token:
+## Connection and durable resume
 
-- `Authorization: Bearer <bridge-token>` - preferred.
-- `X-Bridge-Token: <bridge-token>` - fallback for clients that reserve `Authorization` for something else.
+An MCP server process opens one AgentTab Core connection when it first calls a tool. The host lazily creates the task on the first browser operation. That connection owns the task and may list or mutate only that task's tabs.
 
-Precedence: a valid `Bearer` value wins; otherwise `X-Bridge-Token` is used; if neither header is present the request falls back to the server's ambient `bridge_token.txt` identity, so existing single-identity HTTP setups keep working unchanged. This is always on - no feature flag - and stdio is unaffected (there is no HTTP request behind a stdio tool call, so the ambient token is always used).
+Set `AGENTTAB_CONVERSATION_ID` only when the MCP client can provide one stable, private conversation scope. With it, the adapter stores a resume capability in an owner-only local state file under the AgentTab state directory. On reconnect it offers the stored capability, the host returns a replacement capability, the adapter durably records it, confirms it on that connection, and then activates the replacement. A failed durable confirmation closes the connection instead of treating the task as resumed.
 
-The header token is passed straight to the native host as that request's token. The host resolves it to a client name from `bridge_tokens.txt`, so per-request identity drives policy scoping, audit attribution, and cooperative leasing. An unknown token is rejected by the host with its usual `unauthorized` error; token values are never logged by the MCP server or included in its error text. Both hosts close the TCP connection after that reply, so the shared persistent transport discards its socket and the next request opens a fresh one - a rejected request cannot disrupt the authenticated callers sharing the process, and nothing is replayed because it never reached the extension.
+`AGENTTAB_CONVERSATION_ID` is non-authoritative metadata. The opaque resume capability is the authorization proof and must never be copied into a client config, prompt, log, or shared state. Without a valid capability, a new connection receives a new task; the previous task is not silently shared. The host can rotate a capability with task responses, and the adapter persists the replacement before resolving that response to the caller.
 
-Two agents against one endpoint:
+For MCP, the capability store namespace is `mcp`; for OMP it is `omp`. Both hash the supplied conversation scope into the owner-only filename. See [Commands](commands.md#adapter-environment) for environment variables and [Core RPC connection schema](../schemas/rpc/v1/connection.schema.json) for the connection envelope.
 
+## Seven Standard tools
+
+| Tool | Required input and behavior |
+|---|---|
+| `browser_open` | `mode: "create"` optionally accepts an `http`, `https`, or `about` URL and `background`; it creates a task tab. `mode: "adopt_active"` explicitly adopts only the currently active tab. It returns task, tab, and page-revision identifiers. |
+| `browser_snapshot` | Requires `tab_id`. Modes are `accessibility`, `text`, `html`, and `screenshot`. Only accessibility snapshots return revisioned node references. |
+| `browser_act` | Requires `tab_id`, `expected_page_revision`, and one to 64 typed actions. Actions are click, type, fill, select, scroll, drag, navigate, history movement, reload, close, dialog decision, and staged file upload. No coordinate action exists in Standard mode. |
+| `browser_wait` | Requires `tab_id` and one load, URL, text, selector, network-idle, or download condition. `timeout_ms` is at most 120 seconds. |
+| `browser_tabs` | Takes an empty object and lists only the current task's tabs. |
+| `browser_handoff` | Requires a task tab, expected page revision, prompt, completion condition, and optional timeout. Completion can be navigation, manual completion, a URL, or a selector. |
+| `browser_commit` | Requires the staged token returned by a prior `commit_required` action and executes that one staged operation. |
+
+Every existing-page mutation carries its expected page revision. If navigation or document replacement makes that revision stale, AgentTab rejects the operation rather than selecting a new target.
+
+### Developer mode
+
+`browser_developer` is the only additional tool. MCP lists it only when the adapter starts with `AGENTTAB_DEVELOPER=1`; the extension also requires persistent Developer mode to be enabled in the AgentTab popup. It takes an `action` string and a bounded `params` object. It is intentionally outside the Standard tool surface and should not be enabled for ordinary browser work.
+
+## Result, error, handoff, and Commit semantics
+
+### Results and errors
+
+The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `request_id`, `ok`, and an `outcome`. A successful MCP tool call returns both readable MCP text content and `structuredContent`. A Core error is returned as an MCP tool error with `isError: true`; when available, its structured content contains `code`, `outcome`, `recovery`, and `details`.
+
+| Outcome | Meaning |
+|---|---|
+| `completed` | The operation completed and has a result. |
+| `not_started` | The operation did not begin. Inspect the structured error and recovery before retrying. |
+| `unknown` | The operation may have run but a durable terminal result is unavailable. Do not blindly replay it. |
+| `needs_user` | The operation requires human involvement. Follow the returned recovery or handoff state. |
+| `commit_required` | A recognizable consequential action was staged instead of executed. |
+
+Mutation methods carry a UUIDv7 idempotency key in Core RPC. The adapter generates one when a caller has not supplied a Core request. Reusing a completed key for identical work returns the durable response; reusing it with different input is a conflict. A mutation found only as started after recovery returns `unknown` and is not replayed.
+
+### Your Turn handoff
+
+Call `browser_handoff` before the user enters credentials or completes another human-only step. AgentTab activates a global blackout, focuses the declared tab, opens its user-facing handoff state, and denies browser observation and capture for every task while the handoff is active. Automation resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the handoff is cleared.
+
+The agent must not attempt snapshots, page reads, or mutations during this interval. It should report the handoff prompt to the user and wait for the terminal tool result or an explicit user completion.
+
+### Staged Commit
+
+`browser_act` is the Standard mutation choke point. For recognizable send, publish, purchase, delete, upload, authorization, and permission-grant controls, AgentTab can stop before the side effect and return:
+
+```json
+{
+  "outcome": "commit_required",
+  "result": {
+    "staged_token": "…",
+    "tab_id": 42,
+    "page_revision": 7,
+    "effect": "…",
+    "fingerprint": "…",
+    "expires_at_ms": 0
+  }
+}
 ```
-# bridge_tokens.txt (git-ignored; see bridge_tokens.txt.example)
-researcher:<token-a>
-publisher:<token-b>
-```
 
-```
-BRIDGE_MCP_TRANSPORT=http BRIDGE_MCP_HTTP_PORT=8723 chrome-bridge-mcp
-```
+The token is bound to the task, tab, effect, page revision, and element fingerprint. It expires after at most five minutes and is one-use. The extension popup must first record a human approval for that exact stage. Approval does not execute the action and does not expose the native token. The agent must then call `browser_commit`, which takes only the staged token, revalidates the target, and executes only an approved stage. A changed page, ownership change, expiry, unapproved stage, or repeated token makes the commit fail.
 
-Agent A registers the endpoint with `Authorization: Bearer <token-a>`, agent B with `Authorization: Bearer <token-b>`. `browser_lease` from agent A now blocks agent B's mutating calls with `leased by researcher` and vice versa - lease arbitration works per HTTP client rather than being defeated by a shared identity.
+A `browser_act` batch is sequential and non-atomic. The extension stops before the first recognizable staged action and does not execute later actions implicitly. The current host response preserves the staged token and binding metadata, but does not publicly return the extension's completed-prefix list or staged index. Clients must not infer how many preceding actions ran from a `commit_required` response; inspect the page before deciding the next action. This is a source limitation, not a guarantee of an atomic batch.
 
-Because identity is now per request rather than per process, the automatic lease wrapper (`BRIDGE_MCP_AUTO_IDENTITY`) is disabled under the HTTP transport: its cached lease state assumes one identity per server process, and keeping it would let the first caller silently hold the lease against everyone else. HTTP clients take and drop the lease explicitly with `browser_lease` and `browser_release`. The stdio transport is unchanged and still auto-leases.
+Commit reduces recognizable risk only. It requires both the popup's human approval and the agent's later `browser_commit`, but it cannot prove that a page's labels, event handlers, or side effects are benign.
 
-#### W3C trace context
+## Schemas and related documentation
 
-The incoming request's `traceparent` header is read next to the per-request bridge token and passed through to the host unchanged, so the host's request span joins the caller's trace instead of starting a detached one. Under stdio there is no incoming header, so a root trace is minted per tool call - but only when the host's opt-in spans are switched on with `BRIDGE_OTEL_ENABLED`; with it unset nothing is minted and no `traceparent` is sent.
-
-The header is never logged and never reaches Chrome: the host strips it from the request envelope exactly as it strips the token and `dryRun`. A malformed value starts a fresh trace rather than failing the call. See `docs/telemetry.md` for the span model and for what those spans do and do not carry.
+- [Core request schema](../schemas/rpc/v1/request.schema.json)
+- [Core response schema](../schemas/rpc/v1/response.schema.json)
+- [Open parameters](../schemas/rpc/v1/browser-open.schema.json)
+- [Snapshot parameters](../schemas/rpc/v1/browser-snapshot.schema.json)
+- [Act parameters](../schemas/rpc/v1/browser-act.schema.json)
+- [Wait parameters](../schemas/rpc/v1/browser-wait.schema.json)
+- [Handoff parameters](../schemas/rpc/v1/browser-handoff.schema.json)
+- [Commit parameters](../schemas/rpc/v1/browser-commit.schema.json)
+- [Commands](commands.md)
+- [Setup](setup.md)

@@ -57,6 +57,15 @@
         "typescript": "^5.9.3",
       },
     },
+    "packages/site": {
+      "name": "@agenttab/site",
+      "version": "2.0.0-rc.1",
+      "devDependencies": {
+        "@types/bun": "^1.2.23",
+        "@types/node": "^24.5.2",
+        "typescript": "^5.9.3",
+      },
+    },
   },
   "packages": {
     "@agenttab/extension": ["@agenttab/extension@workspace:packages/extension"],
@@ -64,6 +73,8 @@
     "@agenttab/omp": ["@agenttab/omp@workspace:packages/omp"],
 
     "@agenttab/sdk": ["@agenttab/sdk@workspace:packages/sdk-typescript"],
+
+    "@agenttab/site": ["@agenttab/site@workspace:packages/site"],
 
     "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
 

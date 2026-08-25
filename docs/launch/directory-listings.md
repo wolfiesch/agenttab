@@ -1,59 +1,71 @@
-DRAFT - do not post without explicit approval
+# DRAFT ONLY - AgentTab v2 directory listing copy
 
-# Directory listing copy
+**Do not submit or publish.** AgentTab `v2.0.0-rc.1` is unreleased. v1.0.1 remains the stable legacy release. No public package, site, privacy-policy, support, repository, release, or store URL is asserted by this draft.
 
-Reusable draft copy for MCP directories such as mcpservers.org, PulseMCP, Glama, and Smithery.
+## Product name
+
+AgentTab
+
+## Category
+
+Local browser runtime for AI agents
+
+## Tagline
+
+Any agent. Your browser. Your rules.
 
 ## One-line description
 
-Chrome Bridge lets MCP agents drive your real logged-in Chrome through a local policy-governed native bridge.
+Give an agent a task workspace in your signed-in Chrome profile, not broad control of your browser.
 
 ## Short description
 
-Chrome Bridge exposes your real local Chrome profile to MCP clients through a token-gated native-messaging bridge with host-enforced policy, origin checks, audit JSONL, redaction, confirmation tokens, human handoff, session probes, and cooperative leasing.
+AgentTab is a local browser runtime for AI agents. It gives each agent task-owned tabs, uses Your Turn for human-only input, stages recognizable consequential actions with Commit, and connects local MCP clients through per-user operating-system-native IPC.
 
 ## Long description
 
-Chrome Bridge is a trusted-local browser control bridge for agents that need to work in the Chrome profile you already use. Instead of launching a fresh Playwright or Puppeteer profile, or opening Chrome with a remote-debugging port, it routes local clients through a Chrome MV3 extension and native-messaging host.
+AgentTab is for browser tasks that need the Chrome profile already on a user's computer. Its promise is: **Give an agent a tab, not the keys to your browser.**
 
-The MCP server is a client of the same token-gated `127.0.0.1:9223` bridge API used by the CLI. The host policy is the enforcement boundary: built-in defaults are fail-closed, actions and origins can be explicitly allowed or denied, tab-scoped actions are checked against the live tab origin, sensitive actions can require confirmation tokens, and policy decisions can be inspected before forwarding. Audit logs are JSONL and intentionally omit payload and response bodies. Redaction can mask cookie values, sensitive storage keys, and page-derived content before results reach the client.
+Each agent begins with a task workspace. AgentTab creates or visibly adopts a tab for that task, permits child-tab inheritance from owned tabs, and serializes writes to the same tab. Task groups make active work visible but are display-only: they never grant ownership. A tab moved out of its task group is no longer available to that task.
 
-Chrome Bridge also includes real-profile workflows that are awkward in empty-profile automation. `browser_session_status` gives a redacted auth probe with cookie names/counts and logged-in status, never values. `browser_wait_for_handoff` pauses the agent, focuses the tab, marks the task group as needing review, shows a compact bottom card, lets a human complete login/2FA/captcha/payment, and resumes when the expected page state appears. Cooperative leasing helps multiple local agents share one real profile without colliding.
+The runtime is local-only. One minimal MV3 extension connects through Chrome Native Messaging to a local Rust host. MCP and other local adapters connect to the host through a user-owned Unix socket on macOS and Linux or a current-user named pipe on Windows. There is no cloud relay, hosted browser session, telemetry service, or routine remote control plane.
 
-Python and Rust native hosts share the same baseline policy, audit, and redaction behavior. Documented installers target macOS and Linux.
+The Standard MCP surface has exactly seven tools: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, and `browser_commit`. A separate `browser_developer` tool exists only after a persistent, explicit Developer mode opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
+AgentTab declares the `<all_urls>` host permission so its defined `chrome.scripting` text, HTML, selector, wait, and scroll paths can operate in task-owned pages that the user directs an agent to use. This supports those bounded paths across sites; it does not add raw cookie, storage, arbitrary JavaScript, CDP, or network APIs to Standard mode.
 
-## Category and tag suggestions
+**Your Turn** is the human handoff state for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. During handoff, AgentTab applies an observation blackout across every task, so standard observations return `needs_user`; it does not capture human keystrokes.
 
-- MCP server
+**Commit** is a best-effort review barrier for recognizable send, publish, purchase, delete, upload, authorization, and permission-grant controls. It stages a recognizable action with a preview, requires a human popup approval and the requesting agent's one-use token, and revalidates the page and target before execution. It is not a guarantee that every page-triggered external effect is recognizable.
+
+Task ownership coordinates work but does not isolate the signed-in Chrome profile. An agent acting in an owned tab can use the same web session available to the person at the keyboard. Users should connect only trusted local agents and software. Hostile page content and misleading controls remain risks, including prompt injection and effects that Commit cannot classify correctly.
+
+## MCP integration status
+
+MCP is a local adapter to the AgentTab Core RPC. AgentTab `v2.0.0-rc.1` is unreleased, so this draft intentionally includes no configuration snippet, package coordinate, command, repository link, or install call to action. Public integration instructions must wait for controlled hosting, signed release artifacts, and stable dependencies.
+
+## Privacy statement
+
+AgentTab does not collect, sell, share, or transmit user data to the developer or a remote service. It has no telemetry, analytics endpoint, cloud relay, or hosted browser session. Task data and recovery state stay on the user's computer and are processed only to perform requested local browser work. Standard mode does not return raw cookies, browser storage, passwords, arbitrary scripts, raw CDP, or raw network data to agents.
+
+## Suggested directory tags
+
 - Browser automation
-- Chrome
-- Native messaging
+- MCP
 - Local-first
-- Agent tools
-- Security
+- Native messaging
+- AI agents
 - Human-in-the-loop
+- Security
 - Developer tools
+- Chrome extension
 
-## Install snippet
+## Publication prerequisites
 
-```json
-{
-  "mcpServers": {
-    "chrome-bridge": {
-      "command": "uvx",
-      "args": ["--from", "/ABSOLUTE/PATH/TO/chrome-bridge/mcp", "chrome-bridge-mcp"],
-      "env": {
-        "BRIDGE_REPO_ROOT": "/ABSOLUTE/PATH/TO/chrome-bridge",
-        "BRIDGE_PORT": "9223"
-      }
-    }
-  }
-}
-```
+Do not populate directory links or install fields until all of the following are verified for the exact release candidate or stable release being announced:
 
-Chrome with the loaded extension must be running and the native host must be registered with `./setup.sh` or `./setup-rs.sh`. The MCP server reads the same local bridge token and honors `BRIDGE_PORT`, `BRIDGE_TOKEN_FILE`, `BRIDGE_CONNECT_TIMEOUT_SECONDS`, `BRIDGE_MCP_READONLY`, and `BRIDGE_MCP_ALLOW_SENSITIVE`.
-
-## Links
-
-- Repository: https://github.com/wolfiesch/chrome-bridge (verified from `git remote -v`)
-- Release: https://github.com/wolfiesch/chrome-bridge/releases/tag/v1.0.1 (verified from local `v1.0.1` tag)
+- [ ] Controlled public site, privacy-policy, and support destinations.
+- [ ] Final signed package identities and immutable release artifacts.
+- [ ] Exact MCP package coordinates and supported runtime configuration.
+- [ ] Chrome Web Store package and approval status, if a store listing is being named.
+- [ ] Human review of wording against the final Standard and Developer mode surfaces.
+- [ ] Explicit authorization to submit the directory listing.
