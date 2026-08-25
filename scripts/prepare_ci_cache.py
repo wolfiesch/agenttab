@@ -37,11 +37,11 @@ def prepare_ci_cache(
     measure_directory_bytes: Callable[[Path], int] = directory_bytes,
 ) -> dict[str, int | str]:
     root = cache_root.expanduser().resolve()
-    owned_base = (Path.home() / "Library" / "Caches" / "chrome-bridge-ci").resolve()
+    owned_base = (Path.home() / "Library" / "Caches" / "agenttab-ci").resolve()
     if root.parent != owned_base:
         raise ValueError(
             "cache root must be one versioned child of "
-            "~/Library/Caches/chrome-bridge-ci"
+            "~/Library/Caches/agenttab-ci"
         )
 
     target = root / "cargo-target"

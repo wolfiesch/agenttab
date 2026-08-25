@@ -3,7 +3,9 @@ import {
   nativeEvent,
   nativeHello,
   parseInboundNativeMessage,
+  randomUuidV7,
   type NativeDispatchCommand,
+  type NativeEventAck,
   type NativeInboundMessage,
   type NativeResponse,
   type NativeTab,
@@ -13,10 +15,17 @@ import { mutateState, readState } from "./storage";
 import { OwnershipLedger } from "./ownership";
 import { isRecord } from "./type-guards";
 
-const NATIVE_HOST = "dev.agenttab.host";
+declare const AGENTTAB_NATIVE_HOST: string;
+const NATIVE_HOST = typeof AGENTTAB_NATIVE_HOST === "string" ? AGENTTAB_NATIVE_HOST : "dev.agenttab.host";
 const RECONNECT_ALARM = "agenttab-native-reconnect";
 const RECONNECT_MAX_MS = 30_000;
 type CommandHandler = (command: NativeDispatchCommand) => Promise<NativeResponse>;
+type StageDiscarder = (nativeTokens: readonly string[]) => Promise<void>;
+interface PendingEventAck {
+  resolve: (ack: NativeEventAck) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
 
 interface NativePort {
   postMessage(message: unknown): void;
@@ -40,13 +49,14 @@ export class NativeBridge {
   private port: NativePort | null = null;
   private ready = false;
   private reconnectAttempt = 0;
-
+  private readonly pendingEventAcks = new Map<string, PendingEventAck>();
   constructor(
     private readonly scheduler: MutationScheduler,
     private readonly ownership: OwnershipLedger,
     private readonly handleCommand: CommandHandler,
     private readonly onEventAcknowledged: (event: string, eventId: string) => void = () => undefined,
     private readonly onReady: () => Promise<void> = async () => undefined,
+    private readonly discardStages: StageDiscarder = async () => undefined,
   ) { }
 
   async connect(): Promise<void> {
@@ -76,7 +86,14 @@ export class NativeBridge {
             started_at_ms: state.handoff.startedAtMs,
           }
           : { active: false },
-        Object.values(state.stagedCommits).map(({ action: _action, preview: _preview, ...staged }) => staged),
+        Object.values(state.stagedCommits).map(({
+          action: _action,
+          preview: _preview,
+          dialog: _dialog,
+          review_handle: _reviewHandle,
+          approved: _approved,
+          ...staged
+        }) => staged),
       ));
     } catch {
       this.onDisconnect(port);
@@ -95,6 +112,77 @@ export class NativeBridge {
     }
   }
 
+
+  async approvePopupCommit(
+    reviewHandle: string,
+    taskId: string,
+    tabId: number,
+  ): Promise<Record<string, unknown>> {
+    const acknowledgement = await this.requestPopupEvent("popup_commit_approved", {
+      review_handle: reviewHandle,
+      task_id: taskId,
+      tab_id: tabId,
+    });
+    if (acknowledgement.outcome !== "completed" || !acknowledgement.result) {
+      const error = acknowledgement.error;
+      throw Object.assign(new Error(error?.message ?? "AgentTab could not approve the staged action"), {
+        code: error?.code ?? "popup_commit_failed",
+        acknowledged: true,
+      });
+    }
+    return acknowledgement.result;
+  }
+
+  async abandonPopupCommit(
+    reviewHandle: string,
+    taskId: string,
+    tabId: number,
+  ): Promise<Record<string, unknown>> {
+    const acknowledgement = await this.requestPopupEvent("popup_commit_abandoned", {
+      review_handle: reviewHandle,
+      task_id: taskId,
+      tab_id: tabId,
+    });
+    if (acknowledgement.outcome !== "completed" || !acknowledgement.result) {
+      const error = acknowledgement.error;
+      throw Object.assign(new Error(error?.message ?? "AgentTab could not abandon the staged action"), {
+        code: error?.code ?? "popup_commit_failed",
+        acknowledged: true,
+      });
+    }
+    return acknowledgement.result;
+  }
+
+  private requestPopupEvent(
+    event: "popup_commit_approved" | "popup_commit_abandoned",
+    payload: Record<string, unknown>,
+  ): Promise<NativeEventAck> {
+    const port = this.port;
+    if (!port || !this.ready) {
+      throw Object.assign(new Error("AgentTab host is disconnected; the staged action was not approved"), {
+        code: "extension_disconnected",
+      });
+    }
+    const eventId = randomUuidV7();
+    return new Promise<NativeEventAck>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingEventAcks.delete(eventId);
+        reject(Object.assign(new Error("AgentTab host did not acknowledge the staged action"), {
+          code: "extension_disconnected",
+        }));
+      }, 30_000);
+      this.pendingEventAcks.set(eventId, { resolve, reject, timeout });
+      try {
+        port.postMessage(nativeEvent(event, payload, eventId));
+      } catch {
+        clearTimeout(timeout);
+        this.pendingEventAcks.delete(eventId);
+        reject(Object.assign(new Error("AgentTab host is disconnected; the staged action was not approved"), {
+          code: "extension_disconnected",
+        }));
+      }
+    });
+  }
   async reconnectFromAlarm(alarmName: string): Promise<void> {
     if (alarmName !== RECONNECT_ALARM || this.port) return;
     await this.connect();
@@ -118,10 +206,23 @@ export class NativeBridge {
       return;
     }
     if (parsed.kind === "event_ack") {
-      if (this.ready) this.onEventAcknowledged(parsed.event, parsed.event_id);
+      const pending = this.pendingEventAcks.get(parsed.event_id);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pendingEventAcks.delete(parsed.event_id);
+        pending.resolve(parsed);
+      } else if (this.ready) {
+        this.onEventAcknowledged(parsed.event, parsed.event_id);
+      }
       return;
     }
     if (parsed.kind === "ready") {
+      try {
+        await this.discardStages(parsed.discard_staged_tokens ?? []);
+      } catch {
+        if (this.port === port) port.disconnect();
+        return;
+      }
       this.ready = true;
       this.reconnectAttempt = 0;
       await chrome.alarms.clear(RECONNECT_ALARM);
@@ -165,7 +266,15 @@ export class NativeBridge {
     if (this.port !== port) return;
     this.port = null;
     this.ready = false;
+    for (const [eventId, pending] of this.pendingEventAcks) {
+      clearTimeout(pending.timeout);
+      pending.reject(Object.assign(new Error("AgentTab host disconnected before acknowledging the staged action"), {
+        code: "extension_disconnected",
+      }));
+      this.pendingEventAcks.delete(eventId);
+    }
     this.scheduler.disconnect();
+    void this.discardStages([]);
     this.scheduleReconnect();
   }
 

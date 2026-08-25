@@ -1,27 +1,30 @@
-DRAFT - do not post without explicit approval
+# DRAFT ONLY - Show HN copy for AgentTab v2
 
-# Show HN title
+**Do not post.** AgentTab `v2.0.0-rc.1` is unreleased. v1.0.1 remains the stable legacy release. This draft contains no live link, install instruction, or public availability claim.
 
-Show HN: Chrome Bridge - agents use my real Chrome without getting the keys
+## Proposed title
+
+Show HN: AgentTab gives an AI agent a tab, not the keys to your browser
 
 ## Alternate titles
 
-1. Show HN: I built a governed bridge from local agents to real Chrome
-2. Show HN: Chrome Bridge lets agents use logged-in Chrome with policy gates
-3. Show HN: A trusted-local Chrome bridge for agent handoffs and audits
+1. Show HN: AgentTab is a local browser runtime for AI agents
+2. Show HN: Task workspaces for agents using a signed-in Chrome profile
+3. Show HN: Any agent, your browser, your rules
 
 ## First comment draft
 
-I built Chrome Bridge because the browser automation choices I had kept missing the same thing: agents are useful when they can work inside the browser session I already use, but my real Chrome profile is also one of the most sensitive things on my laptop.
+I built AgentTab around a browser-agent boundary I wanted to be explicit about: a useful agent may need the browser session I already use, but that does not mean it should get broad control of my browser.
 
-So the project is not trying to be generic browser automation. The goal is a trusted local real-profile handoff: a local agent can drive my already-logged-in Chrome through a native-messaging bridge, but the host enforces policy before actions reach the extension.
+AgentTab's promise is: **Give an agent a tab, not the keys to your browser.** It is a local browser runtime for AI agents. An agent begins with a task workspace that creates or visibly adopts a tab. Task-owned child tabs can inherit that workspace, but task groups are only a visual status aid and never grant ownership. Writes to the same tab are serialized, while separate task tabs can proceed independently.
 
-The governance layer is the main story. The TCP API is loopback-only and token-gated. The host policy is fail-closed by default when no valid local policy exists, with explicit allow/deny rules for actions and origins. For tab-scoped actions such as click, type, HTML extraction, or script execution, the host resolves the live tab origin and applies the same site policy before forwarding. Sensitive actions can require same-channel confirmation tokens. Responses can be redacted by policy, including cookie values, sensitive storage keys, and page-derived text matched by configured redaction patterns. Audit logs are JSONL and record request metadata such as timestamp, client, action, targets, decision, reason, and request ID, without payload or response bodies.
+The runtime is one minimal MV3 extension plus a local Rust host. The extension uses Chrome Native Messaging, and local clients such as MCP adapters use per-user operating-system-native IPC: a user-owned Unix socket on macOS and Linux or a current-user named pipe on Windows. There is no cloud relay, hosted browser session, telemetry service, or routine network control plane.
 
-The feature I use most is `waitForHandoff`: the agent pauses, focuses the real tab, marks its tab group as needing review, and shows a compact bottom card while I do the thing it should not do - login, 2FA, captcha, payment confirmation. It resumes when the expected selector, URL, text, or manual page change is reached. `sessionStatus` is the companion redacted login probe: it reports cookie counts, cookie names, and a logged-in boolean for domains, never cookie values, so the agent can decide whether a handoff is needed without dumping secrets.
+Standard MCP access is deliberately small: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, and `browser_commit`. There is one optional Developer-only tool, `browser_developer`, behind a persistent explicit opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
+AgentTab declares the `<all_urls>` host permission so its defined `chrome.scripting` text, HTML, selector, wait, and scroll paths can run in task-owned pages the user selects. That broad site reach does not give Standard mode raw cookie, storage, arbitrary JavaScript, CDP, or network APIs.
 
-There is also cooperative multi-agent leasing, so multiple local clients can share one real profile without stepping on each other. While one named token holds the lease, non-lease actions from other clients are rejected by the host until release or expiry.
+Two human controls are central. **Your Turn** handles passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. While a handoff is active, AgentTab applies an observation blackout for every task, so normal capture and observation calls return `needs_user`; it does not capture the person's keystrokes. **Commit** is a best-effort barrier for recognizable sends, publishes, purchases, deletes, uploads, authorizations, and permission grants. The runtime stages a recognizable action, shows a human popup preview, and allows a one-use token from the requesting agent to execute only after approval. It revalidates the target immediately before execution and invalidates the staged action if the page or target changes.
 
-This is trusted-local software with real risk. It can control the browser profile you actually use. That is exactly why the policy layer, audit log, redaction, confirmation flow, and local-only token model exist.
+This is still real-profile automation. Task ownership coordinates execution; it does not isolate cookies, accounts, or identity. A page can contain prompt injection, a control can hide an effect behind an innocent label, and Commit cannot prove that every external effect is recognizable. The runtime is local-only and has no telemetry, but users still need to trust the local agents and software they connect to their signed-in profile.
 
-The repo includes Python and Rust native-host paths with baseline policy/audit/redaction parity, plus CLI and MCP surfaces for local clients on macOS and Linux installer paths. I would especially like feedback on the trust model, policy ergonomics, MCP tool shape, and whether the human handoff flow matches how people actually want agents to handle login and other sensitive browser steps.
+I am preparing the v2 design for controlled review, not public use. I would eventually welcome feedback on the task-workspace boundary, the Your Turn blackout, the best-effort Commit model, and whether the seven-tool MCP surface is the right default. There is no stable install path or launch link in this draft.

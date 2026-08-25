@@ -8,9 +8,15 @@ interface TaskView {
   name: string;
   state: string;
   tabCount: number;
-  /** number: focusable tab; null: none reachable; undefined: not reported. */
-  focusTabId: number | null | undefined;
   color: string | null;
+}
+
+interface ReviewView {
+  reviewHandle: string;
+  taskId: string;
+  tabId: number;
+  effect: string;
+  expiresAtMs: number;
 }
 
 interface UiState {
@@ -20,6 +26,7 @@ interface UiState {
   pointer: boolean | null;
   handoffPrompt: string | null;
   tasks: TaskView[];
+  reviews: ReviewView[];
 }
 
 /** Chrome's dark tab-group palette, so a popup row matches its group strip. */
@@ -83,6 +90,9 @@ const taskError = element("task-error", HTMLParagraphElement);
 const pointerToggle = element("pointer", HTMLInputElement);
 const pointerDetail = element("pointer-detail", HTMLElement);
 const settingsError = element("settings-error", HTMLParagraphElement);
+const reviews = element("reviews", HTMLElement);
+const reviewList = element("review-list", HTMLUListElement);
+const reviewError = element("review-error", HTMLParagraphElement);
 
 let current: UiState | null = null;
 let pending = false;
@@ -128,10 +138,26 @@ function parseTask(value: Record<string, unknown>): TaskView | null {
     name,
     state: typeof value.state === "string" ? value.state : "working",
     tabCount: typeof value.tab_count === "number" ? value.tab_count : 0,
-    focusTabId: typeof value.focus_tab_id === "number"
-      ? value.focus_tab_id
-      : "focus_tab_id" in value ? null : undefined,
     color: typeof value.color === "string" ? value.color : null,
+  };
+}
+
+function parseReview(value: Record<string, unknown>): ReviewView | null {
+  if (
+    typeof value.review_handle !== "string" ||
+    typeof value.task_id !== "string" ||
+    typeof value.tab_id !== "number" ||
+    typeof value.effect !== "string" ||
+    typeof value.expires_at_ms !== "number"
+  ) {
+    return null;
+  }
+  return {
+    reviewHandle: value.review_handle,
+    taskId: value.task_id,
+    tabId: value.tab_id,
+    effect: value.effect,
+    expiresAtMs: value.expires_at_ms,
   };
 }
 
@@ -152,6 +178,12 @@ async function load(): Promise<UiState> {
         .filter(isRecord)
         .map(parseTask)
         .filter((task): task is TaskView => task !== null)
+      : [],
+    reviews: Array.isArray(response.reviews)
+      ? response.reviews
+        .filter(isRecord)
+        .map(parseReview)
+        .filter((review): review is ReviewView => review !== null)
       : [],
   };
 }
@@ -221,24 +253,6 @@ function renderTask(task: TaskView, developerMode: boolean): HTMLLIElement {
     row.append(badge);
   }
 
-  // `null` means the runtime reported no reachable tab, so no dead control is
-  // rendered; `undefined` means it reported nothing and the click reports back.
-  if (task.focusTabId !== null) {
-    const focus = document.createElement("button");
-    focus.type = "button";
-    focus.className = "link";
-    focus.textContent = "Focus";
-    focus.setAttribute("aria-label", `Focus ${task.name}`);
-    focus.addEventListener("click", () => {
-      void guard(taskError, async () => {
-        const result = await send({ kind: "focus_task", task_id: task.taskId });
-        if (result.focused !== true) {
-          throw new Error(`${task.name} has no reachable tab to focus. Finish it, or let the agent open a new tab.`);
-        }
-      });
-    });
-    row.append(focus);
-  }
 
   const armed = confirming === task.taskId;
   const finish = document.createElement("button");
@@ -265,6 +279,38 @@ function renderTask(task: TaskView, developerMode: boolean): HTMLLIElement {
   });
 
   row.append(finish);
+  return row;
+}
+
+function renderReview(review: ReviewView): HTMLLIElement {
+  const row = document.createElement("li");
+  row.className = "review";
+  const effect = document.createElement("strong");
+  effect.textContent = review.effect;
+  const expiry = document.createElement("small");
+  const seconds = Math.max(0, Math.ceil((review.expiresAtMs - Date.now()) / 1_000));
+  expiry.textContent = seconds === 1 ? "Expires in 1 second" : `Expires in ${seconds} seconds`;
+  const actions = document.createElement("div");
+  actions.className = "review-actions";
+  const abandon = document.createElement("button");
+  abandon.type = "button";
+  abandon.className = "quiet";
+  abandon.textContent = "Decline";
+  abandon.addEventListener("click", () => {
+    void guard(reviewError, async () => {
+      await send({ kind: "abandon_popup_commit", review_handle: review.reviewHandle });
+    });
+  });
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.textContent = "Approve stage";
+  approve.addEventListener("click", () => {
+    void guard(reviewError, async () => {
+      await send({ kind: "approve_popup_commit", review_handle: review.reviewHandle });
+    });
+  });
+  actions.append(abandon, approve);
+  row.append(effect, expiry, actions);
   return row;
 }
 
@@ -296,6 +342,10 @@ function render(state: UiState): void {
     handoffShown = false;
     hide(handoffError);
   }
+
+  reviews.hidden = state.reviews.length === 0;
+  reviewList.replaceChildren(...state.reviews.map(renderReview));
+  if (state.reviews.length === 0) hide(reviewError);
 
   pointerToggle.disabled = state.pointer === null;
   pointerToggle.checked = state.pointer === true;
@@ -359,7 +409,7 @@ function reload(): void {
 
 enableButton.addEventListener("click", () => {
   void guard(permissionError, async () => {
-    const granted = await chrome.permissions.request({ permissions: ["scripting", "debugger"] });
+    const granted = await chrome.permissions.request({ permissions: ["scripting"] });
     if (!granted) {
       throw new Error("Chrome denied AgentTab automation. AgentTab stays installed and disabled until you enable it here.");
     }
@@ -368,13 +418,9 @@ enableButton.addEventListener("click", () => {
 
 disableButton.addEventListener("click", () => {
   void guard(settingsError, async () => {
-    await chrome.permissions.remove({ permissions: ["scripting", "debugger"] });
-    const [scripting, debuggerPermission] = await Promise.all([
-      chrome.permissions.contains({ permissions: ["scripting"] }),
-      chrome.permissions.contains({ permissions: ["debugger"] }),
-    ]);
-    if (scripting || debuggerPermission) {
-      throw new Error("Chrome kept an automation permission. Disable AgentTab from chrome://extensions, then try again.");
+    await chrome.permissions.remove({ permissions: ["scripting"] });
+    if (await chrome.permissions.contains({ permissions: ["scripting"] })) {
+      throw new Error("Chrome kept the optional scripting permission. Disable AgentTab from chrome://extensions, then try again.");
     }
   });
 });

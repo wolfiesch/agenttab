@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="description" content="AgentTab is a local browser runtime for AI agents with visible task workspaces, human handoff, and staged review.">
+    <title>AgentTab | Local browser runtime for AI agents</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell nav-shell">
+        <a class="brand" href="./" aria-label="AgentTab home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>AgentTab</span>
+        </a>
+        <nav aria-label="Primary navigation">
+          <a href="#how-it-works">How it works</a>
+          <a href="#trust">Trust boundary</a>
+          <a href="./privacy/">Privacy</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main-content">
+      <section class="hero shell" aria-labelledby="agenttab-title">
+        <div class="hero-copy">
+          <p class="eyebrow">Local browser runtime for AI agents</p>
+          <h1 id="agenttab-title">AgentTab</h1>
+          <p class="tagline">Any agent. Your browser. Your rules.</p>
+          <p class="hero-promise">Give an agent a tab, not the keys to your browser.</p>
+          <p class="release-status"><strong>Unreleased:</strong> AgentTab v2.0.0-rc.1 is under review. No v2 installation is available from this site.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#trust">Explore the trust boundary</a>
+            <a class="button button-secondary" href="./privacy/">Read the privacy policy</a>
+          </div>
+        </div>
+
+        <figure class="workspace-preview" aria-labelledby="workspace-preview-title">
+          <figcaption id="workspace-preview-title">A visible workspace, with a clear next move</figcaption>
+          <div class="preview-window">
+            <div class="preview-topbar" aria-hidden="true">
+              <span></span><span></span><span></span>
+              <div class="preview-address"></div>
+            </div>
+            <div class="preview-content">
+              <div class="preview-task">
+                <span class="task-spark" aria-hidden="true"></span>
+                <span>Research assistant</span>
+                <span class="task-state">Working</span>
+              </div>
+              <div class="preview-line preview-line-wide"></div>
+              <div class="preview-line"></div>
+              <div class="preview-line preview-line-short"></div>
+              <div class="handoff-card">
+                <p class="handoff-label">Your Turn</p>
+                <p>Complete a password, passkey, or other human-only input.</p>
+                <span>Agent observations are paused.</span>
+              </div>
+            </div>
+          </div>
+        </figure>
+      </section>
+
+      <section class="outcomes shell" aria-labelledby="outcomes-title">
+        <div class="section-heading">
+          <p class="eyebrow">Built for useful work without silent reach</p>
+          <h2 id="outcomes-title">A browser runtime that keeps the important boundaries visible.</h2>
+        </div>
+        <div class="outcome-grid">
+          <article class="outcome-card">
+            <span class="card-number" aria-hidden="true">01</span>
+            <h3>Task-owned workspaces</h3>
+            <p>Agent work is organized into visible task workspaces in your existing signed-in Chrome profile.</p>
+          </article>
+          <article class="outcome-card">
+            <span class="card-number" aria-hidden="true">02</span>
+            <h3>Human-only input stays human</h3>
+            <p>Your Turn hands passwords, passkeys, 2FA, CAPTCHAs, payment secrets, and similar input back to you.</p>
+          </article>
+          <article class="outcome-card">
+            <span class="card-number" aria-hidden="true">03</span>
+            <h3>Recognizable effects stage first</h3>
+            <p>Commit presents a review step for recognizable sends, publishing, purchases, deletion, uploads, authorization, and permission grants.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="how-it-works" id="how-it-works" aria-labelledby="how-title">
+        <div class="shell split-layout">
+          <div class="section-heading">
+            <p class="eyebrow">Outcome-first browser use</p>
+            <h2 id="how-title">From an agent request to a deliberate browser action.</h2>
+            <p class="section-intro">AgentTab makes the ordinary path clear: a task gets a workspace, the agent works in it, and people take over when an action needs them.</p>
+          </div>
+          <ol class="step-list">
+            <li>
+              <span class="step-index" aria-hidden="true">1</span>
+              <div>
+                <h3>Start in a task workspace</h3>
+                <p>A task opens or adopts an explicit tab. Ownership is visible and stays scoped to that task.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-index" aria-hidden="true">2</span>
+              <div>
+                <h3>Let the agent do the routine work</h3>
+                <p>Standard actions use the task workspace, not broad browser control.</p>
+              </div>
+            </li>
+            <li>
+              <span class="step-index" aria-hidden="true">3</span>
+              <div>
+                <h3>Take your turn when it matters</h3>
+                <p>Human handoff protects secret and other human-only input. Recognizable consequential actions wait for Commit.</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="trust shell" id="trust" aria-labelledby="trust-title">
+        <div class="section-heading">
+          <p class="eyebrow">Trust boundary</p>
+          <h2 id="trust-title">Local runtime, signed-in Chrome, bounded standard access.</h2>
+        </div>
+        <div class="boundary-grid">
+          <article class="boundary-card boundary-card-positive">
+            <h3>What AgentTab does</h3>
+            <ul>
+              <li>Runs locally beside your signed-in Chrome profile.</li>
+              <li>Coordinates task-owned browser workspaces and visible handoff.</li>
+              <li>Stages recognizable consequential actions before they take effect.</li>
+            </ul>
+          </article>
+          <article class="boundary-card">
+            <h3>What task ownership does not do</h3>
+            <p>Task ownership is an execution and coordination boundary. It is not cookie, identity, or profile isolation.</p>
+            <p>Standard mode does not provide raw cookies, storage, passwords, arbitrary JavaScript, raw Chrome DevTools Protocol access, or coordinate actions.</p>
+          </article>
+        </div>
+        <aside class="risk-note" aria-labelledby="risk-title">
+          <div class="risk-icon" aria-hidden="true">!</div>
+          <div>
+            <h3 id="risk-title">The remaining risk is real</h3>
+            <p>Web pages can contain prompt injection or attach an external effect to an innocent-looking control. Commit is a best-effort review barrier for recognizable actions, not a guarantee that every external effect is recognized. Review the page and the staged action before you proceed.</p>
+          </div>
+        </aside>
+      </section>
+
+      <section class="privacy-callout">
+        <div class="shell privacy-callout-layout">
+          <div>
+            <p class="eyebrow">Private by architecture</p>
+            <h2>Local only. No telemetry. No remote AgentTab service.</h2>
+          </div>
+          <div>
+            <p>AgentTab does not collect, sell, or share personal data. Browser work happens through your local runtime and your own signed-in browser.</p>
+            <a class="text-link" href="./privacy/">Read the full privacy policy <span aria-hidden="true">→</span></a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-layout">
+        <a class="brand" href="./" aria-label="AgentTab home">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>AgentTab</span>
+        </a>
+        <p>AgentTab v2.0.0-rc.1 is unreleased.</p>
+        <a href="./privacy/">Privacy</a>
+      </div>
+    </footer>
+  </body>
+</html>

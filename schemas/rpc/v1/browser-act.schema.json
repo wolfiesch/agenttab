@@ -11,7 +11,6 @@
         { "$ref": "#/$defs/type" },
         { "$ref": "#/$defs/fill" },
         { "$ref": "#/$defs/select" },
-        { "$ref": "#/$defs/press" },
         { "$ref": "#/$defs/scroll" },
         { "$ref": "#/$defs/drag" },
         { "$ref": "#/$defs/navigate" },
@@ -55,16 +54,6 @@
         "kind": { "const": "select" },
         "ref": { "$ref": "#/$defs/ref" },
         "value": { "type": "string", "maxLength": 2048 }
-      },
-      "additionalProperties": false
-    },
-    "press": {
-      "type": "object",
-      "required": ["kind", "ref", "key"],
-      "properties": {
-        "kind": { "const": "press" },
-        "ref": { "$ref": "#/$defs/ref" },
-        "key": { "type": "string", "minLength": 1, "maxLength": 128 }
       },
       "additionalProperties": false
     },
@@ -118,8 +107,7 @@
       "required": ["kind", "decision"],
       "properties": {
         "kind": { "const": "dialog" },
-        "decision": { "enum": ["accept", "dismiss"] },
-        "prompt_text": { "type": "string", "maxLength": 2048 }
+        "decision": { "enum": ["accept", "dismiss"] }
       },
       "additionalProperties": false
     },

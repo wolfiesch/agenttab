@@ -2,11 +2,13 @@
   "manifest_version": 3,
   "name": "AgentTab",
   "short_name": "AgentTab",
-  "version": "0.2.0",
+  "version": "2.0.0",
+  "version_name": "2.0.0-rc.1",
   "description": "A local browser runtime for task-owned automation in your signed-in Chrome profile.",
   "minimum_chrome_version": "127",
   "permissions": [
     "nativeMessaging",
+    "debugger",
     "tabs",
     "tabGroups",
     "storage",
@@ -14,8 +16,7 @@
     "downloads"
   ],
   "optional_permissions": [
-    "scripting",
-    "debugger"
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"

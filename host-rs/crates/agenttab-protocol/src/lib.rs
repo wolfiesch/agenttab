@@ -398,10 +398,6 @@ pub enum BrowserAction {
         r#ref: String,
         value: String,
     },
-    Press {
-        r#ref: String,
-        key: String,
-    },
     Scroll {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
@@ -424,8 +420,6 @@ pub enum BrowserAction {
     Close,
     Dialog {
         decision: DialogDecision,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prompt_text: Option<String>,
     },
     UploadFile {
         r#ref: String,
@@ -655,10 +649,6 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             require_ref(method, r#ref)?;
             require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "value")
         }
-        BrowserAction::Press { r#ref, key } => {
-            require_ref(method, r#ref)?;
-            require_len(method, key, 1, 128, "key")
-        }
         BrowserAction::Scroll {
             r#ref,
             delta_x,
@@ -685,12 +675,7 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
                 "url must use http, https, or about without whitespace",
             )
         }
-        BrowserAction::Dialog { prompt_text, .. } => {
-            if let Some(value) = prompt_text {
-                require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "prompt_text")?;
-            }
-            Ok(())
-        }
+        BrowserAction::Dialog { .. } => Ok(()),
         BrowserAction::UploadFile { r#ref, files } => {
             require_ref(method, r#ref)?;
             require(
@@ -946,6 +931,42 @@ impl ConnectionInit {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeCapabilityConfirm {
+    pub protocol: String,
+    pub version: u16,
+    pub kind: ResumeCapabilityConfirmKind,
+    pub connection_id: Uuid,
+    pub resume_capability: String,
+}
+
+impl ResumeCapabilityConfirm {
+    pub fn parse(value: Value) -> Result<Self, ProtocolError> {
+        validate_serialized_request_limit(&value)?;
+        let message: Self = serde_json::from_value(value)?;
+        if message.protocol != RPC_PROTOCOL || message.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedProtocol {
+                protocol: message.protocol.clone(),
+                version: message.version,
+            });
+        }
+        if !(32..=MAX_RESUME_CAPABILITY_CHARS).contains(&message.resume_capability.chars().count())
+        {
+            return Err(ProtocolError::InvalidConnection(format!(
+                "resume_capability must contain 32 to {MAX_RESUME_CAPABILITY_CHARS} characters"
+            )));
+        }
+        Ok(message)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCapabilityConfirmKind {
+    ResumeConfirm,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectKind {
@@ -987,6 +1008,27 @@ impl ConnectionAck {
 #[serde(rename_all = "snake_case")]
 pub enum ConnectedKind {
     Connected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeCapabilityConfirmed {
+    pub protocol: String,
+    pub version: u16,
+    pub kind: ResumeCapabilityConfirmedKind,
+    pub connection_id: Uuid,
+}
+
+impl ResumeCapabilityConfirmed {
+    pub fn value(&self) -> Value {
+        serde_json::to_value(self).expect("resume confirmation acknowledgement serializes")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCapabilityConfirmedKind {
+    ResumeConfirmed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1281,6 +1323,9 @@ pub enum NativeEventPayload {
     Pause(NativePauseEvent),
     Handoff(NativeHandoff),
     CommitExpired(NativeCommitExpiredEvent),
+    CommitAbandoned(NativeCommitExpiredEvent),
+    PopupCommitApproved(NativePopupCommitEvent),
+    PopupCommitAbandoned(NativePopupCommitEvent),
     ExtensionDisconnected(NativeDisconnectEvent),
 }
 
@@ -1311,6 +1356,14 @@ pub struct NativeCommitExpiredEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct NativePopupCommitEvent {
+    pub review_handle: String,
+    pub task_id: Uuid,
+    pub tab_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NativeDisconnectEvent {
     pub reason: String,
 }
@@ -1324,9 +1377,16 @@ impl NativeEvent {
                 version: event.version,
             });
         }
-        if event.event_id.is_some() && !matches!(event.event, NativeEventName::HandoffChanged) {
+        if event.event_id.is_some()
+            && !matches!(
+                event.event,
+                NativeEventName::HandoffChanged
+                    | NativeEventName::PopupCommitApproved
+                    | NativeEventName::PopupCommitAbandoned
+            )
+        {
             return Err(ProtocolError::InvalidNativeMessage(
-                "event_id is only supported for handoff_changed".into(),
+                "event_id is only supported for acknowledged native events".into(),
             ));
         }
         let payload = match event.event {
@@ -1345,6 +1405,15 @@ impl NativeEvent {
                 NativeEventPayload::Handoff(decode_native_event_payload(event.payload.clone())?)
             }
             NativeEventName::CommitExpired => NativeEventPayload::CommitExpired(
+                decode_native_event_payload(event.payload.clone())?,
+            ),
+            NativeEventName::CommitAbandoned => NativeEventPayload::CommitAbandoned(
+                decode_native_event_payload(event.payload.clone())?,
+            ),
+            NativeEventName::PopupCommitApproved => NativeEventPayload::PopupCommitApproved(
+                decode_native_event_payload(event.payload.clone())?,
+            ),
+            NativeEventName::PopupCommitAbandoned => NativeEventPayload::PopupCommitAbandoned(
                 decode_native_event_payload(event.payload.clone())?,
             ),
             NativeEventName::ExtensionDisconnected => NativeEventPayload::ExtensionDisconnected(
@@ -1369,10 +1438,27 @@ impl NativeEvent {
                 }
             }
             NativeEventPayload::CommitExpired(event)
+            | NativeEventPayload::CommitAbandoned(event)
                 if !(16..=256).contains(&event.native_token.chars().count()) =>
             {
                 return Err(ProtocolError::InvalidNativeMessage(
-                    "expired native_token must contain 16 to 256 characters".into(),
+                    "native staged token must contain 16 to 256 characters".into(),
+                ));
+            }
+            NativeEventPayload::PopupCommitApproved(popup)
+            | NativeEventPayload::PopupCommitAbandoned(popup)
+                if !(16..=256).contains(&popup.review_handle.chars().count())
+                    || popup.tab_id == 0
+                    || event
+                        .event_id
+                        .as_deref()
+                        .and_then(|event_id| Uuid::parse_str(event_id).ok())
+                        .filter(|event_id| event_id.get_version_num() == 7)
+                        .is_none() =>
+            {
+                return Err(ProtocolError::InvalidNativeMessage(
+                    "popup commit event must bind a review handle, task tab, and UUIDv7 event_id"
+                        .into(),
                 ));
             }
             NativeEventPayload::ExtensionDisconnected(event) if event.reason.is_empty() => {
@@ -1409,6 +1495,9 @@ pub enum NativeEventName {
     PauseChanged,
     HandoffChanged,
     CommitExpired,
+    CommitAbandoned,
+    PopupCommitApproved,
+    PopupCommitAbandoned,
     ExtensionDisconnected,
 }
 
@@ -1462,6 +1551,33 @@ pub fn native_event_ack(event: NativeEventName, event_id: &str) -> Value {
         "event": event,
         "event_id": event_id,
     })
+}
+
+pub fn native_event_ack_result(
+    event: NativeEventName,
+    event_id: &str,
+    outcome: Outcome,
+    result: Option<Value>,
+    error: Option<RpcError>,
+) -> Value {
+    let mut value = native_event_ack(event, event_id);
+    let object = value
+        .as_object_mut()
+        .expect("native event acknowledgement is always an object");
+    object.insert(
+        "outcome".into(),
+        serde_json::to_value(outcome).expect("outcome serializes"),
+    );
+    if let Some(result) = result {
+        object.insert("result".into(), result);
+    }
+    if let Some(error) = error {
+        object.insert(
+            "error".into(),
+            serde_json::to_value(error).expect("error serializes"),
+        );
+    }
+    value
 }
 
 pub fn native_ready(state: RuntimeState) -> Value {
@@ -1602,6 +1718,16 @@ mod tests {
         assert!(RpcRequest::parse(unknown_action_field).is_err());
     }
     #[test]
+    fn standard_actions_reject_press() {
+        let press = json!({
+            "tab_id": 7,
+            "expected_page_revision": 11,
+            "actions": [{"kind": "press", "ref": "e4", "key": "Enter"}]
+        });
+        assert!(RpcRequest::parse(request("browser_act", press, true)).is_err());
+    }
+
+    #[test]
     fn runtime_constraints_match_action_schema_boundaries() {
         let history = request(
             "browser_act",
@@ -1700,6 +1826,44 @@ mod tests {
             })),
             Err(ProtocolError::InvalidConnection(_))
         ));
+        let confirmation = ResumeCapabilityConfirm::parse(json!({
+            "protocol": RPC_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "resume_confirm",
+            "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+            "resume_capability": "a".repeat(32)
+        }))
+        .unwrap();
+        assert_eq!(
+            confirmation.connection_id,
+            Uuid::parse_str("018f22b2-4126-7c1a-8c31-3f45a783da42").unwrap()
+        );
+        assert!(matches!(
+            ResumeCapabilityConfirm::parse(json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "resume_confirm",
+                "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                "resume_capability": "short"
+            })),
+            Err(ProtocolError::InvalidConnection(_))
+        ));
+        assert!(ResumeCapabilityConfirm::parse(json!({
+            "protocol": RPC_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "resume_confirm",
+            "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+            "resume_capability": "a".repeat(32),
+            "task_id": Uuid::new_v4()
+        }))
+        .is_err());
+        let confirmed = ResumeCapabilityConfirmed {
+            protocol: RPC_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            kind: ResumeCapabilityConfirmedKind::ResumeConfirmed,
+            connection_id: confirmation.connection_id,
+        };
+        assert_eq!(confirmed.value()["kind"], "resume_confirmed");
     }
 
     #[test]
@@ -1711,7 +1875,7 @@ mod tests {
             json!({"kind": "type", "ref": ref_value, "text": escaped(MAX_ACTION_TEXT_CHARS)}),
             json!({"kind": "fill", "ref": escaped(MAX_REF_CHARS), "text": escaped(MAX_ACTION_TEXT_CHARS)}),
             json!({"kind": "select", "ref": escaped(MAX_REF_CHARS), "value": escaped(MAX_ACTION_VALUE_CHARS)}),
-            json!({"kind": "dialog", "decision": "accept", "prompt_text": escaped(MAX_ACTION_VALUE_CHARS)}),
+            json!({"kind": "dialog", "decision": "accept"}),
             json!({
                 "kind": "upload_file",
                 "ref": escaped(MAX_REF_CHARS),
@@ -1778,6 +1942,12 @@ mod tests {
             action_schema.pointer("/$defs/upload_file/properties/files/items/maxLength"),
             Some(&json!(MAX_UPLOAD_PATH_CHARS))
         );
+        assert!(action_schema.pointer("/$defs/press").is_none());
+        assert!(!action_schema["$defs"]["action"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == &json!({"$ref": "#/$defs/press"})));
     }
 
     #[test]
@@ -1903,7 +2073,7 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgement_ids_are_reserved_for_handoff_events() {
+    fn acknowledgement_ids_are_rejected_for_unacknowledged_events() {
         assert!(matches!(
             NativeEvent::parse(json!({
                 "protocol": NATIVE_PROTOCOL,
@@ -1913,6 +2083,48 @@ mod tests {
                 "event_id": "not-allowed",
                 "payload": {"paused": true}
             })),
+            Err(ProtocolError::InvalidNativeMessage(_))
+        ));
+    }
+
+    #[test]
+    fn popup_commit_events_require_a_uuidv7_event_id_and_typed_binding() {
+        let task_id = Uuid::now_v7();
+        let valid = json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "event",
+            "event": "popup_commit_approved",
+            "event_id": Uuid::now_v7(),
+            "payload": {
+                "review_handle": "review-handle-000",
+                "task_id": task_id,
+                "tab_id": 3,
+            }
+        });
+        assert!(matches!(
+            NativeEvent::parse(valid),
+            Ok((_, NativeEventPayload::PopupCommitApproved(NativePopupCommitEvent {
+                task_id: parsed_task_id,
+                tab_id: 3,
+                ..
+            }))) if parsed_task_id == task_id
+        ));
+
+        let invalid = json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "event",
+            "event": "popup_commit_approved",
+            "event_id": Uuid::new_v4(),
+            "payload": {
+                "review_handle": "review-handle-000",
+                "task_id": task_id,
+                "tab_id": 3,
+            }
+        });
+        assert!(matches!(
+            NativeEvent::parse(invalid),
             Err(ProtocolError::InvalidNativeMessage(_))
         ));
     }

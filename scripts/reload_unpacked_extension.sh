@@ -3,8 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-KEY_PATH="${AGENTTAB_EXTENSION_KEY:-${BRIDGE_EXTENSION_KEY:-}}"
-CHROME_APP="${AGENTTAB_CHROME_APP:-${BRIDGE_CHROME_APP:-Google Chrome}}"
+CHROME_APP="${AGENTTAB_CHROME_APP:-Google Chrome}"
 EXTENSION_ID=""
 LIVE_LIFECYCLE=0
 SOCKET_PATH=""
@@ -106,25 +105,11 @@ if [[ -n "$EXTENSION_ID" ]]; then
     exit 64
   fi
 else
-  if [[ -z "$KEY_PATH" ]]; then
-    for candidate in \
-      "$HOME/Library/Application Support/AgentTab/extension_key.pem" \
-      "$HOME/Library/Application Support/chrome-native-bridge/extension_key.pem" \
-      "$REPO_ROOT/extension_key.pem"
-    do
-      if [[ -f "$candidate" ]]; then
-        KEY_PATH="$candidate"
-        break
-      fi
-    done
-  fi
-
-  if [[ -z "$KEY_PATH" || ! -f "$KEY_PATH" ]]; then
-    printf '%s\n' 'AgentTab extension key not found; pass --extension-id or configure AGENTTAB_EXTENSION_KEY' >&2
-    exit 1
-  fi
-
-  EXTENSION_ID="$(python3 "$REPO_ROOT/extension_identity.py" id --key "$KEY_PATH")"
+  EXTENSION_ID="$(
+    python3 -c \
+      'import json, pathlib, sys; print(json.loads(pathlib.Path(sys.argv[1]).read_text())["developmentExtension"]["id"])' \
+      "$REPO_ROOT/config/identity.json"
+  )"
 fi
 
 if ((LIVE_LIFECYCLE != 0)) && [[ -z "$SOCKET_PATH" || -z "$DEBUGGING_URL" || -z "$DOWNLOAD_DIR" || -z "$HOST_RESTART_COMMAND" ]]; then

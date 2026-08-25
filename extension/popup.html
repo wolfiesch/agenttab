@@ -1,60 +1,102 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Chrome Bridge</title>
-    <link rel="stylesheet" href="popup.css">
-  </head>
-  <body>
-    <main class="shell" aria-labelledby="product-name">
-      <header class="brand-row">
-        <img class="brand-mark" src="icons/icon-48.png" alt="">
-        <div>
-          <h1 id="product-name">Chrome Bridge</h1>
-          <p>Trusted local automation</p>
-        </div>
-      </header>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentTab</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body data-state="loading">
+  <header>
+    <div class="brand">
+      <span class="spark" aria-hidden="true">✦</span>
+      <strong>AgentTab</strong>
+      <span id="developer-chip" class="chip" hidden>Developer</span>
+    </div>
+    <span id="status" class="status" role="status">Starting</span>
+  </header>
+  <main>
+    <section id="handoff" class="panel handoff" aria-labelledby="handoff-title" tabindex="-1" hidden>
+      <h2 id="handoff-title" class="eyebrow">Your turn</h2>
+      <p id="handoff-prompt" class="lead"></p>
+      <p class="note">AgentTab is not watching this tab. Nothing is captured until you finish.</p>
+      <div class="actions">
+        <button id="handoff-cancel" type="button" class="quiet">Cancel</button>
+        <button id="handoff-done" type="button">I'm done</button>
+      </div>
+      <p id="handoff-error" class="error" role="alert" hidden></p>
+    </section>
 
-      <section class="connection" aria-live="polite">
-        <span class="status-dot" aria-hidden="true"></span>
-        <div>
-          <strong id="connection-status">Checking</strong>
-          <span id="connection-detail">Native host status</span>
-        </div>
-      </section>
+    <section id="reviews" class="panel reviews" aria-labelledby="reviews-title" hidden>
+      <div class="row row-tight">
+        <h2 id="reviews-title" class="label">Review before action</h2>
+      </div>
+      <p class="note">Approve authorizes this exact staged action. It runs only if the requesting agent then commits it.</p>
+      <ul id="review-list" class="review-list"></ul>
+      <p id="review-error" class="error" role="alert" hidden></p>
+    </section>
 
-      <section class="task-panel" aria-labelledby="active-task-label">
-        <div class="eyebrow" id="active-task-label">Active task</div>
-        <div class="task-row">
-          <span id="task-symbol" class="task-symbol" aria-hidden="true">✦</span>
-          <div>
-            <strong id="active-task">No active task</strong>
-            <span id="task-state">Ready when you are</span>
-          </div>
-        </div>
-      </section>
+    <section id="permission" class="panel" aria-labelledby="permission-title" hidden>
+      <h2 id="permission-title" class="label">Automation is off</h2>
+      <p id="permission-detail" class="note">
+        Reading and acting on pages needs Chrome's <code>scripting</code> permission. Granting it once
+        keeps AgentTab inside its own task tabs.
+      </p>
+      <div class="actions">
+        <button id="enable" type="button">Enable AgentTab automation</button>
+      </div>
+      <p id="permission-error" class="error" role="alert" hidden></p>
+    </section>
 
-      <section class="settings" aria-label="Chrome Bridge settings">
-        <div class="setting-row">
-          <div>
-            <strong>Quiet reads</strong>
-            <span>Text, HTML, and waits</span>
-          </div>
-          <span class="on-label">On</span>
+    <section class="panel" aria-labelledby="admission-title">
+      <div class="row">
+        <div class="row-copy">
+          <h2 id="admission-title" class="label">Agent admission</h2>
+          <small id="automation-detail">Checking runtime</small>
         </div>
-        <div class="rule"></div>
-        <div class="setting-row pointer-setting">
-          <label for="pointer-toggle">
-            <strong>Show agent pointer</strong>
-            <span>Only on the tab you are viewing</span>
-          </label>
-          <button id="pointer-toggle" class="toggle" type="button" role="switch" aria-checked="true" aria-label="Show agent pointer">
-            <span></span>
-          </button>
+        <button id="pause" type="button" class="quiet" data-mode="pause">Pause agents</button>
+      </div>
+      <p id="runtime-error" class="error" role="alert" hidden></p>
+    </section>
+
+    <section id="developer" class="panel developer" aria-labelledby="developer-title" hidden>
+      <div class="row">
+        <div class="row-copy">
+          <h2 id="developer-title" class="label">Developer mode is on</h2>
+          <small>Owned tabs accept raw DevTools Protocol calls from agents.</small>
         </div>
-      </section>
-    </main>
-    <script src="popup.js"></script>
-  </body>
+        <button id="developer-off" type="button" class="quiet">Turn off</button>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="tasks-title">
+      <div class="row row-tight">
+        <h2 id="tasks-title" class="label">Task groups</h2>
+        <span id="task-count" class="count">0</span>
+      </div>
+      <ul id="tasks" class="tasks"></ul>
+      <p id="task-error" class="error" role="alert" hidden></p>
+    </section>
+
+    <details id="settings" class="panel settings">
+      <summary>Settings</summary>
+      <div id="automation-setting" class="settings-row" hidden>
+        <span class="row-copy">
+          <strong>Automation access</strong>
+          <small>Remove Chrome's optional scripting permission until you enable it again.</small>
+        </span>
+        <button id="disable" type="button" class="quiet">Turn off</button>
+      </div>
+      <label class="toggle-row" for="pointer">
+        <span class="row-copy">
+          <strong>Agent pointer</strong>
+          <small id="pointer-detail">Show where an agent clicks in a visible tab.</small>
+        </span>
+        <input id="pointer" type="checkbox">
+      </label>
+      <p id="settings-error" class="error" role="alert" hidden></p>
+    </details>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
 </html>

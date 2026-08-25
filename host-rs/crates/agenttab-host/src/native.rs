@@ -1,11 +1,11 @@
 use crate::handoff::HandoffState;
 use crate::lifecycle::Lifecycle;
 use agenttab_protocol::{
-    native_close_task, native_command, native_event_ack, native_ready, read_frame, write_frame,
-    NativeDisconnectRecovery, NativeEvent, NativeEventName, NativeEventPayload, NativeHandoff,
-    NativeHello, NativeOriginPolicy, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
-    ProtocolError, RuntimeState, EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES,
-    NATIVE_PROTOCOL, PROTOCOL_VERSION,
+    native_close_task, native_command, native_event_ack, native_event_ack_result, native_ready,
+    read_frame, write_frame, NativeDisconnectEvent, NativeDisconnectRecovery, NativeEvent,
+    NativeEventName, NativeEventPayload, NativeHandoff, NativeHello, NativeOriginPolicy,
+    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ProtocolError, RpcError, RuntimeState,
+    EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -31,6 +31,30 @@ pub enum NativeError {
     #[error("native transport error: {0}")]
     Transport(String),
 }
+
+#[derive(Debug, Clone)]
+pub struct NativeEventResult {
+    pub outcome: Outcome,
+    pub result: Option<Value>,
+    pub error: Option<RpcError>,
+}
+impl NativeEventResult {
+    pub fn completed(result: Value) -> Self {
+        Self {
+            outcome: Outcome::Completed,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn failure(outcome: Outcome, error: RpcError) -> Self {
+        Self {
+            outcome,
+            result: None,
+            error: Some(error),
+        }
+    }
+}
 pub trait NativeEventSink: Send + Sync {
     fn reconcile(
         &self,
@@ -38,7 +62,11 @@ pub trait NativeEventSink: Send + Sync {
         staged_commits: &[NativeStagedCommit],
         handoff: &NativeHandoff,
     ) -> Result<(), String>;
-    fn handle(&self, payload: &NativeEventPayload, event_id: Option<&str>) -> Result<(), String>;
+    fn handle(
+        &self,
+        payload: &NativeEventPayload,
+        event_id: Option<&str>,
+    ) -> Result<NativeEventResult, String>;
 }
 pub trait NativeTransport: Send + Sync {
     fn dispatch(
@@ -94,19 +122,19 @@ impl StdioNative {
         })
     }
 
-    pub fn reader_loop<R: Read>(&self, mut reader: R) -> Result<(), ProtocolError> {
+    pub fn reader_loop<R: Read>(self: &Arc<Self>, mut reader: R) -> Result<(), ProtocolError> {
         loop {
             let value = match read_frame(&mut reader, EXTENSION_TO_HOST_MAX_BYTES) {
                 Ok(Some(value)) => value,
                 Ok(None) => {
-                    self.disconnected.store(true, Ordering::Release);
+                    self.reconcile_extension_disconnect("native messaging stream closed");
                     self.lifecycle.extension_disconnected();
                     self.handoff.restore(true);
                     self.fail_all(NativeError::Disconnected);
                     return Ok(());
                 }
                 Err(error) => {
-                    self.disconnected.store(true, Ordering::Release);
+                    self.reconcile_extension_disconnect("native messaging stream failed");
                     self.lifecycle.terminal(error.to_string());
                     self.handoff.restore(true);
                     self.fail_all(NativeError::Protocol(error.to_string()));
@@ -114,7 +142,7 @@ impl StdioNative {
                 }
             };
             if let Err(error) = self.handle_inbound(value) {
-                self.disconnected.store(true, Ordering::Release);
+                self.reconcile_extension_disconnect("native protocol failed");
                 self.lifecycle.terminal(error.to_string());
                 self.handoff.restore(true);
                 self.fail_all(NativeError::Protocol(error.to_string()));
@@ -123,7 +151,17 @@ impl StdioNative {
         }
     }
 
-    fn handle_inbound(&self, value: Value) -> Result<(), ProtocolError> {
+    fn reconcile_extension_disconnect(&self, reason: &str) {
+        if let Some(sink) = self.event_sink.read().clone() {
+            let _ = sink.handle(
+                &NativeEventPayload::ExtensionDisconnected(NativeDisconnectEvent {
+                    reason: reason.into(),
+                }),
+                None,
+            );
+        }
+    }
+    fn handle_inbound(self: &Arc<Self>, value: Value) -> Result<(), ProtocolError> {
         let protocol = value
             .get("protocol")
             .and_then(Value::as_str)
@@ -169,6 +207,15 @@ impl StdioNative {
             }
             Some("event") => {
                 let (event, payload) = NativeEvent::parse(value)?;
+                if matches!(
+                    &payload,
+                    NativeEventPayload::PopupCommitApproved(_)
+                        | NativeEventPayload::PopupCommitAbandoned(_)
+                ) {
+                    let native = Arc::clone(self);
+                    std::thread::spawn(move || native.handle_popup_commit_event(event, payload));
+                    return Ok(());
+                }
                 let clear_handoff = matches!(
                     &payload,
                     NativeEventPayload::Handoff(NativeHandoff { active: false, .. })
@@ -183,13 +230,15 @@ impl StdioNative {
                         "handoff clear cannot be acknowledged before reconciliation".into(),
                     ));
                 }
-                let applied = if let Some(sink) = self.event_sink.read().clone() {
-                    sink.handle(&payload, event.event_id.as_deref())
-                        .map_err(ProtocolError::InvalidNativeEvent)?;
-                    true
+                let event_result = if let Some(sink) = self.event_sink.read().clone() {
+                    Some(
+                        sink.handle(&payload, event.event_id.as_deref())
+                            .map_err(ProtocolError::InvalidNativeEvent)?,
+                    )
                 } else {
-                    false
+                    None
                 };
+                let applied = event_result.is_some();
                 match payload {
                     NativeEventPayload::Pause(event) => {
                         self.lifecycle.set_paused(event.paused);
@@ -218,7 +267,12 @@ impl StdioNative {
                     }
                     NativeEventPayload::Inventory(_)
                     | NativeEventPayload::TaskTabs(_)
-                    | NativeEventPayload::CommitExpired(_) => {}
+                    | NativeEventPayload::CommitExpired(_)
+                    | NativeEventPayload::CommitAbandoned(_) => {}
+                    NativeEventPayload::PopupCommitApproved(_)
+                    | NativeEventPayload::PopupCommitAbandoned(_) => unreachable!(
+                        "popup commit events are handled asynchronously to keep the native reader available"
+                    ),
                 }
             }
             Some("disconnect_recovery") => {
@@ -246,6 +300,41 @@ impl StdioNative {
             }
         }
         Ok(())
+    }
+
+    fn handle_popup_commit_event(&self, event: NativeEvent, payload: NativeEventPayload) {
+        let event_id = event
+            .event_id
+            .as_deref()
+            .expect("validated popup commit event must carry an event_id");
+        let result = match self.event_sink.read().clone() {
+            Some(sink) => sink
+                .handle(&payload, Some(event_id))
+                .unwrap_or_else(|error| {
+                    NativeEventResult::failure(
+                        Outcome::Unknown,
+                        RpcError::new("native_event_failed", error),
+                    )
+                }),
+            None => NativeEventResult::failure(
+                Outcome::NotStarted,
+                RpcError::new("runtime_unavailable", "AgentTab runtime is unavailable"),
+            ),
+        };
+        let acknowledgement = native_event_ack_result(
+            event.event,
+            event_id,
+            result.outcome,
+            result.result,
+            result.error,
+        );
+        if self.write_value(&acknowledgement).is_err() {
+            self.reconcile_extension_disconnect("native event acknowledgement failed");
+            self.disconnected.store(true, Ordering::Release);
+            self.lifecycle.extension_disconnected();
+            self.handoff.restore(true);
+            self.fail_all(NativeError::Disconnected);
+        }
     }
 
     fn write_value(&self, value: &Value) -> Result<(), ProtocolError> {
@@ -372,6 +461,48 @@ mod tests {
     use agenttab_protocol::{write_frame, EXTENSION_TO_HOST_MAX_BYTES};
     use serde_json::json;
     use std::io::Cursor;
+
+    struct PopupDispatchSink {
+        native: std::sync::Weak<StdioNative>,
+    }
+
+    impl NativeEventSink for PopupDispatchSink {
+        fn reconcile(
+            &self,
+            _inventory: &[NativeTab],
+            _staged_commits: &[NativeStagedCommit],
+            _handoff: &NativeHandoff,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn handle(
+            &self,
+            payload: &NativeEventPayload,
+            _event_id: Option<&str>,
+        ) -> Result<NativeEventResult, String> {
+            if !matches!(payload, NativeEventPayload::PopupCommitApproved(_)) {
+                return Ok(NativeEventResult::completed(json!({})));
+            }
+            let native = self
+                .native
+                .upgrade()
+                .ok_or("native transport is unavailable")?;
+            let response = native
+                .dispatch(
+                    Uuid::nil(),
+                    Uuid::nil(),
+                    "browser_commit",
+                    json!({ "native_token": "host-owned-token" }),
+                    None,
+                    Duration::from_millis(250),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(NativeEventResult::completed(
+                response.result.unwrap_or_else(|| json!({})),
+            ))
+        }
+    }
     #[derive(Default)]
     struct DurableHandoffSink {
         clear_event_ids: Mutex<Vec<String>>,
@@ -391,7 +522,7 @@ mod tests {
             &self,
             payload: &NativeEventPayload,
             event_id: Option<&str>,
-        ) -> Result<(), String> {
+        ) -> Result<NativeEventResult, String> {
             if matches!(
                 payload,
                 NativeEventPayload::Handoff(NativeHandoff { active: false, .. })
@@ -400,7 +531,7 @@ mod tests {
                     .lock()
                     .push(event_id.unwrap_or_default().to_owned());
             }
-            Ok(())
+            Ok(NativeEventResult::completed(json!({})))
         }
     }
 
@@ -471,6 +602,80 @@ mod tests {
                 "event_id": "handoff-clear-0001",
             })
         );
+    }
+    #[test]
+    fn popup_approval_does_not_block_reader_before_extension_commit_response() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+        let output = SharedWriter::default();
+        let native = StdioNative::new(output.clone(), lifecycle, Arc::new(HandoffState::default()));
+        native.disconnected.store(false, Ordering::Release);
+        native.set_event_sink(Arc::new(PopupDispatchSink {
+            native: Arc::downgrade(&native),
+        }));
+        let event_id = Uuid::now_v7().to_string();
+        native
+            .handle_inbound(json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "event",
+                "event": "popup_commit_approved",
+                "event_id": event_id,
+                "payload": {
+                    "review_handle": "review-handle-opaque",
+                    "task_id": Uuid::nil(),
+                    "tab_id": 3,
+                }
+            }))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let command = loop {
+            let bytes = output.bytes.lock().clone();
+            if let Ok(Some(command)) =
+                read_frame(&mut bytes.as_slice(), HOST_TO_EXTENSION_MAX_BYTES)
+            {
+                break command;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "popup approval blocked the reader before native dispatch"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(command["kind"], "command");
+        assert_eq!(command["method"], "browser_commit");
+        let request_id = command["request_id"].as_str().unwrap();
+        native
+            .handle_inbound(json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "response",
+                "request_id": request_id,
+                "outcome": "completed",
+                "result": { "executed": true },
+            }))
+            .unwrap();
+
+        let acknowledgement = loop {
+            let bytes = output.bytes.lock().clone();
+            let mut frames = bytes.as_slice();
+            let _ = read_frame(&mut frames, HOST_TO_EXTENSION_MAX_BYTES);
+            if let Ok(Some(acknowledgement)) = read_frame(&mut frames, HOST_TO_EXTENSION_MAX_BYTES)
+            {
+                break acknowledgement;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "popup approval did not acknowledge after native commit response"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(acknowledgement["kind"], "event_ack");
+        assert_eq!(acknowledgement["event"], "popup_commit_approved");
+        assert_eq!(acknowledgement["event_id"], event_id);
+        assert_eq!(acknowledgement["outcome"], "completed");
     }
 
     #[test]

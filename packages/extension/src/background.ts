@@ -59,16 +59,32 @@ browser = new StandardBrowserRuntime(
     await chrome.tabs.remove(tabId);
   },
   emit,
+  authorizeOwnedTab,
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber(() => browser.scrubForHandoff());
 
 async function automationEnabled(): Promise<boolean> {
-  const [scripting, debuggerPermission] = await Promise.all([
-    chrome.permissions.contains({ permissions: ["scripting"] }),
-    chrome.permissions.contains({ permissions: ["debugger"] }),
-  ]);
-  return scripting && debuggerPermission;
+  return chrome.permissions.contains({ permissions: ["scripting"] });
+}
+
+function automationRequired(): Error {
+  return Object.assign(new Error("AgentTab automation permissions have not been enabled"), {
+    code: "permissions_required",
+    recovery: "Open the AgentTab popup and choose Enable automation.",
+  });
+}
+
+async function authorizeOwnedTab(tabId: number): Promise<void> {
+  if (!(await automationEnabled())) throw automationRequired();
+  const taskId = await ownership.taskIdForTab(tabId);
+  if (taskId === null) {
+    throw Object.assign(new Error("Tab is not owned by an AgentTab task"), {
+      code: "ownership_denied",
+    });
+  }
+  await ownership.assertOwned(taskId, tabId);
+  if (!(await automationEnabled())) throw automationRequired();
 }
 
 function tabId(params: Record<string, unknown>): number {
@@ -166,6 +182,15 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
   const params = command.params;
   const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer";
   try {
+    if (command.method === "commit_review_bind") {
+      return completed(command.request_id, await browser.bindReview(command.task_id, params));
+    }
+    if (command.method === "commit_review_abandon") {
+      return completed(
+        command.request_id,
+        await browser.abandonNativeStage(command.task_id, params.native_token, params.tab_id),
+      );
+    }
     if ((await readState()).handoff.active) {
       throw Object.assign(new Error("Automation is disabled while credential handoff is active"), {
         code: "handoff_blackout",
@@ -178,10 +203,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       command.method !== "browser_handoff" &&
       !(await automationEnabled())
     ) {
-      throw Object.assign(new Error("AgentTab automation permissions have not been enabled"), {
-        code: "permissions_required",
-        recovery: "Open the AgentTab popup and choose Enable automation.",
-      });
+      throw automationRequired();
     }
     if (command.method === "browser_open") {
       return completed(command.request_id, await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params)));
@@ -293,6 +315,13 @@ nativeBridge = new NativeBridge(
   dispatch,
   (event, eventId) => void handoff.acknowledgeEvent(event, eventId),
   () => handoff.restore(),
+  async (nativeTokens) => {
+    if (nativeTokens.length > 0) {
+      await browser.discardNativeStages(nativeTokens);
+      return;
+    }
+    await browser.abandonAllStages();
+  },
 );
 
 let startup: Promise<void> | null = null;
@@ -339,18 +368,14 @@ chrome.tabGroups.onRemoved.addListener(() => void start().then(() => ownership.r
 chrome.runtime.onStartup.addListener(() => void start());
 chrome.runtime.onInstalled.addListener(() => void start());
 chrome.permissions.onRemoved.addListener((permissions) => {
-  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
-    return;
-  }
+  if (!permissions.permissions?.includes("scripting")) return;
   scheduler.revokePermissions();
   automationRevocationGeneration += 1;
   void start().then(() => browser.scrubForHandoff());
 });
 
 chrome.permissions.onAdded.addListener((permissions) => {
-  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
-    return;
-  }
+  if (!permissions.permissions?.includes("scripting")) return;
   void automationEnabled().then((enabled) => {
     if (enabled) scheduler.restorePermissions();
   });
@@ -383,17 +408,17 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
         state: task.state,
         color: task.color,
         tab_count: task.tabIds.length,
-        focus_tab_id: task.tabIds[0] ?? null,
       })),
+      reviews: Object.values(state.stagedCommits)
+        .filter((staged) => typeof staged.review_handle === "string" && staged.approved !== true)
+        .map((staged) => ({
+          review_handle: staged.review_handle,
+          task_id: staged.task_id,
+          tab_id: staged.tab_id,
+          effect: staged.effect,
+          expires_at_ms: staged.expires_at_ms,
+        })),
     };
-  }
-  if (message.kind === "focus_task" && typeof message.task_id === "string") {
-    const task = (await readState()).tasks[message.task_id];
-    const tabId = task?.tabIds[0];
-    if (!Number.isInteger(tabId)) return { focused: false };
-    const tab = await chrome.tabs.update(Number(tabId), { active: true });
-    if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
-    return { focused: true };
   }
   if (message.kind === "set_pointer" && typeof message.enabled === "boolean") {
     const enabled = message.enabled;
@@ -416,6 +441,35 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
   }
   if (message.kind === "handoff_finish" && typeof message.completed === "boolean") {
     return handoff.finish(message.completed);
+  }
+  if (
+    (message.kind === "approve_popup_commit" || message.kind === "abandon_popup_commit") &&
+    typeof message.review_handle === "string"
+  ) {
+    const binding = await browser.reviewBinding(message.review_handle);
+    const bridge = nativeBridge;
+    if (!bridge) {
+      throw Object.assign(new Error("AgentTab host is disconnected; the staged action was not approved"), {
+        code: "extension_disconnected",
+      });
+    }
+    try {
+      const approving = message.kind === "approve_popup_commit";
+      const result = approving
+        ? await bridge.approvePopupCommit(message.review_handle, binding.task_id, binding.tab_id)
+        : await bridge.abandonPopupCommit(message.review_handle, binding.task_id, binding.tab_id);
+      if (approving) {
+        await browser.approveReview(message.review_handle);
+      } else {
+        await browser.abandonReview(message.review_handle);
+      }
+      return result;
+    } catch (error) {
+      if (isRecord(error) && error.acknowledged === true) {
+        await browser.abandonReview(message.review_handle);
+      }
+      throw error;
+    }
   }
   if (message.kind === "close_task" && typeof message.task_id === "string") {
     await ownership.closeTask(message.task_id);

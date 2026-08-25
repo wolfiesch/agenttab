@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "repository": "wolfiesch/agenttab",
+  "algorithm": "ed25519",
+  "developmentPublicKeyPem": null,
+  "stablePublicKeyPem": null
+}

@@ -7,6 +7,7 @@ import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from
 import { RevisionTracker } from "../src/revisions";
 import { MutationScheduler } from "../src/scheduler";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
+import { isRecord } from "../src/type-guards";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
@@ -77,6 +78,7 @@ let callFunctionException: boolean;
 let debuggerCommandOverride:
   | ((method: string, params: Record<string, unknown>) => Record<string, unknown> | undefined)
   | null;
+let debuggerAttachGate: Promise<void> | null;
 let completedDownloads: Array<Record<string, unknown>>;
 interface DebuggerCommand {
   method: string;
@@ -98,6 +100,7 @@ let permissionRequests: Array<Record<string, unknown>>;
 let permissionRequestResult: boolean;
 let popupMessageListeners: PopupMessageListener[];
 let permissionRemovedListeners: PermissionRemovedListener[];
+let debuggerEventListeners: Array<(...args: unknown[]) => void>;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -121,6 +124,16 @@ async function waitForCondition(predicate: () => boolean): Promise<void> {
   throw new Error("condition did not settle within the bounded wait");
 }
 
+function emitDebuggerEvent(
+  tabId: number,
+  method: string,
+  params: Record<string, unknown> = {},
+): void {
+  for (const listener of debuggerEventListeners) {
+    listener({ tabId }, method, clone(params));
+  }
+}
+
 function installChromeMock(): void {
   persisted = {};
   debuggerCalls = [];
@@ -140,13 +153,18 @@ function installChromeMock(): void {
   debuggerCommands = [];
   callFunctionException = false;
   debuggerCommandOverride = null;
+  debuggerAttachGate = null;
   completedDownloads = [];
   automationPermission = true;
   permissionRequests = [];
   permissionRequestResult = true;
   popupMessageListeners = [];
   permissionRemovedListeners = [];
-  const listeners = { detach: [] as Array<(...args: unknown[]) => void>, event: [] as Array<(...args: unknown[]) => void> };
+  debuggerEventListeners = [];
+  const listeners = {
+    detach: [] as Array<(...args: unknown[]) => void>,
+    event: debuggerEventListeners,
+  };
   const createTab = (url = "about:blank", active = false, windowId = 1): MockTab => {
     const tab = { id: nextTabId++, windowId, groupId: -1, active, url, status: "complete" };
     tabStore.set(tab.id, tab);
@@ -175,7 +193,10 @@ function installChromeMock(): void {
       debugger: {
         onDetach: { addListener(listener: (...args: unknown[]) => void) { listeners.detach.push(listener); } },
         onEvent: { addListener(listener: (...args: unknown[]) => void) { listeners.event.push(listener); } },
-        async attach() { debuggerCalls.push("attach"); },
+        async attach() {
+          debuggerCalls.push("attach");
+          if (debuggerAttachGate) await debuggerAttachGate;
+        },
         async detach() { debuggerCalls.push("detach"); },
         async sendCommand(_target: unknown, method: string, params: Record<string, unknown>) {
           debuggerCalls.push(method);
@@ -352,7 +373,7 @@ function installChromeMock(): void {
       },
       runtime: {
         id: EXTENSION_ID,
-        getManifest() { return { version: "0.2.0" }; },
+        getManifest() { return { version: "2.0.0" }; },
         connectNative() {
           if (!nativePort) throw new Error("native host unavailable");
           return nativePort;
@@ -519,6 +540,35 @@ describe("native protocol", () => {
         denied_origins: [],
       },
     })).toThrow("non-empty strings");
+  });
+
+  test("rejects removed focus and prompt-input action capabilities", () => {
+    const command = {
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "command",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621d",
+      task_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621e",
+      connection_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621f",
+      method: "browser_act",
+      params: {
+        tab_id: 42,
+        expected_page_revision: 1,
+        actions: [{ kind: "dialog", decision: "accept" }],
+      },
+    };
+    expect(parseCommand(command).method).toBe("browser_act");
+    expect(() => parseCommand({
+      ...command,
+      params: { ...command.params, actions: [{ kind: "focus" }] },
+    })).toThrow("Unsupported standard action: focus");
+    expect(() => parseCommand({
+      ...command,
+      params: {
+        ...command.params,
+        actions: [{ kind: "dialog", decision: "accept", prompt_text: "secret" }],
+      },
+    })).toThrow("unknown fields");
   });
 
   test("accepts only the strict native close_task lifecycle command", () => {
@@ -780,13 +830,88 @@ describe("page revision monotonicity", () => {
 
   test("keeps a snapshot revision stable until Chrome reports a new document", async () => {
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const first = await runtime.snapshot(61, { mode: "accessibility" });
     const second = await runtime.snapshot(61, { mode: "accessibility" });
 
     expect(first.page_revision).toBe(1);
     expect(second.page_revision).toBe(1);
     expect((await readState()).revisions["61"]).toMatchObject({ floor: 1, current: 1 });
+    await runtime.detach(61);
+  });
+
+  test("authorizes again immediately before a direct Chrome API call", async () => {
+    let authorizationChecks = 0;
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => {
+        authorizationChecks += 1;
+        if (authorizationChecks === 2) {
+          throw Object.assign(new Error("Automation permission was revoked"), {
+            code: "permissions_required",
+          });
+        }
+      },
+    );
+
+    await expect(runtime.snapshot(61, { mode: "text" })).rejects.toMatchObject({
+      code: "permissions_required",
+    });
+    expect(authorizationChecks).toBe(2);
+    expect(debuggerCalls).toEqual([]);
+  });
+
+  test("shares one debugger initialization across concurrent first use", async () => {
+    const gate = Promise.withResolvers<void>();
+    debuggerAttachGate = gate.promise;
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const calls = Array.from(
+      { length: 8 },
+      () => runtime.developer(61, "Page.getFrameTree", {}),
+    );
+    await waitForCondition(() => debuggerCalls.includes("attach"));
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+
+    gate.resolve();
+    await Promise.all(calls);
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+    await runtime.detach(61);
+  });
+
+  test("cleans up a failed debugger initialization before retrying", async () => {
+    let failInitialization = true;
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.enable" && failInitialization) {
+        failInitialization = false;
+        throw new Error("Page domain unavailable");
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    await expect(runtime.snapshot(61, { mode: "accessibility" })).rejects.toThrow(
+      "Page domain unavailable",
+    );
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(1);
+
+    await expect(runtime.snapshot(61, { mode: "accessibility" })).resolves.toMatchObject({
+      tab_id: 61,
+      mode: "accessibility",
+    });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
     await runtime.detach(61);
   });
 
@@ -804,7 +929,7 @@ describe("page revision monotonicity", () => {
       return undefined;
     };
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
 
     await expect(runtime.snapshot(61, { mode: "accessibility" })).rejects.toMatchObject({
       code: "stale_revision",
@@ -828,7 +953,7 @@ describe("page revision monotonicity", () => {
       return undefined;
     };
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
 
     await expect(runtime.snapshot(61, { mode: "screenshot", full_page: true })).rejects.toMatchObject({
       code: "stale_revision",
@@ -846,7 +971,7 @@ describe("page revision monotonicity", () => {
       endTime: new Date(Date.now() - 60_000).toISOString(),
     }];
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
 
     await expect(runtime.wait(61, {
       condition: { kind: "download" },
@@ -877,7 +1002,7 @@ describe("page revision monotonicity", () => {
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
     const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     let ownershipChecks = 0;
     const waiting = runtime.wait(
       61,
@@ -900,15 +1025,39 @@ describe("page revision monotonicity", () => {
   });
 
   test("types into a background field through one DOM mutation", async () => {
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return {
+          result: {
+            value: {
+              tag: "INPUT",
+              role: "textbox",
+              aria_label: "Search query",
+              name: "query",
+              form_action: "https://example.test/search",
+              form_method: "get",
+            },
+          },
+        };
+      }
+      return undefined;
+    };
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(63);
 
     await runtime.act(TASK_A, 63, pageRevision, [
       { kind: "type", ref: `r${pageRevision}-22`, text: "x" },
     ]);
 
-    const calls = debuggerCommands.filter(({ method }) => method === "Runtime.callFunctionOn");
+    const calls = debuggerCommands.filter(
+      ({ method, params }) =>
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("InputEvent('input'"),
+    );
     expect(calls).toHaveLength(1);
     expect(calls[0]?.params.functionDeclaration).toContain("InputEvent('input'");
     expect(debuggerCalls).not.toContain("Input.insertText");
@@ -917,6 +1066,23 @@ describe("page revision monotonicity", () => {
   test("routes password and payment fields through a human handoff before mutation", async () => {
     let focusCalls = 0;
     debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return {
+          result: {
+            value: {
+              tag: "INPUT",
+              role: "textbox",
+              aria_label: "Account note",
+              name: "note",
+              form_action: "https://example.test/profile",
+              form_method: "get",
+            },
+          },
+        };
+      }
       if (
         method === "Runtime.callFunctionOn" &&
         String(params.functionDeclaration).includes("agenttab_sensitive_field")
@@ -947,7 +1113,7 @@ describe("page revision monotonicity", () => {
       return undefined;
     };
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(63);
 
     for (const action of [
@@ -961,14 +1127,38 @@ describe("page revision monotonicity", () => {
     }
     expect(focusCalls).toBe(0);
     expect(
-      debuggerCommands.filter(({ method }) => method === "Runtime.callFunctionOn"),
+      debuggerCommands.filter(
+        ({ method, params }) =>
+          method === "Runtime.callFunctionOn" &&
+          String(params.functionDeclaration).includes("agenttab_sensitive_field"),
+      ),
     ).toHaveLength(2);
   });
 
   test("rejects a page action that raises in the target document", async () => {
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return {
+          result: {
+            value: {
+              tag: "INPUT",
+              role: "textbox",
+              aria_label: "Search query",
+              name: "query",
+              form_action: "https://example.test/search",
+              form_method: "get",
+            },
+          },
+        };
+      }
+      return undefined;
+    };
     callFunctionException = true;
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(64);
 
     await expect(
@@ -1360,7 +1550,7 @@ describe("native bridge transport", () => {
       protocol: "agenttab.native",
       version: 1,
       kind: "hello",
-      extension_version: "0.2.0",
+      extension_version: "2.0.0",
       inventory: [{
         tab_id: 44,
         window_id: 1,
@@ -1394,6 +1584,46 @@ describe("native bridge transport", () => {
     expect(alarmCreates.at(-1)?.when).toBeLessThanOrEqual(Date.now() + 1_000);
   });
 
+
+  test("sends a popup approval by opaque review handle and requires a host acknowledgment", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const port = new MockNativePort();
+    nativePort = port;
+    const bridge = new NativeBridge(scheduler, ownership, async () => {
+      throw new Error("command handler must not run");
+    });
+    await bridge.connect();
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+    await waitForCondition(() => scheduler.isAccepting());
+
+    const approval = bridge.approvePopupCommit("review-handle-opaque", TASK_A, 44);
+    const event = port.posted.at(-1) as Record<string, unknown>;
+    expect(event).toMatchObject({
+      kind: "event",
+      event: "popup_commit_approved",
+      payload: { review_handle: "review-handle-opaque", task_id: TASK_A, tab_id: 44 },
+    });
+    expect(JSON.stringify(event)).not.toContain("native_token");
+    const eventId = event.event_id;
+    if (typeof eventId !== "string") throw new Error("popup approval event id is missing");
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "event_ack",
+      event: "popup_commit_approved",
+      event_id: eventId,
+      outcome: "completed",
+      result: { receipt_id: "receipt-popup-approval" },
+    });
+    await expect(approval).resolves.toEqual({ receipt_id: "receipt-popup-approval" });
+  });
   test("disconnects on a malformed ready frame", async () => {
     const scheduler = new MutationScheduler();
     const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
@@ -1425,7 +1655,7 @@ describe("consequential action staging", () => {
     focusStealOnClickTabId = 7;
     const revisions = new RevisionTracker();
     const events: string[] = [];
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event));
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event), async () => undefined);
     const pageRevision = await revisions.ensure(7);
     const prepared = await runtime.act(
       "018f47b8-2f80-7c20-9c77-f8a38c9e621e",
@@ -1456,13 +1686,156 @@ describe("consequential action staging", () => {
     await runtime.detach(7);
     expect(events).toEqual([]);
   });
+  test("stages consequential selected and entered values before dispatch while allowing harmless values immediately", async () => {
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method !== "Runtime.callFunctionOn" ||
+        !String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return undefined;
+      }
+      const objectId = String(params.objectId);
+      const firstArgument = Array.isArray(params.arguments) ? params.arguments[0] : undefined;
+      const requestedValue = (
+        firstArgument !== null &&
+        typeof firstArgument === "object" &&
+        typeof (firstArgument as Record<string, unknown>).value === "string"
+      )
+        ? (firstArgument as Record<string, string>).value
+        : null;
+      const expectedValue = objectId.endsWith("-22")
+        ? "account-ending-1234"
+        : objectId.endsWith("-23")
+          ? "Authorize"
+          : objectId.endsWith("-24")
+            ? "Pay"
+            : "keep-draft";
+      expect(requestedValue).toBe(expectedValue);
+      return {
+        result: {
+          value: {
+            tag: objectId.endsWith("-22") ? "SELECT" : "INPUT",
+            role: objectId.endsWith("-22") ? "combobox" : "textbox",
+            text: "Action",
+            aria_label: "Action",
+            name: "action",
+            associated_labels: ["Action"],
+            accessible_labels: ["Action"],
+            requested_value: requestedValue,
+            requested_option_label: objectId.endsWith("-22") ? "Delete" : null,
+            form_action: "https://example.test/profile",
+            form_method: "get",
+          },
+        },
+      };
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(8);
+
+    for (const [action, keyword] of [
+      [{ kind: "select", ref: `r${pageRevision}-22`, value: "account-ending-1234" }, "Delete"],
+      [{ kind: "fill", ref: `r${pageRevision}-23`, text: "Authorize" }, "Authorize"],
+      [{ kind: "type", ref: `r${pageRevision}-24`, text: "Pay" }, "Pay"],
+    ] as const) {
+      const prepared = await runtime.act(TASK_A, 8, pageRevision, [action]);
+      expect(prepared).toMatchObject({
+        result: {
+          tab_id: 8,
+          page_revision: pageRevision,
+          actions: [],
+          staged_index: 0,
+        },
+        staged: {
+          task_id: TASK_A,
+          tab_id: 8,
+          page_revision: pageRevision,
+          effect: expect.stringContaining(keyword),
+          preview: { kind: action.kind },
+        },
+      });
+    }
+    const valueDispatches = debuggerCommands.filter(
+      ({ method, params }) =>
+        method === "Runtime.callFunctionOn" &&
+        /this\.value=|dispatchEvent/.test(String(params.functionDeclaration)),
+    );
+    expect(valueDispatches).toHaveLength(0);
+
+    const harmless = await runtime.act(TASK_A, 8, pageRevision, [
+      { kind: "select", ref: `r${pageRevision}-25`, value: "keep-draft" },
+    ]);
+    expect(harmless).toMatchObject({
+      result: {
+        tab_id: 8,
+        page_revision: pageRevision,
+        actions: [{ kind: "select", completed: true }],
+      },
+    });
+    expect(harmless.staged).toBeUndefined();
+    expect(
+      debuggerCommands.filter(
+        ({ method, params }) =>
+          method === "Runtime.callFunctionOn" &&
+          /this\.value=|dispatchEvent/.test(String(params.functionDeclaration)),
+      ),
+    ).toHaveLength(1);
+  });
+  test("retains an approved popup review until Commit and clears an abandoned review", async () => {
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(7);
+    const prepared = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    const nativeToken = prepared.staged?.native_token;
+    if (typeof nativeToken !== "string") throw new Error("consequential action did not stage");
+
+    await runtime.bindReview(TASK_A, {
+      native_token: nativeToken,
+      review_handle: "popup-review-handle",
+      tab_id: 7,
+    });
+    expect(await runtime.reviewBinding("popup-review-handle")).toEqual({
+      task_id: TASK_A,
+      tab_id: 7,
+    });
+    expect(await runtime.approveReview("popup-review-handle")).toBe(true);
+    expect((await readState()).stagedCommits[nativeToken]).toMatchObject({
+      review_handle: "popup-review-handle",
+      approved: true,
+    });
+    await expect(runtime.reviewBinding("popup-review-handle")).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+    await expect(runtime.commit(TASK_A, { native_token: nativeToken })).resolves.toMatchObject({
+      actions: [{ kind: "click", completed: true }],
+    });
+    expect((await readState()).stagedCommits[nativeToken]).toBeUndefined();
+
+    const abandoned = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-23` },
+    ]);
+    const abandonedToken = abandoned.staged?.native_token;
+    if (typeof abandonedToken !== "string") throw new Error("consequential action did not stage");
+    await runtime.bindReview(TASK_A, {
+      native_token: abandonedToken,
+      review_handle: "popup-review-handle-abandoned",
+      tab_id: 7,
+    });
+    expect(await runtime.abandonReview("popup-review-handle-abandoned")).toBe(true);
+    await expect(runtime.stagedTabId(TASK_A, abandonedToken)).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+  });
   test("preserves a concurrent human tab selection during a task click", async () => {
     tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
     tabStore.set(91, { id: 91, windowId: 1, groupId: -1, active: false });
     focusStealOnClickTabId = 91;
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(7);
     const prepared = await runtime.act(TASK_A, 7, pageRevision, [
       { kind: "click", ref: `r${pageRevision}-22` },
@@ -1476,10 +1849,126 @@ describe("consequential action staging", () => {
   });
 
 
+
+  test("rejects dialog acceptance staging when no JavaScript dialog is open", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(12);
+
+    await expect(runtime.act(TASK_A, 12, pageRevision, [{ kind: "dialog", decision: "accept" }])).rejects
+      .toMatchObject({ code: "invalid_request" });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
+
+  test("accepts a staged dialog only while the same dialog remains open", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(13);
+    await runtime.snapshot(13, { mode: "accessibility" });
+    emitDebuggerEvent(13, "Page.javascriptDialogOpening", {
+      type: "prompt",
+      message: "Enter the confirmation phrase",
+      defaultPrompt: "draft",
+    });
+
+    const prepared = await runtime.act(TASK_A, 13, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+    expect(prepared.staged?.dialog).toMatchObject({ generation: 1, fingerprint: expect.any(String) });
+
+    await expect(runtime.commit(TASK_A, { native_token: token })).resolves.toMatchObject({
+      actions: [{ kind: "dialog", completed: true }],
+    });
+    expect(
+      debuggerCommands.findLast(({ method }) => method === "Page.handleJavaScriptDialog"),
+    ).toMatchObject({
+      params: { accept: true },
+    });
+  });
+
+  test("invalidates a staged dialog token when the dialog is replaced", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(14);
+    await runtime.snapshot(14, { mode: "accessibility" });
+    emitDebuggerEvent(14, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "First confirmation",
+    });
+    const prepared = await runtime.act(TASK_A, 14, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+
+    emitDebuggerEvent(14, "Page.javascriptDialogClosed");
+    emitDebuggerEvent(14, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Replacement confirmation",
+    });
+    await waitForCondition(() => persisted[STATE_KEY] !== undefined);
+    await waitForCondition(() => {
+      const state = persisted[STATE_KEY] as { stagedCommits?: Record<string, unknown> };
+      return state.stagedCommits?.[token] === undefined;
+    });
+
+    await expect(runtime.commit(TASK_A, { native_token: token })).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
+
+  test("invalidates a staged dialog token when page revision changes", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(15);
+    await runtime.snapshot(15, { mode: "accessibility" });
+    emitDebuggerEvent(15, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Navigate away?",
+    });
+    const prepared = await runtime.act(TASK_A, 15, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+
+    await revisions.markNavigation(15);
+    expect((await readState()).stagedCommits[token]).toBeUndefined();
+    await expect(runtime.commit(TASK_A, { native_token: token })).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
+
+  test("invalidates a staged dialog token when its document identity changes", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(16);
+    await runtime.snapshot(16, { mode: "accessibility" });
+    emitDebuggerEvent(16, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Replace document?",
+    });
+    const prepared = await runtime.act(TASK_A, 16, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+
+    await revisions.observeDocument(16, "backend:replacement", "replacement-loader");
+    expect((await readState()).stagedCommits[token]).toBeUndefined();
+    await expect(runtime.commit(TASK_A, { native_token: token })).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+    expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
+  });
   test("rejects and deletes an expired staged token", async () => {
     const revisions = new RevisionTracker();
     const events: string[] = [];
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event));
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event), async () => undefined);
     const pageRevision = await revisions.ensure(8);
     const prepared = await runtime.act(TASK_A, 8, pageRevision, [
       { kind: "click", ref: `r${pageRevision}-22` },
@@ -1499,7 +1988,7 @@ describe("consequential action staging", () => {
 
   test("rejects a tampered staged action before dispatch", async () => {
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(9);
     const prepared = await runtime.act(TASK_A, 9, pageRevision, [
       { kind: "click", ref: `r${pageRevision}-22` },
@@ -1520,7 +2009,7 @@ describe("consequential action staging", () => {
 
   test("binds staged actions to their original task and page revision", async () => {
     const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined);
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(10);
     const prepared = await runtime.act(TASK_A, 10, pageRevision, [
       { kind: "click", ref: `r${pageRevision}-22` },
@@ -1543,7 +2032,7 @@ describe("consequential action staging", () => {
   test("prunes expired staged commits while preserving valid ones", async () => {
     const revisions = new RevisionTracker();
     const events: string[] = [];
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event));
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event), async () => undefined);
     const pageRevision = await revisions.ensure(11);
     const first = await runtime.act(TASK_A, 11, pageRevision, [
       { kind: "click", ref: `r${pageRevision}-22` },
@@ -1714,6 +2203,23 @@ describe("extension entrypoint admission boundaries", () => {
     expect(debuggerCommands).toHaveLength(deniedBeforePermission);
     expect(await sendPopupMessage({ kind: "resume" })).toEqual({ paused: false });
 
+    const press = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6240",
+      TASK_A,
+      "browser_act",
+      {
+        tab_id: 100,
+        expected_page_revision: 1,
+        actions: [{ kind: "press", ref: "r1-22", key: "Enter" }],
+      },
+    );
+    expect(press).toMatchObject({
+      outcome: "not_started",
+      error: { code: "invalid_request" },
+    });
+    expect(debuggerCommands).toHaveLength(deniedBeforePermission);
+
+
     const staleRevision = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6224",
       TASK_A,
@@ -1811,7 +2317,7 @@ describe("extension entrypoint admission boundaries", () => {
         actions: [
           { kind: "scroll", delta_x: 3, delta_y: 4 },
           { kind: "click", ref: "r1-22" },
-          { kind: "press", key: "Enter" },
+          { kind: "type", ref: "r1-22", text: "after staged click" },
         ],
       },
     );
@@ -1834,6 +2340,62 @@ describe("extension entrypoint admission boundaries", () => {
       throw new Error("consequential action did not return a staged token");
     }
     const stagedToken = (stagedMetadata as Record<string, string>).native_token;
+    const reviewHandle = "opaque-popup-review-handle";
+    await expect(
+      sendNativeCommand(
+        "018f47b8-2f80-7c20-9c77-f8a38c9e6250",
+        TASK_A,
+        "commit_review_bind",
+        { native_token: stagedToken, review_handle: reviewHandle, tab_id: 100 },
+      ),
+    ).resolves.toMatchObject({ outcome: "completed", result: { review_bound: true } });
+    expect(await sendPopupMessage({ kind: "get_ui_state" })).toMatchObject({
+      reviews: [{
+        review_handle: reviewHandle,
+        task_id: TASK_A,
+        tab_id: 100,
+      }],
+    });
+    const approval = sendPopupMessage({
+      kind: "approve_popup_commit",
+      review_handle: reviewHandle,
+    });
+    await waitForCondition(() =>
+      port.posted.some(
+        (message) =>
+          isRecord(message) &&
+          message.kind === "event" &&
+          message.event === "popup_commit_approved" &&
+          isRecord(message.payload) &&
+          message.payload.review_handle === reviewHandle,
+      ),
+    );
+    const approvalEvent = port.posted.findLast(
+      (message) =>
+        isRecord(message) &&
+        message.kind === "event" &&
+        message.event === "popup_commit_approved" &&
+        isRecord(message.payload) &&
+        message.payload.review_handle === reviewHandle,
+    );
+    if (!isRecord(approvalEvent) || typeof approvalEvent.event_id !== "string") {
+      throw new Error("popup approval event is missing");
+    }
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "event_ack",
+      event: "popup_commit_approved",
+      event_id: approvalEvent.event_id,
+      outcome: "completed",
+      result: { approved: true },
+    });
+    await expect(approval).resolves.toEqual({ approved: true });
+    expect((await readState()).stagedCommits[stagedToken]).toMatchObject({
+      review_handle: reviewHandle,
+      approved: true,
+    });
+    expect(await sendPopupMessage({ kind: "get_ui_state" })).toMatchObject({ reviews: [] });
     expect(
       debuggerCommands.filter(
         ({ method, params }) =>
@@ -1915,7 +2477,7 @@ describe("extension entrypoint admission boundaries", () => {
     expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
     const detachCountBeforeRevocation = debuggerCalls.filter((call) => call === "detach").length;
     automationPermission = false;
-    for (const listener of permissionRemovedListeners) listener({ permissions: ["debugger"] });
+    for (const listener of permissionRemovedListeners) listener({ permissions: ["scripting"] });
     const tabsDeniedSynchronously = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6236",
       TASK_A,

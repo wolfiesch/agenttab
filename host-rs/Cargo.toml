@@ -1,11 +1,9 @@
 [workspace]
 members = [
-    ".",
     "crates/agenttab-host",
     "crates/agenttab-protocol",
 ]
 default-members = [
-    ".",
     "crates/agenttab-host",
     "crates/agenttab-protocol",
 ]
@@ -14,7 +12,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-version = "0.2.0"
+version = "2.0.0-rc.1"
 
 [workspace.dependencies]
 base64 = "0.22"
@@ -34,21 +32,3 @@ tokio = { version = "1", features = ["full"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 
-[package]
-name = "chrome-bridge-host"
-edition = "2021"
-version = "0.1.0"
-
-[[bin]]
-name = "bridge-host"
-path = "src/main.rs"
-
-[dependencies]
-serde_json = "1"
-uuid = { version = "1", features = ["v4"] }
-chrono = "0.4"
-socket2 = "0.5"
-url = "2"
-glob = "0.3"
-regex = "1"
-sha2 = "0.10"

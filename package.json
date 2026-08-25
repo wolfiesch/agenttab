@@ -1,12 +1,15 @@
 {
   "name": "agenttab",
-  "version": "0.2.0",
+  "version": "2.0.0-rc.1",
   "private": true,
   "workspaces": [
     "packages/*"
   ],
   "scripts": {
     "extension:build": "bun run --cwd packages/extension build",
-    "extension:check": "bun run --cwd packages/extension typecheck && bun run --cwd packages/extension test && bun run --cwd packages/extension build"
+    "extension:check": "bun run --cwd packages/extension typecheck && bun run --cwd packages/extension test && bun run --cwd packages/extension build",
+    "workspace:typecheck": "bun run --cwd packages/extension typecheck && bun run --cwd packages/sdk-typescript typecheck && bun run --cwd packages/mcp typecheck && bun run --cwd packages/omp typecheck && bun run --cwd packages/installer typecheck && bun run --cwd packages/site typecheck",
+    "workspace:test": "bun run --cwd packages/extension test && bun run --cwd packages/sdk-typescript test && bun run --cwd packages/mcp test && bun run --cwd packages/omp test && bun run --cwd packages/installer test",
+    "workspace:build": "bun run --cwd packages/sdk-typescript build && bun run --cwd packages/mcp build && bun run --cwd packages/omp build && bun run --cwd packages/installer build && bun run --cwd packages/site build"
   }
 }

@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agenttab-host"
-version = "0.2.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "agenttab-protocol",
  "base64",
@@ -29,7 +29,7 @@ dependencies = [
 
 [[package]]
 name = "agenttab-protocol"
-version = "0.2.0"
+version = "2.0.0-rc.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -121,20 +121,6 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "chrome-bridge-host"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "glob",
- "regex",
- "serde_json",
- "sha2",
- "socket2 0.5.10",
- "url",
- "uuid",
-]
 
 [[package]]
 name = "chrono"
@@ -303,12 +289,6 @@ dependencies = [
  "libc",
  "r-efi",
 ]
-
-[[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "hashbrown"
