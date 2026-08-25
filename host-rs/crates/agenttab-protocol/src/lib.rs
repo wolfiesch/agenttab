@@ -420,8 +420,6 @@ pub enum BrowserAction {
     Close,
     Dialog {
         decision: DialogDecision,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prompt_text: Option<String>,
     },
     UploadFile {
         r#ref: String,
@@ -677,12 +675,7 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
                 "url must use http, https, or about without whitespace",
             )
         }
-        BrowserAction::Dialog { prompt_text, .. } => {
-            if let Some(value) = prompt_text {
-                require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "prompt_text")?;
-            }
-            Ok(())
-        }
+        BrowserAction::Dialog { .. } => Ok(()),
         BrowserAction::UploadFile { r#ref, files } => {
             require_ref(method, r#ref)?;
             require(
@@ -938,6 +931,42 @@ impl ConnectionInit {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeCapabilityConfirm {
+    pub protocol: String,
+    pub version: u16,
+    pub kind: ResumeCapabilityConfirmKind,
+    pub connection_id: Uuid,
+    pub resume_capability: String,
+}
+
+impl ResumeCapabilityConfirm {
+    pub fn parse(value: Value) -> Result<Self, ProtocolError> {
+        validate_serialized_request_limit(&value)?;
+        let message: Self = serde_json::from_value(value)?;
+        if message.protocol != RPC_PROTOCOL || message.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedProtocol {
+                protocol: message.protocol.clone(),
+                version: message.version,
+            });
+        }
+        if !(32..=MAX_RESUME_CAPABILITY_CHARS).contains(&message.resume_capability.chars().count())
+        {
+            return Err(ProtocolError::InvalidConnection(format!(
+                "resume_capability must contain 32 to {MAX_RESUME_CAPABILITY_CHARS} characters"
+            )));
+        }
+        Ok(message)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCapabilityConfirmKind {
+    ResumeConfirm,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectKind {
@@ -979,6 +1008,27 @@ impl ConnectionAck {
 #[serde(rename_all = "snake_case")]
 pub enum ConnectedKind {
     Connected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeCapabilityConfirmed {
+    pub protocol: String,
+    pub version: u16,
+    pub kind: ResumeCapabilityConfirmedKind,
+    pub connection_id: Uuid,
+}
+
+impl ResumeCapabilityConfirmed {
+    pub fn value(&self) -> Value {
+        serde_json::to_value(self).expect("resume confirmation acknowledgement serializes")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeCapabilityConfirmedKind {
+    ResumeConfirmed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1776,6 +1826,44 @@ mod tests {
             })),
             Err(ProtocolError::InvalidConnection(_))
         ));
+        let confirmation = ResumeCapabilityConfirm::parse(json!({
+            "protocol": RPC_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "resume_confirm",
+            "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+            "resume_capability": "a".repeat(32)
+        }))
+        .unwrap();
+        assert_eq!(
+            confirmation.connection_id,
+            Uuid::parse_str("018f22b2-4126-7c1a-8c31-3f45a783da42").unwrap()
+        );
+        assert!(matches!(
+            ResumeCapabilityConfirm::parse(json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "resume_confirm",
+                "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                "resume_capability": "short"
+            })),
+            Err(ProtocolError::InvalidConnection(_))
+        ));
+        assert!(ResumeCapabilityConfirm::parse(json!({
+            "protocol": RPC_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "resume_confirm",
+            "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+            "resume_capability": "a".repeat(32),
+            "task_id": Uuid::new_v4()
+        }))
+        .is_err());
+        let confirmed = ResumeCapabilityConfirmed {
+            protocol: RPC_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            kind: ResumeCapabilityConfirmedKind::ResumeConfirmed,
+            connection_id: confirmation.connection_id,
+        };
+        assert_eq!(confirmed.value()["kind"], "resume_confirmed");
     }
 
     #[test]
@@ -1787,7 +1875,7 @@ mod tests {
             json!({"kind": "type", "ref": ref_value, "text": escaped(MAX_ACTION_TEXT_CHARS)}),
             json!({"kind": "fill", "ref": escaped(MAX_REF_CHARS), "text": escaped(MAX_ACTION_TEXT_CHARS)}),
             json!({"kind": "select", "ref": escaped(MAX_REF_CHARS), "value": escaped(MAX_ACTION_VALUE_CHARS)}),
-            json!({"kind": "dialog", "decision": "accept", "prompt_text": escaped(MAX_ACTION_VALUE_CHARS)}),
+            json!({"kind": "dialog", "decision": "accept"}),
             json!({
                 "kind": "upload_file",
                 "ref": escaped(MAX_REF_CHARS),

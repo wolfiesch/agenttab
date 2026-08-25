@@ -13,7 +13,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun run build && bun test"
   },
   "devDependencies": {
     "@types/bun": "^1.2.23",

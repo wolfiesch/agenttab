@@ -8,14 +8,19 @@ afterEach(() => {
   else process.env.AGENTTAB_DEVELOPER = originalDeveloper;
 });
 
+const literalValues: unknown[] = [];
 const schema: Record<string, unknown> = new Proxy({}, {
   get: () => (..._args: unknown[]) => schema,
 });
 const zod: Record<string, unknown> = new Proxy({}, {
-  get: () => (..._args: unknown[]) => schema,
+  get: (_target, property) => (...args: unknown[]) => {
+    if (property === "literal") literalValues.push(args[0]);
+    return schema;
+  },
 });
 
 function register(developer: boolean) {
+  literalValues.length = 0;
   if (developer) process.env.AGENTTAB_DEVELOPER = "1";
   else delete process.env.AGENTTAB_DEVELOPER;
   const tools: Array<Record<string, any>> = [];
@@ -30,7 +35,7 @@ function register(developer: boolean) {
     zod,
     registerTool: (tool) => tools.push(tool),
   });
-  return { tools, calls };
+  return { tools, calls, literalValues: [...literalValues] };
 }
 
 test("Standard OMP mode registers exactly seven Core RPC tools", () => {
@@ -43,6 +48,12 @@ test("Standard OMP mode registers exactly seven Core RPC tools", () => {
     "browser_handoff",
     "browser_commit",
   ]);
+});
+
+test("Standard OMP actions expose no direct focus transition", () => {
+  const registered = register(false);
+  expect(registered.literalValues).toContain("click");
+  expect(registered.literalValues).not.toContain("focus");
 });
 
 test("developer mode adds only browser_developer", () => {

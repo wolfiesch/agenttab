@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentTabClient } from "../../sdk-typescript/src/index";
-import { DEVELOPER_TOOL, McpServer, STANDARD_TOOLS, listedTools } from "../src/server";
+import {
+  DEVELOPER_TOOL,
+  McpServer,
+  STANDARD_TOOLS,
+  listedTools,
+  readBoundedLines,
+} from "../src/server";
 
 describe("AgentTab MCP surface", () => {
   test("Standard mode exposes exactly seven Core RPC tools", () => {
@@ -25,11 +31,43 @@ describe("AgentTab MCP surface", () => {
     });
   });
 
+  test("browser_act exposes no direct focus transition", () => {
+    const actionTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_act")!;
+    const definitions = actionTool.inputSchema.$defs as Record<string, any>;
+    expect(definitions.history.properties.kind.enum).toEqual(["go_back", "go_forward"]);
+    expect(JSON.stringify(actionTool.inputSchema)).not.toContain("\"focus\"");
+  });
+
   test("developer mode adds only browser_developer", () => {
     expect(listedTools(true).map((tool) => tool.name)).toEqual([
       ...STANDARD_TOOLS.map((tool) => tool.name),
       "browser_developer",
     ]);
+  });
+
+  test("bounds stdin lines before parsing and recovers at the next newline", async () => {
+    async function* chunks(): AsyncGenerator<Uint8Array> {
+      yield Buffer.from("12345");
+      yield Buffer.from("6789\nok\r\n");
+      yield Buffer.from("tail");
+    }
+    const entries = [];
+    for await (const entry of readBoundedLines(chunks(), 8)) entries.push(entry);
+    expect(entries).toEqual([
+      { error: "AgentTab MCP request exceeds the 8-byte line limit" },
+      { line: "ok" },
+      { line: "tail" },
+    ]);
+  });
+
+  test("accepts a line exactly at the stdin byte limit", async () => {
+    async function* chunks(): AsyncGenerator<string> {
+      yield "1234";
+      yield "5678\n";
+    }
+    const entries = [];
+    for await (const entry of readBoundedLines(chunks(), 8)) entries.push(entry);
+    expect(entries).toEqual([{ line: "12345678" }]);
   });
 
   test("initialize and tools/call map directly to Core RPC", async () => {

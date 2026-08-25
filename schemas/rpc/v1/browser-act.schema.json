@@ -107,8 +107,7 @@
       "required": ["kind", "decision"],
       "properties": {
         "kind": { "const": "dialog" },
-        "decision": { "enum": ["accept", "dismiss"] },
-        "prompt_text": { "type": "string", "maxLength": 2048 }
+        "decision": { "enum": ["accept", "dismiss"] }
       },
       "additionalProperties": false
     },

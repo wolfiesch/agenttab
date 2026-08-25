@@ -1,8 +1,8 @@
-import { createInterface } from "node:readline";
 import { stdin, stdout } from "node:process";
 import {
   AgentTabClient,
   AgentTabError,
+  createResumeCapabilityStore,
   type MethodParams,
   type RpcMethod,
 } from "../../sdk-typescript/src/index";
@@ -19,6 +19,66 @@ import packageJson from "../package.json" with { type: "json" };
 const SERVER_NAME = "agenttab-mcp";
 const SERVER_VERSION = packageJson.version;
 const MCP_PROTOCOL_VERSION = "2025-03-26";
+export const MCP_MAX_LINE_BYTES = 1024 * 1024 + 64 * 1024;
+
+export type BoundedLine = { line: string } | { error: string };
+
+export async function* readBoundedLines(
+  input: AsyncIterable<Uint8Array | string>,
+  maxLineBytes = MCP_MAX_LINE_BYTES,
+): AsyncGenerator<BoundedLine> {
+  if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) {
+    throw new Error("MCP line limit must be a positive safe integer");
+  }
+  let pieces: Buffer[] = [];
+  let lineBytes = 0;
+  let discardingOversizedLine = false;
+  const overflow = () => ({
+    error: `AgentTab MCP request exceeds the ${maxLineBytes}-byte line limit`,
+  });
+
+  for await (const rawChunk of input) {
+    const chunk = typeof rawChunk === "string" ? Buffer.from(rawChunk) : Buffer.from(rawChunk);
+    let start = 0;
+    for (let index = 0; index <= chunk.length; index += 1) {
+      if (index < chunk.length && chunk[index] !== 0x0a) continue;
+      const segment = chunk.subarray(start, index);
+      if (!discardingOversizedLine) {
+        if (lineBytes + segment.length > maxLineBytes) {
+          pieces = [];
+          lineBytes = 0;
+          discardingOversizedLine = true;
+        } else if (segment.length > 0) {
+          pieces.push(segment);
+          lineBytes += segment.length;
+        }
+      }
+      if (index < chunk.length) {
+        if (discardingOversizedLine) {
+          yield overflow();
+        } else {
+          let line = pieces.length === 0
+            ? Buffer.alloc(0)
+            : pieces.length === 1
+              ? pieces[0]
+              : Buffer.concat(pieces, lineBytes);
+          if (line.at(-1) === 0x0d) line = line.subarray(0, -1);
+          yield { line: line.toString("utf8") };
+        }
+        pieces = [];
+        lineBytes = 0;
+        discardingOversizedLine = false;
+        start = index + 1;
+      }
+    }
+  }
+  if (discardingOversizedLine) {
+    yield overflow();
+  } else if (lineBytes > 0) {
+    const line = pieces.length === 1 ? pieces[0] : Buffer.concat(pieces, lineBytes);
+    yield { line: line.toString("utf8") };
+  }
+}
 
 interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -146,9 +206,18 @@ export class McpServer {
 
   constructor(options: { developer?: boolean; clientFactory?: () => Promise<AgentTabClient> } = {}) {
     this.#developer = options.developer ?? process.env.AGENTTAB_DEVELOPER === "1";
-    this.#clientFactory = options.clientFactory ?? (() => AgentTabClient.connect({
-      conversationId: process.env.AGENTTAB_CONVERSATION_ID,
-    }));
+    if (options.clientFactory) {
+      this.#clientFactory = options.clientFactory;
+      return;
+    }
+    const conversationId = process.env.AGENTTAB_CONVERSATION_ID;
+    const capabilityStore = conversationId
+      ? createResumeCapabilityStore("mcp", { scope: conversationId })
+      : undefined;
+    this.#clientFactory = () => AgentTabClient.connect({
+      conversationId,
+      capabilityStore,
+    });
   }
 
   async handle(request: JsonRpcRequest): Promise<unknown> {
@@ -206,15 +275,22 @@ export class McpServer {
 
 export async function main(): Promise<void> {
   const server = new McpServer();
-  const input = createInterface({ input: stdin, crlfDelay: Infinity });
+  let shuttingDown = false;
   const shutdown = () => {
+    shuttingDown = true;
     server.close();
-    input.close();
+    stdin.destroy();
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
 
-  for await (const line of input) {
+  for await (const entry of readBoundedLines(stdin)) {
+    if (shuttingDown) break;
+    if ("error" in entry) {
+      respondError(null, -32700, entry.error);
+      continue;
+    }
+    const { line } = entry;
     if (!line.trim()) continue;
     let request: JsonRpcRequest;
     try {

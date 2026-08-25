@@ -88,7 +88,7 @@ export interface InstallOptions {
   runtimeAssets?: RuntimeAssets;
   publicKeyPem?: string;
   dryRun?: boolean;
-  skipReadiness?: boolean;
+  verifyReadiness?: boolean;
   openBrowser?: boolean;
   print?: (line: string) => void;
   transactionFailAfter?: number;
@@ -109,7 +109,16 @@ export interface InstallResult {
   transaction: TransactionResult;
   skippedConfigs: Array<{ client: string; path: string; reason: string }>;
   legacy: LegacyReport;
-  readiness: { passed: boolean; skipped: boolean };
+  extension: {
+    path: string;
+    status: "planned" | "manual_load_required" | "verified";
+    instructions: string[];
+  };
+  readiness: {
+    passed: boolean;
+    skipped: boolean;
+    reason?: "dry_run" | "manual_extension_load";
+  };
 }
 
 export class InstallError extends Error {
@@ -800,10 +809,35 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
     print(`Chrome Bridge ${legacy.recoveryTag} remains untouched. Prove AgentTab first, then disable extension ${legacy.unpackedExtensionId} manually.`);
   }
 
-  let readiness = { passed: false, skipped: options.skipReadiness === true || options.dryRun === true };
-  if (!readiness.skipped) {
+  const instructions = [
+    "Open chrome://extensions in Chrome.",
+    "Enable Developer mode.",
+    `Choose Load unpacked and select ${extensionRoot}.`,
+    "Confirm that AgentTab is enabled, then run agenttab doctor --layer extension.",
+  ];
+  let readiness: InstallResult["readiness"];
+  let extensionStatus: InstallResult["extension"]["status"];
+  if (options.dryRun === true) {
+    readiness = { passed: false, skipped: true, reason: "dry_run" };
+    extensionStatus = "planned";
+  } else if (options.verifyReadiness === true) {
     await runReadiness(options.openBrowser !== false, platform);
     readiness = { passed: true, skipped: false };
+    extensionStatus = "verified";
+  } else {
+    readiness = { passed: false, skipped: true, reason: "manual_extension_load" };
+    extensionStatus = "manual_load_required";
+    print(`AgentTab extension setup is required. Load unpacked from ${extensionRoot}`);
+    for (const instruction of instructions) print(`  ${instruction}`);
   }
-  return { version, target, stateDir, transaction, skippedConfigs: configPlan.skipped, legacy, readiness };
+  return {
+    version,
+    target,
+    stateDir,
+    transaction,
+    skippedConfigs: configPlan.skipped,
+    legacy,
+    extension: { path: extensionRoot, status: extensionStatus, instructions },
+    readiness,
+  };
 }

@@ -1,6 +1,8 @@
 use crate::journal::{Journal, JournalError, TaskLease};
 use agenttab_protocol::{
-    ConnectedKind, ConnectionAck, ConnectionInit, RuntimeState, PROTOCOL_VERSION, RPC_PROTOCOL,
+    ConnectedKind, ConnectionAck, ConnectionInit, ResumeCapabilityConfirm,
+    ResumeCapabilityConfirmed, ResumeCapabilityConfirmedKind, RuntimeState, PROTOCOL_VERSION,
+    RPC_PROTOCOL,
 };
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,15 +102,31 @@ impl ConnectionContext {
             .flatten()
     }
 
-    pub fn acknowledge_resume_capability(&self, journal: &Journal) -> Result<(), JournalError> {
+    pub fn resume_confirmation_required(&self) -> bool {
+        self.task.lock().resume_rotation_pending
+    }
+
+    pub fn confirm_resume_capability(
+        &self,
+        confirmation: &ResumeCapabilityConfirm,
+        journal: &Journal,
+    ) -> Result<ResumeCapabilityConfirmed, JournalError> {
         let mut state = self.task.lock();
-        if !state.resume_rotation_pending {
-            return Ok(());
+        if !state.resume_rotation_pending || confirmation.connection_id != self.connection_id {
+            return Err(JournalError::ResumeRotationLost);
         }
         let lease = state.lease.as_ref().ok_or(JournalError::MissingTask)?;
+        if confirmation.resume_capability != lease.resume_capability {
+            return Err(JournalError::ResumeRotationLost);
+        }
         journal.acknowledge_resume_capability(lease.task_id, &lease.resume_capability)?;
         state.resume_rotation_pending = false;
-        Ok(())
+        Ok(ResumeCapabilityConfirmed {
+            protocol: RPC_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            kind: ResumeCapabilityConfirmedKind::ResumeConfirmed,
+            connection_id: self.connection_id,
+        })
     }
 
     pub fn rollback_resume_capability(&self, journal: &Journal) -> Result<(), JournalError> {
@@ -139,7 +157,7 @@ impl ConnectionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agenttab_protocol::{ConnectKind, ConnectionInit};
+    use agenttab_protocol::{ConnectKind, ConnectionInit, ResumeCapabilityConfirmKind};
 
     fn init(capability: Option<String>) -> ConnectionInit {
         ConnectionInit {
@@ -147,6 +165,16 @@ mod tests {
             version: PROTOCOL_VERSION,
             kind: ConnectKind::Connect,
             conversation_id: Some("conversation".into()),
+            resume_capability: capability,
+        }
+    }
+
+    fn confirmation(connection_id: Uuid, capability: String) -> ResumeCapabilityConfirm {
+        ResumeCapabilityConfirm {
+            protocol: RPC_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            kind: ResumeCapabilityConfirmKind::ResumeConfirm,
+            connection_id,
             resume_capability: capability,
         }
     }
@@ -175,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_rotates_capability_in_connection_ack() {
+    fn resume_rotates_only_after_same_connection_candidate_confirmation() {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&temp.path().join("state.sqlite3")).unwrap());
         let created = journal.create_task(None).unwrap();
@@ -185,13 +213,61 @@ mod tests {
             RuntimeState::Ready,
         )
         .unwrap();
+        let candidate = ack.resume_capability.unwrap();
+
         assert!(ack.resumed);
         assert_eq!(ack.task_id, Some(created.task_id));
-        assert_ne!(ack.resume_capability.unwrap(), created.resume_capability);
-        connection.acknowledge_resume_capability(&journal).unwrap();
+        assert!(connection.resume_confirmation_required());
         assert!(journal
             .resume_task(&created.resume_capability)
             .unwrap()
             .is_none());
+        assert!(matches!(
+            connection.confirm_resume_capability(
+                &confirmation(Uuid::new_v4(), candidate.clone()),
+                &journal
+            ),
+            Err(JournalError::ResumeRotationLost)
+        ));
+        assert!(matches!(
+            connection.confirm_resume_capability(
+                &confirmation(connection.connection_id, created.resume_capability.clone()),
+                &journal
+            ),
+            Err(JournalError::ResumeRotationLost)
+        ));
+
+        let confirmed = connection
+            .confirm_resume_capability(
+                &confirmation(connection.connection_id, candidate.clone()),
+                &journal,
+            )
+            .unwrap();
+        assert_eq!(confirmed.connection_id, connection.connection_id);
+        assert!(!connection.resume_confirmation_required());
+        assert!(journal
+            .resume_task(&created.resume_capability)
+            .unwrap()
+            .is_none());
+        assert!(journal.resume_task(&candidate).unwrap().is_some());
+    }
+
+    #[test]
+    fn disconnect_rollback_keeps_the_old_capability_recoverable() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&temp.path().join("state.sqlite3")).unwrap());
+        let created = journal.create_task(None).unwrap();
+        let (connection, _) = ConnectionContext::negotiate(
+            init(Some(created.resume_capability.clone())),
+            &journal,
+            RuntimeState::Ready,
+        )
+        .unwrap();
+
+        connection.rollback_resume_capability(&journal).unwrap();
+        assert!(journal
+            .resume_task(&created.resume_capability)
+            .unwrap()
+            .is_some());
     }
 }

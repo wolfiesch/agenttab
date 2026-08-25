@@ -203,6 +203,7 @@ function parseState(value: unknown): ExtensionState | null {
         (typeof commit.review_handle !== "string" ||
           commit.review_handle.length < 16 ||
           commit.review_handle.length > 256)) ||
+      (commit.approved !== undefined && typeof commit.approved !== "boolean") ||
       (commit.dialog !== undefined &&
         (!dialog ||
           !finiteInteger(dialog.generation, 1) ||

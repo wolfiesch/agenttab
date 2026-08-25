@@ -1,14 +1,17 @@
 import { execFileSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { existsSync, statSync, type Stats } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
 import { createConnection, type Socket } from "node:net";
+import { join } from "node:path";
 
 export const RPC_PROTOCOL = "agenttab.rpc" as const;
 export const RPC_VERSION = 1 as const;
-export const CLIENT_TO_HOST_MAX_BYTES = 64 * 1024;
+export const CLIENT_TO_HOST_MAX_BYTES = 1024 * 1024;
 export const HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024;
+
+export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
 
 export type BrowserOpenParams =
   | { mode: "create"; url?: string; background?: boolean }
@@ -26,9 +29,9 @@ export type BrowserAction =
   | { kind: "scroll"; delta_x: number; delta_y: number; ref?: string }
   | { kind: "drag"; ref: string; target_ref: string }
   | { kind: "navigate"; url: string }
-  | { kind: "go_back" | "go_forward" | "focus" | "close" }
+  | { kind: "go_back" | "go_forward" | "close" }
   | { kind: "reload"; bypass_cache?: boolean }
-  | { kind: "dialog"; decision: "accept" | "dismiss"; prompt_text?: string }
+  | { kind: "dialog"; decision: "accept" | "dismiss" }
   | { kind: "upload_file"; ref: string; files: string[] };
 
 export interface BrowserActParams {
@@ -131,12 +134,199 @@ export class AgentTabError extends Error {
   }
 }
 
+export interface ResumeCapabilityStore {
+  readonly path: string;
+  load(): Promise<string | undefined>;
+  loadPending(): Promise<string | undefined>;
+  save(capability: string): Promise<void>;
+  prepareReplacement(currentCapability: string, replacementCapability: string): Promise<void>;
+  activateReplacement(replacementCapability: string): Promise<void>;
+}
+
+interface StoredResumeCapability {
+  schemaVersion: 1;
+  resumeCapability: string;
+  pendingResumeCapability?: string;
+}
+
+function validateResumeCapability(capability: string): void {
+  if (capability.length < 32 || capability.length > 64) {
+    throw new Error("AgentTab resume capability must contain 32 to 64 characters");
+  }
+}
+
+async function prepareCapabilityDirectory(directory: string, create: boolean): Promise<boolean> {
+  if (create) await mkdir(directory, { recursive: true, mode: 0o700 });
+  let metadata: Stats;
+  try {
+    metadata = await lstat(directory);
+  } catch (error) {
+    if (!create && (error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`AgentTab client state path is not a regular directory: ${directory}`);
+  }
+  if (platform() !== "win32" && (metadata.mode & 0o077) !== 0) {
+    if (!create) throw new Error(`AgentTab client state directory must be owner-only (0700): ${directory}`);
+    await chmod(directory, 0o700);
+  }
+  return true;
+}
+
+export function createResumeCapabilityStore(
+  namespace: string,
+  options: { scope: string; stateDir?: string },
+): ResumeCapabilityStore {
+  if (!/^[a-z0-9_-]+$/.test(namespace)) {
+    throw new Error("AgentTab capability store namespace must contain only lowercase letters, digits, dashes, or underscores");
+  }
+  if (options.scope.length === 0) {
+    throw new Error("AgentTab capability store scope must not be empty");
+  }
+  const stateDir = options.stateDir ?? process.env.AGENTTAB_STATE_DIR ?? join(homedir(), ".agenttab");
+  const scopeHash = createHash("sha256").update(options.scope).digest("hex").slice(0, 32);
+  const directory = join(stateDir, "clients");
+  const path = join(directory, `${namespace}-${scopeHash}.json`);
+
+  async function loadStoredCapability(): Promise<StoredResumeCapability | undefined> {
+    if (!await prepareCapabilityDirectory(directory, false)) return undefined;
+    let metadata;
+    try {
+      metadata = await lstat(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`AgentTab resume capability path is not a regular file: ${path}`);
+    }
+    if (platform() !== "win32" && (metadata.mode & 0o077) !== 0) {
+      throw new Error(`AgentTab resume capability must be owner-only (0600): ${path}`);
+    }
+    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (
+      !isRecord(value) ||
+      value.schemaVersion !== 1 ||
+      typeof value.resumeCapability !== "string" ||
+      (value.pendingResumeCapability !== undefined && typeof value.pendingResumeCapability !== "string")
+    ) {
+      throw new Error(`AgentTab resume capability file is invalid: ${path}`);
+    }
+    validateResumeCapability(value.resumeCapability);
+    if (value.pendingResumeCapability !== undefined) validateResumeCapability(value.pendingResumeCapability);
+    return {
+      schemaVersion: 1,
+      resumeCapability: value.resumeCapability,
+      ...(value.pendingResumeCapability !== undefined
+        ? { pendingResumeCapability: value.pendingResumeCapability }
+        : {}),
+    };
+  }
+
+  async function saveStoredCapability(capability: StoredResumeCapability): Promise<void> {
+    validateResumeCapability(capability.resumeCapability);
+    if (capability.pendingResumeCapability !== undefined) {
+      validateResumeCapability(capability.pendingResumeCapability);
+    }
+    await prepareCapabilityDirectory(directory, true);
+    const temporaryPath = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+    const handle = await open(temporaryPath, "wx", 0o600);
+    try {
+      await handle.writeFile(`${JSON.stringify(capability)}\n`, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await rename(temporaryPath, path);
+      if (platform() !== "win32") await chmod(path, 0o600);
+      const committed = await open(path, "r");
+      try {
+        await committed.sync();
+      } finally {
+        await committed.close();
+      }
+      if (platform() !== "win32") {
+        const directoryHandle = await open(directory, "r");
+        try {
+          await directoryHandle.sync();
+        } finally {
+          await directoryHandle.close();
+        }
+      }
+    } catch (error) {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+  }
+
+  return {
+    path,
+    async load(): Promise<string | undefined> {
+      return (await loadStoredCapability())?.resumeCapability;
+    },
+    async loadPending(): Promise<string | undefined> {
+      return (await loadStoredCapability())?.pendingResumeCapability;
+    },
+    async save(capability: string): Promise<void> {
+      validateResumeCapability(capability);
+      await saveStoredCapability({ schemaVersion: 1, resumeCapability: capability });
+    },
+    async prepareReplacement(currentCapability: string, replacementCapability: string): Promise<void> {
+      validateResumeCapability(currentCapability);
+      validateResumeCapability(replacementCapability);
+      if (currentCapability === replacementCapability) {
+        throw new Error("AgentTab resume capability replacement must differ from the current capability");
+      }
+      const stored = await loadStoredCapability();
+      if (
+        !stored ||
+        (stored.resumeCapability !== currentCapability && stored.pendingResumeCapability !== currentCapability)
+      ) {
+        throw new Error("AgentTab resume capability store does not contain the capability being resumed");
+      }
+      await saveStoredCapability({
+        schemaVersion: 1,
+        resumeCapability: currentCapability,
+        pendingResumeCapability: replacementCapability,
+      });
+    },
+    async activateReplacement(replacementCapability: string): Promise<void> {
+      validateResumeCapability(replacementCapability);
+      const stored = await loadStoredCapability();
+      if (!stored || stored.pendingResumeCapability !== replacementCapability) {
+        throw new Error("AgentTab resume capability store does not contain the confirmed replacement");
+      }
+      await saveStoredCapability({ schemaVersion: 1, resumeCapability: replacementCapability });
+    },
+  };
+}
+
+function capabilityPersistenceError(response: RpcResponse, error: unknown): AgentTabError {
+  return new AgentTabError({
+    protocol: RPC_PROTOCOL,
+    version: RPC_VERSION,
+    request_id: response.request_id,
+    ok: false,
+    outcome: response.outcome,
+    error: {
+      code: "capability_persistence_failed",
+      message: `AgentTab completed the RPC but could not persist its rotated resume capability: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      recovery: "Repair the owner-only AgentTab client state directory before restarting or retrying.",
+    },
+  });
+}
+
 export interface ClientOptions {
   conversationId?: string;
   resumeCapability?: string;
   endpoint?: string;
   connectTimeoutMs?: number;
   requestTimeoutMs?: number;
+  capabilityStore?: ResumeCapabilityStore;
 }
 
 const MUTATIONS = new Set<RpcMethod>([
@@ -225,7 +415,117 @@ export function resolveEndpoint(environment: NodeJS.ProcessEnv = process.env): s
 interface PendingRequest {
   resolve(response: RpcResponse): void;
   reject(error: Error): void;
-  timer: ReturnType<typeof setTimeout>;
+  timer: NodeJS.Timeout;
+}
+
+interface NegotiatedConnection {
+  socket: Socket;
+  decoder: FrameDecoder;
+  connected: ConnectionAck;
+}
+
+async function negotiateConnection(
+  endpoint: string,
+  timeoutMs: number,
+  conversationId: string | undefined,
+  resumeCapability: string | undefined,
+): Promise<NegotiatedConnection> {
+  const socket = createConnection(endpoint);
+  const decoder = new FrameDecoder();
+  const connected = await new Promise<ConnectionAck>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Timed out after ${timeoutMs} ms connecting to AgentTab at ${endpoint}`));
+    }, timeoutMs);
+    const closed = () => fail(new Error("AgentTab closed during connection negotiation"));
+    const fail = (error: Error) => {
+      clearTimeout(timer);
+      socket.off("error", fail);
+      socket.off("close", closed);
+      reject(error);
+    };
+    const accept = (value: ConnectionAck) => {
+      clearTimeout(timer);
+      socket.off("error", fail);
+      socket.off("close", closed);
+      socket.removeAllListeners("data");
+      resolve(value);
+    };
+    socket.once("error", fail);
+    socket.once("close", closed);
+    socket.on("data", (chunk) => {
+      try {
+        for (const value of decoder.push(chunk)) {
+          if (!isConnectionAck(value)) throw new Error("AgentTab sent a response before connection negotiation completed");
+          accept(value);
+          return;
+        }
+      } catch (error) {
+        socket.destroy();
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    socket.once("connect", () => {
+      socket.write(encodeFrame({
+        protocol: RPC_PROTOCOL,
+        version: RPC_VERSION,
+        kind: "connect",
+        ...(conversationId ? { conversation_id: conversationId } : {}),
+        ...(resumeCapability ? { resume_capability: resumeCapability } : {}),
+      }));
+    });
+  });
+  return { socket, decoder, connected };
+}
+
+async function confirmResumeCapability(
+  socket: Socket,
+  decoder: FrameDecoder,
+  connection: ConnectionAck,
+  capability: string,
+  timeoutMs: number,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Timed out after ${timeoutMs} ms confirming the AgentTab resume capability`));
+    }, timeoutMs);
+    const closed = () => fail(new Error("AgentTab closed before accepting the resume confirmation"));
+    const fail = (error: Error) => {
+      clearTimeout(timer);
+      socket.off("error", fail);
+      socket.off("close", closed);
+      socket.removeAllListeners("data");
+      reject(error);
+    };
+    socket.once("error", fail);
+    socket.once("close", closed);
+    socket.on("data", (chunk) => {
+      try {
+        for (const value of decoder.push(chunk)) {
+          if (!isResumeCapabilityConfirmed(value, connection.connection_id)) {
+            throw new Error("AgentTab rejected or malformed the resume capability confirmation");
+          }
+          clearTimeout(timer);
+          socket.off("error", fail);
+          socket.off("close", closed);
+          socket.removeAllListeners("data");
+          resolve();
+          return;
+        }
+      } catch (error) {
+        socket.destroy();
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    socket.write(encodeFrame({
+      protocol: RPC_PROTOCOL,
+      version: RPC_VERSION,
+      kind: "resume_confirm",
+      connection_id: connection.connection_id,
+      resume_capability: capability,
+    }));
+  });
 }
 
 export class AgentTabClient {
@@ -234,59 +534,85 @@ export class AgentTabClient {
   #pending = new Map<string, PendingRequest>();
   #requestTimeoutMs: number;
   #resumeCapability?: string;
+  #capabilityStore?: ResumeCapabilityStore;
+  #capabilityWrites: Promise<void> = Promise.resolve();
   #closed = false;
 
-  private constructor(socket: Socket, connection: ConnectionAck, requestTimeoutMs: number) {
+  private constructor(
+    socket: Socket,
+    connection: ConnectionAck,
+    requestTimeoutMs: number,
+    capabilityStore?: ResumeCapabilityStore,
+  ) {
     this.#socket = socket;
     this.connection = connection;
     this.#requestTimeoutMs = requestTimeoutMs;
     this.#resumeCapability = connection.resume_capability;
+    this.#capabilityStore = capabilityStore;
   }
 
   static async connect(options: ClientOptions = {}): Promise<AgentTabClient> {
     const endpoint = options.endpoint ?? resolveEndpoint();
-    const socket = createConnection(endpoint);
-    const decoder = new FrameDecoder();
     const timeoutMs = options.connectTimeoutMs ?? 5_000;
-
-    const connected = await new Promise<ConnectionAck>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        socket.destroy();
-        reject(new Error(`Timed out after ${timeoutMs} ms connecting to AgentTab at ${endpoint}`));
-      }, timeoutMs);
-      const fail = (error: Error) => {
-        clearTimeout(timer);
-        reject(error);
-      };
-      socket.once("error", fail);
-      socket.on("data", (chunk) => {
-        try {
-          for (const value of decoder.push(chunk)) {
-            if (!isConnectionAck(value)) throw new Error("AgentTab sent a response before connection negotiation completed");
-            clearTimeout(timer);
-            socket.off("error", fail);
-            resolve(value);
-          }
-        } catch (error) {
-          socket.destroy();
-          fail(error instanceof Error ? error : new Error(String(error)));
-        }
-      });
-      socket.once("connect", () => {
-        socket.write(
-          encodeFrame({
-            protocol: RPC_PROTOCOL,
-            version: RPC_VERSION,
-            kind: "connect",
-            ...(options.conversationId ? { conversation_id: options.conversationId } : {}),
-            ...(options.resumeCapability ? { resume_capability: options.resumeCapability } : {}),
-          }),
+    const store = options.capabilityStore;
+    if (options.resumeCapability && !store) {
+      throw new Error("AgentTab refuses to resume without a persistent ResumeCapabilityStore");
+    }
+    const pendingCapability = options.resumeCapability ? undefined : await store?.loadPending();
+    const activeCapability = options.resumeCapability ?? await store?.load();
+    const candidates = [pendingCapability, activeCapability]
+      .filter((value): value is string => value !== undefined)
+      .filter((value, index, values) => values.indexOf(value) === index);
+    let attemptedCapability: string | undefined;
+    let negotiated: NegotiatedConnection | undefined;
+    for (const capability of candidates.length === 0 ? [undefined] : candidates) {
+      const attempt = await negotiateConnection(endpoint, timeoutMs, options.conversationId, capability);
+      if (capability && !attempt.connected.resumed) {
+        attempt.socket.destroy();
+        if (capability !== activeCapability) continue;
+        throw new Error(
+          "AgentTab rejected the stored resume capability; remove that client state only when starting a new task is intended",
         );
-      });
-    });
+      }
+      attemptedCapability = capability;
+      negotiated = attempt;
+      break;
+    }
+    if (!negotiated) throw new Error("AgentTab could not establish a connection");
 
-    socket.removeAllListeners("data");
-    const client = new AgentTabClient(socket, connected, options.requestTimeoutMs ?? 30_000);
+    const { socket, decoder, connected } = negotiated;
+    if (connected.resumed) {
+      const replacement = connected.resume_capability;
+      if (!store || !attemptedCapability || !replacement) {
+        socket.destroy();
+        throw new Error("AgentTab resumed without the durable resume-confirmation prerequisites");
+      }
+      try {
+        await store.prepareReplacement(attemptedCapability, replacement);
+        await confirmResumeCapability(socket, decoder, connected, replacement, timeoutMs);
+        await store.activateReplacement(replacement);
+      } catch (error) {
+        socket.destroy();
+        throw new Error(
+          `AgentTab could not complete durable resume-capability rotation: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    } else if (connected.resume_capability && store) {
+      try {
+        await store.save(connected.resume_capability);
+      } catch (error) {
+        socket.destroy();
+        throw error;
+      }
+    }
+    const client = new AgentTabClient(
+      socket,
+      connected,
+      options.requestTimeoutMs ?? 30_000,
+      store,
+    );
     client.#startReader(decoder);
     return client;
   }
@@ -367,8 +693,18 @@ export class AgentTabClient {
     if (!pending) return;
     this.#pending.delete(value.request_id);
     clearTimeout(pending.timer);
-    if (value.task?.resume_capability) this.#resumeCapability = value.task.resume_capability;
-    pending.resolve(value);
+    const rotated = value.task?.resume_capability;
+    if (!rotated || !this.#capabilityStore) {
+      if (rotated) this.#resumeCapability = rotated;
+      pending.resolve(value);
+      return;
+    }
+    this.#resumeCapability = rotated;
+    this.#capabilityWrites = this.#capabilityWrites.then(() => this.#capabilityStore!.save(rotated));
+    void this.#capabilityWrites.then(
+      () => pending.resolve(value),
+      (error) => pending.reject(capabilityPersistenceError(value, error)),
+    );
   }
 
   #rejectPending(error: Error): void {
@@ -391,7 +727,19 @@ function isConnectionAck(value: unknown): value is ConnectionAck {
     value.version === RPC_VERSION &&
     value.kind === "connected" &&
     typeof value.connection_id === "string" &&
-    typeof value.resumed === "boolean"
+    typeof value.resumed === "boolean" &&
+    (!value.resumed ||
+      (typeof value.task_id === "string" && typeof value.resume_capability === "string"))
+  );
+}
+
+function isResumeCapabilityConfirmed(value: unknown, connectionId: string): boolean {
+  return (
+    isRecord(value) &&
+    value.protocol === RPC_PROTOCOL &&
+    value.version === RPC_VERSION &&
+    value.kind === "resume_confirmed" &&
+    value.connection_id === connectionId
   );
 }
 

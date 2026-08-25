@@ -132,6 +132,7 @@ export interface StagedCommit {
   fingerprint: string;
   expires_at_ms: number;
   review_handle?: string;
+  approved?: boolean;
   action: Record<string, unknown>;
   preview: Record<string, unknown>;
   dialog?: StagedDialog;
@@ -274,7 +275,6 @@ function assertAction(value: unknown): Record<string, unknown> {
       return action;
     case "go_back":
     case "go_forward":
-    case "focus":
     case "close":
       assertExactObject(action, ["kind"], [], `${action.kind} action`);
       return action;
@@ -285,11 +285,10 @@ function assertAction(value: unknown): Record<string, unknown> {
       }
       return action;
     case "dialog":
-      assertExactObject(action, ["kind", "decision"], ["prompt_text"], "dialog action");
+      assertExactObject(action, ["kind", "decision"], [], "dialog action");
       if (action.decision !== "accept" && action.decision !== "dismiss") {
         commandError("dialog.decision must be accept or dismiss");
       }
-      if (action.prompt_text !== undefined) assertBoundedString(action.prompt_text, "dialog.prompt_text", 0, 65_536);
       return action;
     case "upload_file":
       assertExactObject(action, ["kind", "ref", "files"], [], "upload_file action");

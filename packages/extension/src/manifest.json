@@ -8,6 +8,7 @@
   "minimum_chrome_version": "127",
   "permissions": [
     "nativeMessaging",
+    "debugger",
     "tabs",
     "tabGroups",
     "storage",
@@ -15,8 +16,7 @@
     "downloads"
   ],
   "optional_permissions": [
-    "scripting",
-    "debugger"
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"

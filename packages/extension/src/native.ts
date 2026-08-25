@@ -91,6 +91,7 @@ export class NativeBridge {
           preview: _preview,
           dialog: _dialog,
           review_handle: _reviewHandle,
+          approved: _approved,
           ...staged
         }) => staged),
       ));

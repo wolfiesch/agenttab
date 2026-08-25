@@ -95,8 +95,8 @@ if (channel === "development") {
   }
   delete manifest.key;
 }
-const required = ["nativeMessaging", "tabs", "tabGroups", "storage", "alarms", "downloads"];
-const optional = ["scripting", "debugger"];
+const required = ["nativeMessaging", "debugger", "tabs", "tabGroups", "storage", "alarms", "downloads"];
+const optional = ["scripting"];
 const forbiddenKeys = ["content_scripts", "web_accessible_resources", "externally_connectable", "side_panel", "commands"];
 for (const key of forbiddenKeys) {
   if (key in manifest) throw new Error(`Forbidden manifest surface: ${key}`);

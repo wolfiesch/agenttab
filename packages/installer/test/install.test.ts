@@ -257,7 +257,6 @@ describe("Windows host archives", () => {
         arch: "x64",
         runtimeAssets: await runtimeAssets(root),
         dryRun: true,
-        skipReadiness: true,
         openBrowser: false,
         print: () => undefined,
       });
@@ -288,7 +287,6 @@ describe("Windows host archives", () => {
       platform: "win32",
       arch: "x64",
       dryRun: true,
-      skipReadiness: true,
       openBrowser: false,
       print: () => undefined,
     })).rejects.toThrow(`agenttab-host-v${version}-${target}.zip`);
@@ -317,7 +315,6 @@ describe("Windows host archives", () => {
         platform: "win32",
         arch: "x64",
         dryRun: true,
-        skipReadiness: true,
         openBrowser: false,
         print: () => undefined,
       })).rejects.toThrow("host ZIP");
@@ -370,8 +367,6 @@ describe("end-to-end development install", () => {
       home,
       stateDir,
       runtimeAssets: assets,
-      skipReadiness: true,
-      openBrowser: false,
       print: (line: string) => output.push(line),
     } as const;
     const first = await install(options);
@@ -382,6 +377,13 @@ describe("end-to-end development install", () => {
     expect(await readFile(windsurf, "utf8")).toBe("{malformed");
     expect(first.legacy.stateArtifacts).toContain(join(legacyRoot, "bridge_policy.json"));
     expect(first.legacy.unpackedExtensionId).toBe("idnlffjfkgcnjfdhocemdeihhejpamkc");
+    expect(first.extension).toMatchObject({
+      path: join(stateDir, "versions", "v2.0.0-rc.1", "extension"),
+      status: "manual_load_required",
+    });
+    expect(first.readiness).toEqual({ passed: false, skipped: true, reason: "manual_extension_load" });
+    expect(output.join("\n")).toContain("Open chrome://extensions in Chrome.");
+    expect(output.join("\n")).toContain("Choose Load unpacked and select");
     expect(output.join("\n")).not.toContain("bridge_policy.json\n{}");
 
     const mtimes = new Map<string, number>();
@@ -407,12 +409,13 @@ describe("end-to-end development install", () => {
       stateDir,
       runtimeAssets: assets,
       dryRun: true,
-      skipReadiness: true,
       openBrowser: false,
       print: () => undefined,
     });
     expect(result.transaction.changed).toEqual([]);
     expect(existsSync(stateDir)).toBe(false);
+    expect(result.extension.status).toBe("planned");
+    expect(result.readiness).toEqual({ passed: false, skipped: true, reason: "dry_run" });
   });
 
   test("reports the frozen v1 recovery identity without mutating it", async () => {

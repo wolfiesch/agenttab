@@ -1,6 +1,8 @@
 import {
   AgentTabClient,
   AgentTabError,
+  STANDARD_ACTION_VALUE_MAX_CHARS,
+  createResumeCapabilityStore,
   type MethodParams,
   type RpcMethod,
 } from "../../sdk-typescript/src/index";
@@ -70,9 +72,9 @@ const DEFINITIONS: ReadonlyArray<{
         const ref = z.string().min(1).max(256);
         const action = z.discriminatedUnion("kind", [
           z.object({ kind: z.literal("click"), ref }).strict(),
-          z.object({ kind: z.literal("type"), ref, text: z.string().max(1_048_576) }).strict(),
-          z.object({ kind: z.literal("fill"), ref, text: z.string().max(1_048_576) }).strict(),
-          z.object({ kind: z.literal("select"), ref, value: z.string().max(65_536) }).strict(),
+          z.object({ kind: z.literal("type"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
+          z.object({ kind: z.literal("fill"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
+          z.object({ kind: z.literal("select"), ref, value: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
           z.object({
             kind: z.literal("scroll"),
             ref: ref.optional(),
@@ -80,21 +82,19 @@ const DEFINITIONS: ReadonlyArray<{
             delta_y: z.number().int().min(-100_000).max(100_000),
           }).strict(),
           z.object({ kind: z.literal("drag"), ref, target_ref: ref }).strict(),
-          z.object({ kind: z.literal("navigate"), url: z.string().regex(/^(https?:\/\/|about:)[^\s]+$/) }).strict(),
+          z.object({ kind: z.literal("navigate"), url: z.string().max(2048).regex(/^(https?:\/\/|about:)[^\s]+$/) }).strict(),
           z.object({ kind: z.literal("go_back") }).strict(),
           z.object({ kind: z.literal("go_forward") }).strict(),
           z.object({ kind: z.literal("reload"), bypass_cache: z.boolean().optional() }).strict(),
-          z.object({ kind: z.literal("focus") }).strict(),
           z.object({ kind: z.literal("close") }).strict(),
           z.object({
             kind: z.literal("dialog"),
             decision: z.enum(["accept", "dismiss"]),
-            prompt_text: z.string().max(65_536).optional(),
           }).strict(),
           z.object({
             kind: z.literal("upload_file"),
             ref,
-            files: z.array(z.string().min(1)).min(1).max(32),
+            files: z.array(z.string().min(1).max(512)).min(1).max(4),
           }).strict(),
         ]);
         return z.object({
@@ -188,9 +188,16 @@ function failure(error: unknown): Record<string, unknown> {
   };
 }
 
-export function makeExtension(clientFactory: ClientFactory = () => AgentTabClient.connect({
-  conversationId: process.env.AGENTTAB_CONVERSATION_ID,
-})) {
+export function makeExtension(clientFactory?: ClientFactory) {
+  const connectClient = clientFactory ?? (() => {
+    const conversationId = process.env.AGENTTAB_CONVERSATION_ID;
+    return AgentTabClient.connect({
+      conversationId,
+      capabilityStore: conversationId
+        ? createResumeCapabilityStore("omp", { scope: conversationId })
+        : undefined,
+    });
+  });
   return function agentTabExtension(pi: OmpApi): void {
     if (!pi.zod) throw new Error("AgentTab's OMP adapter requires the OMP Zod extension API.");
     pi.setLabel?.("AgentTab");
@@ -206,7 +213,7 @@ export function makeExtension(clientFactory: ClientFactory = () => AgentTabClien
         parameters: definition.schema(pi.zod),
         execute: async (_id: string, params: Record<string, unknown>) => {
           try {
-            client ??= await clientFactory();
+            client ??= await connectClient();
             const result = await client.call(
               definition.name,
               params as MethodParams[RpcMethod],

@@ -45,13 +45,14 @@ ROOT_MANIFEST = ROOT / "manifest.json"
 MIRROR_MANIFEST = ROOT / "extension" / "manifest.json"
 REQUIRED_PERMISSIONS = (
     "nativeMessaging",
+    "debugger",
     "tabs",
     "tabGroups",
     "storage",
     "alarms",
     "downloads",
 )
-OPTIONAL_PERMISSIONS = ("scripting", "debugger")
+OPTIONAL_PERMISSIONS = ("scripting",)
 REMOVED_PERMISSIONS = (
     "activeTab",
     "bookmarks",
@@ -715,7 +716,7 @@ class ChromeInspector:
 
     def assert_automation_permissions(self, expected: bool, operation: str) -> None:
         self.assert_permission("scripting", expected, operation)
-        self.assert_permission("debugger", expected, operation)
+        self.assert_permission("debugger", True, operation)
     def selection(self) -> tuple[int, int]:
         state = self.state()
         return state["active_window_id"], state["active_tab_id"]
@@ -1310,8 +1311,8 @@ class LiveLifecycleProbe:
         fixture.download_filename = f"agenttab-permission-probe-{uuid.uuid4().hex}.txt"
         initial_state = self.inspector.state()
         run_start_permissions = initial_state["scripting"]
-        if initial_state["debugger_permission"] is not run_start_permissions:
-            raise ChromeOperationFailure("AgentTab scripting/debugger permissions did not begin in one lifecycle state")
+        if not initial_state["debugger_permission"]:
+            raise ChromeOperationFailure("AgentTab required debugger permission is unavailable")
         if self.initial_automation_permissions is None:
             self.initial_automation_permissions = run_start_permissions
         if run_start_permissions:
@@ -1333,7 +1334,7 @@ class LiveLifecycleProbe:
 
         self.prompt(
             f"run {run_number}: optional automation grant",
-            "Choose Enable AgentTab automation. Chrome grants scripting and debugger together from the click.",
+            "Choose Enable AgentTab automation. Chrome grants the optional scripting permission from the click.",
         )
         self.inspector.assert_automation_permissions(True, "grant observation")
         self.snapshot(tab_id, "text", "browser_snapshot text after automation grant")
@@ -1374,7 +1375,7 @@ class LiveLifecycleProbe:
         revocation_generation = self.inspector.automation_revocation_generation()
         self.prompt(
             f"run {run_number}: optional automation revocation",
-            "Open AgentTab Settings and choose Turn off under Automation access.",
+            "Open AgentTab Settings and choose Turn off under Automation access. This removes scripting and detaches task debugger sessions.",
         )
         self.inspector.assert_automation_permissions(False, "revocation observation")
         detach_deadline = time.monotonic() + self.args.timeout_seconds

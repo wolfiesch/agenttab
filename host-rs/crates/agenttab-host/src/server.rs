@@ -1,7 +1,7 @@
 use crate::runtime::{request_lock_scope, RequestLockScope, Runtime};
 use agenttab_protocol::{
-    ConnectionInit, Outcome, RpcError, RpcMethod, RpcResponse, CLIENT_TO_HOST_MAX_BYTES,
-    HOST_TO_CLIENT_MAX_BYTES,
+    ConnectionInit, Outcome, ResumeCapabilityConfirm, RpcError, RpcMethod, RpcResponse,
+    CLIENT_TO_HOST_MAX_BYTES, HOST_TO_CLIENT_MAX_BYTES,
 };
 #[cfg(all(test, unix))]
 use agenttab_protocol::{PROTOCOL_VERSION, RPC_PROTOCOL};
@@ -31,6 +31,7 @@ const OLD_HOST_EXIT_RETRY: std::time::Duration = std::time::Duration::from_secs(
 const OLD_HOST_EXIT_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
 #[cfg(unix)]
 const OLD_HOST_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const INVALID_RESUME_CAPABILITY_ERROR: &str = "invalid_resume_capability";
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -505,9 +506,17 @@ where
     };
     let init = ConnectionInit::parse(init_value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let resume_capability_supplied = init.resume_capability.is_some();
     let (connection, ack) = runtime
         .connect(init)
         .map_err(|error| io::Error::other(error.to_string()))?;
+    if resume_capability_supplied && !ack.resumed {
+        let _ = runtime.disconnect(&connection);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            INVALID_RESUME_CAPABILITY_ERROR,
+        ));
+    }
     if let Err(error) = write_frame_async(
         &mut stream,
         &serde_json::to_value(ack)?,
@@ -518,9 +527,39 @@ where
         let _ = runtime.disconnect(&connection);
         return Err(error);
     }
-    if let Err(error) = runtime.acknowledge_connection(&connection) {
-        let _ = runtime.disconnect(&connection);
-        return Err(io::Error::other(error.to_string()));
+    if connection.resume_confirmation_required() {
+        let confirmation_value = match read_frame_async(&mut stream, CLIENT_TO_HOST_MAX_BYTES).await
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                let _ = runtime.disconnect(&connection);
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = runtime.disconnect(&connection);
+                return Err(error);
+            }
+        };
+        let confirmation = match ResumeCapabilityConfirm::parse(confirmation_value) {
+            Ok(confirmation) => confirmation,
+            Err(error) => {
+                let _ = runtime.disconnect(&connection);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+            }
+        };
+        let confirmed = match runtime.confirm_resume_capability(&connection, &confirmation) {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                let _ = runtime.disconnect(&connection);
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, error));
+            }
+        };
+        if let Err(error) =
+            write_frame_async(&mut stream, &confirmed.value(), HOST_TO_CLIENT_MAX_BYTES).await
+        {
+            let _ = runtime.disconnect(&connection);
+            return Err(error);
+        }
     }
 
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -777,6 +816,199 @@ mod tests {
         }
     }
 
+    fn test_runtime(temp: &tempfile::TempDir) -> (Arc<Runtime>, AgentTabPaths) {
+        let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.complete_reconciliation(false);
+        let runtime = Runtime::open(
+            &paths,
+            lifecycle,
+            Arc::new(UnusedNative),
+            Arc::new(HandoffState::default()),
+        )
+        .unwrap();
+        (runtime, paths)
+    }
+
+    fn connection_init(resume_capability: Option<String>) -> ConnectionInit {
+        ConnectionInit {
+            protocol: RPC_PROTOCOL.into(),
+            version: PROTOCOL_VERSION,
+            kind: agenttab_protocol::ConnectKind::Connect,
+            conversation_id: None,
+            resume_capability,
+        }
+    }
+
+    async fn start_test_connection(
+        runtime: Arc<Runtime>,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let (client, stream) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(handle_connection(runtime, stream));
+        (client, server)
+    }
+
+    async fn write_browser_open(client: &mut tokio::io::DuplexStream, request_id: &str) {
+        write_frame_async(
+            client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": request_id,
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_open",
+                "params": {"mode": "create"}
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn task_count(paths: &AgentTabPaths) -> i64 {
+        rusqlite::Connection::open(&paths.state_db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_invalid_resume_capability_closes_before_a_pipelined_rpc_can_create_a_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, paths) = test_runtime(&temp);
+        let (mut client, server) = start_test_connection(runtime).await;
+        write_frame_async(
+            &mut client,
+            &serde_json::to_value(connection_init(Some("x".repeat(32)))).unwrap(),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        write_browser_open(&mut client, "pipelined-browser-open").await;
+
+        assert!(read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .is_none());
+        let error = server.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), INVALID_RESUME_CAPABILITY_ERROR);
+        assert_eq!(task_count(&paths), 0);
+    }
+
+    #[tokio::test]
+    async fn no_capability_creates_a_task_and_valid_resume_confirmation_still_works() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, paths) = test_runtime(&temp);
+        let (mut client, server) = start_test_connection(runtime.clone()).await;
+        write_frame_async(
+            &mut client,
+            &serde_json::to_value(connection_init(None)).unwrap(),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let acknowledgement = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(acknowledgement["kind"], "connected");
+        assert_eq!(acknowledgement["resumed"], false);
+        write_browser_open(&mut client, "create-task").await;
+        let created = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        let task_id = created["task"]["task_id"].as_str().unwrap().to_owned();
+        let initial_capability = created["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(task_count(&paths), 1);
+        drop(client);
+        assert!(server.await.unwrap().is_ok());
+
+        let (mut resumed_client, resumed_server) = start_test_connection(runtime.clone()).await;
+        write_frame_async(
+            &mut resumed_client,
+            &serde_json::to_value(connection_init(Some(initial_capability.clone()))).unwrap(),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let resumed = read_frame_async(&mut resumed_client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed["kind"], "connected");
+        assert_eq!(resumed["resumed"], true);
+        assert_eq!(resumed["task_id"], task_id);
+        let replacement_capability = resumed["resume_capability"].as_str().unwrap();
+        assert_ne!(replacement_capability, initial_capability);
+        write_frame_async(
+            &mut resumed_client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "resume_confirm",
+                "connection_id": resumed["connection_id"],
+                "resume_capability": replacement_capability
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let confirmed = read_frame_async(&mut resumed_client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed["kind"], "resume_confirmed");
+        assert_eq!(confirmed["connection_id"], resumed["connection_id"]);
+        write_frame_async(
+            &mut resumed_client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "resumed-status",
+                "method": "agenttab.status",
+                "params": {}
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let status = read_frame_async(&mut resumed_client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["outcome"], serde_json::json!(Outcome::Completed));
+        assert_eq!(status["result"]["task_id"], task_id);
+        drop(resumed_client);
+        assert!(resumed_server.await.unwrap().is_ok());
+
+        let (mut expired_client, expired_server) = start_test_connection(runtime).await;
+        write_frame_async(
+            &mut expired_client,
+            &serde_json::to_value(connection_init(Some(initial_capability))).unwrap(),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        write_browser_open(&mut expired_client, "expired-browser-open").await;
+        assert!(
+            read_frame_async(&mut expired_client, HOST_TO_CLIENT_MAX_BYTES)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let error = expired_server.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), INVALID_RESUME_CAPABILITY_ERROR);
+        assert_eq!(task_count(&paths), 1);
+    }
     #[tokio::test]
     async fn private_socket_accepts_same_uid_and_status_request() {
         let temp = tempfile::tempdir().unwrap();

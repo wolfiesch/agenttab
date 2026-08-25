@@ -1,4 +1,6 @@
-use agenttab_protocol::{NativeHandoff, NativeStagedCommit, NativeTab, RpcMethod};
+use agenttab_protocol::{
+    NativeHandoff, NativeStagedCommit, NativeTab, Outcome, RpcError, RpcMethod, RpcResponse,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use parking_lot::Mutex;
@@ -98,7 +100,53 @@ pub struct StagedCommitHandles {
     pub review_handle: String,
 }
 
-type StagedCommitRow = (String, String, i64, i64, String, String, i64, String);
+#[derive(Debug)]
+pub enum StagedCommitConsumption {
+    Ready(StagedRecord),
+    ApprovalRequired,
+    Expired(Vec<PathBuf>),
+}
+
+#[derive(Debug)]
+pub enum StagedCommitApproval {
+    Approved,
+    Expired(Vec<PathBuf>),
+}
+
+#[derive(Debug)]
+pub enum StagedReplayResolution {
+    Active,
+    Unavailable,
+    Expired(Vec<PathBuf>),
+}
+
+fn staged_commit_terminal_failure(request_id: impl Into<String>) -> RpcResponse {
+    RpcResponse::failure(
+        request_id,
+        Outcome::NotStarted,
+        RpcError::new(
+            "staged_token_invalid",
+            JournalError::InvalidStagedToken.to_string(),
+        )
+        .with_recovery(
+            "Inspect the page, then request and review a new staged operation with a new UUIDv7 idempotency key.",
+        ),
+    )
+}
+
+type StagedCommitRow = (
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    i64,
+    String,
+    bool,
+    bool,
+    Option<String>,
+);
 
 #[derive(Debug)]
 pub struct Journal {
@@ -180,7 +228,9 @@ impl Journal {
                  effect TEXT NOT NULL,
                  fingerprint TEXT NOT NULL,
                  expires_at_ms INTEGER NOT NULL,
+                 approved INTEGER NOT NULL DEFAULT 0 CHECK (approved IN (0, 1)),
                  used INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)),
+                 consumed_idempotency_key TEXT,
                  upload_paths_json TEXT NOT NULL DEFAULT '[]',
                  FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
              );
@@ -210,6 +260,18 @@ impl Journal {
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
         ensure_column(&connection, "staged_commits", "review_handle_hash", "BLOB")?;
+        ensure_column(
+            &connection,
+            "staged_commits",
+            "approved",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (approved IN (0, 1))",
+        )?;
+        ensure_column(
+            &connection,
+            "staged_commits",
+            "consumed_idempotency_key",
+            "TEXT",
+        )?;
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_staged_commits_review_handle
              ON staged_commits(review_handle_hash)",
@@ -628,8 +690,8 @@ impl Journal {
         transaction.execute(
             "INSERT INTO staged_commits(
                  token_hash, review_handle_hash, task_id, native_token, tab_id, page_revision,
-                 effect, fingerprint, expires_at_ms, used, upload_paths_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10)",
+                 effect, fingerprint, expires_at_ms, approved, used, upload_paths_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10)",
             params![
                 token_hash.as_slice(),
                 review_handle_hash.as_slice(),
@@ -654,44 +716,19 @@ impl Journal {
         &self,
         task_id: Uuid,
         host_token: &str,
-    ) -> Result<StagedRecord, JournalError> {
-        self.consume_staged_commit_by_hash(task_id, capability_hash(host_token), "token_hash", None)
-    }
-
-    pub fn consume_popup_staged_commit(
-        &self,
-        task_id: Uuid,
-        tab_id: u64,
-        review_handle: &str,
-    ) -> Result<StagedRecord, JournalError> {
-        self.consume_staged_commit_by_hash(
-            task_id,
-            capability_hash(review_handle),
-            "review_handle_hash",
-            Some(tab_id),
-        )
-    }
-
-    fn consume_staged_commit_by_hash(
-        &self,
-        task_id: Uuid,
-        capability_hash_value: [u8; 32],
-        key_column: &str,
-        expected_tab_id: Option<u64>,
-    ) -> Result<StagedRecord, JournalError> {
+        idempotency_key: Uuid,
+    ) -> Result<StagedCommitConsumption, JournalError> {
         let now = now_ms();
+        let token_hash = capability_hash(host_token);
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let query = format!(
-            "SELECT task_id, native_token, tab_id, page_revision, effect, fingerprint,
-                    expires_at_ms, upload_paths_json
-             FROM staged_commits
-             WHERE {key_column} = ?1 AND task_id = ?2 AND used = 0 AND expires_at_ms >= ?3"
-        );
         let record: Option<StagedCommitRow> = transaction
             .query_row(
-                &query,
-                params![capability_hash_value.as_slice(), task_id.to_string(), now],
+                "SELECT task_id, native_token, tab_id, page_revision, effect, fingerprint,
+                        expires_at_ms, upload_paths_json, approved, used, consumed_idempotency_key
+                 FROM staged_commits
+                 WHERE token_hash = ?1 AND task_id = ?2",
+                params![token_hash.as_slice(), task_id.to_string()],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -702,6 +739,9 @@ impl Journal {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -715,14 +755,56 @@ impl Journal {
             fingerprint,
             expires_at_ms,
             upload_paths_json,
+            approved,
+            used,
+            consumed_idempotency_key,
         )) = record
         else {
             transaction.rollback()?;
             return Err(JournalError::InvalidStagedToken);
         };
-        if expected_tab_id.is_some_and(|expected| sqlite_u64(expected).ok() != Some(tab_id)) {
+        if expires_at_ms <= now {
+            let terminal_response = serde_json::to_string(
+                &staged_commit_terminal_failure("expired-staged-consumption").value(),
+            )?;
+            if let Some(consumed_idempotency_key) = consumed_idempotency_key {
+                let consumed_idempotency_key = Uuid::parse_str(&consumed_idempotency_key)?;
+                if consumed_idempotency_key != idempotency_key {
+                    self.replace_terminal_mutation(
+                        &transaction,
+                        task_id,
+                        consumed_idempotency_key,
+                        &terminal_response,
+                    )?;
+                }
+            }
+            self.replace_terminal_mutation(
+                &transaction,
+                task_id,
+                idempotency_key,
+                &terminal_response,
+            )?;
+            if transaction.execute(
+                "DELETE FROM staged_commits
+                 WHERE token_hash = ?1 AND task_id = ?2 AND expires_at_ms <= ?3",
+                params![token_hash.as_slice(), task_id.to_string(), now],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(JournalError::InvalidStagedToken);
+            }
+            transaction.commit()?;
+            return Ok(StagedCommitConsumption::Expired(serde_json::from_str(
+                &upload_paths_json,
+            )?));
+        }
+        if used {
             transaction.rollback()?;
             return Err(JournalError::InvalidStagedToken);
+        }
+        if !approved {
+            transaction.rollback()?;
+            return Ok(StagedCommitConsumption::ApprovalRequired);
         }
         let current_revision: Option<i64> = transaction
             .query_row(
@@ -738,14 +820,24 @@ impl Journal {
             transaction.rollback()?;
             return Err(JournalError::StaleStagedCommit);
         }
-        let update =
-            format!("UPDATE staged_commits SET used = 1 WHERE {key_column} = ?1 AND used = 0");
-        if transaction.execute(&update, params![capability_hash_value.as_slice()])? != 1 {
+        if transaction.execute(
+            "UPDATE staged_commits
+             SET used = 1, consumed_idempotency_key = ?1
+             WHERE token_hash = ?2 AND task_id = ?3 AND approved = 1
+               AND used = 0 AND expires_at_ms > ?4",
+            params![
+                idempotency_key.to_string(),
+                token_hash.as_slice(),
+                task_id.to_string(),
+                now,
+            ],
+        )? != 1
+        {
             transaction.rollback()?;
             return Err(JournalError::InvalidStagedToken);
         }
         transaction.commit()?;
-        Ok(StagedRecord {
+        Ok(StagedCommitConsumption::Ready(StagedRecord {
             task_id: Uuid::parse_str(&stored_task)?,
             native_token,
             tab_id: sqlite_to_u64(tab_id)?,
@@ -754,7 +846,224 @@ impl Journal {
             fingerprint,
             expires_at_ms,
             upload_paths: serde_json::from_str(&upload_paths_json)?,
-        })
+        }))
+    }
+
+    pub fn approve_popup_staged_commit(
+        &self,
+        task_id: Uuid,
+        tab_id: u64,
+        review_handle: &str,
+    ) -> Result<StagedCommitApproval, JournalError> {
+        let now = now_ms();
+        let review_handle_hash = capability_hash(review_handle);
+        let expected_tab_id = sqlite_u64(tab_id)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let record: Option<(i64, i64, i64, bool, String)> = transaction
+            .query_row(
+                "SELECT tab_id, page_revision, expires_at_ms, used, upload_paths_json
+                 FROM staged_commits
+                 WHERE review_handle_hash = ?1 AND task_id = ?2",
+                params![review_handle_hash.as_slice(), task_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((stored_tab_id, page_revision, expires_at_ms, used, upload_paths_json)) = record
+        else {
+            transaction.rollback()?;
+            return Err(JournalError::InvalidStagedToken);
+        };
+        if stored_tab_id != expected_tab_id || used {
+            transaction.rollback()?;
+            return Err(JournalError::InvalidStagedToken);
+        }
+        if expires_at_ms <= now {
+            if transaction.execute(
+                "DELETE FROM staged_commits
+                 WHERE review_handle_hash = ?1 AND task_id = ?2 AND expires_at_ms <= ?3",
+                params![review_handle_hash.as_slice(), task_id.to_string(), now],
+            )? != 1
+            {
+                transaction.rollback()?;
+                return Err(JournalError::InvalidStagedToken);
+            }
+            transaction.commit()?;
+            return Ok(StagedCommitApproval::Expired(serde_json::from_str(
+                &upload_paths_json,
+            )?));
+        }
+        let current_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT task_tabs.page_revision
+                 FROM task_tabs JOIN tasks USING(task_id)
+                 WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
+                   AND tasks.state = 'active'",
+                params![task_id.to_string(), stored_tab_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_revision != Some(page_revision) {
+            transaction.rollback()?;
+            return Err(JournalError::StaleStagedCommit);
+        }
+        if transaction.execute(
+            "UPDATE staged_commits
+             SET approved = 1
+             WHERE review_handle_hash = ?1 AND task_id = ?2
+               AND used = 0 AND expires_at_ms > ?3",
+            params![review_handle_hash.as_slice(), task_id.to_string(), now],
+        )? != 1
+        {
+            transaction.rollback()?;
+            return Err(JournalError::InvalidStagedToken);
+        }
+        transaction.commit()?;
+        Ok(StagedCommitApproval::Approved)
+    }
+
+    pub fn resolve_staged_commit_replay(
+        &self,
+        task_id: Uuid,
+        staged_token: &str,
+        idempotency_key: Uuid,
+        terminal_response: &Value,
+        terminalize_unavailable: bool,
+    ) -> Result<StagedReplayResolution, JournalError> {
+        self.resolve_staged_commit_replay_by_hash(
+            task_id,
+            capability_hash(staged_token),
+            "token_hash",
+            None,
+            idempotency_key,
+            terminal_response,
+            terminalize_unavailable,
+        )
+    }
+
+    fn resolve_staged_commit_replay_by_hash(
+        &self,
+        task_id: Uuid,
+        capability_hash_value: [u8; 32],
+        key_column: &str,
+        expected_tab_id: Option<u64>,
+        idempotency_key: Uuid,
+        terminal_response: &Value,
+        terminalize_unavailable: bool,
+    ) -> Result<StagedReplayResolution, JournalError> {
+        let now = now_ms();
+        let encoded_response = serde_json::to_string(terminal_response)?;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let query = format!(
+            "SELECT tab_id, expires_at_ms, used, upload_paths_json, consumed_idempotency_key
+             FROM staged_commits
+             WHERE {key_column} = ?1 AND task_id = ?2"
+        );
+        let record: Option<(i64, i64, bool, String, Option<String>)> = transaction
+            .query_row(
+                &query,
+                params![capability_hash_value.as_slice(), task_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((tab_id, expires_at_ms, used, upload_paths_json, consumed_idempotency_key)) =
+            record
+        {
+            if expected_tab_id.is_some_and(|expected| sqlite_u64(expected).ok() != Some(tab_id)) {
+                transaction.rollback()?;
+                return Ok(StagedReplayResolution::Unavailable);
+            }
+            if expires_at_ms <= now {
+                if let Some(consumed_idempotency_key) = consumed_idempotency_key {
+                    let consumed_idempotency_key = Uuid::parse_str(&consumed_idempotency_key)?;
+                    if consumed_idempotency_key != idempotency_key {
+                        self.replace_terminal_mutation(
+                            &transaction,
+                            task_id,
+                            consumed_idempotency_key,
+                            &encoded_response,
+                        )?;
+                    }
+                }
+                self.replace_terminal_mutation(
+                    &transaction,
+                    task_id,
+                    idempotency_key,
+                    &encoded_response,
+                )?;
+                let delete = format!(
+                    "DELETE FROM staged_commits
+                     WHERE {key_column} = ?1 AND task_id = ?2 AND expires_at_ms <= ?3"
+                );
+                if transaction.execute(
+                    &delete,
+                    params![capability_hash_value.as_slice(), task_id.to_string(), now],
+                )? != 1
+                {
+                    transaction.rollback()?;
+                    return Err(JournalError::InvalidStagedToken);
+                }
+                transaction.commit()?;
+                return Ok(StagedReplayResolution::Expired(serde_json::from_str(
+                    &upload_paths_json,
+                )?));
+            }
+            if !used {
+                transaction.rollback()?;
+                return Ok(StagedReplayResolution::Active);
+            }
+        }
+        if terminalize_unavailable {
+            self.replace_terminal_mutation(
+                &transaction,
+                task_id,
+                idempotency_key,
+                &encoded_response,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(StagedReplayResolution::Unavailable)
+    }
+
+    fn replace_terminal_mutation(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: Uuid,
+        idempotency_key: Uuid,
+        encoded_response: &str,
+    ) -> Result<(), JournalError> {
+        if transaction.execute(
+            "UPDATE idempotency_journal
+             SET state = 'completed', response_json = ?1, completed_at_ms = ?2
+             WHERE task_id = ?3 AND idempotency_key = ?4",
+            params![
+                encoded_response,
+                now_ms(),
+                task_id.to_string(),
+                idempotency_key.to_string(),
+            ],
+        )? != 1
+        {
+            return Err(JournalError::MissingStartedRecord);
+        }
+        Ok(())
     }
 
     pub fn finish_staged_commit(&self, native_token: &str) -> Result<(), JournalError> {
@@ -802,14 +1111,14 @@ impl Journal {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let rows = {
-            let mut statement =
-                transaction.prepare("SELECT upload_paths_json FROM staged_commits")?;
+            let mut statement = transaction
+                .prepare("SELECT upload_paths_json FROM staged_commits WHERE used = 0")?;
             let rows = statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
-        transaction.execute("DELETE FROM staged_commits", [])?;
+        transaction.execute("DELETE FROM staged_commits WHERE used = 0", [])?;
         transaction.commit()?;
         let mut upload_paths = Vec::new();
         for paths in rows {
@@ -825,14 +1134,19 @@ impl Journal {
         let now = now_ms();
         let active_tokens = staged_commits
             .iter()
-            .filter(|staged| staged.expires_at_ms >= now)
+            .filter(|staged| staged.expires_at_ms > now)
             .map(|staged| staged.native_token.as_str())
             .collect::<std::collections::HashSet<_>>();
+        let terminal_response = serde_json::to_string(
+            &staged_commit_terminal_failure("recovered-staged-expiry").value(),
+        )?;
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let persisted = {
             let mut statement = transaction.prepare(
-                "SELECT native_token, upload_paths_json, expires_at_ms, used FROM staged_commits",
+                "SELECT native_token, upload_paths_json, expires_at_ms, used, task_id,
+                        consumed_idempotency_key
+                 FROM staged_commits",
             )?;
             let rows = statement
                 .query_map([], |row| {
@@ -841,14 +1155,38 @@ impl Journal {
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, bool>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             rows
         };
         let mut removed_uploads = Vec::new();
-        for (native_token, upload_paths_json, expires_at_ms, used) in persisted {
-            if used || expires_at_ms < now || !active_tokens.contains(native_token.as_str()) {
+        for (
+            native_token,
+            upload_paths_json,
+            expires_at_ms,
+            used,
+            task_id,
+            consumed_idempotency_key,
+        ) in persisted
+        {
+            if expires_at_ms <= now {
+                if let Some(consumed_idempotency_key) = consumed_idempotency_key {
+                    self.replace_terminal_mutation(
+                        &transaction,
+                        Uuid::parse_str(&task_id)?,
+                        Uuid::parse_str(&consumed_idempotency_key)?,
+                        &terminal_response,
+                    )?;
+                }
+                removed_uploads.extend(serde_json::from_str::<Vec<PathBuf>>(&upload_paths_json)?);
+                transaction.execute(
+                    "DELETE FROM staged_commits WHERE native_token = ?1",
+                    params![native_token],
+                )?;
+            } else if !used && !active_tokens.contains(native_token.as_str()) {
                 removed_uploads.extend(serde_json::from_str::<Vec<PathBuf>>(&upload_paths_json)?);
                 transaction.execute(
                     "DELETE FROM staged_commits WHERE native_token = ?1",
@@ -861,25 +1199,37 @@ impl Journal {
     }
 
     pub fn expire_staged_commit(&self, native_token: &str) -> Result<Vec<PathBuf>, JournalError> {
+        let terminal_response = serde_json::to_string(
+            &staged_commit_terminal_failure("expired-staged-commit").value(),
+        )?;
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let upload_paths_json: Option<String> = transaction
+        let record: Option<(String, Option<String>, String)> = transaction
             .query_row(
-                "SELECT upload_paths_json FROM staged_commits WHERE native_token = ?1",
+                "SELECT task_id, consumed_idempotency_key, upload_paths_json
+                 FROM staged_commits WHERE native_token = ?1",
                 params![native_token],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+        let Some((task_id, consumed_idempotency_key, upload_paths_json)) = record else {
+            transaction.rollback()?;
+            return Ok(Vec::new());
+        };
+        if let Some(consumed_idempotency_key) = consumed_idempotency_key {
+            self.replace_terminal_mutation(
+                &transaction,
+                Uuid::parse_str(&task_id)?,
+                Uuid::parse_str(&consumed_idempotency_key)?,
+                &terminal_response,
+            )?;
+        }
         transaction.execute(
             "DELETE FROM staged_commits WHERE native_token = ?1",
             params![native_token],
         )?;
         transaction.commit()?;
-        upload_paths_json
-            .map(|value| serde_json::from_str(&value))
-            .transpose()
-            .map(|paths| paths.unwrap_or_default())
-            .map_err(JournalError::from)
+        Ok(serde_json::from_str(&upload_paths_json)?)
     }
     pub fn reconcile_handoff(&self, handoff: &NativeHandoff) -> Result<(), JournalError> {
         self.store_handoff(handoff, None, false)
@@ -1139,6 +1489,36 @@ mod tests {
     }
 
     #[test]
+    fn host_restart_discards_an_unconfirmed_candidate_and_preserves_the_old_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.sqlite3");
+        let (task_id, old_capability, candidate) = {
+            let journal = Journal::open(&state_path).unwrap();
+            let created = journal.create_task(None).unwrap();
+            let candidate = journal
+                .resume_task(&created.resume_capability)
+                .unwrap()
+                .unwrap();
+            (
+                created.task_id,
+                created.resume_capability,
+                candidate.resume_capability,
+            )
+        };
+
+        let restarted = Journal::open(&state_path).unwrap();
+        assert!(restarted.resume_task(&candidate).unwrap().is_none());
+        assert_eq!(
+            restarted
+                .resume_task(&old_capability)
+                .unwrap()
+                .expect("the pre-confirmation capability remains recoverable")
+                .task_id,
+            task_id
+        );
+    }
+
+    #[test]
     fn disconnected_task_remains_resumable_until_explicit_close() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_journal(&temp);
@@ -1335,29 +1715,174 @@ mod tests {
             .store_staged_commit(&staged, std::slice::from_ref(&upload_path))
             .unwrap();
         assert!(matches!(
-            journal.consume_staged_commit(other.task_id, &token.staged_token),
+            journal.consume_staged_commit(other.task_id, &token.staged_token, Uuid::now_v7()),
             Err(JournalError::InvalidStagedToken)
         ));
-        let consumed = journal
-            .consume_staged_commit(task.task_id, &token.staged_token)
-            .unwrap();
+        assert!(matches!(
+            journal.consume_staged_commit(task.task_id, &token.staged_token, Uuid::now_v7()),
+            Ok(StagedCommitConsumption::ApprovalRequired)
+        ));
+        assert!(matches!(
+            journal.approve_popup_staged_commit(task.task_id, 7, &token.review_handle),
+            Ok(StagedCommitApproval::Approved)
+        ));
+        let StagedCommitConsumption::Ready(consumed) = journal
+            .consume_staged_commit(task.task_id, &token.staged_token, Uuid::now_v7())
+            .unwrap()
+        else {
+            panic!("fresh staged commit must be consumable");
+        };
         assert_eq!(consumed.native_token, staged.native_token);
         assert_eq!(consumed.upload_paths, vec![upload_path.clone()]);
         assert!(matches!(
-            journal.consume_staged_commit(task.task_id, &token.staged_token),
+            journal.consume_staged_commit(task.task_id, &token.staged_token, Uuid::now_v7()),
             Err(JournalError::InvalidStagedToken)
         ));
-        assert_eq!(
-            journal
-                .reconcile_staged_commits(std::slice::from_ref(&staged))
-                .unwrap(),
-            vec![upload_path],
-        );
-        assert!(journal.reconcile_staged_commits(&[]).unwrap().is_empty());
+        journal
+            .finish_staged_commit(&consumed.native_token)
+            .unwrap();
+        assert!(journal
+            .reconcile_staged_commits(std::slice::from_ref(&staged))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
-    fn popup_review_handle_is_private_task_tab_bound_and_one_use() {
+    fn unconsumed_staged_commits_are_removed_by_expiry_and_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let task = journal.create_task(None).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(task.task_id, 9)])
+            .unwrap();
+
+        let direct_upload = temp.path().join("direct-expiry.upload");
+        let direct = NativeStagedCommit {
+            native_token: "native-token-direct-expiry".into(),
+            task_id: task.task_id,
+            tab_id: 7,
+            page_revision: 9,
+            effect: "upload file".into(),
+            fingerprint: "d".repeat(64),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        let direct_handles = journal
+            .store_staged_commit(&direct, std::slice::from_ref(&direct_upload))
+            .unwrap();
+        assert_eq!(
+            journal.expire_staged_commit(&direct.native_token).unwrap(),
+            vec![direct_upload],
+        );
+        assert!(matches!(
+            journal.consume_staged_commit(
+                task.task_id,
+                &direct_handles.staged_token,
+                Uuid::now_v7()
+            ),
+            Err(JournalError::InvalidStagedToken)
+        ));
+
+        let reconciled_upload = temp.path().join("reconciled-expiry.upload");
+        let reconciled = NativeStagedCommit {
+            native_token: "native-token-reconciled-expiry".into(),
+            task_id: task.task_id,
+            tab_id: 7,
+            page_revision: 9,
+            effect: "upload file".into(),
+            fingerprint: "r".repeat(64),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        let reconciled_handles = journal
+            .store_staged_commit(&reconciled, std::slice::from_ref(&reconciled_upload))
+            .unwrap();
+        Connection::open(temp.path().join("state.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE staged_commits SET expires_at_ms = ?1 WHERE native_token = ?2",
+                params![now_ms() - 1, reconciled.native_token],
+            )
+            .unwrap();
+        assert_eq!(
+            journal.reconcile_staged_commits(&[]).unwrap(),
+            vec![reconciled_upload],
+        );
+        assert!(matches!(
+            journal.consume_staged_commit(
+                task.task_id,
+                &reconciled_handles.staged_token,
+                Uuid::now_v7()
+            ),
+            Err(JournalError::InvalidStagedToken)
+        ));
+    }
+
+    #[test]
+    fn expired_staged_commit_is_durably_removed_before_consumption() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let task = journal.create_task(None).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(task.task_id, 9)])
+            .unwrap();
+        let upload_path = temp.path().join("expired-staged-upload");
+        let staged = NativeStagedCommit {
+            native_token: "native-token-expired-consumption".into(),
+            task_id: task.task_id,
+            tab_id: 7,
+            page_revision: 9,
+            effect: "submit order".into(),
+            fingerprint: "e".repeat(64),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        let handles = journal
+            .store_staged_commit(&staged, std::slice::from_ref(&upload_path))
+            .unwrap();
+        let commit_key = Uuid::now_v7();
+        journal
+            .begin_mutation(
+                task.task_id,
+                commit_key,
+                RpcMethod::BrowserCommit,
+                "expired",
+            )
+            .unwrap();
+        Connection::open(temp.path().join("state.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE staged_commits SET expires_at_ms = ?1 WHERE native_token = ?2",
+                params![now_ms() - 1, staged.native_token],
+            )
+            .unwrap();
+
+        let StagedCommitConsumption::Expired(paths) = journal
+            .consume_staged_commit(task.task_id, &handles.staged_token, commit_key)
+            .unwrap()
+        else {
+            panic!("an expired staged record must never be consumed");
+        };
+        assert_eq!(paths, vec![upload_path]);
+        let BeginDecision::Cached(cached) = journal
+            .lookup_mutation(
+                task.task_id,
+                commit_key,
+                RpcMethod::BrowserCommit,
+                "expired",
+            )
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expiry consumption must terminalize the started commit before deletion");
+        };
+        assert_eq!(cached["outcome"], "not_started");
+        assert_eq!(cached["error"]["code"], "staged_token_invalid");
+        assert!(matches!(
+            journal.consume_staged_commit(task.task_id, &handles.staged_token, commit_key),
+            Err(JournalError::InvalidStagedToken)
+        ));
+    }
+
+    #[test]
+    fn popup_review_handle_is_private_and_approves_task_bound_commit() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_journal(&temp);
         let task = journal.create_task(None).unwrap();
@@ -1380,23 +1905,38 @@ mod tests {
             .unwrap();
         assert_ne!(handles.staged_token, handles.review_handle);
         assert!(matches!(
-            journal.consume_popup_staged_commit(other.task_id, 7, &handles.review_handle),
+            journal.approve_popup_staged_commit(other.task_id, 7, &handles.review_handle),
             Err(JournalError::InvalidStagedToken)
         ));
         assert!(matches!(
-            journal.consume_popup_staged_commit(task.task_id, 8, &handles.review_handle),
+            journal.approve_popup_staged_commit(task.task_id, 8, &handles.review_handle),
             Err(JournalError::InvalidStagedToken)
         ));
-        let consumed = journal
-            .consume_popup_staged_commit(task.task_id, 7, &handles.review_handle)
-            .unwrap();
+        assert!(matches!(
+            journal.consume_staged_commit(task.task_id, &handles.staged_token, Uuid::now_v7(),),
+            Ok(StagedCommitConsumption::ApprovalRequired)
+        ));
+        assert!(matches!(
+            journal.approve_popup_staged_commit(task.task_id, 7, &handles.review_handle),
+            Ok(StagedCommitApproval::Approved)
+        ));
+        assert!(matches!(
+            journal.approve_popup_staged_commit(task.task_id, 7, &handles.review_handle),
+            Ok(StagedCommitApproval::Approved)
+        ));
+        let StagedCommitConsumption::Ready(consumed) = journal
+            .consume_staged_commit(task.task_id, &handles.staged_token, Uuid::now_v7())
+            .unwrap()
+        else {
+            panic!("approved staged commit must be consumable");
+        };
         assert_eq!(consumed.native_token, staged.native_token);
         assert_eq!(consumed.upload_paths, vec![upload]);
         journal
             .finish_staged_commit(&consumed.native_token)
             .unwrap();
         assert!(matches!(
-            journal.consume_popup_staged_commit(task.task_id, 7, &handles.review_handle),
+            journal.approve_popup_staged_commit(task.task_id, 7, &handles.review_handle),
             Err(JournalError::InvalidStagedToken)
         ));
     }
@@ -1429,7 +1969,7 @@ mod tests {
             vec![upload],
         );
         assert!(matches!(
-            journal.consume_staged_commit(task.task_id, &handles.staged_token),
+            journal.consume_staged_commit(task.task_id, &handles.staged_token, Uuid::now_v7()),
             Err(JournalError::InvalidStagedToken)
         ));
     }
@@ -1460,6 +2000,10 @@ mod tests {
             expires_at_ms: now_ms() + 60_000,
         };
         let token = journal.store_staged_commit(&staged, &[]).unwrap();
+        assert!(matches!(
+            journal.approve_popup_staged_commit(task.task_id, 7, &token.review_handle),
+            Ok(StagedCommitApproval::Approved)
+        ));
         journal
             .reconcile_inventory(&[owned_tab(task.task_id, 10)])
             .unwrap();
@@ -1471,7 +2015,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            journal.consume_staged_commit(task.task_id, &token.staged_token),
+            journal.consume_staged_commit(task.task_id, &token.staged_token, Uuid::now_v7()),
             Err(JournalError::StaleStagedCommit)
         ));
         assert!(matches!(

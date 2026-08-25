@@ -85,7 +85,8 @@ function parseState(value) {
   const stagedCommits = {};
   for (const [token, candidate] of Object.entries(commitsValue)) {
     const commit = objectValue(candidate);
-    if (!commit || commit.native_token !== token || token.length < 16 || typeof commit.task_id !== "string" || !finiteInteger(commit.tab_id) || !finiteInteger(commit.page_revision, 1) || typeof commit.effect !== "string" || typeof commit.fingerprint !== "string" || commit.fingerprint.length < 32 || !finiteInteger(commit.expires_at_ms) || !objectValue(commit.action) || !objectValue(commit.preview)) {
+    const dialog = commit?.dialog === undefined ? undefined : objectValue(commit.dialog);
+    if (!commit || commit.native_token !== token || token.length < 16 || typeof commit.task_id !== "string" || !finiteInteger(commit.tab_id) || !finiteInteger(commit.page_revision, 1) || typeof commit.effect !== "string" || typeof commit.fingerprint !== "string" || commit.fingerprint.length < 32 || !finiteInteger(commit.expires_at_ms) || commit.review_handle !== undefined && (typeof commit.review_handle !== "string" || commit.review_handle.length < 16 || commit.review_handle.length > 256) || commit.approved !== undefined && typeof commit.approved !== "boolean" || commit.dialog !== undefined && (!dialog || !finiteInteger(dialog.generation, 1) || typeof dialog.fingerprint !== "string" || dialog.fingerprint.length < 32) || !objectValue(commit.action) || !objectValue(commit.preview)) {
       return null;
     }
     stagedCommits[token] = commit;
@@ -284,6 +285,9 @@ var taskError = element("task-error", HTMLParagraphElement);
 var pointerToggle = element("pointer", HTMLInputElement);
 var pointerDetail = element("pointer-detail", HTMLElement);
 var settingsError = element("settings-error", HTMLParagraphElement);
+var reviews = element("reviews", HTMLElement);
+var reviewList = element("review-list", HTMLUListElement);
+var reviewError = element("review-error", HTMLParagraphElement);
 var current = null;
 var pending = false;
 var handoffShown = false;
@@ -319,8 +323,19 @@ function parseTask(value) {
     name,
     state: typeof value.state === "string" ? value.state : "working",
     tabCount: typeof value.tab_count === "number" ? value.tab_count : 0,
-    focusTabId: typeof value.focus_tab_id === "number" ? value.focus_tab_id : ("focus_tab_id" in value) ? null : undefined,
     color: typeof value.color === "string" ? value.color : null
+  };
+}
+function parseReview(value) {
+  if (typeof value.review_handle !== "string" || typeof value.task_id !== "string" || typeof value.tab_id !== "number" || typeof value.effect !== "string" || typeof value.expires_at_ms !== "number") {
+    return null;
+  }
+  return {
+    reviewHandle: value.review_handle,
+    taskId: value.task_id,
+    tabId: value.tab_id,
+    effect: value.effect,
+    expiresAtMs: value.expires_at_ms
   };
 }
 async function load() {
@@ -333,7 +348,8 @@ async function load() {
     developerMode: response.developer_mode === true,
     pointer: typeof response.show_agent_pointer === "boolean" ? response.show_agent_pointer : null,
     handoffPrompt: handoff === null ? null : prompt,
-    tasks: Array.isArray(response.tasks) ? response.tasks.filter(isRecord).map(parseTask).filter((task) => task !== null) : []
+    tasks: Array.isArray(response.tasks) ? response.tasks.filter(isRecord).map(parseTask).filter((task) => task !== null) : [],
+    reviews: Array.isArray(response.reviews) ? response.reviews.filter(isRecord).map(parseReview).filter((review) => review !== null) : []
   };
 }
 function lifecycle(state) {
@@ -401,22 +417,6 @@ function renderTask(task, developerMode) {
     badge.title = "Developer mode exposes raw DevTools Protocol calls for this task";
     row.append(badge);
   }
-  if (task.focusTabId !== null) {
-    const focus = document.createElement("button");
-    focus.type = "button";
-    focus.className = "link";
-    focus.textContent = "Focus";
-    focus.setAttribute("aria-label", `Focus ${task.name}`);
-    focus.addEventListener("click", () => {
-      guard(taskError, async () => {
-        const result = await send({ kind: "focus_task", task_id: task.taskId });
-        if (result.focused !== true) {
-          throw new Error(`${task.name} has no reachable tab to focus. Finish it, or let the agent open a new tab.`);
-        }
-      });
-    });
-    row.append(focus);
-  }
   const armed = confirming === task.taskId;
   const finish = document.createElement("button");
   finish.type = "button";
@@ -437,6 +437,37 @@ function renderTask(task, developerMode) {
     });
   });
   row.append(finish);
+  return row;
+}
+function renderReview(review) {
+  const row = document.createElement("li");
+  row.className = "review";
+  const effect = document.createElement("strong");
+  effect.textContent = review.effect;
+  const expiry = document.createElement("small");
+  const seconds = Math.max(0, Math.ceil((review.expiresAtMs - Date.now()) / 1000));
+  expiry.textContent = seconds === 1 ? "Expires in 1 second" : `Expires in ${seconds} seconds`;
+  const actions = document.createElement("div");
+  actions.className = "review-actions";
+  const abandon = document.createElement("button");
+  abandon.type = "button";
+  abandon.className = "quiet";
+  abandon.textContent = "Decline";
+  abandon.addEventListener("click", () => {
+    guard(reviewError, async () => {
+      await send({ kind: "abandon_popup_commit", review_handle: review.reviewHandle });
+    });
+  });
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.textContent = "Approve stage";
+  approve.addEventListener("click", () => {
+    guard(reviewError, async () => {
+      await send({ kind: "approve_popup_commit", review_handle: review.reviewHandle });
+    });
+  });
+  actions.append(abandon, approve);
+  row.append(effect, expiry, actions);
   return row;
 }
 function render(state) {
@@ -464,6 +495,10 @@ function render(state) {
     handoffShown = false;
     hide(handoffError);
   }
+  reviews.hidden = state.reviews.length === 0;
+  reviewList.replaceChildren(...state.reviews.map(renderReview));
+  if (state.reviews.length === 0)
+    hide(reviewError);
   pointerToggle.disabled = state.pointer === null;
   pointerToggle.checked = state.pointer === true;
   pointerDetail.textContent = state.pointer === null ? "Unavailable: the runtime did not report a pointer preference." : "Show where an agent clicks in a visible tab.";
@@ -512,7 +547,7 @@ function reload() {
 }
 enableButton.addEventListener("click", () => {
   guard(permissionError, async () => {
-    const granted = await chrome.permissions.request({ permissions: ["scripting", "debugger"] });
+    const granted = await chrome.permissions.request({ permissions: ["scripting"] });
     if (!granted) {
       throw new Error("Chrome denied AgentTab automation. AgentTab stays installed and disabled until you enable it here.");
     }
@@ -520,13 +555,9 @@ enableButton.addEventListener("click", () => {
 });
 disableButton.addEventListener("click", () => {
   guard(settingsError, async () => {
-    await chrome.permissions.remove({ permissions: ["scripting", "debugger"] });
-    const [scripting, debuggerPermission] = await Promise.all([
-      chrome.permissions.contains({ permissions: ["scripting"] }),
-      chrome.permissions.contains({ permissions: ["debugger"] })
-    ]);
-    if (scripting || debuggerPermission) {
-      throw new Error("Chrome kept an automation permission. Disable AgentTab from chrome://extensions, then try again.");
+    await chrome.permissions.remove({ permissions: ["scripting"] });
+    if (await chrome.permissions.contains({ permissions: ["scripting"] })) {
+      throw new Error("Chrome kept the optional scripting permission. Disable AgentTab from chrome://extensions, then try again.");
     }
   });
 });

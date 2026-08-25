@@ -28,7 +28,9 @@ var CORE_METHODS = {
   browser_tabs: true,
   browser_handoff: true,
   browser_commit: true,
-  browser_developer: true
+  browser_developer: true,
+  commit_review_bind: true,
+  commit_review_abandon: true
 };
 var NATIVE_EVENTS = {
   inventory: true,
@@ -38,6 +40,9 @@ var NATIVE_EVENTS = {
   pause_changed: true,
   handoff_changed: true,
   commit_expired: true,
+  commit_abandoned: true,
+  popup_commit_approved: true,
+  popup_commit_abandoned: true,
   extension_disconnected: true
 };
 var UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -134,7 +139,6 @@ function assertAction(value) {
       return action;
     case "go_back":
     case "go_forward":
-    case "focus":
     case "close":
       assertExactObject(action, ["kind"], [], `${action.kind} action`);
       return action;
@@ -145,12 +149,10 @@ function assertAction(value) {
       }
       return action;
     case "dialog":
-      assertExactObject(action, ["kind", "decision"], ["prompt_text"], "dialog action");
+      assertExactObject(action, ["kind", "decision"], [], "dialog action");
       if (action.decision !== "accept" && action.decision !== "dismiss") {
         commandError("dialog.decision must be accept or dismiss");
       }
-      if (action.prompt_text !== undefined)
-        assertBoundedString(action.prompt_text, "dialog.prompt_text", 0, 65536);
       return action;
     case "upload_file":
       assertExactObject(action, ["kind", "ref", "files"], [], "upload_file action");
@@ -161,6 +163,8 @@ function assertAction(value) {
       return action;
     case "set_viewport":
       commandError("set_viewport is unavailable in Standard mode");
+    case "press":
+      commandError("press is unavailable in Standard mode because it has no identifiable target");
     default:
       commandError(`Unsupported standard action: ${action.kind}`);
   }
@@ -247,6 +251,15 @@ function assertDeveloperParams(value) {
     commandError("browser_developer.params must be an object");
   return params;
 }
+function assertCommitReviewParams(value, method) {
+  const params = method === "commit_review_bind" ? assertExactObject(value, ["native_token", "review_handle", "tab_id"], [], `${method} parameters`) : assertExactObject(value, ["native_token", "tab_id"], [], `${method} parameters`);
+  assertBoundedString(params.native_token, "native_token", 16, 256);
+  assertTabId(params.tab_id);
+  if (method === "commit_review_bind") {
+    assertBoundedString(params.review_handle, "review_handle", 16, 256);
+  }
+  return params;
+}
 function validateParams(method, value) {
   switch (method) {
     case "browser_open": {
@@ -291,6 +304,9 @@ function validateParams(method, value) {
     }
     case "browser_developer":
       return assertDeveloperParams(value);
+    case "commit_review_bind":
+    case "commit_review_abandon":
+      return assertCommitReviewParams(value, method);
   }
 }
 function parseCommand(value) {
@@ -345,18 +361,43 @@ function parseInboundNativeMessage(value) {
   if (value.kind === "close_task")
     return parseCloseTask(value);
   if (value.kind === "event_ack") {
-    if (!hasOnlyKeys(value, ["protocol", "version", "kind", "event", "event_id"]) || value.event !== "handoff_changed" || !isBoundedString(value.event_id, 16, 256)) {
+    if (!hasOnlyKeys(value, ["protocol", "version", "kind", "event", "event_id"], ["outcome", "result", "error"]) || value.event !== "handoff_changed" && value.event !== "popup_commit_approved" && value.event !== "popup_commit_abandoned" || !isBoundedString(value.event_id, 16, 256)) {
       throw new Error("native event acknowledgement is invalid");
+    }
+    if (value.event === "handoff_changed") {
+      if (value.outcome !== undefined || value.result !== undefined || value.error !== undefined) {
+        throw new Error("handoff acknowledgement must not contain a result");
+      }
+      return {
+        protocol: NATIVE_PROTOCOL,
+        version: PROTOCOL_VERSION,
+        kind: "event_ack",
+        event: "handoff_changed",
+        event_id: value.event_id
+      };
+    }
+    if (value.outcome !== "completed" && value.outcome !== "not_started" && value.outcome !== "unknown" || (value.outcome === "completed" ? !isRecord(value.result) || value.error !== undefined : !isRecord(value.error) || value.result !== undefined) || isRecord(value.error) && (!isBoundedString(value.error.code, 1, 128) || !isBoundedString(value.error.message, 1, 2000))) {
+      throw new Error("popup commit acknowledgement is invalid");
     }
     return {
       protocol: NATIVE_PROTOCOL,
       version: PROTOCOL_VERSION,
       kind: "event_ack",
-      event: "handoff_changed",
-      event_id: value.event_id
+      event: value.event,
+      event_id: value.event_id,
+      outcome: value.outcome,
+      ...isRecord(value.result) ? { result: value.result } : {},
+      ...isRecord(value.error) ? {
+        error: {
+          code: value.error.code,
+          message: value.error.message,
+          ...typeof value.error.recovery === "string" ? { recovery: value.error.recovery } : {},
+          ...isRecord(value.error.details) ? { details: value.error.details } : {}
+        }
+      } : {}
     };
   }
-  if (value.kind !== "ready" || !hasOnlyKeys(value, ["protocol", "version", "kind", "host_version", "state"]) || !isBoundedString(value.host_version, 1, 128) || value.state !== "ready" && value.state !== "paused") {
+  if (value.kind !== "ready" || !hasOnlyKeys(value, ["protocol", "version", "kind", "host_version", "state"], ["discard_staged_tokens"]) || !isBoundedString(value.host_version, 1, 128) || value.state !== "ready" && value.state !== "paused" || value.discard_staged_tokens !== undefined && (!Array.isArray(value.discard_staged_tokens) || !value.discard_staged_tokens.every((token) => isBoundedString(token, 16, 256)))) {
     throw new Error("native ready message is invalid");
   }
   return {
@@ -364,7 +405,8 @@ function parseInboundNativeMessage(value) {
     version: PROTOCOL_VERSION,
     kind: "ready",
     host_version: value.host_version,
-    state: value.state
+    state: value.state,
+    ...value.discard_staged_tokens === undefined ? {} : { discard_staged_tokens: [...value.discard_staged_tokens] }
   };
 }
 function completed(requestId, result) {
@@ -388,7 +430,7 @@ function needsUser(requestId, result) {
   };
 }
 function commitRequired(requestId, result, staged) {
-  const { action: _action, preview: _preview, ...publicStaged } = staged;
+  const { action: _action, preview: _preview, dialog: _dialog, ...publicStaged } = staged;
   return {
     protocol: NATIVE_PROTOCOL,
     version: PROTOCOL_VERSION,
@@ -451,9 +493,18 @@ function nativeEvent(event, payload, eventId) {
     case "handoff_changed":
       assertNativeHandoff(payload);
       break;
-    case "commit_expired": {
+    case "commit_expired":
+    case "commit_abandoned": {
       const eventPayload = assertExactObject(payload, ["native_token"], [], "commit event payload");
       assertBoundedString(eventPayload.native_token, "native_token", 16, 256);
+      break;
+    }
+    case "popup_commit_approved":
+    case "popup_commit_abandoned": {
+      const eventPayload = assertExactObject(payload, ["review_handle", "task_id", "tab_id"], [], "popup commit event payload");
+      assertBoundedString(eventPayload.review_handle, "review_handle", 16, 256);
+      assertUuid(eventPayload.task_id, "task_id");
+      assertTabId(eventPayload.tab_id);
       break;
     }
     case "extension_disconnected": {
@@ -464,6 +515,9 @@ function nativeEvent(event, payload, eventId) {
   }
   if (eventId !== undefined)
     assertBoundedString(eventId, "event_id", 16, 256);
+  if ((event === "popup_commit_approved" || event === "popup_commit_abandoned") && eventId === undefined) {
+    commandError("popup commit events require an event_id");
+  }
   return {
     protocol: NATIVE_PROTOCOL,
     version: PROTOCOL_VERSION,
@@ -505,6 +559,18 @@ function assertNativeHandoff(value) {
 function randomToken(byteLength = 32) {
   const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+function randomUuidV7() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let timestamp = Date.now();
+  for (let index = 5;index >= 0; index -= 1) {
+    bytes[index] = timestamp & 255;
+    timestamp = Math.floor(timestamp / 256);
+  }
+  bytes[6] = bytes[6] & 15 | 112;
+  bytes[8] = bytes[8] & 63 | 128;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 function canonicalize(value) {
   if (Array.isArray(value))
@@ -607,7 +673,8 @@ function parseState(value) {
   const stagedCommits = {};
   for (const [token, candidate] of Object.entries(commitsValue)) {
     const commit = objectValue(candidate);
-    if (!commit || commit.native_token !== token || token.length < 16 || typeof commit.task_id !== "string" || !finiteInteger(commit.tab_id) || !finiteInteger(commit.page_revision, 1) || typeof commit.effect !== "string" || typeof commit.fingerprint !== "string" || commit.fingerprint.length < 32 || !finiteInteger(commit.expires_at_ms) || !objectValue(commit.action) || !objectValue(commit.preview)) {
+    const dialog = commit?.dialog === undefined ? undefined : objectValue(commit.dialog);
+    if (!commit || commit.native_token !== token || token.length < 16 || typeof commit.task_id !== "string" || !finiteInteger(commit.tab_id) || !finiteInteger(commit.page_revision, 1) || typeof commit.effect !== "string" || typeof commit.fingerprint !== "string" || commit.fingerprint.length < 32 || !finiteInteger(commit.expires_at_ms) || commit.review_handle !== undefined && (typeof commit.review_handle !== "string" || commit.review_handle.length < 16 || commit.review_handle.length > 256) || commit.approved !== undefined && typeof commit.approved !== "boolean" || commit.dialog !== undefined && (!dialog || !finiteInteger(dialog.generation, 1) || typeof dialog.fingerprint !== "string" || dialog.fingerprint.length < 32) || !objectValue(commit.action) || !objectValue(commit.preview)) {
       return null;
     }
     stagedCommits[token] = commit;
@@ -743,14 +810,21 @@ class StandardBrowserRuntime {
   revisions;
   closeTab;
   emit;
+  authorize;
   sessions = new Map;
-  constructor(revisions, closeTab, emit) {
+  constructor(revisions, closeTab, emit, authorize) {
     this.revisions = revisions;
     this.closeTab = closeTab;
     this.emit = emit;
+    this.authorize = authorize;
     chrome.debugger.onDetach.addListener((source) => {
-      if (source.tabId !== undefined)
-        this.sessions.delete(source.tabId);
+      if (source.tabId === undefined)
+        return;
+      const session = this.sessions.get(source.tabId);
+      if (session)
+        session.cancelled = true;
+      this.sessions.delete(source.tabId);
+      this.invalidateStagedDialogs(source.tabId);
     });
     chrome.debugger.onEvent.addListener((source, method, rawParams) => {
       if (source.tabId === undefined)
@@ -766,17 +840,32 @@ class StandardBrowserRuntime {
         session.inflight.delete(params.requestId);
         session.lastNetworkActivity = Date.now();
       } else if (method === "Page.javascriptDialogOpening") {
-        session.dialogOpen = true;
+        session.dialogGeneration += 1;
+        session.dialog = {
+          generation: session.dialogGeneration,
+          fingerprint: sha256Hex({
+            type: typeof params.type === "string" ? params.type : null,
+            message: typeof params.message === "string" ? params.message : null,
+            default_prompt: typeof params.defaultPrompt === "string" ? params.defaultPrompt : null
+          })
+        };
+        this.invalidateStagedDialogs(source.tabId);
       } else if (method === "Page.javascriptDialogClosed") {
-        session.dialogOpen = false;
+        session.dialogGeneration += 1;
+        session.dialog = undefined;
+        this.invalidateStagedDialogs(source.tabId);
       }
     });
+    this.revisions.onChange((tabId) => this.invalidateStagedDialogs(tabId));
   }
   async detach(tabId) {
     const session = this.sessions.get(tabId);
+    if (session)
+      session.cancelled = true;
     if (session?.idleTimer)
       clearTimeout(session.idleTimer);
     this.sessions.delete(tabId);
+    await this.invalidateStagedDialogs(tabId);
     if (session?.attached)
       await chrome.debugger.detach({ tabId }).catch(() => {
         return;
@@ -786,6 +875,7 @@ class StandardBrowserRuntime {
     await Promise.all([...this.sessions.keys()].map((tabId) => this.detach(tabId)));
   }
   async snapshot(tabId, params) {
+    await this.authorize(tabId);
     const mode = params.mode;
     if (mode === "text" || mode === "html")
       return this.scriptSnapshot(tabId, mode, params);
@@ -828,6 +918,7 @@ class StandardBrowserRuntime {
     };
   }
   async act(taskId, tabId, expectedRevision, actions) {
+    await this.authorize(tabId);
     const pageRevision = await this.revisions.assertExpected(tabId, expectedRevision);
     if (!Array.isArray(actions) || actions.length === 0 || actions.length > 64) {
       throw Object.assign(new Error("actions must contain between 1 and 64 operations"), {
@@ -865,9 +956,15 @@ class StandardBrowserRuntime {
             kind: action.kind,
             target: stagedConsequence.target,
             ...typeof action.ref === "string" ? { ref: action.ref } : {}
-          }
+          },
+          ...stagedConsequence.dialog !== undefined ? { dialog: stagedConsequence.dialog.binding } : {}
         };
         await mutateState((state) => {
+          if (stagedConsequence.dialog !== undefined && this.sessions.get(tabId)?.dialog !== stagedConsequence.dialog.live) {
+            throw Object.assign(new Error("JavaScript dialog changed before it could be staged"), {
+              code: "invalid_request"
+            });
+          }
           state.stagedCommits[staged.native_token] = staged;
         });
         return {
@@ -890,6 +987,88 @@ class StandardBrowserRuntime {
       }
     };
   }
+  async bindReview(taskId, params) {
+    const nativeToken = params.native_token;
+    const reviewHandle = params.review_handle;
+    const tabId = params.tab_id;
+    if (typeof nativeToken !== "string" || typeof reviewHandle !== "string" || !Number.isInteger(tabId)) {
+      throw Object.assign(new Error("Commit review binding is malformed"), { code: "invalid_request" });
+    }
+    const bound = await mutateState((state) => {
+      const staged = state.stagedCommits[nativeToken];
+      if (!staged || staged.task_id !== taskId || staged.tab_id !== tabId || staged.review_handle !== undefined) {
+        return false;
+      }
+      staged.review_handle = reviewHandle;
+      staged.approved = false;
+      return true;
+    });
+    if (!bound) {
+      throw Object.assign(new Error("Commit review binding does not match a staged operation"), {
+        code: "invalid_staged_token"
+      });
+    }
+    return { review_bound: true };
+  }
+  async reviewBinding(reviewHandle) {
+    const staged = Object.values((await readState()).stagedCommits).find((candidate) => candidate.review_handle === reviewHandle && candidate.approved !== true);
+    if (!staged) {
+      throw Object.assign(new Error("Commit review is no longer available"), {
+        code: "invalid_staged_token"
+      });
+    }
+    return { task_id: staged.task_id, tab_id: staged.tab_id };
+  }
+  async approveReview(reviewHandle) {
+    return mutateState((state) => {
+      const staged = Object.values(state.stagedCommits).find((candidate) => candidate.review_handle === reviewHandle && candidate.approved !== true);
+      if (!staged)
+        return false;
+      staged.approved = true;
+      return true;
+    });
+  }
+  async abandonReview(reviewHandle) {
+    return mutateState((state) => {
+      const entry = Object.entries(state.stagedCommits).find(([, staged]) => staged.review_handle === reviewHandle);
+      if (!entry)
+        return false;
+      delete state.stagedCommits[entry[0]];
+      return true;
+    });
+  }
+  async abandonNativeStage(taskId, nativeToken, tabId) {
+    if (typeof nativeToken !== "string" || !Number.isInteger(tabId)) {
+      throw Object.assign(new Error("Commit stage cleanup is malformed"), { code: "invalid_request" });
+    }
+    const abandoned = await mutateState((state) => {
+      const staged = state.stagedCommits[nativeToken];
+      if (!staged || staged.task_id !== taskId || staged.tab_id !== tabId)
+        return false;
+      delete state.stagedCommits[nativeToken];
+      return true;
+    });
+    if (!abandoned) {
+      throw Object.assign(new Error("Commit stage is invalid, used, or belongs to another task"), {
+        code: "invalid_staged_token"
+      });
+    }
+    return { abandoned: true };
+  }
+  async discardNativeStages(nativeTokens) {
+    if (nativeTokens.length === 0)
+      return;
+    const tokens = new Set(nativeTokens);
+    await mutateState((state) => {
+      for (const token of tokens)
+        delete state.stagedCommits[token];
+    });
+  }
+  async abandonAllStages() {
+    await mutateState((state) => {
+      state.stagedCommits = {};
+    });
+  }
   async stagedTabId(taskId, nativeToken) {
     if (typeof nativeToken !== "string") {
       throw Object.assign(new Error("browser_commit requires a native token"), { code: "invalid_request" });
@@ -905,13 +1084,14 @@ class StandardBrowserRuntime {
   async commit(taskId, params) {
     const nativeToken = params.native_token;
     const tabId = await this.stagedTabId(taskId, nativeToken);
+    await this.authorize(tabId);
     const staged = (await readState()).stagedCommits[String(nativeToken)];
     if (!staged || staged.task_id !== taskId || staged.tab_id !== tabId) {
       throw Object.assign(new Error("Staged commit token is invalid, used, or belongs to another task"), {
         code: "invalid_staged_token"
       });
     }
-    if (staged.expires_at_ms < Date.now()) {
+    if (staged.expires_at_ms <= Date.now()) {
       await mutateState((state) => {
         delete state.stagedCommits[String(nativeToken)];
       });
@@ -936,7 +1116,7 @@ class StandardBrowserRuntime {
         code: "staged_commit_mismatch"
       });
     }
-    const currentTarget = typeof action.ref === "string" ? await this.targetDescriptor(staged.tab_id, staged.page_revision, action.ref) : { kind: action.kind };
+    const currentTarget = typeof action.ref === "string" ? await this.targetDescriptor(staged.tab_id, staged.page_revision, action.ref, action) : { kind: action.kind };
     if (await this.stageFingerprint(taskId, staged.tab_id, staged.page_revision, action, currentTarget) !== staged.fingerprint) {
       await mutateState((state) => {
         delete state.stagedCommits[String(nativeToken)];
@@ -948,7 +1128,7 @@ class StandardBrowserRuntime {
     await mutateState((state) => {
       delete state.stagedCommits[String(nativeToken)];
     });
-    const result = await this.performAction(staged.tab_id, staged.page_revision, action);
+    const result = action.kind === "dialog" && action.decision === "accept" ? await this.acceptStagedDialog(staged.tab_id, action, staged.dialog) : await this.performAction(staged.tab_id, staged.page_revision, action);
     return {
       tab_id: staged.tab_id,
       page_revision: await this.revisions.current(staged.tab_id),
@@ -957,7 +1137,7 @@ class StandardBrowserRuntime {
   }
   async expireCommits() {
     const expired = await mutateState((state) => {
-      const tokens = Object.values(state.stagedCommits).filter((staged) => staged.expires_at_ms < Date.now()).map((staged) => staged.native_token);
+      const tokens = Object.values(state.stagedCommits).filter((staged) => staged.expires_at_ms <= Date.now()).map((staged) => staged.native_token);
       for (const token of tokens)
         delete state.stagedCommits[token];
       return tokens;
@@ -975,6 +1155,7 @@ class StandardBrowserRuntime {
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     do {
+      await this.authorize(tabId);
       if (revalidate)
         await revalidate();
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
@@ -998,6 +1179,7 @@ class StandardBrowserRuntime {
     });
   }
   async developer(tabId, action, params) {
+    await this.authorize(tabId);
     const [domain, ...rest] = action.split(".");
     if (!domain || rest.length === 0) {
       throw Object.assign(new Error("Developer action must be a CDP Domain.method"), {
@@ -1007,6 +1189,7 @@ class StandardBrowserRuntime {
     return this.send(tabId, action, params);
   }
   async scriptSnapshot(tabId, mode, params) {
+    await this.authorize(tabId);
     const selector = typeof params.selector === "string" ? params.selector : null;
     const maxBytes = typeof params.max_bytes === "number" ? params.max_bytes : 256000;
     const [{ result }] = await chrome.scripting.executeScript({
@@ -1113,13 +1296,16 @@ class StandardBrowserRuntime {
     if (action.kind === "dialog" && action.decision === "accept") {
       return {
         effect: "Accept a browser confirmation dialog",
-        target: { kind: action.kind }
+        target: { kind: action.kind },
+        dialog: await this.stageDialog(tabId)
       };
     }
-    if (action.kind !== "click")
+    if (action.kind !== "click" && action.kind !== "select" && action.kind !== "fill" && action.kind !== "type") {
       return null;
-    const target = await this.targetDescriptor(tabId, pageRevision, action.ref);
+    }
+    const target = await this.targetDescriptor(tabId, pageRevision, action.ref, action);
     const label = [
+      target.role,
       target.text,
       target.aria_label,
       target.title,
@@ -1127,11 +1313,15 @@ class StandardBrowserRuntime {
       target.id,
       target.type,
       target.form_action,
-      target.form_method
+      target.form_method,
+      ...Array.isArray(target.associated_labels) ? target.associated_labels : [],
+      ...Array.isArray(target.accessible_labels) ? target.accessible_labels : [],
+      target.requested_value,
+      target.requested_option_label
     ].filter((value) => typeof value === "string").join(" ").replace(/\s+/g, " ").trim();
     if (/\b(buy|purchase|pay|send|transfer|delete|remove|publish|post|deploy|merge|approve|authorize|grant|revoke|unsubscribe|cancel subscription|place order|checkout|submit order|confirm order|permission)\b/i.test(label)) {
       return {
-        effect: `Activate consequential control: ${label.slice(0, 160)}`,
+        effect: `${action.kind === "click" ? "Activate" : "Change"} consequential control: ${label.slice(0, 160)}`,
         target
       };
     }
@@ -1140,7 +1330,56 @@ class StandardBrowserRuntime {
   async stageFingerprint(taskId, tabId, pageRevision, action, target) {
     return sha256Hex({ task_id: taskId, tab_id: tabId, page_revision: pageRevision, action, target });
   }
-  async targetDescriptor(tabId, pageRevision, ref) {
+  async stageDialog(tabId) {
+    await this.ensureAttached(tabId);
+    const dialog = this.sessions.get(tabId)?.dialog;
+    if (!dialog) {
+      throw Object.assign(new Error("Accepting a dialog requires an open JavaScript dialog"), {
+        code: "invalid_request"
+      });
+    }
+    const fingerprint = await dialog.fingerprint;
+    if (this.sessions.get(tabId)?.dialog !== dialog) {
+      throw Object.assign(new Error("JavaScript dialog changed before it could be staged"), {
+        code: "invalid_request"
+      });
+    }
+    return { binding: { generation: dialog.generation, fingerprint }, live: dialog };
+  }
+  async acceptStagedDialog(tabId, action, stagedDialog) {
+    if (!stagedDialog) {
+      throw Object.assign(new Error("Staged dialog binding is missing"), { code: "staged_commit_mismatch" });
+    }
+    await this.ensureAttached(tabId);
+    await this.authorize(tabId);
+    const dialog = this.sessions.get(tabId)?.dialog;
+    if (!dialog || dialog.generation !== stagedDialog.generation) {
+      throw Object.assign(new Error("The staged JavaScript dialog is no longer open"), {
+        code: "staged_commit_mismatch"
+      });
+    }
+    const fingerprint = await dialog.fingerprint;
+    if (fingerprint !== stagedDialog.fingerprint || this.sessions.get(tabId)?.dialog !== dialog || dialog.generation !== stagedDialog.generation) {
+      throw Object.assign(new Error("The staged JavaScript dialog changed before Commit"), {
+        code: "staged_commit_mismatch"
+      });
+    }
+    await this.authorize(tabId);
+    await chrome.debugger.sendCommand({ tabId }, "Page.handleJavaScriptDialog", { accept: true });
+    return { kind: "dialog", completed: true };
+  }
+  async invalidateStagedDialogs(tabId) {
+    await mutateState((state) => {
+      for (const [token, staged] of Object.entries(state.stagedCommits)) {
+        const action = staged.action.action;
+        if (staged.tab_id === tabId && isRecord(action) && action.kind === "dialog") {
+          delete state.stagedCommits[token];
+        }
+      }
+    });
+  }
+  async targetDescriptor(tabId, pageRevision, ref, action) {
+    const requestedValue = action?.kind === "select" ? String(action.value ?? "") : action?.kind === "fill" || action?.kind === "type" ? String(action.text ?? "") : null;
     const backendNodeId = this.backendNodeId(pageRevision, ref);
     const resolved = await this.send(tabId, "DOM.resolveNode", { backendNodeId });
     if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
@@ -1148,7 +1387,8 @@ class StandardBrowserRuntime {
     }
     const described = await this.send(tabId, "Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
-      functionDeclaration: "function(){const f=this.form;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype}}",
+      functionDeclaration: "function(requestedValue){const f=this.form;const text=node=>String(node&&((node.innerText??node.textContent)??'')||'').trim();const ids=String(this.getAttribute('aria-labelledby')||'')+' '+String(this.getAttribute('aria-describedby')||'');const associated=(this.labels?Array.from(this.labels):[]).map(text).filter(Boolean);const accessible=[this.getAttribute('aria-label'),...ids.trim().split(/\\s+/).filter(Boolean).map(id=>text(document.getElementById(id)))].filter(value=>typeof value==='string'&&value.trim());const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_value:requestedValue,requested_option_label:option?String(option.label||option.textContent||'').trim():null}}",
+      arguments: [{ value: requestedValue }],
       returnByValue: true
     });
     if (!isRecord(described.result) || !isRecord(described.result.value)) {
@@ -1157,6 +1397,7 @@ class StandardBrowserRuntime {
     return described.result.value;
   }
   async performAction(tabId, pageRevision, action) {
+    await this.authorize(tabId);
     const kind = action.kind;
     if (kind === "navigate") {
       if (typeof action.url !== "string")
@@ -1176,12 +1417,6 @@ class StandardBrowserRuntime {
       await chrome.tabs.reload(tabId, { bypassCache: action.bypass_cache === true });
       return { kind, started: true };
     }
-    if (kind === "focus") {
-      const tab = await chrome.tabs.update(tabId, { active: true });
-      if (tab?.windowId !== undefined)
-        await chrome.windows.update(tab.windowId, { focused: true });
-      return { kind, completed: true };
-    }
     if (kind === "close") {
       await this.closeTab(tabId);
       return { kind, completed: true };
@@ -1192,9 +1427,15 @@ class StandardBrowserRuntime {
       });
     }
     if (kind === "dialog") {
-      await this.send(tabId, "Page.handleJavaScriptDialog", {
-        accept: action.decision === "accept",
-        ...typeof action.prompt_text === "string" ? { promptText: action.prompt_text } : {}
+      if (action.decision === "accept") {
+        throw Object.assign(new Error("Accepting a dialog requires a staged Commit"), {
+          code: "invalid_request"
+        });
+      }
+      await chrome.debugger.sendCommand({
+        tabId
+      }, "Page.handleJavaScriptDialog", {
+        accept: false
       });
       return { kind, completed: true };
     }
@@ -1363,21 +1604,73 @@ class StandardBrowserRuntime {
     return typeof frame.loaderId === "string" ? frame.loaderId : undefined;
   }
   async ensureAttached(tabId) {
+    await this.authorize(tabId);
     let session = this.sessions.get(tabId);
     if (!session) {
-      session = { attached: false, inflight: new Set, lastNetworkActivity: Date.now(), dialogOpen: false };
+      session = {
+        attached: false,
+        inflight: new Set,
+        lastNetworkActivity: Date.now(),
+        dialogGeneration: 0
+      };
       this.sessions.set(tabId, session);
     }
-    if (!session.attached) {
-      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
-      session.attached = true;
-      await Promise.all([
-        chrome.debugger.sendCommand({ tabId }, "Page.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "Network.enable", {})
-      ]);
+    if (!session.attached && !session.initializing) {
+      const initialization2 = (async () => {
+        try {
+          await this.authorize(tabId);
+          if (session.cancelled || this.sessions.get(tabId) !== session) {
+            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
+              code: "ownership_revoked"
+            });
+          }
+          await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+          session.attached = true;
+          if (session.cancelled || this.sessions.get(tabId) !== session) {
+            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
+              code: "ownership_revoked"
+            });
+          }
+          await this.authorize(tabId);
+          await Promise.all([
+            chrome.debugger.sendCommand({ tabId }, "Page.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "Network.enable", {})
+          ]);
+        } catch (error) {
+          if (session.attached) {
+            session.attached = false;
+            await chrome.debugger.detach({ tabId }).catch(() => {
+              return;
+            });
+          }
+          if (this.sessions.get(tabId) === session)
+            this.sessions.delete(tabId);
+          throw error;
+        }
+      })();
+      session.initializing = initialization2;
+      try {
+        await initialization2;
+      } finally {
+        if (session.initializing === initialization2)
+          session.initializing = undefined;
+      }
+    } else if (session.initializing) {
+      await session.initializing;
+    }
+    try {
+      await this.authorize(tabId);
+    } catch (error) {
+      await this.detach(tabId);
+      throw error;
+    }
+    if (session.cancelled || !session.attached || this.sessions.get(tabId) !== session) {
+      throw Object.assign(new Error("Debugger session was revoked while attaching"), {
+        code: "ownership_revoked"
+      });
     }
     if (session.idleTimer)
       clearTimeout(session.idleTimer);
@@ -1385,6 +1678,13 @@ class StandardBrowserRuntime {
   }
   async send(tabId, method, params) {
     await this.ensureAttached(tabId);
+    await this.authorize(tabId);
+    const session = this.sessions.get(tabId);
+    if (!session?.attached || session.cancelled) {
+      throw Object.assign(new Error("Debugger session is no longer authorized"), {
+        code: "ownership_revoked"
+      });
+    }
     const result = await chrome.debugger.sendCommand({ tabId }, method, params);
     return isRecord(result) ? result : {};
   }
@@ -1872,12 +2172,16 @@ class NativeBridge {
   handleCommand;
   onEventAcknowledged;
   onReady;
+  discardStages;
   port = null;
   ready = false;
   reconnectAttempt = 0;
+  pendingEventAcks = new Map;
   constructor(scheduler, ownership, handleCommand, onEventAcknowledged = () => {
     return;
   }, onReady = async () => {
+    return;
+  }, discardStages = async () => {
     return;
   }) {
     this.scheduler = scheduler;
@@ -1885,6 +2189,7 @@ class NativeBridge {
     this.handleCommand = handleCommand;
     this.onEventAcknowledged = onEventAcknowledged;
     this.onReady = onReady;
+    this.discardStages = discardStages;
   }
   async connect() {
     if (this.port)
@@ -1907,7 +2212,14 @@ class NativeBridge {
         task_id: state.handoff.taskId,
         tab_id: state.handoff.tabId,
         started_at_ms: state.handoff.startedAtMs
-      } : { active: false }, Object.values(state.stagedCommits).map(({ action: _action, preview: _preview, ...staged }) => staged)));
+      } : { active: false }, Object.values(state.stagedCommits).map(({
+        action: _action,
+        preview: _preview,
+        dialog: _dialog,
+        review_handle: _reviewHandle,
+        approved: _approved,
+        ...staged
+      }) => staged)));
     } catch {
       this.onDisconnect(port);
     }
@@ -1921,6 +2233,63 @@ class NativeBridge {
     } catch {
       this.onDisconnect(this.port);
     }
+  }
+  async approvePopupCommit(reviewHandle, taskId, tabId) {
+    const acknowledgement = await this.requestPopupEvent("popup_commit_approved", {
+      review_handle: reviewHandle,
+      task_id: taskId,
+      tab_id: tabId
+    });
+    if (acknowledgement.outcome !== "completed" || !acknowledgement.result) {
+      const error = acknowledgement.error;
+      throw Object.assign(new Error(error?.message ?? "AgentTab could not approve the staged action"), {
+        code: error?.code ?? "popup_commit_failed",
+        acknowledged: true
+      });
+    }
+    return acknowledgement.result;
+  }
+  async abandonPopupCommit(reviewHandle, taskId, tabId) {
+    const acknowledgement = await this.requestPopupEvent("popup_commit_abandoned", {
+      review_handle: reviewHandle,
+      task_id: taskId,
+      tab_id: tabId
+    });
+    if (acknowledgement.outcome !== "completed" || !acknowledgement.result) {
+      const error = acknowledgement.error;
+      throw Object.assign(new Error(error?.message ?? "AgentTab could not abandon the staged action"), {
+        code: error?.code ?? "popup_commit_failed",
+        acknowledged: true
+      });
+    }
+    return acknowledgement.result;
+  }
+  requestPopupEvent(event, payload) {
+    const port = this.port;
+    if (!port || !this.ready) {
+      throw Object.assign(new Error("AgentTab host is disconnected; the staged action was not approved"), {
+        code: "extension_disconnected"
+      });
+    }
+    const eventId = randomUuidV7();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingEventAcks.delete(eventId);
+        reject(Object.assign(new Error("AgentTab host did not acknowledge the staged action"), {
+          code: "extension_disconnected"
+        }));
+      }, 30000);
+      this.pendingEventAcks.set(eventId, { resolve, reject, timeout });
+      try {
+        port.postMessage(nativeEvent(event, payload, eventId));
+      } catch {
+        clearTimeout(timeout);
+        this.pendingEventAcks.delete(eventId);
+        reject(Object.assign(new Error("AgentTab host is disconnected; the staged action was not approved"), {
+          code: "extension_disconnected"
+        }));
+      }
+    });
   }
   async reconnectFromAlarm(alarmName) {
     if (alarmName !== RECONNECT_ALARM || this.port)
@@ -1941,11 +2310,24 @@ class NativeBridge {
       return;
     }
     if (parsed.kind === "event_ack") {
-      if (this.ready)
+      const pending = this.pendingEventAcks.get(parsed.event_id);
+      if (pending) {
+        clearTimeout(pending.timeout);
+        this.pendingEventAcks.delete(parsed.event_id);
+        pending.resolve(parsed);
+      } else if (this.ready) {
         this.onEventAcknowledged(parsed.event, parsed.event_id);
+      }
       return;
     }
     if (parsed.kind === "ready") {
+      try {
+        await this.discardStages(parsed.discard_staged_tokens ?? []);
+      } catch {
+        if (this.port === port)
+          port.disconnect();
+        return;
+      }
       this.ready = true;
       this.reconnectAttempt = 0;
       await chrome.alarms.clear(RECONNECT_ALARM);
@@ -1987,7 +2369,15 @@ class NativeBridge {
       return;
     this.port = null;
     this.ready = false;
+    for (const [eventId, pending] of this.pendingEventAcks) {
+      clearTimeout(pending.timeout);
+      pending.reject(Object.assign(new Error("AgentTab host disconnected before acknowledging the staged action"), {
+        code: "extension_disconnected"
+      }));
+      this.pendingEventAcks.delete(eventId);
+    }
     this.scheduler.disconnect();
+    this.discardStages([]);
     this.scheduleReconnect();
   }
   scheduleReconnect() {
@@ -2276,7 +2666,7 @@ class OwnershipLedger {
         });
       }
       await this.grant(ownedParent.taskId, childTabId, ownedParent.name);
-    } catch { }
+    } catch {}
   }
   async revokeIfMovedNow(tabId) {
     const state = await readState();
@@ -2336,7 +2726,7 @@ class OwnershipLedger {
       try {
         await chrome.tabs.remove(tabId);
         closedTabIds.push(tabId);
-      } catch { }
+      } catch {}
     }
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
@@ -2469,6 +2859,11 @@ class OwnershipLedger {
 
 // src/revisions.ts
 class RevisionTracker {
+  changeListeners = new Set;
+  onChange(listener) {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
+  }
   async ensure(tabId) {
     return mutateState((state) => {
       const key = String(tabId);
@@ -2484,16 +2879,18 @@ class RevisionTracker {
     return current ?? this.ensure(tabId);
   }
   async markNavigation(tabId) {
-    return mutateState((state) => {
+    const pageRevision = await mutateState((state) => {
       const key = String(tabId);
       const existing = state.revisions[key];
       const next = Math.max((existing?.current ?? 0) + 1, (existing?.floor ?? 0) + 1, 1);
       state.revisions[key] = { floor: next, current: next };
       return next;
     });
+    await this.publishChange(tabId, pageRevision);
+    return pageRevision;
   }
   async observeDocument(tabId, documentId, loaderId) {
-    return mutateState((state) => {
+    const observed = await mutateState((state) => {
       const key = String(tabId);
       const existing = state.revisions[key];
       if (!existing) {
@@ -2503,18 +2900,21 @@ class RevisionTracker {
           ...documentId !== undefined ? { documentId } : {},
           ...loaderId !== undefined ? { loaderId } : {}
         };
-        return 1;
+        return { pageRevision: 1, changed: false };
       }
       const changed = documentId !== undefined && existing.documentId !== undefined && documentId !== existing.documentId || loaderId !== undefined && existing.loaderId !== undefined && loaderId !== existing.loaderId;
-      const current = changed ? Math.max(existing.current + 1, existing.floor + 1) : existing.current;
+      const pageRevision = changed ? Math.max(existing.current + 1, existing.floor + 1) : existing.current;
       state.revisions[key] = {
-        floor: Math.max(existing.floor, current),
-        current,
+        floor: Math.max(existing.floor, pageRevision),
+        current: pageRevision,
         ...documentId !== undefined ? { documentId } : existing.documentId !== undefined ? { documentId: existing.documentId } : {},
         ...loaderId !== undefined ? { loaderId } : existing.loaderId !== undefined ? { loaderId: existing.loaderId } : {}
       };
-      return current;
+      return { pageRevision, changed };
     });
+    if (observed.changed)
+      await this.publishChange(tabId, observed.pageRevision);
+    return observed.pageRevision;
   }
   async assertExpected(tabId, expected) {
     if (!Number.isInteger(expected) || Number(expected) < 0) {
@@ -2529,12 +2929,19 @@ class RevisionTracker {
     return current;
   }
   async remove(tabId) {
-    await mutateState((state) => {
+    const pageRevision = await mutateState((state) => {
       const key = String(tabId);
       const existing = state.revisions[key];
       const next = Math.max((existing?.current ?? 0) + 1, (existing?.floor ?? 0) + 1, 1);
       state.revisions[key] = { floor: next, current: next };
+      return next;
     });
+    await this.publishChange(tabId, pageRevision);
+  }
+  async publishChange(tabId, pageRevision) {
+    for (const listener of this.changeListeners) {
+      await listener(tabId, pageRevision);
+    }
   }
 }
 
@@ -2574,15 +2981,30 @@ browser = new StandardBrowserRuntime(revisions, async (tabId) => {
   await ownership.revoke(tabId, "tab_removed");
   await browser.detach(tabId);
   await chrome.tabs.remove(tabId);
-}, emit);
+}, emit, authorizeOwnedTab);
 var handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber(() => browser.scrubForHandoff());
 async function automationEnabled() {
-  const [scripting, debuggerPermission] = await Promise.all([
-    chrome.permissions.contains({ permissions: ["scripting"] }),
-    chrome.permissions.contains({ permissions: ["debugger"] })
-  ]);
-  return scripting && debuggerPermission;
+  return chrome.permissions.contains({ permissions: ["scripting"] });
+}
+function automationRequired() {
+  return Object.assign(new Error("AgentTab automation permissions have not been enabled"), {
+    code: "permissions_required",
+    recovery: "Open the AgentTab popup and choose Enable automation."
+  });
+}
+async function authorizeOwnedTab(tabId) {
+  if (!await automationEnabled())
+    throw automationRequired();
+  const taskId = await ownership.taskIdForTab(tabId);
+  if (taskId === null) {
+    throw Object.assign(new Error("Tab is not owned by an AgentTab task"), {
+      code: "ownership_denied"
+    });
+  }
+  await ownership.assertOwned(taskId, tabId);
+  if (!await automationEnabled())
+    throw automationRequired();
 }
 function tabId(params) {
   if (!Number.isInteger(params.tab_id) || Number(params.tab_id) < 0) {
@@ -2670,6 +3092,12 @@ async function dispatch(command) {
   const params = command.params;
   const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer";
   try {
+    if (command.method === "commit_review_bind") {
+      return completed(command.request_id, await browser.bindReview(command.task_id, params));
+    }
+    if (command.method === "commit_review_abandon") {
+      return completed(command.request_id, await browser.abandonNativeStage(command.task_id, params.native_token, params.tab_id));
+    }
     if ((await readState()).handoff.active) {
       throw Object.assign(new Error("Automation is disabled while credential handoff is active"), {
         code: "handoff_blackout",
@@ -2677,10 +3105,7 @@ async function dispatch(command) {
       });
     }
     if (command.method !== "browser_open" && command.method !== "browser_tabs" && command.method !== "browser_handoff" && !await automationEnabled()) {
-      throw Object.assign(new Error("AgentTab automation permissions have not been enabled"), {
-        code: "permissions_required",
-        recovery: "Open the AgentTab popup and choose Enable automation."
-      });
+      throw automationRequired();
     }
     if (command.method === "browser_open") {
       return completed(command.request_id, await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params)));
@@ -2769,7 +3194,13 @@ async function dispatch(command) {
     return failed(command.request_id, code, error instanceof Error ? error.message : String(error), errorOutcome(error, mutating, code), errorRecovery(error), isRecord(error) && typeof error.currentPageRevision === "number" ? { current_page_revision: error.currentPageRevision } : undefined);
   }
 }
-nativeBridge = new NativeBridge(scheduler, ownership, dispatch, (event, eventId) => void handoff.acknowledgeEvent(event, eventId), () => handoff.restore());
+nativeBridge = new NativeBridge(scheduler, ownership, dispatch, (event, eventId) => void handoff.acknowledgeEvent(event, eventId), () => handoff.restore(), async (nativeTokens) => {
+  if (nativeTokens.length > 0) {
+    await browser.discardNativeStages(nativeTokens);
+    return;
+  }
+  await browser.abandonAllStages();
+});
 var startup = null;
 function start() {
   if (startup)
@@ -2817,17 +3248,15 @@ chrome.tabGroups.onRemoved.addListener(() => void start().then(() => ownership.r
 chrome.runtime.onStartup.addListener(() => void start());
 chrome.runtime.onInstalled.addListener(() => void start());
 chrome.permissions.onRemoved.addListener((permissions) => {
-  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
+  if (!permissions.permissions?.includes("scripting"))
     return;
-  }
   scheduler.revokePermissions();
   automationRevocationGeneration += 1;
   start().then(() => browser.scrubForHandoff());
 });
 chrome.permissions.onAdded.addListener((permissions) => {
-  if (!permissions.permissions?.some((permission) => permission === "scripting" || permission === "debugger")) {
+  if (!permissions.permissions?.includes("scripting"))
     return;
-  }
   automationEnabled().then((enabled) => {
     if (enabled)
       scheduler.restorePermissions();
@@ -2863,20 +3292,16 @@ async function handlePopupMessage(message) {
         name: task.name,
         state: task.state,
         color: task.color,
-        tab_count: task.tabIds.length,
-        focus_tab_id: task.tabIds[0] ?? null
+        tab_count: task.tabIds.length
+      })),
+      reviews: Object.values(state.stagedCommits).filter((staged) => typeof staged.review_handle === "string" && staged.approved !== true).map((staged) => ({
+        review_handle: staged.review_handle,
+        task_id: staged.task_id,
+        tab_id: staged.tab_id,
+        effect: staged.effect,
+        expires_at_ms: staged.expires_at_ms
       }))
     };
-  }
-  if (message.kind === "focus_task" && typeof message.task_id === "string") {
-    const task = (await readState()).tasks[message.task_id];
-    const tabId2 = task?.tabIds[0];
-    if (!Number.isInteger(tabId2))
-      return { focused: false };
-    const tab = await chrome.tabs.update(Number(tabId2), { active: true });
-    if (tab?.windowId !== undefined)
-      await chrome.windows.update(tab.windowId, { focused: true });
-    return { focused: true };
   }
   if (message.kind === "set_pointer" && typeof message.enabled === "boolean") {
     const enabled = message.enabled;
@@ -2899,6 +3324,30 @@ async function handlePopupMessage(message) {
   }
   if (message.kind === "handoff_finish" && typeof message.completed === "boolean") {
     return handoff.finish(message.completed);
+  }
+  if ((message.kind === "approve_popup_commit" || message.kind === "abandon_popup_commit") && typeof message.review_handle === "string") {
+    const binding = await browser.reviewBinding(message.review_handle);
+    const bridge = nativeBridge;
+    if (!bridge) {
+      throw Object.assign(new Error("AgentTab host is disconnected; the staged action was not approved"), {
+        code: "extension_disconnected"
+      });
+    }
+    try {
+      const approving = message.kind === "approve_popup_commit";
+      const result = approving ? await bridge.approvePopupCommit(message.review_handle, binding.task_id, binding.tab_id) : await bridge.abandonPopupCommit(message.review_handle, binding.task_id, binding.tab_id);
+      if (approving) {
+        await browser.approveReview(message.review_handle);
+      } else {
+        await browser.abandonReview(message.review_handle);
+      }
+      return result;
+    } catch (error) {
+      if (isRecord(error) && error.acknowledged === true) {
+        await browser.abandonReview(message.review_handle);
+      }
+      throw error;
+    }
   }
   if (message.kind === "close_task" && typeof message.task_id === "string") {
     await ownership.closeTask(message.task_id);

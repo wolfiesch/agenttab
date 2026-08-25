@@ -13,6 +13,8 @@ interface JavaScriptDialog {
 
 interface DebugSession {
   attached: boolean;
+  initializing?: Promise<void>;
+  cancelled?: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
   inflight: Set<string>;
   lastNetworkActivity: number;
@@ -43,6 +45,7 @@ interface PageIdentity {
 
 type CloseTab = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
+type AuthorizeTab = (tabId: number) => Promise<void>;
 
 export interface ActionExecution {
   result?: Record<string, unknown>;
@@ -69,9 +72,12 @@ export class StandardBrowserRuntime {
     private readonly revisions: RevisionTracker,
     private readonly closeTab: CloseTab,
     private readonly emit: EventSink,
+    private readonly authorize: AuthorizeTab,
   ) {
     chrome.debugger.onDetach.addListener((source: { tabId?: number }) => {
       if (source.tabId === undefined) return;
+      const session = this.sessions.get(source.tabId);
+      if (session) session.cancelled = true;
       this.sessions.delete(source.tabId);
       void this.invalidateStagedDialogs(source.tabId);
     });
@@ -113,6 +119,7 @@ export class StandardBrowserRuntime {
 
   async detach(tabId: number): Promise<void> {
     const session = this.sessions.get(tabId);
+    if (session) session.cancelled = true;
     if (session?.idleTimer) clearTimeout(session.idleTimer);
     this.sessions.delete(tabId);
     await this.invalidateStagedDialogs(tabId);
@@ -123,6 +130,7 @@ export class StandardBrowserRuntime {
   }
 
   async snapshot(tabId: number, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    await this.authorize(tabId);
     const mode = params.mode;
     if (mode === "text" || mode === "html") return this.scriptSnapshot(tabId, mode, params);
     if (mode === "screenshot") return this.screenshot(tabId, params);
@@ -181,6 +189,7 @@ export class StandardBrowserRuntime {
     expectedRevision: unknown,
     actions: unknown,
   ): Promise<ActionExecution> {
+    await this.authorize(tabId);
     const pageRevision = await this.revisions.assertExpected(tabId, expectedRevision);
     if (!Array.isArray(actions) || actions.length === 0 || actions.length > 64) {
       throw Object.assign(new Error("actions must contain between 1 and 64 operations"), {
@@ -288,6 +297,7 @@ export class StandardBrowserRuntime {
         return false;
       }
       staged.review_handle = reviewHandle;
+      staged.approved = false;
       return true;
     });
     if (!bound) {
@@ -300,7 +310,7 @@ export class StandardBrowserRuntime {
 
   async reviewBinding(reviewHandle: string): Promise<{ task_id: string; tab_id: number }> {
     const staged = Object.values((await readState()).stagedCommits).find(
-      (candidate) => candidate.review_handle === reviewHandle,
+      (candidate) => candidate.review_handle === reviewHandle && candidate.approved !== true,
     );
     if (!staged) {
       throw Object.assign(new Error("Commit review is no longer available"), {
@@ -308,6 +318,17 @@ export class StandardBrowserRuntime {
       });
     }
     return { task_id: staged.task_id, tab_id: staged.tab_id };
+  }
+
+  async approveReview(reviewHandle: string): Promise<boolean> {
+    return mutateState((state) => {
+      const staged = Object.values(state.stagedCommits).find(
+        (candidate) => candidate.review_handle === reviewHandle && candidate.approved !== true,
+      );
+      if (!staged) return false;
+      staged.approved = true;
+      return true;
+    });
   }
 
   async abandonReview(reviewHandle: string): Promise<boolean> {
@@ -373,13 +394,14 @@ export class StandardBrowserRuntime {
   async commit(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     const nativeToken = params.native_token;
     const tabId = await this.stagedTabId(taskId, nativeToken);
+    await this.authorize(tabId);
     const staged = (await readState()).stagedCommits[String(nativeToken)];
     if (!staged || staged.task_id !== taskId || staged.tab_id !== tabId) {
       throw Object.assign(new Error("Staged commit token is invalid, used, or belongs to another task"), {
         code: "invalid_staged_token",
       });
     }
-    if (staged.expires_at_ms < Date.now()) {
+    if (staged.expires_at_ms <= Date.now()) {
       await mutateState((state) => {
         delete state.stagedCommits[String(nativeToken)];
       });
@@ -407,7 +429,7 @@ export class StandardBrowserRuntime {
       });
     }
     const currentTarget = typeof action.ref === "string"
-      ? await this.targetDescriptor(staged.tab_id, staged.page_revision, action.ref)
+      ? await this.targetDescriptor(staged.tab_id, staged.page_revision, action.ref, action)
       : { kind: action.kind };
     if (
       await this.stageFingerprint(taskId, staged.tab_id, staged.page_revision, action, currentTarget) !==
@@ -436,7 +458,7 @@ export class StandardBrowserRuntime {
   async expireCommits(): Promise<void> {
     const expired = await mutateState((state) => {
       const tokens = Object.values(state.stagedCommits)
-        .filter((staged) => staged.expires_at_ms < Date.now())
+        .filter((staged) => staged.expires_at_ms <= Date.now())
         .map((staged) => staged.native_token);
       for (const token of tokens) delete state.stagedCommits[token];
       return tokens;
@@ -459,6 +481,7 @@ export class StandardBrowserRuntime {
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     do {
+      await this.authorize(tabId);
       if (revalidate) await revalidate();
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
       if (revalidate) await revalidate();
@@ -481,6 +504,7 @@ export class StandardBrowserRuntime {
   }
 
   async developer(tabId: number, action: string, params: Record<string, unknown>): Promise<unknown> {
+    await this.authorize(tabId);
     const [domain, ...rest] = action.split(".");
     if (!domain || rest.length === 0) {
       throw Object.assign(new Error("Developer action must be a CDP Domain.method"), {
@@ -495,6 +519,7 @@ export class StandardBrowserRuntime {
     mode: "text" | "html",
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    await this.authorize(tabId);
     const selector = typeof params.selector === "string" ? params.selector : null;
     const maxBytes = typeof params.max_bytes === "number" ? params.max_bytes : 256_000;
     const [{ result }] = await chrome.scripting.executeScript({
@@ -617,9 +642,17 @@ export class StandardBrowserRuntime {
         dialog: await this.stageDialog(tabId),
       };
     }
-    if (action.kind !== "click") return null;
-    const target = await this.targetDescriptor(tabId, pageRevision, action.ref);
+    if (
+      action.kind !== "click" &&
+      action.kind !== "select" &&
+      action.kind !== "fill" &&
+      action.kind !== "type"
+    ) {
+      return null;
+    }
+    const target = await this.targetDescriptor(tabId, pageRevision, action.ref, action);
     const label = [
+      target.role,
       target.text,
       target.aria_label,
       target.title,
@@ -628,14 +661,18 @@ export class StandardBrowserRuntime {
       target.type,
       target.form_action,
       target.form_method,
-    ].filter((value) => typeof value === "string").join(" ").replace(/\s+/g, " ").trim();
+      ...(Array.isArray(target.associated_labels) ? target.associated_labels : []),
+      ...(Array.isArray(target.accessible_labels) ? target.accessible_labels : []),
+      target.requested_value,
+      target.requested_option_label,
+    ].filter((value): value is string => typeof value === "string").join(" ").replace(/\s+/g, " ").trim();
     if (
       /\b(buy|purchase|pay|send|transfer|delete|remove|publish|post|deploy|merge|approve|authorize|grant|revoke|unsubscribe|cancel subscription|place order|checkout|submit order|confirm order|permission)\b/i.test(
         label,
       )
     ) {
       return {
-        effect: `Activate consequential control: ${label.slice(0, 160)}`,
+        effect: `${action.kind === "click" ? "Activate" : "Change"} consequential control: ${label.slice(0, 160)}`,
         target,
       };
     }
@@ -678,6 +715,7 @@ export class StandardBrowserRuntime {
       throw Object.assign(new Error("Staged dialog binding is missing"), { code: "staged_commit_mismatch" });
     }
     await this.ensureAttached(tabId);
+    await this.authorize(tabId);
     const dialog = this.sessions.get(tabId)?.dialog;
     if (!dialog || dialog.generation !== stagedDialog.generation) {
       throw Object.assign(new Error("The staged JavaScript dialog is no longer open"), {
@@ -694,13 +732,11 @@ export class StandardBrowserRuntime {
         code: "staged_commit_mismatch",
       });
     }
+    await this.authorize(tabId);
     await chrome.debugger.sendCommand(
       { tabId },
       "Page.handleJavaScriptDialog",
-      {
-        accept: true,
-        ...(typeof action.prompt_text === "string" ? { promptText: action.prompt_text } : {}),
-      },
+      { accept: true },
     );
     return { kind: "dialog", completed: true };
   }
@@ -720,7 +756,13 @@ export class StandardBrowserRuntime {
     tabId: number,
     pageRevision: number,
     ref: unknown,
+    action?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    const requestedValue = action?.kind === "select"
+      ? String(action.value ?? "")
+      : action?.kind === "fill" || action?.kind === "type"
+        ? String(action.text ?? "")
+        : null;
     const backendNodeId = this.backendNodeId(pageRevision, ref);
     const resolved = await this.send(tabId, "DOM.resolveNode", { backendNodeId });
     if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
@@ -729,7 +771,8 @@ export class StandardBrowserRuntime {
     const described = await this.send(tabId, "Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
       functionDeclaration:
-        "function(){const f=this.form;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype}}",
+        "function(requestedValue){const f=this.form;const text=node=>String(node&&((node.innerText??node.textContent)??'')||'').trim();const ids=String(this.getAttribute('aria-labelledby')||'')+' '+String(this.getAttribute('aria-describedby')||'');const associated=(this.labels?Array.from(this.labels):[]).map(text).filter(Boolean);const accessible=[this.getAttribute('aria-label'),...ids.trim().split(/\\s+/).filter(Boolean).map(id=>text(document.getElementById(id)))].filter(value=>typeof value==='string'&&value.trim());const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_value:requestedValue,requested_option_label:option?String(option.label||option.textContent||'').trim():null}}",
+      arguments: [{ value: requestedValue }],
       returnByValue: true,
     });
     if (!isRecord(described.result) || !isRecord(described.result.value)) {
@@ -743,6 +786,7 @@ export class StandardBrowserRuntime {
     pageRevision: number,
     action: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    await this.authorize(tabId);
     const kind = action.kind;
     if (kind === "navigate") {
       if (typeof action.url !== "string") throw Object.assign(new Error("navigate requires url"), { code: "invalid_request" });
@@ -761,11 +805,6 @@ export class StandardBrowserRuntime {
       await chrome.tabs.reload(tabId, { bypassCache: action.bypass_cache === true });
       return { kind, started: true };
     }
-    if (kind === "focus") {
-      const tab = await chrome.tabs.update(tabId, { active: true });
-      if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
-      return { kind, completed: true };
-    }
     if (kind === "close") {
       await this.closeTab(tabId);
       return { kind, completed: true };
@@ -781,9 +820,10 @@ export class StandardBrowserRuntime {
           code: "invalid_request",
         });
       }
-      await this.send(tabId, "Page.handleJavaScriptDialog", {
+      await chrome.debugger.sendCommand({
+        tabId,
+      }, "Page.handleJavaScriptDialog", {
         accept: false,
-        ...(typeof action.prompt_text === "string" ? { promptText: action.prompt_text } : {}),
       });
       return { kind, completed: true };
     }
@@ -1000,6 +1040,7 @@ export class StandardBrowserRuntime {
   }
 
   private async ensureAttached(tabId: number): Promise<void> {
+    await this.authorize(tabId);
     let session = this.sessions.get(tabId);
     if (!session) {
       session = {
@@ -1010,16 +1051,58 @@ export class StandardBrowserRuntime {
       };
       this.sessions.set(tabId, session);
     }
-    if (!session.attached) {
-      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
-      session.attached = true;
-      await Promise.all([
-        chrome.debugger.sendCommand({ tabId }, "Page.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}),
-        chrome.debugger.sendCommand({ tabId }, "Network.enable", {}),
-      ]);
+    if (!session.attached && !session.initializing) {
+      const initialization = (async () => {
+        try {
+          await this.authorize(tabId);
+          if (session.cancelled || this.sessions.get(tabId) !== session) {
+            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
+              code: "ownership_revoked",
+            });
+          }
+          await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+          session.attached = true;
+          if (session.cancelled || this.sessions.get(tabId) !== session) {
+            throw Object.assign(new Error("Debugger session was revoked while attaching"), {
+              code: "ownership_revoked",
+            });
+          }
+          await this.authorize(tabId);
+          await Promise.all([
+            chrome.debugger.sendCommand({ tabId }, "Page.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "DOM.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "Accessibility.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "Runtime.enable", {}),
+            chrome.debugger.sendCommand({ tabId }, "Network.enable", {}),
+          ]);
+        } catch (error) {
+          if (session.attached) {
+            session.attached = false;
+            await chrome.debugger.detach({ tabId }).catch(() => undefined);
+          }
+          if (this.sessions.get(tabId) === session) this.sessions.delete(tabId);
+          throw error;
+        }
+      })();
+      session.initializing = initialization;
+      try {
+        await initialization;
+      } finally {
+        if (session.initializing === initialization) session.initializing = undefined;
+      }
+    } else if (session.initializing) {
+      await session.initializing;
+    }
+    try {
+      await this.authorize(tabId);
+    } catch (error) {
+      await this.detach(tabId);
+      throw error;
+    }
+    if (session.cancelled || !session.attached || this.sessions.get(tabId) !== session) {
+      throw Object.assign(new Error("Debugger session was revoked while attaching"), {
+        code: "ownership_revoked",
+      });
     }
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.idleTimer = setTimeout(() => void this.detach(tabId), DEBUGGER_IDLE_MS);
@@ -1027,6 +1110,13 @@ export class StandardBrowserRuntime {
 
   private async send(tabId: number, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     await this.ensureAttached(tabId);
+    await this.authorize(tabId);
+    const session = this.sessions.get(tabId);
+    if (!session?.attached || session.cancelled) {
+      throw Object.assign(new Error("Debugger session is no longer authorized"), {
+        code: "ownership_revoked",
+      });
+    }
     const result: unknown = await chrome.debugger.sendCommand({ tabId }, method, params);
     return isRecord(result) ? result : {};
   }

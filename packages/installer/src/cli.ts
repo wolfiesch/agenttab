@@ -49,7 +49,7 @@ function boolFlag(args: ParsedArgs, name: string): boolean {
 function usage(): never {
   console.error([
     "Usage:",
-    "  agenttab install [--version X.Y.Z] [--development --manifest-url URL --signature-url URL]",
+    "  agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]",
     "  agenttab status",
     "  agenttab doctor [--layer ipc|extension]",
     "  agenttab mcp",
@@ -122,7 +122,7 @@ async function run(): Promise<void> {
       home: stringFlag(parsed, "home"),
       publicKeyPem: publicKeyPath ? await readFile(publicKeyPath, "utf8") : undefined,
       dryRun: boolFlag(parsed, "dry-run"),
-      skipReadiness: boolFlag(parsed, "skip-readiness"),
+      verifyReadiness: boolFlag(parsed, "verify-readiness"),
       openBrowser: !boolFlag(parsed, "no-open-browser"),
     });
     console.log(JSON.stringify(result, null, 2));
