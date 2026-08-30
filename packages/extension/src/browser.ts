@@ -1,10 +1,31 @@
 import { RevisionTracker } from "./revisions";
+import { automationRoute, restrictedOriginError } from "./routes";
 import { isRecord } from "./type-guards";
 import { randomToken, sha256Hex, type StagedCommit, type StagedDialog } from "./protocol";
 import { mutateState, readState } from "./storage";
 
 const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
+const TAB_ONLY_ACTIONS: Readonly<Record<string, true>> = {
+  navigate: true,
+  go_back: true,
+  go_forward: true,
+  reload: true,
+  close: true,
+};
+const TAB_ONLY_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
+  load: true,
+  url: true,
+  download: true,
+};
+const SUPPORTED_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
+  load: true,
+  url: true,
+  text: true,
+  selector: true,
+  network_idle: true,
+  download: true,
+};
 
 interface JavaScriptDialog {
   generation: number;
@@ -256,14 +277,22 @@ export class StandardBrowserRuntime {
     else this.expectedDetaches.set(tabId, pendingExpected - 1);
   }
 
+  private async requireFullAutomationRoute(tabId: number, operation: string): Promise<void> {
+    const tab = await chrome.tabs.get(tabId);
+    if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") {
+      throw restrictedOriginError(operation);
+    }
+  }
+
   async snapshot(tabId: number, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const mode = params.mode;
-    if (mode === "text" || mode === "html") return this.scriptSnapshot(tabId, mode, params);
-    if (mode === "screenshot") return this.screenshot(tabId, params);
-    if (mode !== "accessibility") {
+    if (mode !== "text" && mode !== "html" && mode !== "screenshot" && mode !== "accessibility") {
       throw Object.assign(new Error("Unsupported snapshot mode"), { code: "invalid_request" });
     }
+    await this.requireFullAutomationRoute(tabId, `capture a ${mode} snapshot`);
+    if (mode === "text" || mode === "html") return this.scriptSnapshot(tabId, mode, params);
+    if (mode === "screenshot") return this.screenshot(tabId, params);
     const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
     const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
     const before = await this.pageIdentity(tabId);
@@ -329,6 +358,9 @@ export class StandardBrowserRuntime {
         throw Object.assign(new Error("Each browser action requires a kind"), { code: "invalid_request" });
       }
       validated.push(action);
+    }
+    if (validated.some((action) => TAB_ONLY_ACTIONS[String(action.kind)] !== true)) {
+      await this.requireFullAutomationRoute(tabId, "perform page actions");
     }
     const completedActions: Array<Record<string, unknown>> = [];
     for (const [index, action] of validated.entries()) {
@@ -543,6 +575,9 @@ export class StandardBrowserRuntime {
       });
       throw Object.assign(new Error("Staged operation is malformed"), { code: "staged_commit_mismatch" });
     }
+    if (TAB_ONLY_ACTIONS[action.kind] !== true) {
+      await this.requireFullAutomationRoute(tabId, "commit a page action");
+    }
     const stagedTarget = isRecord(staged.preview.target) ? staged.preview.target : null;
     const fingerprint = stagedTarget
       ? await this.stageFingerprint(taskId, staged.tab_id, staged.page_revision, action, stagedTarget)
@@ -604,19 +639,33 @@ export class StandardBrowserRuntime {
       throw Object.assign(new Error("browser_wait requires a condition"), { code: "invalid_request" });
     }
     const condition = params.condition;
+    const conditionKind = String(condition.kind);
+    if (SUPPORTED_WAIT_CONDITIONS[conditionKind] !== true) {
+      throw Object.assign(new Error(`Unsupported wait condition: ${conditionKind}`), {
+        code: "invalid_request",
+      });
+    }
+    const requiresFullAutomationRoute = TAB_ONLY_WAIT_CONDITIONS[conditionKind] !== true;
+    await this.authorizeDebuggerUse(tabId);
+    if (requiresFullAutomationRoute) {
+      await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
+    }
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30_000;
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     do {
       await this.authorizeDebuggerUse(tabId);
       if (revalidate) await revalidate();
+      if (requiresFullAutomationRoute) {
+        await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
+      }
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
       if (revalidate) await revalidate();
       if (matched) {
         return {
           tab_id: tabId,
           page_revision: await this.revisions.current(tabId),
-          condition: condition.kind,
+          condition: conditionKind,
           matched: true,
         };
       }
@@ -638,6 +687,7 @@ export class StandardBrowserRuntime {
         code: "invalid_request",
       });
     }
+    await this.requireFullAutomationRoute(tabId, `run ${action}`);
     return this.send(tabId, action, params);
   }
 

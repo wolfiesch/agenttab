@@ -10,11 +10,11 @@ use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTrans
 use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
-    BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams,
-    ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload, NativeHandoff,
-    NativePopupCommitEvent, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
+    BrowserAction, BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams,
+    BrowserWaitParams, ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload,
+    NativeHandoff, NativePopupCommitEvent, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
     ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest,
-    RpcResponse, TaskBinding, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -27,6 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 const RESPONSE_TASK_BINDING_RESERVE: usize = 512;
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TAB_STAGED_EFFECT: &str = "Close an AgentTab-owned browser tab";
 
 #[derive(Debug, Error)]
 pub enum RuntimeBuildError {
@@ -942,6 +943,9 @@ impl Runtime {
         self.journal
             .verify_task_tab(task_id, tab_id, expected_page_revision)
             .map_err(journal_rpc_error)?;
+        if is_tab_only_request(params) {
+            return Ok(());
+        }
         let tab_url = self.tab_urls.read().get(&tab_id).cloned();
         self.guardrails.authorize_current_tab(tab_url.as_deref())
     }
@@ -1086,23 +1090,25 @@ impl Runtime {
                             )
                         }
                     };
-                let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
-                if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
-                    let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
-                    let finish = self.journal.finish_staged_commit(&staged.native_token);
-                    return match (cleanup, finish) {
-                        (Ok(()), Ok(())) => {
-                            RpcResponse::failure(request_id, Outcome::NotStarted, error)
-                        }
-                        (Err(cleanup_error), _) => {
-                            RpcResponse::failure(request_id, Outcome::Unknown, cleanup_error)
-                        }
-                        (_, Err(journal_error)) => RpcResponse::failure(
-                            request_id,
-                            Outcome::Unknown,
-                            journal_rpc_error(journal_error),
-                        ),
-                    };
+                if staged_commit_requires_verified_current_tab(&staged.effect) {
+                    let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
+                    if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
+                        let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
+                        let finish = self.journal.finish_staged_commit(&staged.native_token);
+                        return match (cleanup, finish) {
+                            (Ok(()), Ok(())) => {
+                                RpcResponse::failure(request_id, Outcome::NotStarted, error)
+                            }
+                            (Err(cleanup_error), _) => {
+                                RpcResponse::failure(request_id, Outcome::Unknown, cleanup_error)
+                            }
+                            (_, Err(journal_error)) => RpcResponse::failure(
+                                request_id,
+                                Outcome::Unknown,
+                                journal_rpc_error(journal_error),
+                            ),
+                        };
+                    }
                 }
                 let origin_policy = self.guardrails.native_origin_policy(staged.tab_id);
                 committed_native_token = Some(staged.native_token.clone());
@@ -1333,6 +1339,30 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Developer(_) => None,
     }
 }
+fn is_tab_only_request(params: &MethodParams) -> bool {
+    match params {
+        MethodParams::Act(params) => params.actions.iter().all(|action| {
+            matches!(
+                action,
+                BrowserAction::Navigate { .. }
+                    | BrowserAction::GoBack
+                    | BrowserAction::GoForward
+                    | BrowserAction::Reload { .. }
+                    | BrowserAction::Close
+            )
+        }),
+        MethodParams::Wait(params) => matches!(
+            &params.condition,
+            WaitCondition::Load | WaitCondition::Url { .. } | WaitCondition::Download
+        ),
+        MethodParams::Handoff(_) => true,
+        _ => false,
+    }
+}
+fn staged_commit_requires_verified_current_tab(effect: &str) -> bool {
+    effect != CLOSE_TAB_STAGED_EFFECT
+}
+
 fn staged_matches_act(params: &MethodParams, staged: &NativeStagedCommit) -> bool {
     matches!(
         params,
@@ -1580,6 +1610,7 @@ mod tests {
     struct FakeNative {
         calls: AtomicUsize,
         staged: Mutex<bool>,
+        staged_effect: Mutex<String>,
         sensitive_error: bool,
         close_task_error: bool,
         current_commit_origin: Mutex<Option<String>>,
@@ -1595,6 +1626,7 @@ mod tests {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
+                staged_effect: Mutex::new("submit purchase".into()),
                 sensitive_error: false,
                 close_task_error: false,
                 current_commit_origin: Mutex::new(None),
@@ -1611,6 +1643,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: true,
+                staged_effect: Mutex::new("submit purchase".into()),
                 close_task_error: false,
                 current_commit_origin: Mutex::new(None),
                 executed_commits: AtomicUsize::new(0),
@@ -1626,6 +1659,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(true),
                 sensitive_error: false,
+                staged_effect: Mutex::new("submit purchase".into()),
                 close_task_error: false,
                 current_commit_origin: Mutex::new(None),
                 executed_commits: AtomicUsize::new(0),
@@ -1641,6 +1675,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: false,
+                staged_effect: Mutex::new("submit purchase".into()),
                 close_task_error: true,
                 current_commit_origin: Mutex::new(None),
                 executed_commits: AtomicUsize::new(0),
@@ -1699,7 +1734,7 @@ mod tests {
                         task_id,
                         tab_id: 3,
                         page_revision: 7,
-                        effect: "submit purchase".into(),
+                        effect: self.staged_effect.lock().clone(),
                         fingerprint: "f".repeat(64),
                         expires_at_ms: current_time_ms() + 60_000,
                     }),
@@ -1802,6 +1837,31 @@ mod tests {
     ) -> (tempfile::TempDir, Arc<Runtime>, Arc<ConnectionContext>) {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+        let runtime =
+            Runtime::for_test(&paths, lifecycle, native, Arc::new(HandoffState::default()));
+        let (connection, _) = runtime
+            .connect(ConnectionInit {
+                protocol: RPC_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: ConnectKind::Connect,
+                conversation_id: None,
+                resume_capability: None,
+            })
+            .unwrap();
+        (temp, runtime, connection)
+    }
+
+    fn connected_runtime_with_policy(
+        native: Arc<dyn NativeTransport>,
+        policy: &str,
+    ) -> (tempfile::TempDir, Arc<Runtime>, Arc<ConnectionContext>) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
+        paths.prepare().unwrap();
+        std::fs::write(&paths.policy_file, policy).unwrap();
         let lifecycle = Arc::new(Lifecycle::default());
         lifecycle.begin_reconciliation();
         lifecycle.complete_reconciliation(false);
@@ -2172,36 +2232,69 @@ mod tests {
                 denied_origins: vec!["*.example.com".into()],
             }))
         );
+        runtime
+            .tab_urls
+            .write()
+            .insert(3, "chrome://settings/".into());
+        let blocked_system_snapshot = runtime.handle(&connection, snapshot("system-snapshot"));
+        assert_eq!(blocked_system_snapshot["error"]["code"], "scheme_denied");
+        let navigate_away = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "system-navigate",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_act",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "actions": [{"kind": "navigate", "url": "https://allowed.test/recovered"}]
+                }
+            }),
+        );
+        assert_eq!(navigate_away["outcome"], "completed");
+        let wait_for_system_url = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "system-url-wait",
+                "method": "browser_wait",
+                "params": {
+                    "tab_id": 3,
+                    "condition": {"kind": "url", "value": "chrome://settings/"},
+                    "timeout_ms": 100
+                }
+            }),
+        );
+        assert_eq!(wait_for_system_url["outcome"], "completed");
+        let system_handoff = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "system-handoff",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_handoff",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "prompt": "Inspect browser settings",
+                    "completion": {"kind": "manual_done"},
+                    "timeout_ms": 1000
+                }
+            }),
+        );
+        assert_eq!(system_handoff["outcome"], "completed", "{system_handoff}");
     }
     #[test]
     fn commit_rechecks_staged_tab_policy_after_navigation() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
-        paths.prepare().unwrap();
-        std::fs::write(
-            &paths.policy_file,
-            r#"{"denied_origins":["*.example.com"]}"#,
-        )
-        .unwrap();
-        let lifecycle = Arc::new(Lifecycle::default());
-        lifecycle.begin_reconciliation();
-        lifecycle.complete_reconciliation(false);
         let native = FakeNative::staging();
-        let runtime = Runtime::for_test(
-            &paths,
-            lifecycle,
+        let (_temp, runtime, connection) = connected_runtime_with_policy(
             native.clone(),
-            Arc::new(HandoffState::default()),
+            r#"{"denied_origins":["*.example.com"]}"#,
         );
-        let (connection, _) = runtime
-            .connect(ConnectionInit {
-                protocol: RPC_PROTOCOL.into(),
-                version: PROTOCOL_VERSION,
-                kind: ConnectKind::Connect,
-                conversation_id: None,
-                resume_capability: None,
-            })
-            .unwrap();
         let task_id = own_tab(&runtime, &connection, 7);
 
         let staged = runtime.handle(
@@ -2408,6 +2501,74 @@ mod tests {
             .approve_popup_staged_commit(task_id, 3, &event.review_handle)
             .is_err());
     }
+    #[test]
+    fn approved_close_commit_ignores_stale_denied_cached_url() {
+        let native = FakeNative::staging();
+        *native.staged_effect.lock() = CLOSE_TAB_STAGED_EFFECT.into();
+        let (_temp, runtime, connection) = connected_runtime_with_policy(
+            native.clone(),
+            r#"{"denied_origins":["*.example.com"]}"#,
+        );
+        let task_id = own_tab(&runtime, &connection, 7);
+        runtime
+            .tab_urls
+            .write()
+            .insert(3, "https://private.example.com/stale".into());
+        let stage = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "stage-restricted-close",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_act",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "actions": [{"kind": "close"}]
+                }
+            }),
+        );
+        assert_eq!(stage["outcome"], "commit_required");
+        let staged_token = stage["result"]["staged_token"].as_str().unwrap().to_owned();
+        let review_handle = native.last_params.lock().as_ref().unwrap()["review_handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        *native.staged.lock() = false;
+        let approved = runtime.commit_popup_review(
+            &NativePopupCommitEvent {
+                review_handle,
+                task_id,
+                tab_id: 3,
+            },
+            &Uuid::now_v7().to_string(),
+        );
+        assert_eq!(approved.outcome, Outcome::Completed);
+
+        let committed = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "commit-restricted-close",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_commit",
+                "params": {"staged_token": staged_token}
+            }),
+        );
+        assert_eq!(committed["outcome"], "completed");
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            native.origin_policies.lock().last(),
+            Some(&Some(NativeOriginPolicy {
+                tab_id: 3,
+                allowed_origins: Vec::new(),
+                denied_origins: vec!["*.example.com".into()],
+            }))
+        );
+    }
+
     #[test]
     fn popup_review_rejects_mismatched_or_unknown_handles_without_execution() {
         let native = FakeNative::staging();

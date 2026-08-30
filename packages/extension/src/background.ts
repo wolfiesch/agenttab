@@ -13,6 +13,12 @@ import {
   type Outcome,
 } from "./protocol";
 import { RevisionTracker } from "./revisions";
+import {
+  automationRoute,
+  automationRouteFields,
+  normalizeRestrictedOriginError,
+  restrictedOriginError,
+} from "./routes";
 import { MutationScheduler, NotStartedError } from "./scheduler";
 import { mutateState, readState } from "./storage";
 import { isRecord } from "./type-guards";
@@ -49,6 +55,7 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   origin_unavailable: true,
   origin_policy_mismatch: true,
   scheme_denied: true,
+  history_origin_unverified: true,
   sensitive_field_requires_handoff: true,
 };
 
@@ -229,6 +236,32 @@ function originMatches(pattern: string, url: URL): boolean {
   return url.hostname !== suffix && url.hostname.endsWith(`.${suffix}`);
 }
 
+function assertHistoryOriginKnown(
+  actions: unknown,
+  policy: NativeOriginPolicy | undefined,
+): void {
+  if (
+    policy === undefined ||
+    (policy.allowed_origins.length === 0 && policy.denied_origins.length === 0) ||
+    !Array.isArray(actions)
+  ) {
+    return;
+  }
+  if (
+    actions.some((action) =>
+      isRecord(action) && (action.kind === "go_back" || action.kind === "go_forward")
+    )
+  ) {
+    throw Object.assign(
+      new Error("AgentTab cannot authorize a browser history destination before navigation"),
+      {
+        code: "history_origin_unverified",
+        recovery: "Navigate explicitly to an allowed URL, or remove the managed origin restriction.",
+      },
+    );
+  }
+}
+
 async function assertCurrentOrigin(tabId: number, policy: NativeOriginPolicy | undefined): Promise<void> {
   if (policy === undefined) return;
   if (policy.tab_id !== tabId) {
@@ -251,6 +284,13 @@ async function assertCurrentOrigin(tabId: number, policy: NativeOriginPolicy | u
       code: "origin_unavailable",
     });
   }
+  if (
+    automationRoute(rawUrl) === "tab_only" &&
+    url.protocol !== "http:" &&
+    url.protocol !== "https:"
+  ) {
+    return;
+  }
   if (url.protocol === "about:") return;
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw Object.assign(new Error(`AgentTab Standard mode does not allow ${url.protocol.slice(0, -1)} URLs`), {
@@ -269,6 +309,19 @@ async function assertCurrentOrigin(tabId: number, policy: NativeOriginPolicy | u
     throw Object.assign(new Error(`AgentTab policy does not allow ${url.origin}`), {
       code: "origin_not_allowed",
     });
+  }
+}
+async function assertHandoffRoute(
+  targetTabId: number,
+  params: Record<string, unknown>,
+  policy: NativeOriginPolicy | undefined,
+): Promise<void> {
+  await assertCurrentOrigin(targetTabId, policy);
+  const completion = params.completion;
+  if (!isRecord(completion) || completion.kind !== "selector") return;
+  const tab = await chrome.tabs.get(targetTabId);
+  if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") {
+    throw restrictedOriginError("wait for a handoff selector");
   }
 }
 
@@ -337,7 +390,9 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     if (command.method === "browser_tabs") {
       const result = await scheduler.enqueueGlobal(() => ownership.inventory());
       return completed(command.request_id, {
-        tabs: result.filter((tab) => tab.task_id === command.task_id),
+        tabs: result
+          .filter((tab) => tab.task_id === command.task_id)
+          .map((tab) => ({ ...tab, ...automationRouteFields(typeof tab.url === "string" ? tab.url : undefined) })),
       });
     }
     if (command.method === "browser_handoff") {
@@ -349,7 +404,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await handoff.begin(
           command.task_id,
           params,
-          () => assertCurrentOrigin(tabId(params), command.origin_policy),
+          () => assertHandoffRoute(tabId(params), params, command.origin_policy),
         ),
       );
     }
@@ -409,6 +464,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     if (command.method === "browser_act") {
       const execution = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
         await ownership.assertOwned(command.task_id, targetTabId);
+        assertHistoryOriginKnown(params.actions, command.origin_policy);
         await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
       });
@@ -421,15 +477,16 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       code: "unsupported_method",
     });
   } catch (error) {
-    const code = error instanceof NotStartedError ? error.code : errorCode(error);
+    const normalized = normalizeRestrictedOriginError(error, command.method);
+    const code = normalized instanceof NotStartedError ? normalized.code : errorCode(normalized);
     return failed(
       command.request_id,
       code,
-      error instanceof Error ? error.message : String(error),
-      errorOutcome(error, mutating, code),
-      errorRecovery(error),
-      isRecord(error) && typeof error.currentPageRevision === "number"
-        ? { current_page_revision: error.currentPageRevision }
+      normalized instanceof Error ? normalized.message : String(normalized),
+      errorOutcome(normalized, mutating, code),
+      errorRecovery(normalized),
+      isRecord(normalized) && typeof normalized.currentPageRevision === "number"
+        ? { current_page_revision: normalized.currentPageRevision }
         : undefined,
     );
   }

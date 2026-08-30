@@ -22,11 +22,13 @@ The command has no path, token, or shell-specific argument and is suitable for P
 
 ## A task-owned workflow
 
-1. An agent calls `browser_open` with `mode: "create"`. Agent Tab creates a background tab for that task and returns its task, tab, window, and page-revision identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
-2. The agent calls `browser_snapshot`, works from revisioned accessibility references, then calls `browser_act` with the expected page revision. It cannot act on unrelated tabs.
+1. An agent calls `browser_open` with `mode: "create"`. Agent Tab creates a background tab for that task and returns its task, tab, window, page-revision, and automation-route identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
+2. On a normal web origin, the agent calls `browser_snapshot`, works from revisioned accessibility references, then calls `browser_act` with the expected page revision. It cannot act on unrelated tabs.
 3. If a site requires human-only input, the agent calls `browser_handoff`. Agent Tab focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
 4. If Agent Tab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token.
 5. The task can list only its own tabs with `browser_tabs`. A separate client gets a separate task unless it proves its durable resume capability.
+
+Chrome does not expose page scripting or debugger access on browser-restricted origins such as `chrome://`, `chrome-extension://`, `devtools://`, and the Chrome Web Store. Agent Tab reports these task tabs with `automation_route: "tab_only"`. Explicit navigation, reload, close, load, URL, or download waits, and human-only `browser_handoff` remain available. History movement is also available when managed origin constraints are absent; with constraints, Agent Tab rejects it because Chrome does not expose the destination for authorization before navigation. Page snapshots, element actions, page-content waits, and raw Developer-mode CDP fail immediately with `browser_restricted_origin` and `outcome: "not_started"` before Agent Tab attempts the blocked route. Use a focus-safe OS accessibility driver bound to the exact browser window when native UI work is required.
 
 Commit is a two-party, best-effort semantic barrier, not proof that a page has no external effect. The popup records the human approval, while only the agent's later `browser_commit` can execute the staged action. Page content is untrusted data and a page can attach an effect to an innocently labelled control. Inspect the page and staged action before approving or committing.
 
@@ -43,11 +45,11 @@ Standard mode exposes exactly seven MCP tools:
 
 | Tool | Purpose |
 |---|---|
-| `browser_open` | Create a task tab, create an unfocused window for a new task, or explicitly adopt the active tab. |
-| `browser_snapshot` | Read an accessibility tree, bounded text or HTML, or a screenshot from a task tab. |
-| `browser_act` | Run typed actions against one task tab and expected page revision. |
-| `browser_wait` | Wait for load, URL, text, selector, network-idle, or download conditions. |
-| `browser_tabs` | List only tabs owned by the current task. |
+| `browser_open` | Create a task tab, create an unfocused window for a new task, or explicitly adopt the active tab. Reports whether the resulting tab supports `full` or `tab_only` automation. |
+| `browser_snapshot` | Read an accessibility tree, bounded text or HTML, or a screenshot from a full-route task tab. |
+| `browser_act` | Run typed actions against one task tab and expected page revision. Restricted-origin task tabs retain only navigation, history, reload, and close actions. |
+| `browser_wait` | Wait for load, URL, text, selector, network-idle, or download conditions supported by the tab's route. |
+| `browser_tabs` | List only tabs owned by the current task, including each tab's automation route. |
 | `browser_handoff` | Give the user control for human-only input. |
 | `browser_commit` | Execute one staged consequential action. |
 
