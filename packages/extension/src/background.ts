@@ -87,6 +87,7 @@ let browser: StandardBrowserRuntime;
 browser = new StandardBrowserRuntime(
   revisions,
   async (tabId) => {
+    await handoff.cancelForTab(tabId);
     await ownership.revoke(tabId, "tab_removed");
     await browser.detach(tabId);
     await chrome.tabs.remove(tabId);
@@ -344,6 +345,7 @@ function errorOutcome(error: unknown, mutating: boolean, code: string): Outcome 
 async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse> {
   if (command.kind === "close_task") {
     try {
+      await handoff.cancelForTask(command.task_id);
       const closedTabIds = await ownership.closeTask(command.task_id);
       return completed(command.request_id, {
         task_id: command.task_id,
@@ -544,6 +546,7 @@ function start(): Promise<void> {
 
 async function reconcileOwnership(): Promise<void> {
   const revokedTabIds = await ownership.reconcile();
+  await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
   await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
 }
 
@@ -552,6 +555,7 @@ chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) =
 });
 chrome.tabs.onRemoved.addListener((removedTabId: number) => {
   void start().then(async () => {
+    await handoff.cancelForTab(removedTabId);
     await browser.detach(removedTabId);
     await ownership.revoke(removedTabId, "tab_removed");
   });
@@ -566,7 +570,10 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
     }
     if ("groupId" in changeInfo) {
       const revoked = await ownership.revokeIfMoved(updatedTabId);
-      if (revoked) await browser.detach(updatedTabId);
+      if (revoked) {
+        await handoff.cancelForTab(updatedTabId);
+        await browser.detach(updatedTabId);
+      }
     }
     if (typeof changeInfo.url === "string" || changeInfo.status === "complete") {
       await ownership.publishInventory();
@@ -701,6 +708,7 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
     }
   }
   if (message.kind === "close_task" && typeof message.task_id === "string") {
+    await handoff.cancelForTask(message.task_id);
     await ownership.closeTask(message.task_id);
     return { closed: true };
   }

@@ -2049,11 +2049,16 @@ describe("page revision monotonicity", () => {
           ? { type: "password" }
           : objectId.endsWith("-23")
             ? { autocomplete: "section-checkout billing cc-number" }
-            : { autocomplete: "cc-exp-month" };
+            : objectId.endsWith("-24")
+              ? { autocomplete: "cc-exp-month" }
+              : objectId.endsWith("-25")
+                ? { name: "card-number", "aria-label": "Card number", inputmode: "numeric" }
+                : { name: "otp", "aria-label": "Verification code", inputmode: "numeric" };
         const target = {
           form: null,
           labels: [],
           options: [],
+          ownerDocument: { getElementById() { return null; } },
           tagName: objectId.endsWith("-24") ? "SELECT" : "INPUT",
           innerText: "",
           textContent: "",
@@ -2090,6 +2095,8 @@ describe("page revision monotonicity", () => {
       { kind: "type", ref: `r${pageRevision}-22`, text: "password" },
       { kind: "fill", ref: `r${pageRevision}-23`, text: "4111111111111111" },
       { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
+      { kind: "fill", ref: `r${pageRevision}-25`, text: "4111111111111111" },
+      { kind: "type", ref: `r${pageRevision}-26`, text: "123456" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
@@ -2101,7 +2108,7 @@ describe("page revision monotonicity", () => {
     expect((await readState()).stagedCommits).toEqual({});
   });
 
-  test("rechecks select sensitivity immediately before mutation", async () => {
+  test("rechecks inferred sensitivity immediately before mutation", async () => {
     let assignments = 0;
     let dispatchedEvents = 0;
     debuggerCommandOverride = (method, params) => {
@@ -2112,9 +2119,9 @@ describe("page revision monotonicity", () => {
         return {
           result: {
             value: {
-              tag: "SELECT",
-              role: "combobox",
-              aria_label: "Expiration month",
+              tag: "INPUT",
+              role: "textbox",
+              aria_label: "Account reference",
               autocomplete: "",
               form_action: "https://example.test/profile",
               form_method: "get",
@@ -2127,8 +2134,15 @@ describe("page revision monotonicity", () => {
         String(params.functionDeclaration).includes("agenttab_sensitive_field")
       ) {
         const target = {
+          tagName: "INPUT",
+          id: "",
+          labels: [],
+          ownerDocument: { getElementById() { return null; } },
           getAttribute(name: string) {
-            return name === "autocomplete" ? "section-checkout cc-exp-month" : "";
+            if (name === "name") return "card-number";
+            if (name === "aria-label") return "Card number";
+            if (name === "inputmode") return "numeric";
+            return "";
           },
           set value(_value: string) {
             assignments += 1;
@@ -2157,7 +2171,7 @@ describe("page revision monotonicity", () => {
 
     await expect(
       runtime.act(TASK_A, 63, pageRevision, [
-        { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
+        { kind: "fill", ref: `r${pageRevision}-24`, text: "4111111111111111" },
       ]),
     ).rejects.toMatchObject({
       code: "sensitive_field_requires_handoff",
@@ -2587,6 +2601,49 @@ describe("handoff and pause barriers", () => {
     expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]?.state).toBe("working");
     expect(events.filter((event) => event === "handoff_changed")).toHaveLength(2);
+  });
+
+  test("clears handoffs when their owned tab or task disappears", async () => {
+    await seedTask(TASK_A, [33]);
+    await seedTask(TASK_B, [34], 6);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload) => {
+      events.push({ event, payload });
+    });
+    const firstRevision = await revisions.ensure(33);
+    await handoff.begin(TASK_A, {
+      tab_id: 33,
+      expected_page_revision: firstRevision,
+      prompt: "Complete authentication",
+      completion: { kind: "manual_done" },
+    });
+
+    expect(await handoff.cancelForTab(999)).toBe(false);
+    expect(await handoff.cancelForTab(33)).toBe(true);
+    expect((await readState()).handoff).toEqual({ active: false });
+    expect((await readState()).tasks[TASK_A]?.state).toBe("working");
+    expect(scheduler.isAccepting()).toBe(true);
+
+    const secondRevision = await revisions.ensure(34);
+    await handoff.begin(TASK_B, {
+      tab_id: 34,
+      expected_page_revision: secondRevision,
+      prompt: "Complete payment",
+      completion: { kind: "manual_done" },
+    });
+
+    expect(await handoff.cancelForTask(TASK_A)).toBe(false);
+    expect(await handoff.cancelForTask(TASK_B)).toBe(true);
+    expect((await readState()).handoff).toEqual({ active: false });
+    expect((await readState()).tasks[TASK_B]?.state).toBe("working");
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(events.filter(({ event, payload }) =>
+      event === "handoff_changed" && payload.active === false
+    )).toHaveLength(2);
+    expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(2);
   });
 
   test("requires acknowledgment to clear an expired handoff without resuming manual Pause", async () => {
