@@ -1079,6 +1079,14 @@ nav a[aria-current="page"],
   transform: none;
 }
 
+@media print {
+  [data-reveal] {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+}
+
 @media (max-width: 54rem) {
   .hero,
   .split-layout,
