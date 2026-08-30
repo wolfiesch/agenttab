@@ -14,7 +14,11 @@ const extensionBuild = Bun.spawn([
   "--cwd",
   join(packagesRoot, "extension"),
   "build",
-], { stdout: "inherit", stderr: "inherit" });
+], {
+  env: { ...process.env, AGENTTAB_EXTENSION_CHANNEL: "development" },
+  stdout: "inherit",
+  stderr: "inherit",
+});
 if (await extensionBuild.exited !== 0) process.exit(1);
 
 const [cli, omp] = await Promise.all([
