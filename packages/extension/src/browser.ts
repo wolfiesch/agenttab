@@ -47,6 +47,7 @@ interface DebugSession {
   busyCount: number;
   inflight: Set<string>;
   lastNetworkActivity: number;
+  pageLoadInFlight: boolean;
   dialogGeneration: number;
   dialog?: JavaScriptDialog;
   pendingWindowOpen?: PendingWindowOpen;
@@ -1117,7 +1118,13 @@ export class StandardBrowserRuntime {
     if (kind === "network_idle") {
       await this.ensureAttached(tabId);
       const session = this.sessions.get(tabId);
-      return Boolean(session && session.inflight.size === 0 && Date.now() - session.lastNetworkActivity >= 500);
+      if (!session) return false;
+      if (session.pageLoadInFlight) {
+        if ((await chrome.tabs.get(tabId)).status === "loading") return false;
+        session.pageLoadInFlight = false;
+        session.lastNetworkActivity = Date.now();
+      }
+      return session.inflight.size === 0 && Date.now() - session.lastNetworkActivity >= 500;
     }
     if (kind === "download") {
       const downloads = await chrome.downloads.search({ state: "complete" });
@@ -1278,6 +1285,7 @@ export class StandardBrowserRuntime {
         busyCount: 0,
         inflight: new Set(),
         lastNetworkActivity: Date.now(),
+        pageLoadInFlight: false,
         dialogGeneration: 0,
       };
       this.sessions.set(tabId, session);
@@ -1308,6 +1316,10 @@ export class StandardBrowserRuntime {
         ]) {
           await this.authorizeDebuggerUse(tabId);
           await chrome.debugger.sendCommand({ tabId }, method, {});
+          if (method === "Network.enable") {
+            session.pageLoadInFlight = (await chrome.tabs.get(tabId)).status === "loading";
+            session.lastNetworkActivity = Date.now();
+          }
         }
       } catch (error) {
         try {

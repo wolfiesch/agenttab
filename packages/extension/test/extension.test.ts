@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, setSystemTime, test } from "bun:test";
+import { beforeEach, describe, expect, setSystemTime, test, vi } from "bun:test";
 import { StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
@@ -987,6 +987,92 @@ describe("page revision monotonicity", () => {
     await expect(runtime.detach(62)).rejects.toThrow("debugger detach failed");
     await expect(runtime.detach(62)).resolves.toBeUndefined();
     expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(2);
+  });
+
+  test("waits for a page load already active when network tracking attaches", async () => {
+    vi.useFakeTimers();
+    try {
+      const flushPromiseQueue = async (): Promise<void> => {
+        for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+      };
+      const advanceTimers = async (milliseconds: number): Promise<void> => {
+        for (let elapsed = 0; elapsed < milliseconds; elapsed += 50) {
+          vi.advanceTimersByTime(Math.min(50, milliseconds - elapsed));
+          await flushPromiseQueue();
+        }
+        if (milliseconds === 0) {
+          vi.advanceTimersByTime(0);
+          await flushPromiseQueue();
+        }
+      };
+      let releaseAttach!: () => void;
+      debuggerAttachGate = new Promise<void>((resolve) => {
+        releaseAttach = resolve;
+      });
+      debuggerCommandOverride = (method) => {
+        if (method === "Network.enable") {
+          setTimeout(() => {
+            emitDebuggerEvent(61, "Network.requestWillBeSent", { requestId: "racing-enable" });
+          }, 0);
+        }
+        return undefined;
+      };
+      tabStore.set(61, {
+        id: 61,
+        windowId: 1,
+        groupId: -1,
+        url: "https://example.test/",
+        status: "loading",
+      });
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+      );
+
+      emitDebuggerEvent(61, "Network.requestWillBeSent", { requestId: "already-active" });
+      let settled = false;
+      const waiting = runtime.wait(61, {
+        condition: { kind: "network_idle" },
+        timeout_ms: 3_000,
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+      for (let turn = 0; turn < 20 && !debuggerCalls.includes("attach"); turn += 1) {
+        await Promise.resolve();
+      }
+      expect(debuggerCalls).toContain("attach");
+      releaseAttach();
+      for (let turn = 0; turn < 20 && !debuggerCalls.includes("Network.enable"); turn += 1) {
+        await Promise.resolve();
+      }
+      expect(debuggerCalls).toContain("Network.enable");
+      await advanceTimers(0);
+      emitDebuggerEvent(61, "Network.loadingFinished", { requestId: "racing-enable" });
+
+      await advanceTimers(550);
+      expect(settled).toBe(false);
+
+      const tab = tabStore.get(61);
+      if (!tab) throw new Error("missing task tab");
+      tab.status = "complete";
+      const completedAt = Date.now();
+      emitDebuggerEvent(61, "Network.loadingFinished", { requestId: "already-active" });
+
+      await advanceTimers(450);
+      expect(settled).toBe(false);
+      await advanceTimers(100);
+      await expect(waiting).resolves.toMatchObject({
+        tab_id: 61,
+        condition: "network_idle",
+        matched: true,
+      });
+      expect(Date.now() - completedAt).toBeGreaterThanOrEqual(500);
+      await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("retains a partially initialized debugger session until cleanup succeeds", async () => {
