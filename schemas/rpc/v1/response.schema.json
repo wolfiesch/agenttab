@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/response.schema.json",
+  "title": "AgentTab Core RPC v1 response",
+  "type": "object",
+  "required": ["protocol", "version", "request_id", "ok", "outcome"],
+  "properties": {
+    "protocol": { "const": "agenttab.rpc" },
+    "version": { "const": 1 },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "ok": { "type": "boolean" },
+    "outcome": {
+      "enum": ["completed", "not_started", "unknown", "needs_user", "commit_required"]
+    },
+    "result": {},
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "recovery": { "type": "string" },
+        "details": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "required": ["task_id"],
+      "properties": {
+        "task_id": { "type": "string", "format": "uuid" },
+        "resume_capability": { "type": "string", "minLength": 32 }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "properties": { "ok": { "const": true } },
+      "required": ["result"],
+      "not": { "required": ["error"] }
+    },
+    {
+      "properties": { "ok": { "const": false } },
+      "required": ["error"],
+      "not": { "required": ["result"] }
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": { "enum": ["completed", "needs_user", "commit_required"] }
+        }
+      },
+      "then": {
+        "properties": { "ok": { "const": true } }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": { "enum": ["not_started", "unknown"] }
+        }
+      },
+      "then": {
+        "properties": { "ok": { "const": false } }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

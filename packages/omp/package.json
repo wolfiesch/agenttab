@@ -1,0 +1,30 @@
+{
+  "name": "@getagenttab/omp",
+  "version": "2.0.0-rc.1",
+  "description": "Native OMP and Pi adapter for AgentTab",
+  "type": "module",
+  "exports": "./dist/index.mjs",
+  "files": ["dist"],
+  "omp": {
+    "extensions": ["./dist/index.mjs"]
+  },
+  "pi": {
+    "extensions": ["./dist/index.mjs"]
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "typebox": "^1.3.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.23",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.3"
+  }
+}

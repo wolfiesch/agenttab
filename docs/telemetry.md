@@ -1,117 +1,49 @@
-# Telemetry
+# Telemetry and local operational records
 
-Two unrelated things live under this name, and neither one sends anything anywhere by default:
+AgentTab has no product telemetry. The v2 host, extension, and shipped adapters contain no analytics, usage reporting, OpenTelemetry exporter, crash-reporting endpoint, or automatic network sink for operational data. AgentTab does not send task, browser, audit, or usage data to a product service.
 
-- **Local usage diagnostics** - `usage_telemetry.py`, an offline script that mines local agent logs to count tool use.
-- **OpenTelemetry request spans** - an opt-in host feature that emits one span per bridge request, off unless you switch it on.
+This statement does not mean no local records exist, and it does not govern traffic that a user explicitly causes through a browser page, an advanced proxy, package download, or a separately configured tool.
 
-## Local usage diagnostics
+## Local audit log
 
-`usage_telemetry.py` is an advanced local diagnostic script. It mines local agent logs to count how often the bridge's browser tools are used and breaks the total down by source so you can see each one's magnitude as a share of the whole. It is not product telemetry: it only reads local files you point it at and never sends data anywhere.
+The Rust host writes a local `audit.jsonl` by default under the AgentTab state directory. On Unix it is mode `0600`. The host records:
 
-- **claude** - Claude Code transcripts under `~/.claude/projects` (`--projects-dir`). MCP `tool_use` blocks matching `--server-match` (default `chrome[-_]devtools`).
-- **codex** - Codex rollout sessions under `~/.codex/sessions` (`--codex-dir`). Canonical `mcp_tool_call_end` events (deduped by `call_id`; the bare `function_call` twin is ignored) whose `server`/`tool` match `--server-match`.
-- **bridge** - the host's own `bridge_audit.jsonl` (`--bridge-audit`). Already bridge-specific, so `--server-match` is not applied; forwarded actions that log two rows under one `requestId` collapse to one call.
+- start and completion time;
+- connection ID, task ID when assigned, and request ID;
+- RPC method, outcome, duration, and replay status;
+- target origins parsed from request URLs;
+- structural argument and result summaries;
+- a SHA-256 digest of canonical request parameters;
+- error code and recovery text when present.
 
-```bash
-python3 usage_telemetry.py --format json --since 2025-01-01
-```
+It intentionally does not write raw request values or raw result values. Structural metadata can still be sensitive: origins, object keys, string lengths, error text, and parameter digests can reveal useful context. A digest is not a promise that low-entropy data cannot be guessed. Keep the state directory private and do not upload an audit log as support evidence without review.
 
-Each report carries `total_calls`, a `by_source` map (`calls` + fractional `share`), and per-source/per-tool counts. Restrict sources with `--sources` (e.g. `--sources claude,codex`) and drop blocked bridge requests with `--exclude-denied`.
+The local policy can disable audit writing. Disabling it changes local accountability, not product telemetry, and does not cause data to be sent elsewhere.
 
-```bash
-python3 usage_telemetry.py --sources codex,bridge --format text
-```
+## SQLite state and receipts
 
-It only reads transcript/audit files and never contacts the bridge or Chrome.
+`state.sqlite3` is local runtime state, not telemetry. It contains task/ownership state, page-revision floors, hashes of resume capabilities and staged Commit tokens, idempotency records, handoff state, and native-event receipts. It supports crash recovery and one-use operations. It is not a proof that a remote website accepted an action.
 
-## OpenTelemetry request spans (opt-in)
+A user-visible website confirmation, transaction receipt, or download is independent evidence. The host's audit entry and journal receipt record only AgentTab's local processing.
 
-Both hosts can emit one OpenTelemetry span per bridge request, with child spans for policy evaluation and the extension forward. This is **off by default**. With `BRIDGE_OTEL_ENABLED` unset the code path is inert: no extra module is imported, no file is opened, no socket is created, and the request behaves exactly as it does on a host that has no telemetry code at all.
+## Extension local state
 
-### Configuration
+The extension keeps task state, paused state, active handoff marker, staged Commit records, and revision information in Chrome extension storage. This lets it restore safety barriers after service-worker restart. Chrome may sync or back up browser-profile data according to the user's browser/account configuration; AgentTab does not initiate a telemetry upload.
 
-Telemetry is **process-level configuration, not policy**. It is set with environment variables on the host process, so there is no new policy key and no per-client switch: a policy layer cannot turn tracing on for one client, and turning tracing on can never change a policy decision. (Policy stays the answer to "may this request run"; telemetry only describes requests that already got an answer.)
+## Explicit network paths
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `BRIDGE_OTEL_ENABLED` | unset (off) | `1`/`true`/`yes`/`on` enables span emission. Anything else, including unset, leaves the whole path inert. |
-| `BRIDGE_OTEL_ENDPOINT` | unset | OTLP/HTTP endpoint to POST spans to, e.g. `http://127.0.0.1:4318`. `/v1/traces` is appended when the value does not already contain it. **Nothing leaves the machine unless this is set.** |
-| `BRIDGE_OTEL_FILE` | unset | Local file sink. Each request appends one OTLP/HTTP JSON document as a JSON line. Purely local; useful without a collector and used by the guardrails contract. |
-| `BRIDGE_OTEL_SERVICE_NAME` | `chrome-bridge` | `service.name` resource attribute. |
+AgentTab can drive a signed-in browser tab to a website. That website receives traffic according to the user's account and the page's behavior. This is browser activity requested by the task, not AgentTab product telemetry.
 
-Both sinks may be set at once, and enabling the feature with neither set is valid (spans are built and discarded, which is how you measure the overhead).
+The advanced `agenttab proxy` command is an explicit loopback TCP bridge with a private token file. It is not enabled by Standard mode and does not turn on reporting. Package acquisition and future publication systems are external services whose own privacy terms apply when the user chooses to use them.
 
-```bash
-BRIDGE_OTEL_ENABLED=1 BRIDGE_OTEL_FILE=/tmp/chrome-bridge-spans.jsonl python3 bridge.py
-```
+## Operational handling
 
-No `opentelemetry` SDK is required or installed: the document written or posted **is** the OTLP/HTTP JSON wire format, built with the standard library.
+Treat the following as sensitive local operational data:
 
-### Span model
+- `audit.jsonl` and `state.sqlite3`;
+- policy files and upload staging files;
+- adapter configuration containing resume capabilities or proxy token paths;
+- browser profile and extension storage;
+- terminal output, screenshots, and browser traces.
 
-One request produces one `SERVER` span named `execute_tool <action>`, following the OpenTelemetry GenAI tool-execution convention, plus one `INTERNAL` child span per instrumented stage:
-
-- `bridge.policy_evaluate` - host-side policy evaluation
-- `bridge.extension_forward` - the round trip to the extension
-
-Attributes on the request span:
-
-| Attribute | Value |
-| --- | --- |
-| `gen_ai.tool.name` | the action name |
-| `gen_ai.tool.type` | `extension` |
-| `bridge.action` | the action name |
-| `bridge.client` | the resolved client name (from the token registry, never the token) |
-| `bridge.decision` | the same decision string the audit log records (`allow`, `deny`, `dry_run`, `lease_deny`, `confirmation_required`, `extension_success`, ...) |
-| `bridge.effective_tier` | `read_only` or `mutating`, computed from the payload and not the action name alone |
-| `bridge.duration_ms` | wall-clock duration of the whole request |
-| `bridge.tab_id_count` | how many distinct tab ids the request touched |
-| `bridge.success` | whether the client received a success |
-| `bridge.request_id` | the host-generated forward id, when the request reached the extension |
-| `bridge.trace_id` | the session trace id, when the request is trace-eligible |
-| `bridge.host` | `python` or `rust` |
-
-Span status is `OK` on success and `ERROR` otherwise.
-
-### What is and is not exported
-
-Exported: action names, the resolved client name, host decision strings, the effective tier, timings, a count of touched tab ids, success, the host's own request id, and the caller's session/trace id.
-
-Never exported, under any configuration:
-
-- request payloads or any field of one (no selectors, no URLs, no typed text, no file paths)
-- response bodies, page content, accessibility snapshots, or screenshots
-- cookies, storage values, credential values, bridge tokens, or confirmation tokens
-- denial reason strings and extension error strings (they can quote caller- or page-supplied text, so spans carry the decision instead)
-
-The only attribute value that originates outside the host is the caller's own trace/session id, and every string attribute - that one included - is run through the same `secretMaskFile` masking the audit log uses before export, so a known secret appears as `<masked:name>` or not at all.
-
-Nothing leaves the machine unless `BRIDGE_OTEL_ENDPOINT` is set. With only `BRIDGE_OTEL_FILE` set, spans stay in a local file you chose.
-
-### Correlating spans with session trace artifacts
-
-When policy also sets `traceDir` (see `docs/security.md`), the session trace artifact and the exported span describe the same request from two directions. With telemetry enabled, each JSONL event additionally carries `otelTraceId` and `otelSpanId` next to its existing `traceId`, naming exactly the span that was exported for that request. With telemetry disabled those fields are absent and the artifact is byte-identical to an untraced host's.
-
-### W3C trace context
-
-A caller can name the trace a request belongs to, and the host continues that trace rather than starting a new one:
-
-- **TCP request envelope** - a `traceparent` field alongside `action`, `payload`, and `token`. Like the token and `dryRun`, it is host-only: it is stripped before anything is forwarded to the extension.
-- **MCP over HTTP** - the incoming request's `traceparent` header, read next to the per-request bridge token and passed through unchanged.
-- **MCP over stdio** - there is no incoming header, so a root trace is minted per tool call, but only when `BRIDGE_OTEL_ENABLED` is set.
-- **CLI** - the global `--traceparent <value>` flag, for scripted runs.
-
-```bash
-chrome-bridge --traceparent 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01 getTabs
-```
-
-A malformed or absent `traceparent` starts a fresh trace; it never fails the request.
-
-### Failure handling
-
-Export is best effort, exactly like an audit-log write: a failure is logged once and the request continues unaffected. The OTLP POST runs on a background thread with a bounded queue and a short timeout, so a slow or dead collector cannot add latency to browser automation, and a broken sink is disabled for the rest of the process instead of being retried on every request.
-
-### Rust host scope
-
-The Rust host emits the same spans, with the same names, the same attribute keys, and the same OTLP/HTTP JSON document as the Python host. Its exporter is a minimal `std::net` HTTP/1.1 writer rather than a TLS-capable client, so `BRIDGE_OTEL_ENDPOINT` must be a cleartext `http://` endpoint (the usual local-collector case, `http://127.0.0.1:4318`). An `https://` endpoint is refused with one log line rather than linking a TLS stack into the host; `BRIDGE_OTEL_FILE` behaves identically on both hosts.
+Before sharing diagnostics, minimize the time window, remove secret values, identity, paths, URLs, capabilities, and page content, then retain only the fields needed to reproduce the issue. No central AgentTab service exists to request, aggregate, or retain these records.

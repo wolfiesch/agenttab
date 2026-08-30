@@ -1,305 +1,117 @@
-# Setup and project layout
+# AgentTab v2 setup
 
-Chrome Bridge is published from the canonical GitHub repository `wolfiesch/chrome-bridge`. Your local checkout directory may have a different name; commands in this document assume you are running from the repository root.
+AgentTab v2 is currently local, prerelease source at `2.0.0-rc.1`. It has no public package, signed release artifact, Chrome Web Store installation, or hosted setup page. **Chrome Bridge v1.0.1 is still the public stable legacy path.**
 
-## Layout
+This guide distinguishes the contributor source path from the future signed RC and stable paths. Do not substitute an old Chrome Bridge script, Python host, TCP port, bearer token, or hand-written native-host manifest for any of them.
+
+## Prerequisites and trust boundary
+
+- Chrome must be version 127 or later for the current extension manifest.
+- AgentTab runs in the existing signed-in Chrome profile. It is task-scoped browser control, not a separate profile, cookie jar, or identity boundary.
+- Keep page content untrusted. Use **Your Turn** for passwords, passkeys, 2FA, CAPTCHA, payment secrets, and other human-only input. Review a staged **Commit** before performing it.
+- A future installation needs an AgentTab extension and the `dev.agenttab.host` native host. Standard mode does not require a TCP listener, a bearer token, or a Python process.
+
+The product boundary and residual Commit risk are described in the [runtime ADR](adr/0001-agenttab-runtime.md) and [Security](security.md).
+
+## Current source path
+
+A checkout is a contributor build path, not a supported consumer installation. From the repository root, the following pathless commands build the source components. They are written for POSIX shells, PowerShell, and `cmd.exe` when run from the repository root:
 
 ```text
-chrome-bridge/
-├── extension/                          <- public unkeyed extension source copy
-│   ├── manifest.json
-│   ├── background.js
-│   ├── wake.html
-│   └── wake.js
-├── background.js                       <- editable service-worker source
-├── wake.html / wake.js                 <- legacy explicit wake page; routine retries never open it
-├── manifest.json                       <- public unkeyed source manifest
-├── extension_identity.py               <- local key and extension ID helper
-├── bridge.py                           <- native host
-├── broker.py                           <- opt-in launchd TCP broker for stable client port 9223
-├── bridge_policy.example.json          <- explicit opt-in policy template
-├── com.automation.bridge.json.template <- host-manifest template (setup.sh fills it in)
-├── setup.sh / setup-rs.sh              <- generates token/policy, deploys extension, registers host
-├── setup-windows.ps1                   <- user-scope (HKCU) native-host registration on Windows
-├── setup-edge.sh                       <- adds a Microsoft Edge registration for an existing install
-├── setup-broker.sh                     <- installs launchd broker mode on macOS
-├── uninstall-broker.sh                 <- stops launchd broker mode
-├── bridge_wake.py                      <- shared wake-page discovery/opening helper
-├── test_client.py                      <- CLI client
-├── benchmark_harness.py                <- benchmark and comparison harness
-├── verify_bridge.py                    <- offline framing/auth test
-├── verify_cli_contract.py              <- offline CLI dispatch test
-├── verify_heartbeat_contract.py        <- offline heartbeat/structure test
-├── verify_benchmark_harness.py         <- offline benchmark contract test
-├── verify_install_contract.py           <- offline install/identity contract test
-├── verify_agent_actions_live.py        <- manual live browser gate
-└── README.md
+bun install --frozen-lockfile
+bun run extension:build
+bun run workspace:build
+cargo build --locked --manifest-path host-rs/Cargo.toml
 ```
 
-`setup.sh` generates `bridge_token.txt` (0600 shared secret), installs `bridge_policy.json` from `bridge_policy.example.json` when absent, deploys a local keyed extension manifest, and writes `com.automation.bridge.json`. `setup-rs.sh` additionally generates `com.automation.bridge.rust.json` and the `bridge-host-launch.sh` wrapper. The optional `bridge_tokens.txt` named-token registry (see Multi-client tokens and leasing) is also a local secret. All of these are git-ignored and stay local. Keep Python files out of Chrome-loaded extension directories: running them creates `__pycache__`, and Chrome refuses folders containing `_`-prefixed names.
+`bun run extension:build` creates the unpacked development extension in `packages/extension/dist/` from the canonical source in `packages/extension/src/`. `bun run workspace:build` builds the TypeScript adapters, installer packages, and site. The Rust command builds the host workspace.
 
-## Components
+These commands do **not** create a public release, verify a signed artifact, register a complete consumer installation, or make the extension available through the Chrome Web Store. This repository does not publish a manual source host-registration recipe. The supported consumer path must be the artifact-verifying installer once an RC is available.
 
-| File | Role |
+## Future signed RC path
+
+When, and only when, an explicitly signed `2.0.0-rc.1` package and immutable RC artifact manifest are made available to approved testers, the intended command is:
+
+```text
+npx agenttab@2.0.0-rc.1 install --version 2.0.0-rc.1 --verify-readiness
+```
+
+That is not a command to run today. The package and signing material are not public. The installer rejects `latest` URLs, verifies the signed manifest, requires the exact `vX.Y.Z` tag and matching host asset, then records an install receipt. `--verify-readiness` opens Chrome unless `--no-open-browser` is supplied, creates a disposable task tab, captures an accessibility snapshot, and closes the tab.
+
+For an approved development artifact, `agenttab install --development` accepts an explicitly supplied manifest URL, signature URL, and public-key file. Those inputs are supplied by the release workflow, not inferred from a local checkout. See the exact flag behavior in [Commands](commands.md#agenttab-install).
+
+## Future public stable path
+
+After signing, registry, Chrome Web Store, controlled-domain, and platform gates are complete, the stable host installation flow will be:
+
+```text
+npx agenttab install
+```
+
+This is a future command, not evidence of a live package. The final stable flow requires the publicly reachable AgentTab extension from the Chrome Web Store and the matching versioned installer artifact. Until those are published, load only a development extension for approved source or RC testing.
+
+## Loading and enabling the development extension
+
+The installer deliberately stages the extension but does not silently install or enable a browser extension. Its result identifies the extension directory. For an approved source or RC test:
+
+1. Open `chrome://extensions` in Chrome.
+2. Enable **Developer mode**.
+3. Choose **Load unpacked** and select the installer-reported AgentTab extension directory. For a source build, that is `packages/extension/dist/`.
+4. Confirm that **AgentTab** is enabled.
+5. Open the AgentTab popup and choose **Enable AgentTab automation**. Chrome requests the optional `scripting` permission. The required `debugger` permission is already present from extension installation; both capabilities are required for Standard browser automation.
+6. Run `agenttab doctor --layer extension` after the extension is enabled. Use `agenttab doctor --layer ipc` to check the local host path.
+
+The manifest keeps `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, and `alarms` as required permissions because Chrome rejects `debugger` in `optional_permissions`. `scripting` is optional and is requested only from the user-facing popup. Removing it disables automation and detaches active task debugger sessions until it is enabled again.
+
+## Native identity, registration, and local paths
+
+The frozen native host identity is `dev.agenttab.host`. The extension build derives its stable development identity and the native-host allowed origins from [config/identity.json](../config/identity.json). Do not edit a generated native-host JSON, substitute an extension ID, or add an origin by hand.
+
+A successful installer registers the same native-host manifest for supported browser locations:
+
+| Platform | Native Messaging registration |
 |---|---|
-| `extension/manifest.json` | Public unkeyed MV3 source manifest. `setup.sh` and `deploy.sh --with-local-key` write a keyed copy into the local extension directory for a deterministic unpacked ID. |
-| `extension/background.js` | Service worker: connects to the native host, runs browser actions, and uses `chrome.alarms` plus heartbeat messages to self-heal after idle or sleep. |
-| `wake.html`, `wake.js` | One-shot extension page used for explicit recovery and background reload. A `?reload=1` request removes its trigger before calling `chrome.runtime.reload()`; the replacement worker reconnects through its normal startup path. Routine retries never open the page. |
-| `bridge.py` | Native host. Talks to Chrome over stdio and exposes a token-gated TCP server on `127.0.0.1:9223` for local clients. |
-| `com.automation.bridge.json.template` | Host-manifest template. `setup.sh` substitutes the absolute host path and local or packaged extension ID. |
-| `test_client.py` | Positional CLI client (`python3 test_client.py <action> ...`). |
-| `scripts/reload_unpacked_extension.sh` | macOS development helper that opens the keyed extension's one-shot reload page with `open -g`, so an already-running Chrome stays in the background and no accessibility or Computer Use interaction is required. It starts Chrome if the browser is closed. |
-| `.github/workflows/ci.yml` | Pull-request and `main` push gates for syntax, offline contracts, Rust parity, benchmarks, and packaging checks. |
-| `.github/workflows/release.yml` | Tag-driven release workflow for `v*` tags after the CI command set passes. |
-| `scripts/package_release.py` | Stdlib release packager for source archives, unpacked extension bundles, and Rust host binaries. |
-| `scripts/quick_install.sh` | One-command bootstrap: runs `setup.sh`, probes the bridge, and prints the extension-load and MCP-registration steps. |
-| `scripts/generate_browser_manifests.py` | Deterministic Edge/Firefox native-messaging manifest generator plus the Firefox extension staging directory. Writes into `dist/browsers` and prints metadata only. |
+| macOS | Per-user Chrome, Chromium, and Microsoft Edge `NativeMessagingHosts` directories below `~/Library/Application Support/`. |
+| Linux | Per-user Google Chrome, Chromium, and Microsoft Edge `NativeMessagingHosts` directories below `~/.config/`. |
+| Windows | A manifest below the installer state directory plus current-user `HKCU` registrations for Chrome, Chromium, and Microsoft Edge. |
 
-## Requirements
+The Rust host uses `AGENTTAB_STATE_DIR` when it is explicitly set. Without it, the host root is `~/.agenttab` on Unix and `%LOCALAPPDATA%\AgentTab` on Windows. The installer has its own `--state-dir` default of `~/.agenttab`; use its receipt rather than assuming that the installer directory is the host state root on Windows. The TypeScript client also uses `AGENTTAB_STATE_DIR` for private resume-capability storage and for its Unix fallback endpoint.
 
-- Google Chrome, Chrome Beta, or Chromium with Developer mode. The macOS installer also registers Chrome Canary.
-- Python 3.9+ for the core bridge and CLI; Python 3.10+ for the MCP server (`mcp/`, matching `mcp/pyproject.toml`).
-- macOS or Linux for `setup.sh` and `setup-rs.sh`; Windows for `setup-windows.ps1`. Broker mode and `setup-broker.sh` are macOS-only because they use launchd.
+Normal local adapter traffic uses one of these OS-native endpoints:
 
-## Platform and browser matrix
+| Platform | Endpoint |
+|---|---|
+| macOS and Linux | `$XDG_RUNTIME_DIR/agenttab/agenttab.sock` only when that runtime directory belongs to the current user; otherwise `$AGENTTAB_STATE_DIR/run/agenttab.sock`, defaulting to `~/.agenttab/run/agenttab.sock`. |
+| Windows | `\\.\pipe\agenttab-<current-user-SID>`. |
 
-| Browser | Platform | Installer | Status |
-|---|---|---|---|
-| Chrome / Chromium | macOS, Linux | `./setup.sh`, `./setup-rs.sh` | Supported. Full action surface, live gates run here. |
-| Chrome | Windows | `setup-windows.ps1` | Supported registration. Same extension and same host code; HKCU registry registration instead of a manifest directory. Broker mode is unavailable (launchd only). |
-| Microsoft Edge (Chromium) | macOS, Linux | `./setup-edge.sh` | Supported registration. Same `chrome-extension://` origin scheme, same MV3 service worker, canonical extension unchanged. |
-| Microsoft Edge (Chromium) | Windows | `setup-windows.ps1 -Browser Edge` | Supported registration under the Edge HKCU key. |
-| Firefox | any | `scripts/generate_browser_manifests.py --browser firefox` | Generated artifacts only. The native-messaging manifest and a staged extension directory are produced deterministically; the runtime is **not supported**. See Firefox limitations below. |
+On Unix, AgentTab requires its state and runtime directories to be current-user owned and mode `0700`; its socket and host lock are mode `0600`. The host authenticates local peers with OS credentials. On Windows, the named-pipe DACL is limited to the current user SID and `SYSTEM`. `AGENTTAB_SOCKET` and `AGENTTAB_PIPE_NAME` are adapter overrides for configured local endpoints, not normal setup switches.
 
-## Quickstart
+## Migration from Chrome Bridge v1.0.1
 
-From a fresh checkout, one command runs the installer and prints everything left to do by hand:
+AgentTab v2 is side-by-side and recoverable:
 
-```bash
-scripts/quick_install.sh
-```
+1. Leave the existing Chrome Bridge extension, `com.automation.bridge` native-host registration, legacy token or policy files, and logs intact.
+2. Install and prove AgentTab first, including an enabled extension and a successful `agenttab doctor` check.
+3. Only then disable the old unpacked Chrome Bridge extension manually in `chrome://extensions`.
+4. Keep v1 repair or recovery work pinned to `v1.0.1` until the v2 release is public.
 
-It detects macOS or Linux, runs `./setup.sh --print-json` from the repository root, probes the bridge with `python3 test_client.py ping` (a failure there is expected and non-fatal until the extension is loaded), and then prints the unpacked-extension directory reported by `setup.sh`, the `chrome://extensions/` steps, and a ready-to-paste MCP registration block with this checkout's absolute path already substituted.
+The installer detects the old native-host registration and known legacy state artifacts, reports them, and leaves them untouched. It never silently removes the v1 extension, registration, files, policies, or logs.
 
-To install on a non-default port, pass it positionally or through `PORT`; either form is forwarded to `./setup.sh --host-port`:
+## Rollback and uninstall status
 
-```bash
-scripts/quick_install.sh 9224
-PORT=9224 scripts/quick_install.sh
-```
+The installer stages changed files, creates backups for replaced files, and rolls back touched files if a multi-file installation transaction fails. A second successful installation of the same verified version leaves matching files unchanged.
 
-Only macOS and Linux are supported, matching `setup.sh`'s native-host auto-registration. Everything the script does can be done by hand with the steps below.
+To return a test profile to the available legacy path, disable AgentTab manually in `chrome://extensions` and continue using the preserved Chrome Bridge v1.0.1 setup. Do not delete Chrome Bridge files as part of that rollback.
 
-## Setup
+There is **no `agenttab uninstall` command in the current CLI source**, and the current installer does not implement an automated v2 removal procedure. Keep the install receipt, native-host manifest, and any listed backups until a supported uninstall path is released. This is intentionally not replaced with an unsafe manual-deletion recipe.
 
-Default local install:
+## Supported-platform state
 
-```bash
-./setup.sh
-```
+The installer source recognizes host target triples for macOS ARM64 and x86_64, Linux ARM64 and x86_64, and Windows ARM64 and x86_64. Those mappings are implementation support, not a public release promise: no signed v2 artifact matrix is available yet. A public v2 installation is unavailable on every platform until the release gates are complete.
 
-The script generates or reuses `extension_key.pem`, deploys `background.js` plus a keyed manifest into a per-user extension directory, registers the native host for that deterministic extension ID, creates `bridge_token.txt` when absent, and installs `bridge_policy.json` from the example template when absent. It prints the extension directory at the end.
+## Next steps
 
-Then:
-
-1. Open `chrome://extensions/` and enable Developer mode.
-2. Load unpacked: the extension directory printed by `./setup.sh`.
-3. Enable only one bridge extension at a time. Duplicate bridge extensions race to bind port `9223`.
-4. Verify:
-   ```bash
-   python3 test_client.py ping
-   python3 test_client.py policyCheck getTabs '{}'
-   ```
-   Expected: `ping` succeeds. `policyCheck getTabs '{}'` is allowed when setup installed the example policy.
-
-Advanced setup:
-
-```bash
-./setup.sh --extension-id <id>
-```
-
-Use this for an already-packaged or future Web Store extension ID. It registers that packaged/store extension ID separately and does not generate or inject a local extension key for the developer-mode unpacked copy.
-
-```bash
-cargo build --release --manifest-path host-rs/Cargo.toml
-./setup-rs.sh
-```
-
-Use this to register the Rust host with the same extension-ID resolution flow.
-
-### Windows (Chrome or Edge)
-
-Windows has no native-messaging manifest directory; Chrome and Edge read a registry key instead. `setup-windows.ps1` performs that registration for the current user only:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File setup-windows.ps1
-```
-
-Parameters, all optional: `-RepoRoot <path>` (defaults to the script's directory), `-HostPort <port>` (default `9223`), `-ExtensionId <id>`, `-UseRustHost`, and `-Browser Chrome|Edge|Both` (default `Chrome`).
-
-What it does:
-
-1. Creates `bridge_token.txt`, `bridge_tokens.txt`, and `bridge_policy.json` (from `bridge_policy.example.json`) only when they are absent, and restricts each to the current user with `icacls`. Existing files are never overwritten, and no token value is printed.
-2. Writes `bridge-host-launch.cmd`, a git-ignored launcher that exports `BRIDGE_PORT`, the token/policy paths, and the log paths, then runs `python.exe bridge.py` - or `host-rs\target\release\bridge-host.exe` with `-UseRustHost`. Windows native messaging launches the manifest `path` directly, so the interpreter has to live in a wrapper.
-3. Writes `com.automation.bridge.json` with the resolved launcher path and `chrome-extension://<id>/` origin.
-4. Sets the default value of `HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.automation.bridge` (and the matching `HKCU:\Software\Microsoft\Edge\...` key for `-Browser Edge|Both`) to that manifest path.
-5. Prints metadata only: manifest path, host name, host kind, port, extension ID, and next steps.
-
-The extension ID resolves from `-ExtensionId`, then `extension_id.txt`, then an existing `extension_key.pem`. If none of those exist, load the unpacked extension from `chrome://extensions/` first and re-run with the ID Chrome assigned.
-
-Windows notes: broker mode is macOS-only, so clients talk to the host directly on `BRIDGE_PORT`. Nothing is written to `HKLM` and no elevated shell is required; a machine-wide registration would let any account on the box drive your profile.
-
-### Microsoft Edge (Chromium)
-
-Edge is Chromium: same `chrome-extension://` origin scheme, same MV3 service worker, same extension bytes. Only the native-messaging host directory differs. Run `./setup.sh` first, then add the Edge registration:
-
-```bash
-./setup-edge.sh
-```
-
-`setup-edge.sh` creates no secrets. It reads the extension ID from `extension_id.txt` (or `--extension-id`), reads the host path from the generated `com.automation.bridge.json` (or `--host-path`), regenerates the Edge manifest into `dist/browsers/edge/`, and symlinks it into the Edge, Edge Beta, Edge Dev, and Edge Canary native-messaging directories on macOS, or Edge/Edge Beta/Edge Dev on Linux. Load the same unpacked extension directory from `edge://extensions/` and confirm the ID matches. On Windows use `setup-windows.ps1 -Browser Edge`.
-
-Enable only one bridge extension across all installed browsers; they compete for the same host port.
-
-### Firefox (generated artifacts, unsupported runtime)
-
-Firefox artifacts are generated, not installed:
-
-```bash
-python3 scripts/generate_browser_manifests.py \
-  --browser firefox \
-  --host-path "$PWD/bridge.py" \
-  --addon-id chrome-bridge@wolfie.gg \
-  --out-dir dist/browsers
-```
-
-This writes `dist/browsers/firefox/com.automation.bridge.json` (a Firefox host manifest using `allowed_extensions` instead of `allowed_origins`) and `dist/browsers/firefox/extension/`, a staging directory holding `background.js`, `wake.html`, and `wake.js` byte-identical to the canonical root files plus a manifest that is the canonical manifest with only the Gecko differences applied:
-
-- `browser_specific_settings.gecko.id` and `strict_min_version`;
-- `background: {"scripts": ["background.js"]}` instead of a service worker;
-- the Chrome-only permissions `debugger`, `tabGroups`, and `contentSettings` removed and reported as `droppedPermissions`.
-
-The canonical Chrome `manifest.json` is untouched, and `dist/` is git-ignored. `--browser all` also emits the Edge manifest; `--browser edge` requires `--extension-id`. Output is deterministic: the same inputs produce the same digests. Nothing is registered and no secret is read.
-
-Firefox limitations - these are why the runtime is not supported, not a to-do list:
-
-- Firefox has no `chrome.debugger`/CDP API. Every debugger-backed action is unavailable: background-safe `screenshot`, `printToPDF`, `clickAt`, screencast recording, `executeScriptCDP`, performance metrics, network/CPU throttling, and emulation.
-- Firefox has no `chrome.tabGroups`, so task sessions cannot create named tab groups.
-- Firefox has no `chrome.contentSettings`, so permission and content-setting control is unavailable.
-- Firefox MV3 runs an event page, not a service worker; the keepalive and heartbeat paths in `background.js` are tuned for Chrome's worker lifecycle.
-- No live gate in this repository exercises Firefox. Treat the staged output as material for a future port, not as a working install.
-
-### Packaged/store extension
-
-Build the upload zip for the Chrome Web Store developer dashboard:
-
-```bash
-python3 scripts/package_extension_store.py --out dist/chrome-bridge-extension-store.zip
-```
-
-The script creates `dist/` when needed, packages only `manifest.json`, `background.js`, `wake.html`, and `wake.js`, validates the surface before writing, and prints metadata only: output path, sha256, byte count, and per-file list. Add `--check-js` to also run `node --check` on the packaged JavaScript; that gate is off by default so the script works without `node`. Nothing is uploaded and no Chrome Web Store API is contacted - upload the zip yourself through the developer dashboard.
-
-Stable extension identity: the script never creates, reads, or packages `extension_key.pem`. A store listing gets a permanent item ID from the Chrome Web Store itself, and that is the ID to register:
-
-```bash
-./setup.sh --extension-id <store-id>
-```
-
-If you need a locally packed CRX with a stable ID instead, keep the private key outside the repository (never commit it) and pass it to Chrome's "Pack extension" flow; the repository stays key-free either way.
-
-## Managed distribution: shipping one policy to a fleet
-
-Chrome Bridge has no server, so an org baseline travels as a file plus a digest. The host applies the file only when the digest matches, which makes distribution channel-agnostic: MDM, config management, a signed package, or a shared read-only mount all work, because the lockfile - not the transport - is what authorizes the bundle.
-
-On the admin's machine, author the baseline and pin it:
-
-```bash
-cp bridge_policy_bundle.example.json org-policy.json
-# edit org-policy.json: default + clients layers, exactly like bridge_policy.json
-chrome-bridge policy bundle lock org-policy.json --lockfile org-policy.lock
-```
-
-`policy bundle lock` writes the bundle's SHA-256 into the lockfile (mode `600`). Editing the bundle later changes its digest, so re-run the same command; it refuses to repin a lockfile that holds a different digest unless you pass `--force`, which keeps an accidental edit from silently becoming the new baseline. `bridge_policy_bundle.lock.example` ships a placeholder digest of all zeros that can never verify - a real digest must come from this command.
-
-Ship both files to each machine (same directory, any path the host user can read), then point the machine's local policy at them:
-
-```json
-{
-  "policyBundle": {
-    "path": "/etc/chrome-bridge/org-policy.json",
-    "lockfile": "/etc/chrome-bridge/org-policy.lock"
-  }
-}
-```
-
-Confirm on the machine:
-
-```bash
-chrome-bridge policy bundle verify /etc/chrome-bridge/org-policy.json \
-  --lockfile /etc/chrome-bridge/org-policy.lock
-chrome-bridge policy bundle show
-```
-
-`verify` exits `0` only on a match; `show` reports what the running host resolved (`path`, `verified`, and a 12-character digest) and exits `1` when the active bundle is unverified. If a machine reports `verified: false`, the host is serving the built-in fail-closed default policy - only `ping`, `policyCheck`, `policyInfo`, and lease actions - and `chrome-bridge audit tail` shows one `policy_bundle_rejected` entry with the expected and actual digests.
-
-Two properties matter operationally. A machine's local `bridge_policy.json` still layers on top of the bundle, so a stricter machine can tighten the baseline without a separate bundle. And a bundle can never loosen a local deny list: composed `deniedActions`/`deniedOrigins` are the union of the bundle's and the machine's. To roll out a change, update the bundle, re-run `policy bundle lock`, and ship both files together - shipping a new bundle without its lockfile fails every machine closed rather than leaving the old policy in force. See docs/security.md for the full precedence and verification rules.
-
-## Launchd broker mode
-
-Broker mode is optional on macOS. launchd keeps a small Python broker listening on public port `9223`; Chrome-launched Python or Rust native hosts bind backend port `19223`. Clients keep using `BRIDGE_PORT=9223`, or no override. On first install, `setup-broker.sh` seeds the state-dir token from the repo token so the existing `chrome-bridge` CLI keeps working; if both token files already exist and differ, the script warns and clients should set `BRIDGE_TOKEN_FILE` to the state token path.
-
-Install Python-host broker mode:
-
-```bash
-./setup-broker.sh --host python
-```
-
-Install Rust-host broker mode after building Rust:
-
-```bash
-cargo build --release --manifest-path host-rs/Cargo.toml
-./setup-broker.sh --host rust
-```
-
-After setup completes, load the state-dir extension path printed by `setup-broker.sh` and disable any older bridge extension. Broker mode uses state under `~/Library/Application Support/chrome-native-bridge` by default, including its own extension key, extension ID, token, policy, and launcher. If you are migrating from a repo-local install, reload exactly the printed state-dir extension so the loaded extension ID matches the broker native-host registration.
-
-Verify the broker process and public endpoint:
-
-```bash
-launchctl print gui/$UID/gg.wolfie.chrome-native-bridge.broker
-chrome-bridge ping
-```
-
-Disable broker mode:
-
-```bash
-./uninstall-broker.sh
-```
-
-`extension_key.pem` is a private local identity key for the developer-mode unpacked extension. Keep it git-ignored and never commit it. A packaged or Web Store extension has a separate store-managed ID; register that ID with `./setup.sh --extension-id <store-id>`.
-
-## Troubleshooting
-
-The host writes a local `bridge_debug.log` (git-ignored) next to `bridge.py`:
-
-```bash
-tail -f bridge_debug.log
-```
-
-Run `python3 scripts/diagnose_install.py` for a read-only comparison of repository and deployed files plus broker/backend connection state. It never launches Chrome or opens a tab.
-
-After deploying service-worker changes on macOS, reload the unpacked extension without focusing Chrome:
-
-```bash
-./scripts/reload_unpacked_extension.sh
-chrome-bridge ready 10000 250
-```
-
-The helper opens a background extension tab that requests one reload. Chrome tears down the old extension page, and the replacement worker reconnects through its normal startup path. If Chrome is closed, `open` starts it. Use the `chrome://extensions/` reload button only if this bounded path fails.
-
-- `Connection refused` after retry in direct mode: Chrome is closed, no bridge extension is enabled, or the native connection is down. Routine retries never open Chrome or create a tab. Open Chrome normally, then inspect the extension service worker and `bridge_debug.log`.
-- MCP says `server not connected` while `chrome-bridge ping` works: update to a build containing the packaged-startup path fix, then restart the MCP client once so it launches the corrected server. The MCP package now adds `BRIDGE_REPO_ROOT` before importing repo-local helpers and retries one safe pre-send connection failure automatically; a separate `PYTHONPATH` entry is no longer required.
-- `Connection refused` in broker mode: launchd broker is not loaded. Run `launchctl print gui/$UID/gg.wolfie.chrome-native-bridge.broker`.
-- `broker backend unavailable: native host did not start`: broker is up, but Chrome, the extension, or the native host did not connect within `BRIDGE_BROKER_BACKEND_TIMEOUT_SECONDS`. The broker returns `status: browser_unavailable` without opening Chrome. Reload the extension and check `broker_debug.log` plus `bridge_debug.log`.
-- `FATAL: could not bind 127.0.0.1:9223`: two direct-mode bridge extensions are enabled, or direct mode is racing the broker.
-- `unauthorized`: token mismatch, or the native-host manifest authorized the wrong extension ID. Re-run `./setup.sh`, reload the printed extension directory, and disable duplicate bridge extensions.
+- [Command reference](commands.md)
+- [MCP stdio setup and tool semantics](mcp.md)
+- [Security and trust boundary](security.md)
+- [Runtime architecture decision](adr/0001-agenttab-runtime.md)

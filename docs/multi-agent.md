@@ -1,63 +1,55 @@
-# Multi-agent tokens and leasing
+# Multi-agent task model
 
-## Multi-client tokens and leasing
+AgentTab coordinates multiple agents through server-owned tasks, not through client-selected identities, global leases, or shared browser control.
 
-The bridge accepts multiple named client tokens and offers a cooperative, host-side lease so several agents can share one real Chrome profile without colliding. Both the Python and Rust hosts implement this identically; it is enforced entirely in the host (lease actions are never forwarded to the extension).
+## Connection-bound tasks
 
-### Named tokens
+Each Core RPC connection receives a host-generated connection ID. On its first browser request, the host lazily creates a task and binds it to that connection. The connection's `conversation_id` is retained only as metadata. A caller-supplied task, owner, or conversation identifier never grants access.
 
-`bridge_token.txt` (the legacy single token) is always accepted under the client name `default`. Additionally, if `bridge_tokens.txt` (override with `BRIDGE_TOKENS_FILE`) exists, each non-empty, non-`#` line is parsed as `name:token` (split on the first colon) and registered as an extra named client. See `bridge_tokens.txt.example`. A request is authorized if its token matches any known token; the matched token determines the requesting client's name. `bridge_tokens.txt` is a secret registry and is git-ignored.
+A fresh adapter connection therefore gets a distinct task. Adapters that need to reconnect must retain the resume capability supplied for that task. HTTP MCP sessions must use separate Core connections so their tasks cannot be shared accidentally.
 
-### Lease protocol
+## Resume capabilities
 
-Three host-answered actions (also exposed as MCP tools `browser_lease`, `browser_release`, `browser_lease_status`):
+A resume capability is a 256-bit random bearer secret. The host persists only its hash. A client must durably persist and confirm an initial capability before the host accepts another RPC. On successful resume the host returns a replacement capability under the same persist-then-confirm barrier; if delivery or confirmation fails, a durably retained capability remains recoverable. Once a replacement is confirmed, the old capability no longer resumes the task.
 
-- `lease` - payload optional `{"ttlMs": int}` (default 300000). Acquires the lease when free, expired, or already yours; otherwise returns `leased by <owner>`.
-- `release` - releases your lease (`released: true`); `released: false` when no live lease; `not lease owner` when another client holds it.
-- `leaseStatus` - non-mutating snapshot `{owner, expiresAt, now}` (epoch ms; `owner` null when unheld).
+Store the capability only in adapter-owned private state. Never put it in prompts, page content, logs, task titles, or shared configuration. A missing or invalid capability creates a new task rather than recovering another agent's task.
 
-While a live lease is held, every non-lease action from a different client (including `batch`) is rejected with `leased by <owner>` before forwarding, so the lease cannot be bypassed. Leases auto-expire after their TTL. `BRIDGE_SOCKET_IDLE_TIMEOUT` (default 300s) bounds how long a persistent connection may idle.
+## Task-owned tabs and visible groups
 
-`verify_lease_contract.py` covers the basic named-token and lease semantics. `verify_lease_stress_contract.py` adds race/load coverage for simultaneous lease acquisition, non-owner denial without extension forwarding, owner concurrency, TTL expiry, release races, and TCP disconnect behavior.
+Only three paths can grant tab ownership:
 
-### Parallel work under one token
+1. AgentTab creates a tab through `browser_open` with `mode: "create"`.
+2. Chrome reports a child tab whose opener is already owned.
+3. The user permits `browser_open` with `mode: "adopt_active"` for the currently active tab.
 
-The lease arbitrates *between token identities*, not between concurrent requests from the same identity. The host records the lease owner as the client *name* resolved from the presented token, and only rejects an action when `owner is not None and owner != name`. So a second workstream running under the same token is never blocked by its own lease - and gains nothing from taking one.
+AgentTab gives owned tabs a visible task group. The group makes work legible to the user, but group membership alone never grants authority. Manual grouping does not adopt a tab. If Chrome cannot create or preserve the group, creation or adoption fails rather than keeping hidden ownership.
 
-Within one identity the supported concurrency primitive is **task sessions**: `createTaskSession` / `navigateTaskSession` / `getTaskSessions` / `closeTaskSession` (MCP: `browser_task_session_*`). A task session owns only its own tabs, opens them inactive, and closes only what it owns, so two sessions do not steal focus from each other or tear down each other's tabs.
+`browser_open` defaults to placing a new tab in the task's existing window. `placement: "new_window"` is intentionally narrower than a general window-control capability: it is accepted only while the task owns no tabs, it always creates an unfocused normal window, and the extension grants ownership from the persisted task record. It cannot focus, resize, move, change, or close an unrelated window. `browser_handoff` remains the sole normal focus transition.
 
-Guidance:
+Moving an owned tab out of its task group, ungrouping it, closing it, or finding inconsistent ownership immediately revokes it. Revocation increments the tab generation and rejects queued work before it is dispatched. A child-popup grouping race does not give AgentTab authority to close a user tab.
 
-- One task session per workstream. Never interleave two workstreams inside one session's tabs.
-- Non-conflicting reads (`getTabs`, `observe`, `extractText`, `getHtml`, `screenshot`) across distinct session-owned tabs need no lease.
-- Take the lease around a *mutating burst* that must not interleave with another identity - a login flow, a form submit sequence, a `githubAttachPrBody` upload - and release it immediately after. Keep the TTL short; it is a courtesy window, not a mutex against yourself.
-- Anything that changes global browser state rather than one tab (window/tab activation, `waitForHandoff`, profile-wide emulation) still conflicts within a single identity. Serialize those in your own agent; the host will not do it for you.
+## Ordering and concurrency
 
-Recipe (MCP tool names; the lease actions have no CLI subcommand, so mixed CLI/MCP agents drive the lease through MCP):
+Mutations for one tab are ordered. Reads wait behind the relevant tab mutation so they do not observe an in-progress change. Browser-global operations use a separate global barrier.
 
-```
-browser_task_session_create   name="research"   -> sessionId R
-browser_task_session_create   name="publish"    -> sessionId P
-browser_task_session_navigate session_id=R url="https://example.com/docs"
-browser_task_session_navigate session_id=P url="https://github.com/owner/repo/pull/1"
+The current extension scheduler also maintains an ordered tail per task. It therefore does **not** promise parallel mutation execution for separate tabs in the same task, even though separate connections and host request handling can be concurrent. Different tasks can make progress independently unless a global barrier applies. Do not build an adapter that depends on cross-tab write parallelism.
 
-# interleave reads freely across R's and P's tabs - no lease needed
-browser_snapshot / browser_extract_text on either session's tabs
+Every existing-page mutation includes `expected_page_revision`. The host and extension reject actions when ownership, document revision, or ref epoch no longer matches. A page snapshot does not grant an indefinite right to act on a later page.
 
-browser_lease   ttl_ms=60000        # only around the mutating burst
-browser_click   tab_id=<P tab> selector="button[type=submit]"
-browser_release
+## Pause and recovery
 
-browser_task_session_close session_id=R
-browser_task_session_close session_id=P
-```
+Pause is a barrier, not an optimistic UI toggle. It stops new admissions, lets already-dispatched work settle, rejects waiting work as not started, and persists the paused state. On restart, the extension restores paused state before reconciliation. Resume reconciles ownership before reopening admission.
 
-When policy sets `traceDir`, each of those session-scoped requests also lands in its own local trace artifact: the host keys the JSONL file on the request's `sessionId` (or `taskSessionId`), so `<traceDir>/R.jsonl` and `<traceDir>/P.jsonl` separate the two workstreams automatically. A request that names no session can join a trace by carrying an explicit `traceId` in its payload, which also lets several identities write to one shared trace - useful when a hand-off crosses tokens. `traceId` wins over `sessionId`, and both are metadata only: read the result with `chrome-bridge trace summary <traceId>` / `trace tail`, or MCP `browser_trace_summary` / `browser_trace_tail`. See `docs/security.md` for what a trace does and does not store.
+A host that has not completed its native handshake and reconciliation remains unavailable for browser work. The connection status can report its lifecycle, but callers must retry only after it becomes ready or the user resumes it.
 
-When two workstreams genuinely need to *exclude* each other, give them separate named tokens (`bridge_tokens.txt`) rather than separate task sessions - that is the only configuration the lease can arbitrate. Over HTTP transport this no longer requires separate MCP servers: see per-request bridge tokens in `docs/mcp.md`.
+## Global Your Turn blackout
 
-### Per-client site modes and scheduled workflows
+Only one handoff can be active. Starting `browser_handoff` pauses the scheduler, records the marker durably, and focuses the human's task tab. While it is active, page observations, captures, and browser work are denied across every task and connection. The host independently enforces this blackout and restores it after restart from SQLite state.
 
-`siteModes` is part of the per-client policy layer, so different identities can hold different trust on the same origin: put the shared modes in `default` and override single origins under `clients.<name>`. The map is merged **per pattern**, so `clients.publisher: {"siteModes": {"https://github.com": "skip"}}` overrides only GitHub and inherits every other origin's mode from `default`. Set them with `chrome-bridge policy site-mode <originPattern> manual|auto|skip <client>` - naming a client always edits that client's own section, so a grant for one agent never widens the shared default. Give an unattended identity its own token and its own `clients.<name>` layer; do not relax `default` to make one scheduled agent work.
+Automation resumes only after the declared completion condition or explicit completion, capture scrubbing, an acknowledged handoff-clear event, and a non-paused state. Handoff is the sole normal AgentTab focus transition for human input.
 
-Scheduling is deliberately outside this coordination surface. `chrome-bridge schedule` only writes local metadata to git-ignored `bridge_schedules.json`; it runs nothing, holds no lease, and has no daemon, so a registered schedule cannot participate in lease arbitration. When an OS scheduler eventually invokes the run command, that run is an ordinary client like any other: it presents a token, resolves to a client name, and takes the lease around its own mutating burst if it needs to exclude the interactive agents. Two schedules that must not interleave need distinct named tokens and explicit leases, exactly like two live agents.
+## Consequential work across agents
+
+Each recognizable consequential Standard action stages its own Commit. A staged token is bound to one task and tab, expires after five minutes, revalidates the page revision and target fingerprint, and executes once. A batch stops at its first staged action; another agent cannot use that stage to run later batch items.
+
+There are no agent-facing global lease tools. Coordinating intent is still the responsibility of the agents and the user. Use distinct tasks for independent work, observe task counts in the extension, and have the human review staged effects before Commit.

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "tag": "v1.0.1",
+  "nativeHost": "com.automation.bridge",
+  "developmentExtensionId": "idnlffjfkgcnjfdhocemdeihhejpamkc",
+  "stateArtifacts": [
+    "bridge_tokens.txt",
+    "bridge_policy.json",
+    "bridge_debug.log",
+    "bridge_audit.jsonl"
+  ]
+}

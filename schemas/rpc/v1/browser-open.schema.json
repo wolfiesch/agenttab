@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-open.schema.json",
+  "title": "browser_open parameters",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["mode"],
+      "properties": {
+        "mode": { "const": "create" },
+        "url": { "type": "string", "maxLength": 2048, "pattern": "^(https?://|about:)[^\\s]+$" },
+        "background": { "type": "boolean", "default": true },
+        "placement": { "enum": ["task", "new_window"], "default": "task" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["placement"],
+            "properties": { "placement": { "const": "new_window" } }
+          },
+          "then": {
+            "properties": { "background": { "const": true } }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["mode"],
+      "properties": { "mode": { "const": "adopt_active" } },
+      "additionalProperties": false
+    }
+  ]
+}

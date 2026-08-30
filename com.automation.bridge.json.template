@@ -1,9 +1,0 @@
-{
-  "name": "com.automation.bridge",
-  "description": "Chrome Native Messaging Automation Bridge",
-  "path": "__BRIDGE_PY_PATH__",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://__EXTENSION_ID__/"
-  ]
-}

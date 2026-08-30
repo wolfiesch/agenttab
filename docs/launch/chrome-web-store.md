@@ -1,100 +1,94 @@
-# DRAFT - Chrome Web Store submission prep only
+# DRAFT ONLY - AgentTab v2 Chrome Web Store review preparation
 
-No Chrome Web Store package may be submitted, uploaded, or published from this document without explicit approval.
+**Release status:** AgentTab `v2.0.0-rc.1` is unreleased. v1.0.1 remains the stable legacy release. This document is preparation copy only. It is not authorization to create, upload, submit, publish, or edit a Chrome Web Store listing.
 
-## Listing copy
+## Proposed listing fields
 
-### Name
+### Title
 
-Chrome Bridge
+AgentTab: Browser Access for AI Agents
 
-### Subtitle
+### Short description
 
-Trusted local automation for your real Chrome profile
+Give local AI agents controlled access to your signed-in Chrome profile.
 
-### Summary
+### Category
 
-Let trusted local agents control your real Chrome profile through a policy-governed native messaging bridge.
+Local browser runtime for AI agents
+
+### Tagline
+
+Any agent. Your browser. Your rules.
 
 ### Detailed description
 
-Chrome Bridge is a trusted-local automation bridge for people who want agents and local tools to operate the Chrome profile they already use, without launching Chrome with `--remote-debugging-port`, using an empty automation profile, or handing browsing activity to a cloud browser.
+AgentTab is a local browser runtime for AI agents that need to work in the Chrome profile already on your computer. Its operating promise is simple: **Give an agent a tab, not the keys to your browser.**
 
-The extension is the Chrome-side half of a local native-messaging system. It connects only to the native host installed by the user on the same machine. Local clients then talk to that host over `127.0.0.1:9223` with a shared local token. The native host applies the bridge policy before forwarding actions to Chrome: it is fail-closed by default, supports explicit action and origin allow-lists, writes local audit records, redacts sensitive response fields, and can require confirmation tokens for higher-risk actions.
+An agent starts with a task workspace, not general access to every tab. AgentTab creates or visibly adopts a tab for that task, keeps task-owned tabs distinct, and serializes writes to the same tab. Task groups are a visible status aid only. They never grant ownership. A task may create child tabs from its owned tabs, but it cannot claim arbitrary tabs merely because they appear in a group.
 
-Chrome Bridge is built for controlled real-profile handoff rather than generic scraping. Agents can inspect tabs, navigate, wait for selectors or text, click and type, upload files, take screenshots, collect redacted diagnostics, and use the existing signed-in browser session when policy permits. Task-owned tab groups show whether an agent is working, needs the user, or has finished. For sensitive moments such as login, 2FA, captcha, passkeys, or payment confirmation, `waitForHandoff` focuses the tab, shows a compact in-page card, pauses automation, and waits for the user to finish the step. `sessionStatus` can check whether the real profile appears signed in to a domain by reporting cookie names and counts, not cookie values.
+The runtime consists of one minimal MV3 extension, a local Rust host, and per-user operating-system-native IPC. The extension uses Chrome Native Messaging to reach the local host. Client adapters, including MCP, connect to the host through a user-owned Unix socket on macOS and Linux or a current-user named pipe on Windows. AgentTab has no cloud relay, remote browser session, telemetry service, or routine network control plane.
 
-The extension does not include a remote service. It is not useful by itself: users must install and register the local native host from the Chrome Bridge repository, then keep the local token, policy file, native-host manifest, audit logs, and generated extension identity private. Because this extension can control the user's real browser profile when paired with the host and an approved policy, it should be installed only on machines the user controls and only for trusted local automation workflows.
+Standard MCP access exposes exactly seven tools: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, and `browser_commit`. `browser_developer` is available only after a persistent, explicit Developer mode opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
+
+### Human controls
+
+**Your Turn** is for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. During a handoff, AgentTab applies an observation blackout: standard capture and observation requests for every task return `needs_user`. The runtime clears the blackout only after the declared completion condition or explicit Done and its recovery checks. AgentTab does not capture human keystrokes.
+
+**Commit** is a best-effort review barrier for recognizable sends, publishes, purchases, deletes, uploads, authorizations, and permission grants. Before acting, AgentTab prepares, classifies, and revalidates the target. A recognizable consequential action is staged with a preview, then requires approval in a human popup and the requesting agent's one-use token. The record expires after a short interval, cannot be replayed, and is invalidated if the page or target changes. Harmless actions proceed without Commit review. Commit reduces recognizable risk; it cannot prove that a page has no hidden external effect.
+
+### Trust boundary
+
+AgentTab can operate in the signed-in Chrome profile the user already uses. Task ownership is an execution and coordination boundary, not cookie, account, password, or profile isolation. A trusted local agent can act within an owned tab through the same signed-in web session available to the person at the keyboard. Users should connect only agents and local software they trust.
+
+Browser automation also remains exposed to hostile or misleading page content. A page can attempt prompt injection, a control can have consequences that are not apparent from its label, and an agent can make a poor decision from ordinary page content. Your Turn and Commit address bounded parts of that risk. They are not guarantees against every external side effect.
 
 ## Manifest permissions and host permissions
 
-Source checked: `manifest.json` version `1.0.1`.
+This section is draft review copy for the v2 contract. It must be reconciled against the final canonical store package before any controlled review. AgentTab requires the `<all_urls>` host permission so its `chrome.scripting` text, HTML, selector, wait, and scroll paths can run on task-owned pages the user directs an agent to use. That permission does not expose raw storage, cookies, JavaScript, CDP, or network APIs in Standard mode.
 
-| Manifest entry | Type | Web Store review justification |
+| Manifest entry | Type | Review justification |
 |---|---:|---|
-| `nativeMessaging` | Permission | Required for the extension's core function: connecting the MV3 service worker to the locally installed native host named `com.automation.bridge`. The extension does not operate as a standalone browser feature; browser actions are requested by local clients, authorized by the token-gated native host, checked against the local policy, and then delivered to the extension through Chrome native messaging. Without this permission, Chrome Bridge cannot receive policy-approved commands from the local host or return action results to the local client. |
-| `tabs` | Permission | Required to implement tab lifecycle and real-profile handoff features: listing tabs, opening a URL in a tab, activating/focusing a tab, closing/reloading a tab, reading current tab metadata needed for origin checks, waiting for tab load or URL changes, and capturing the visible tab for screenshots. The host policy evaluates tab-scoped actions against the live tab origin before forwarding them, and tab information is treated as sensitive because it can reveal browsing context. |
-| `scripting` | Permission | Required for page-level automation that cannot be performed through tab metadata alone, including controlled script execution in the page's main world, semantic selectors for click/type/fill flows, DOM text/HTML extraction, file-upload interaction, the optional foreground-only agent pointer, and the temporary `waitForHandoff` card. Script execution is gated by the native host policy and site-origin rules, and response redaction is applied by policy where configured. |
-| `activeTab` | Permission | Required as a narrow user-context permission for operations on the currently active tab, especially visible-tab capture and active-page interactions initiated through the bridge. Chrome Bridge primarily uses explicit `tabId` operations, but the real-profile workflow also supports resolving the currently active tab when a local client asks to operate on the browser state the user is viewing. This permission supports that handoff-oriented behavior without requiring the extension to inject page code on every page at install time. |
-| `cookies` | Permission | Required for redacted real-profile session checks and storage-state export. `sessionStatus` reports cookie names, counts, and a derived signed-in signal without returning cookie values; `getCookies` and `storageState` are available only when the native host policy allows them, and policy redaction replaces cookie values before responses reach clients by default. This permission is sensitive because cookie metadata can reveal account and site usage, so the listing and privacy policy should explain that all access remains local and policy-governed. |
-| `debugger` | Permission | Required for Chrome DevTools Protocol-backed automation capabilities that Chrome extension APIs do not otherwise expose: console and network monitoring, request interception, JavaScript dialog handling, screenshots/viewport and emulation controls, geolocation overrides, performance metrics, and CDP script execution. The bridge attaches the debugger only for policy-approved actions and detaches when the action or monitoring session ends; long-lived monitoring and interception explicitly remain attached until stopped. This is one of the highest-scrutiny permissions and should be justified with a demo showing the local policy gate. |
-| `alarms` | Permission | Required to keep the MV3 service worker connected to the native host across service-worker suspension, browser idle periods, and machine sleep/wake. The background worker uses heartbeat and reconnect alarms to retry `connectNative()` with bounded backoff so the local bridge remains reliable without a persistent always-on extension page. This permission is not used for tracking, scheduling remote work, or background data collection. |
-| `storage` | Permission | Required to persist transient service-worker reconnect state, task-group status, and the user's agent-pointer preference. Reconnect state prefers `chrome.storage.session`; task state and the small UI preference use local extension storage. Chrome Bridge does not use extension storage to collect browsing history, page content, cookies, or analytics. |
-| `tabGroups` | Permission | Required to keep agent-owned tabs visually separate from human tabs. Each task group gets a stable Chrome color and a short status label for working, review needed, or completed. The bridge never adds unrelated tabs to its groups. |
-| `downloads` | Permission | Required for the `downloadUrl` action, which asks Chrome to download a policy-approved URL into Chrome's configured downloads location. The bridge does not silently choose arbitrary absolute output paths; Chrome's own download handling and user settings still apply. The local host policy can deny or confirm download actions before they reach the extension. |
-| `contentSettings` | Permission | Required for controlled geolocation workflows. `setGeolocation` grants location permission for the current tab origin through Chrome content settings before applying a CDP geolocation override, and `clearGeolocation` resets that origin back to `ask`. This permission is used only for policy-approved geolocation actions and should be explained as part of test automation and user-approved real-profile handoff, not general site preference management. |
-| `<all_urls>` | Host permission | Required because Chrome Bridge is a user-directed automation bridge for the user's real Chrome profile, and the local policy determines which origins may be automated at runtime. The extension must be technically capable of operating on arbitrary sites the user chooses: tab origin checks, page interaction, screenshots, content extraction, cookies for requested domains, monitoring, interception, downloads, and handoff flows all need access across potential web origins. The native host's fail-closed policy, action/origin allow-lists, confirmation tokens, local audit log, and redaction controls are the intended governance layer for this broad host permission. |
+| `nativeMessaging` | Required permission | Connects the MV3 extension to the user-installed local AgentTab host. It is the extension-to-host link for task ownership, lifecycle reconciliation, handoff state, Commit staging, and command results. It does not connect the extension to a cloud service. |
+| `debugger` | Required permission | Supports the task-scoped browser capabilities required for accessibility snapshots, precise click, type, fill, select, scroll, key press, inactive screenshots, network-idle observation, and exact download completion attribution. AgentTab attaches lazily only to task-owned tabs, reuses the task connection while needed, and exposes no generic CDP method in Standard mode. |
+| `tabs` | Required permission | Lets AgentTab create and visibly adopt task tabs, track their lifecycle and document revision, focus a handoff tab when the user asks, and clean up a closed task. It is not used to make unrelated tabs owned by an agent. |
+| `tabGroups` | Required permission | Shows task-owned tabs as a visible workspace with working, needs-you, or finished status. Group membership is display-only and never authorizes an operation. Removing or moving a tab out of its task group revokes its ownership. |
+| `storage` | Required permission | Persists the minimum extension state needed to recover task status, pause state, handoff blackout state, revision floors, and user interface preferences across MV3 service-worker restarts. It is not an analytics store and is not used to collect browsing history. |
+| `alarms` | Required permission | Schedules bounded MV3 lifecycle work such as reconnect, expiry, and recovery checks after service-worker suspension. It is not used for tracking, advertising, or remote scheduling. |
+| `scripting` | Optional permission | Requested only after the user explicitly clicks **Enable AgentTab automation** in the AgentTab popup. It is not a required install-time permission, denial leaves the extension visibly disabled, and it does not add a Standard raw-script API. |
+| `<all_urls>` | Required host permission | Required so the `chrome.scripting` text, HTML, selector, wait, and scroll paths can run on the task-owned page the user directs AgentTab to use, regardless of its site. It does not let an agent claim tabs or expose raw cookies, browser storage, arbitrary JavaScript, CDP, or network APIs in Standard mode. |
 
-## Review risk and expected reviewer questions
+## Reviewer setup notes
 
-This is a maximum-scrutiny permission set. `debugger`, `<all_urls>`, `cookies`, and `nativeMessaging` together allow deep control of a user's real Chrome profile when the local host and policy allow it. The submission should assume manual review and should not rely on generic automation language. The review narrative must consistently explain the trusted-local model: local host, loopback-only TCP API, shared local token, fail-closed policy, origin/action allow-lists, redaction, confirmation tokens, and local audit logs.
+These notes are for a controlled reviewer package only. They are not public installation instructions.
 
-The extension is useless without the locally installed native host. A reviewer may install only the CRX/Web Store item and see no user-facing product unless the native host registration has also been run. The listing, support material, and demo should make this dependency explicit and show the supported install flow.
+1. Use a dedicated Chrome test profile and test accounts with no personal data, payment instruments, or production administrative access.
+2. Provide the exact `v2.0.0-rc.1` extension package together with the matching separately installed local AgentTab host. The extension should report that it is disconnected until the compatible local host is ready.
+3. Reconcile the package identity and native-host allowed origins with `config/identity.json` before review. Do not infer an identity from this document or treat it as store publication evidence.
+4. Demonstrate a local MCP client opening a task workspace, taking an accessibility snapshot, performing a harmless action, waiting for a defined condition, and listing only that task's tabs.
+5. Demonstrate Your Turn with a harmless test page. Verify that observations from every task return `needs_user` during the handoff and that the agent resumes only after Done or the declared completion condition.
+6. Demonstrate Commit with a controlled test control labelled as a send, upload, delete, authorization, or permission action. Verify that no side effect occurs before the human popup approves the staged action with the requesting agent's one-use token. Do not use a real message, purchase, upload, deletion, or authorization.
+7. Demonstrate Pause and Resume, including that queued work does not start after Pause and that task status remains visible after recovery.
+8. Verify that Standard discovery exposes exactly the seven Standard tools and that the Developer-only tool is absent until the reviewer explicitly enables Developer mode.
 
-Review may require a demo video. The demo should show installation of the native host, the extension connecting through native messaging, a denied action under default policy, a policy-approved simple action, redacted `sessionStatus`, and `waitForHandoff` pausing for a human login/2FA-style step. The video should avoid exposing personal accounts, cookies, raw tab URLs, audit-log secrets, or local absolute paths.
+## Privacy declaration draft
 
-Review may require a privacy policy URL even if no remote data is collected. Prepare a public privacy policy before submission; do not submit with only this local draft.
+AgentTab operates locally on the user's computer. It does not collect, sell, share, or transmit user data to the developer or to a remote service. It has no telemetry, analytics endpoint, cloud relay, or hosted browser session.
 
-## Privacy policy skeleton
+The extension and local host process browser information only to perform the user's requested task workflow. That information may include the content and state of task-owned tabs, accessibility snapshots, screenshots, action targets, download events, and handoff or Commit state. Standard mode does not return raw cookies, browser storage, passwords, arbitrary scripts, raw CDP, or raw network data to agents.
 
-### Data collection
+The local host and extension communicate through Chrome Native Messaging and per-user operating-system-native IPC. Local task and recovery state remains on the user's computer. The `<all_urls>` host permission is limited to the defined `chrome.scripting` text, HTML, selector, wait, and scroll paths on task-owned tabs, not a Standard raw browser-data interface. The final public privacy policy, support destination, and site destination remain unverified placeholders until controlled hosting exists. They must not be invented or entered into a store listing from this draft.
 
-Chrome Bridge does not collect, sell, share, or transmit user data to the developer or to any remote server operated by the developer.
+## Asset and submission checklist
 
-### Local-only operation
+None of these items is represented as complete by this draft. Verify each item against the final package and controlled hosting before any submission.
 
-The extension communicates with a native host installed by the user on the same machine through Chrome's native messaging API. Local clients communicate with that host over the loopback interface (`127.0.0.1`). There is no cloud relay, hosted browser session, analytics endpoint, telemetry endpoint, or remote command service in the extension.
-
-### Browser data access
-
-When the user installs the native host and allows actions in the local policy, Chrome Bridge can access browser state needed for automation, including tab metadata, page content, screenshots, downloads, content settings for geolocation tests, debugger data, cookie metadata, and cookie values for policy-approved cookie/storage actions. The default security posture is fail-closed, and sensitive outputs such as cookie values can be redacted by policy before they reach local clients.
-
-### Local secrets and audit logs
-
-The shared token, optional token registry, policy file, native-host manifest, generated extension identity, debug logs, and audit logs remain on the user's machine. Audit logs are local JSONL records of request metadata and decisions; they intentionally omit payload and response bodies. Users are responsible for keeping these local files private.
-
-### Human handoff
-
-`waitForHandoff` is designed for sensitive steps that an agent should not perform. It focuses the tab, marks the task group as needing review, shows a compact local in-page card, waits for the user to complete the step, and then resumes automation when the requested condition is met. It does not read, import, or overwrite authentication secrets.
-
-## Required asset checklist
-
-- [x] 128 px extension icon, plus 16/32/48 px toolbar sizes, declared in `manifest.json`.
-- [ ] 440 x 280 small promotional tile.
-- [ ] 1280 x 800 screenshots showing the native-host install, extension status, a policy-denied action, a policy-approved action, redacted `sessionStatus`, and `waitForHandoff`.
-- [ ] Demo video for manual review, with a clean browser profile or scrubbed test account and no exposed local secrets, cookies, raw logs, or identity-revealing local paths.
-- [ ] Public privacy policy URL based on the skeleton above.
-- [ ] Support/contact URL or email for Web Store listing fields.
-- [ ] Reviewer notes explaining that the extension requires the separately installed native host and local policy file.
-
-## Store-ID migration note
-
-A Web Store-published extension receives a store-managed extension ID that differs from the local developer-mode unpacked ID. Users who install the Web Store build must register that store ID with the local native host before Chrome native messaging will connect.
-
-The README already documents this flow in two places: the advanced setup section says to run `./setup.sh --extension-id <id>` for an already packaged or future Web Store extension ID, and the release packaging section repeats the store-specific command:
-
-```bash
-./setup.sh --extension-id <store-id>
-```
-
-Launch materials should instruct Web Store users to run that command after installing Chrome Bridge from the store, replacing `<store-id>` with the ID shown by Chrome for the published extension. Users should then reload/enable only one bridge extension at a time so duplicate bridge instances do not race to bind port `9223`.
+- [ ] Final store package built from the frozen `v2.0.0-rc.1` source and package identity.
+- [ ] Required 16, 32, 48, and 128 pixel icons verified in the final package.
+- [ ] Store promotional image in the required current dimensions.
+- [ ] Screenshots that show a task workspace, Your Turn, Commit staged but not approved, and the local-only status without exposing identity, URLs, secrets, or local paths.
+- [ ] Scrubbed reviewer demonstration using a dedicated test profile and accounts.
+- [ ] Public privacy-policy destination verified under controlled hosting.
+- [ ] Public support destination verified under controlled hosting.
+- [ ] Store title, short description, category, permission rationale, and reviewer instructions reconciled with the exact final package.
+- [ ] Chrome Web Store item identity checked against `config/identity.json` without adding an unverified public URL to launch copy.
+- [ ] Explicit authorization received for any upload, submission, review request, or publication.

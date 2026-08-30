@@ -1,0 +1,17 @@
+{
+  "name": "@getagenttab/site",
+  "version": "2.0.0-rc.1",
+  "private": true,
+  "description": "Static AgentTab landing and privacy site",
+  "type": "module",
+  "files": ["dist"],
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.23",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.3"
+  }
+}

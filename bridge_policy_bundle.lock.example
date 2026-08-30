@@ -1,6 +1,0 @@
-{
-  "_comment": "Example lockfile for an org policy bundle. The sha256 below is a PLACEHOLDER (all zeros) and will never verify: a real digest must be produced by 'chrome-bridge policy bundle lock <bundlePath> --lockfile <lockPath>', which hashes the bundle and writes it here. Copy this file to a local name (for example bridge_policy_bundle.lock), then run the lock command. A host whose lockfile still holds this placeholder rejects the bundle and serves the built-in fail-closed default policy.",
-  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-  "bundle": "bridge_policy_bundle.example.json",
-  "updated": "1970-01-01T00:00:00+00:00"
-}

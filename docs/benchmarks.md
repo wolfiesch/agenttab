@@ -1,64 +1,36 @@
-# Benchmarks
+# AgentTab measurement rules
 
-## Benchmarking against other browser automation surfaces
+This repository does not contain a current v2 benchmark harness or published v2 benchmark result. Do not reuse legacy timing tables, adapter comparisons, or scorecards as AgentTab v2 performance evidence.
 
-The benchmark harness measures speed for selected adapters. `chrome-bridge`, `playwright`, `puppeteer`, and `chrome-devtools-mcp` are live-measurable; Claude in Chrome and Codex Chrome Extension remain manual/static capability metadata. The report also emits a normalized scorecard, claim-discipline note, and gap tickets.
+## What a performance claim requires
 
-Run the offline contract adapter:
+Every measured claim must retain a raw artifact and record:
 
-```bash
-python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
-```
+- the exact source commit, dirty-state status, build identity, host version, extension version, and adapter version;
+- the complete scenario and success criterion, including URL or controlled fixture, requested action, payload size, and whether an external side effect was intentionally avoided;
+- hardware, OS, browser channel/version, Chrome profile class, network conditions, and display/browser state where relevant;
+- configuration that can affect the result, including Standard or Developer mode, optional permissions, policy, IPC endpoint, proxy use, and timeout;
+- iteration count, warmup policy, cache state, concurrency, retry policy, start/end time, and per-iteration raw output;
+- summary method, exclusions, failures, timeouts, and the raw artifact path.
 
-Run measured adapters:
+Separate observed measurements from interpretation. For example, a measured latency distribution may support a statement about that scenario on that machine. It does not establish universal browser performance, safety, availability, or superiority over another product.
 
-```bash
-python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --output /tmp/chrome-bridge-results.json
-python3 benchmark_harness.py run --adapter playwright --iterations 5 --output /tmp/playwright-results.json
-python3 benchmark_harness.py run --adapter puppeteer --iterations 5 --output /tmp/puppeteer-results.json
-python3 benchmark_harness.py run --adapter chrome-devtools-mcp --iterations 5 --output /tmp/chrome-devtools-results.json
-```
+## Scenario design
 
-`chrome-bridge`, `playwright`, `puppeteer`, and `chrome-devtools-mcp` start a local HTTP fixture by default. To benchmark another page, pass `--base-url`:
+Use controlled fixtures for interaction and Commit measurements. A valid scenario should name the browser path, page readiness condition, snapshot mode, ref revision, action sequence, expected outcome, and timing boundary. Keep authenticated checks limited to benign actions or staged-but-uncommitted effects.
 
-```bash
-python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --base-url http://127.0.0.1:PORT/ --output /tmp/results.json
-```
+Measure cold and warm paths separately. Distinguish process startup, Native Messaging handshake, host reconciliation, first debugger attach, ordinary request IPC, page work, and response serialization. Report separate-tab and same-tab behavior explicitly; do not infer concurrency from a scheduler that may serialize task work.
 
-Missing optional dependencies or browser binaries are reported as unsupported/fail in the adapter output without breaking the noop/offline checks. Shadow DOM, iframe, and semantic locator user-action parity are measured as explicit capability rows.
+When comparing another surface, run the same scenario, user-visible success criterion, browser/profile class, network condition, and iteration policy. Record each tool's version and configuration. Do not compare a local fixture for one tool with a remote authenticated flow for another.
 
-Generate the Markdown report, with optional CI-friendly JUnit XML and GitHub Step Summary outputs:
+## Commit and handoff measurements
 
-```bash
-python3 benchmark_harness.py compare --input /tmp/results.json --output /tmp/report.md --junit-output /tmp/benchmark.xml --github-step-summary /tmp/summary.md
-python3 benchmark_harness.py compare --input /tmp/chrome-bridge-results.json --input /tmp/chrome-devtools-results.json --output /tmp/head-to-head.md
-```
+Do not convert security barriers into speed-only scores. If measuring Commit, record classification result, stage creation, human review delay as a separate interval, revalidation outcome, and execution or refusal. Never Commit a real consequential action only to collect a timing number.
 
-### Persistent in-process client
+If measuring handoff, record only safe lifecycle timestamps such as request accepted, blackout active, completion acknowledged, and resume ready. Do not record keys, secrets, page contents, screenshots, or human input.
 
-The benchmark harness talks to the bridge over one keep-alive TCP connection (see `BridgeClient` in `benchmark_harness.py`) instead of spawning `python3 test_client.py` per operation. The native host (`bridge.py`) serves many newline-delimited requests per connection, awaiting each extension response on a per-request queue before reading the next, so request/response order is preserved on a shared socket.
+## Publishing a result
 
-This avoids per-operation Python interpreter startup and TCP connection setup in the harness path. Exact latency depends on the local browser profile, machine load, adapter versions, and benchmark run. Generate a fresh report before making comparative speed claims. The CLI (`test_client.py`) still uses one connection per command; the persistent client is the harness/agent path. Set `CHROME_BRIDGE_CLIENT` to force the harness back onto an external launcher.
+Before publishing or quoting a result, reproduce it from a clean checkout or documented artifact, retain the raw data, and review it for secrets, identities, URLs, local paths, and profile metadata. Label the result with its date and configuration. If the raw artifact is unavailable, present no numerical claim.
 
-### Batched bridge actions
-
-The bridge supports a composite `batch` action for workflows where several sub-commands should share one native-message request. The batch fails as a whole if any sub-command throws or returns `success: false`.
-
-```bash
-python3 test_client.py batch '[{"action":"startMonitoring"},{"action":"click","payload":{"selector":"#log"}},{"action":"consoleMessages","delayMs":100}]' <tabId>
-```
-
-Treat batching as a capability, not a benchmark claim. If you publish batching latency, cite a fresh raw result artifact from a harness path that actually invokes `batch`.
-
-### Generating head-to-head results
-
-Do not treat static README examples as maintained speed evidence. Run the measured adapters locally, then compare the generated result files:
-
-```bash
-python3 benchmark_harness.py run --adapter chrome-bridge --iterations 5 --output /tmp/chrome-bridge-results.json
-python3 benchmark_harness.py run --adapter playwright --iterations 5 --output /tmp/playwright-results.json
-python3 benchmark_harness.py run --adapter puppeteer --iterations 5 --output /tmp/puppeteer-results.json
-python3 benchmark_harness.py compare --input /tmp/chrome-bridge-results.json --input /tmp/playwright-results.json --input /tmp/puppeteer-results.json --output /tmp/head-to-head.md
-```
-
-Only rows marked `measured` in the generated report support speed or capability claims. Static metadata rows describe expected strengths and limits only. When publishing exact timings, keep the raw JSON and generated Markdown report, and record the source commit, host build identity, OS/hardware/browser/tool versions, command lines, iteration count, timeout/warmup policy, fixture URL, profile/cache state, and run timestamp.
+Benchmark evidence is distinct from release evidence. A fast local result does not prove signed packaging, public availability, Chrome Web Store approval, or production reliability.

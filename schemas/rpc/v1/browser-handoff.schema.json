@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-handoff.schema.json",
+  "title": "browser_handoff parameters",
+  "type": "object",
+  "required": ["tab_id", "expected_page_revision", "prompt", "completion"],
+  "properties": {
+    "tab_id": { "type": "integer", "minimum": 0 },
+    "expected_page_revision": { "type": "integer", "minimum": 0 },
+    "prompt": { "type": "string", "minLength": 1, "maxLength": 2000 },
+    "completion": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "enum": ["navigation", "manual_done"] } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "enum": ["url", "selector"] },
+            "value": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 900000, "default": 300000 }
+  },
+  "additionalProperties": false
+}

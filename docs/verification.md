@@ -1,127 +1,79 @@
-# Verification and release packaging
+# Verification and release evidence
 
-## Verification
+AgentTab verification has distinct evidence layers. Passing a source test is not proof of a real signed package, Chrome Web Store item, registry package, hosted page, or public release. `2.0.0-rc.1` is prerelease and unreleased.
 
-Offline checks (no browser needed), run from the repo root:
+## Offline source gates
 
-```bash
-PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_broker_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_task_session_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_quiet_debugger_contract.py
-node verify_quiet_debugger_behavior.mjs
-PYTHONDONTWRITEBYTECODE=1 ./verify_github_attachment_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_mcp_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
-python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/results.json
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py scripts/background_reliability.py scripts/generate_browser_manifests.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_quiet_debugger_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_mcp_contract.py
-node --check background.js
-node --check wake.js
-diff -q manifest.json extension/manifest.json
-diff -q background.js extension/background.js
-diff -q wake.html extension/wake.html
-diff -q wake.js extension/wake.js
-```
-
-Live gates after deploying and reloading the unpacked extension (opens real Chrome tabs):
+Run these from the repository root when validating source changes:
 
 ```bash
-./scripts/reload_unpacked_extension.sh
-chrome-bridge ready 10000 250
-python3 test_client.py ping
-python3 scripts/background_reliability.py --duration-seconds 60 --output /tmp/background-reliability.json
-PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_agent_actions_live.py
-PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
+bun install --frozen-lockfile
+bun run workspace:typecheck
+bun run workspace:test
+bun run workspace:build
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=packages/sdk-python python3 -m unittest discover -s packages/sdk-python/tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_permissions.py
+cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
+PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_protocol_schemas.py
+PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_identity.py
+PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_forbidden_surface.py
+cargo fmt --all --manifest-path host-rs/Cargo.toml -- --check
+cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
+cargo build --release --locked --manifest-path host-rs/Cargo.toml -p agenttab-host
 ```
 
-`verify_capability_matrix.py` skips `downloadUrl` by default in live profiles because Chrome's "Ask where to save each file before downloading" setting can open a modal save dialog and block unattended smoke runs. To exercise that capability intentionally, run:
+The workspace checks TypeScript adapters, extension code, installer, OMP adapter, and package builds. The architecture gates cover manifest identity, required and optional permission behavior, RPC schemas, forbidden legacy surface, and Rust IPC framing. They do not operate a real signed-in browser.
+
+## Live browser evidence
+
+Use a disposable Chrome profile and a disposable test account. Reload the unpacked extension through Chrome's extension UI, then observe the actual surface after every UI action. Exercise:
+
+1. required `debugger` availability plus optional `scripting` grant and revocation from the popup;
+2. host handshake and reconciliation to ready;
+3. create and adopt-active task tabs, child popup inheritance, visible grouping, and ownership revocation after an ungroup or move;
+4. accessibility, text, HTML, and screenshot snapshots; stale revision/ref rejection; wait conditions; and debugger detach/restart;
+5. ready, working, needs-you, resumed, and finished popup states;
+6. Pause, restart while paused, reconciliation, and Resume;
+7. global blackout during `browser_handoff`, including host and extension restart during the handoff;
+8. recognizable consequential controls staged without side effect, a changed target rejected, one unchanged Commit execution, and harmless controls executed without review.
+
+Never Commit a real send, purchase, delete, permission grant, or upload against a live account merely to prove the barrier. Use controlled fixtures and stop at the staged preview for live authenticated checks.
+
+## Platform evidence
+
+Linux and Windows IPC behavior requires the platform-specific jobs in CI:
 
 ```bash
-CHROME_BRIDGE_TEST_DOWNLOAD=1 PYTHONDONTWRITEBYTECODE=1 ./verify_capability_matrix.py
+cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
+cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
 ```
 
-`verify_live_install_smoke.py` uses a temporary HOME/XDG_CONFIG_HOME and exits 0 with `SKIP live install smoke: Chrome/Chromium executable not found` only when no Chrome/Chromium executable is available.
+On Windows, additionally prove the current-user SID pipe name, DACL, remote-client rejection, and client SID verification. On Unix, prove the private runtime directory, socket mode, same-user peer check, stale-socket handling, and second-host lock. Source-level success on one platform is not portability evidence for another.
 
-The default sample policy is intentionally fail-closed and denies loopback URLs. For these localhost live gates, temporarily use an explicit smoke-test policy, then restore your normal policy:
+Installer tests use temporary user/config homes and cover transactional configuration changes, malformed configuration preservation, rollback, proxy authentication, and repeat-install behavior. A successful test fixture is not a clean-machine install of a signed release.
 
-```json
-{
-  "default": {
-    "allowedActions": ["*"],
-    "allowedOrigins": ["http://127.0.0.1:*"],
-    "deniedActions": [],
-    "deniedOrigins": [],
-    "requireConfirmation": [],
-    "redact": true,
-    "audit": true
-  }
-}
-```
+## Packaged artifact evidence
 
-`verify_capability_matrix.py` binds its HTTP fixture to port `0`, derives the URL at runtime, writes screenshots/HTML/storage to temp files, and prints compact redacted JSON.
+The store package is produced locally by `scripts/package_extension_store.py`. Verify the exact ZIP that will be reviewed or installed, its exhaustive member manifest, manifest-referenced assets, and a clean-profile load. Verify release archives only after they are built from a frozen source revision.
 
-`verify_guardrails_contract.py` runs every host-enforced guardrail against **both** native hosts in turn, so a Python-only or Rust-only fix fails the gate. Among the regression cases it pins:
+For each release candidate, record the source commit, tag, target triple, unsigned staging digest, final artifact digest, artifact-manifest signature, platform signature result, installer version mapping, and clean-machine install result. The installer expects an Ed25519-signed artifact manifest plus Apple code signing on macOS, Authenticode on Windows, and signed-manifest verification on Linux.
 
-- the full handoff blackout set - one-shot observations including `observe`, the collector reads `consoleMessages`/`networkRequests`/`interceptedRequests`/`screencastFrames`, and the collector starts `startMonitoring`/`startInterception`/`startScreencast` - each denied with `handoff in progress` and never forwarded, plus a `batch` and a `replayWorkflow` that wrap a blacked-out step and are denied as a whole;
-- `replayWorkflow` step-level enforcement before any forward: a denied nested action fails as `workflow step <n>: <reason>` with a `policyDenial.batchStep` index, a reserved action is not dispatchable as a step, a confirmation-gated nested action fails as `workflow step <n> requires confirmation` and mints no token, an all-allowed workflow forwards, and `--tab` retargeting is origin-checked against the live origin of the tab actually targeted;
-- secret masking armed on the **first** request: a policy denial that quotes a `secretMaskFile` value in its target writes `<masked:...>` to the audit log, never the raw value, with no prior reload or successful forward to prime it;
-- audit export as a mirror rather than a second source: a `jsonl` sink whose lines equal the local audit events field for field (including a denial with decision `deny`), a `secretMaskFile` value that reaches the sink only as `<masked:...>`, an unwritable destination that produces exactly one `audit_export_unavailable` event and still lets the request succeed, a captured CEF line asserted against the documented header and extension mapping, a captured RFC 5424 UDP datagram asserted against the documented framing and its deny-versus-allow severity split, and single-generation rotation that drops no events. The export cases block on a polling barrier over the sink rather than a sleep, so they cannot race host startup.
+The checked-in release trust configuration currently contains no public signing key. Therefore no signed artifact or installed package is verified by this checkout alone.
 
-## Release packaging
+## Publication evidence
 
-Pull requests run `.github/workflows/ci.yml`. Tags that match `v*` run `.github/workflows/release.yml`.
+These external gates are **unverified** until independently observed on the exact release version and digest:
 
-The extension artifact is an unpacked, developer-mode bundle and remains unkeyed. A packaged or Web Store extension uses its own store-managed ID and must be registered separately:
+- repository rename and final repository identity;
+- GitHub release assets and checksums;
+- npm, PyPI, and prerelease-channel package ownership and publication;
+- signing, notarization, Authenticode timestamping, provenance, and SBOM publication;
+- Chrome Web Store item, package upload, review, trusted-tester install, and production availability;
+- a controlled site and privacy-policy URL;
+- final domain, support, and store links.
 
-```bash
-./setup.sh --extension-id <store-id>
-```
+Do not label a release stable, publish a stable install path, or claim availability before all required external gates are verified. Existing public `v1.0.1` is legacy context only, not evidence that v2 is available.
 
-Build local release artifacts with:
+## Evidence record
 
-```bash
-python3 scripts/package_release.py --version <version> --dist dist
-```
-
-## Store package verification
-
-`scripts/package_extension_store.py` builds the zip that is uploaded by hand to the Chrome Web Store developer dashboard. The script writes a local file and prints metadata; it performs no upload and makes no Chrome Web Store API call.
-
-```bash
-python3 scripts/package_extension_store.py --out dist/chrome-bridge-extension-store.zip
-```
-
-Optional JavaScript syntax gate, skipped by default and requiring `node` on `PATH`:
-
-```bash
-python3 scripts/package_extension_store.py --out dist/chrome-bridge-extension-store.zip --check-js
-```
-
-Before writing anything the script fails closed when:
-
-- `extension/background.js` or `extension/manifest.json` exists and is not byte-identical to the canonical root file;
-- `manifest_version` is not `3`, the service worker is not `background.js`, or `nativeMessaging` is missing;
-- the packaged manifest drops any permission held by the canonical root `manifest.json`;
-- the manifest carries a `key` field. This is checked against the manifest **as read from disk**, before the packager touches it: a `key` is a hard failure, never silently stripped, so a staging directory that still carries a local unpacked-extension key can never produce a clean-looking upload;
-- `background.js` does not reference the `com.automation.bridge` native messaging host;
-- any forbidden local artifact pattern (tokens, `bridge_policy.json`, `*.pem`, logs, caches, docs, tests) matches a member name.
-
-The archive contains exactly `background.js`, `manifest.json`, `wake.html`, and `wake.js`, written in sorted order with a fixed timestamp, so repeated runs on unchanged inputs produce the same sha256. `verify_install_contract.py` covers this: it packages into a temp directory and asserts the exact member set, the absence of forbidden patterns, `manifest_version` 3, no `key`, root-permission coverage, the fixed timestamp, digest stability across two builds, rejection of a staged manifest that drops root permissions, and rejection of a staged manifest carrying a `key` field with no archive written at all.
-
-`--source <dir>` packages a prepared staging directory instead of the repository root; the canonical root `manifest.json` is still the permission baseline.
-
-## Cross-platform install verification
-
-`setup-windows.ps1` needs Windows and a live browser, so `verify_install_contract.py` covers it statically instead of running it: the Chrome and Edge `HKCU` registry path strings are present, the manifest path is written to the key's **unnamed default value** with `Set-Item` and read back for verification (the `Set-ItemProperty -Name "(Default)"` form is rejected outright, because it creates a value literally named `(Default)` and leaves the real default empty, so the browser finds no host), `HKLM:`/`HKEY_LOCAL_MACHINE` and any elevation request are absent, the `-RepoRoot`/`-HostPort`/`-ExtensionId`/`-UseRustHost` parameters exist, the Rust host path and the `.cmd` launcher are referenced, the launcher is git-ignored, secrets are kept rather than overwritten, the policy is seeded from `bridge_policy.example.json`, no output statement can print the token, and braces and parentheses balance.
-
-`setup-edge.sh` is checked the same way: it references the macOS and Linux Edge native-messaging directories, builds its manifest through `scripts/generate_browser_manifests.py`, points Windows users at the PowerShell installer, and never creates or reads a token, key, or policy.
-
-`scripts/generate_browser_manifests.py` is exercised for real in a temp directory with a fixture host path. The contract asserts the exact Edge and Firefox host-manifest objects, that the Firefox staging directory holds exactly `background.js`, `manifest.json`, `wake.html`, and `wake.js` with no forbidden artifact, that the three copied files are byte-identical to the canonical root files, that the staged manifest keeps `manifest_version` 3 and `nativeMessaging`, carries no `key`, uses `background: {"scripts": [...]}` plus the gecko id, and drops exactly `debugger`, `tabGroups`, and `contentSettings`, that the canonical Chrome manifest still declares its service worker, that a second run reproduces every digest, and that a missing or malformed extension ID, a malformed add-on ID, and a relative host path are all rejected.
-
-No live Firefox or Edge gate exists. Edge shares Chrome's action surface, so the Chrome live gates cover it once registration succeeds; Firefox is generated output only.
+For every claim, retain the command or scenario, exact source revision, platform and browser version, configuration, account/profile class, cache state, iteration count, timeout, raw artifact path, output, and timestamp. Separate observed facts from inferences. Scrub identities, secrets, URLs, local paths, cookies, page content, resume capabilities, and raw audit records before sharing evidence.

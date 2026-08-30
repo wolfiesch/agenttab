@@ -1,118 +1,119 @@
-<div align="center">
+# Agent Tab
 
-# Chrome Bridge
+**Any agent. Your browser. Your rules.**
 
-**Hand an agent your real, logged-in Chrome. Keep local control.**
+**Local browser runtime for AI agents**
 
-A policy-governed native-messaging bridge that lets local agents drive your actual Chrome profile -
-no `--remote-debugging-port`, no fresh automation profile, no cloud browser.
+> Give an agent a tab, not the keys to your browser.
 
-<p>
-  <a href="https://github.com/wolfiesch/chrome-bridge/releases/latest"><img src="https://img.shields.io/github/v/release/wolfiesch/chrome-bridge?color=blue" alt="Release"></a>
-  <a href="https://github.com/wolfiesch/chrome-bridge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/chrome-MV3-orange" alt="Chrome MV3">
-  <img src="https://img.shields.io/badge/python-%E2%89%A53.10-blue" alt="Python >= 3.10">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="Platform">
-</p>
+Agent Tab lets an agent work in your existing signed-in Chrome profile without giving it unrestricted control of the profile. Each connection receives a task-owned browser workspace. The agent can create tabs, inspect and act in those tabs, wait for page state, and ask for help. Passwords, passkeys, 2FA, CAPTCHA, payment secrets, and other human-only input belong to **Your Turn**. Recognizable consequential actions are staged for **Commit** instead of being performed immediately.
 
-</div>
+## Release status
 
----
+Agent Tab v2 is **unreleased**. The local source version is `2.0.0-rc.1`; it is not a public npm package, Chrome Web Store item, hosted site, or published release artifact. **Chrome Bridge v1.0.1 remains the available stable legacy path** until the v2 launch cutover.
 
-Opening a browser is the easy part. The hard part is safely handing an agent your **existing signed-in Chrome session** - cookies, SSO, passkeys - without giving up local control. Chrome Bridge solves exactly that:
+Do not expect `npx agenttab install` to work today. Stable v2 remains blocked on signing, package-registry, Chrome Web Store, controlled-domain, and platform release gates. The command below is the intended public install flow only after those dependencies are live:
 
-- **Fail-closed policy engine** in the native host - nothing runs without an explicit local grant
-- **Confirmation tokens, response redaction, and a full audit log** for every action
-- **Calm, visible task state** - named tab groups show whether the agent is working, waiting for you, or finished
-- **`waitForHandoff`** - the agent stops, focuses the real tab, and shows a compact card while you do login, 2FA, captcha, or payment
-- **Cooperative multi-agent leasing** so two agents never mutate one real profile at the same time
+```text
+npx agenttab install
+```
 
-## How it works
+The command has no path, token, or shell-specific argument and is suitable for POSIX shells, PowerShell, and `cmd.exe` once the package is published. Current source and prerelease setup are documented in [Setup](docs/setup.md).
+
+## A task-owned workflow
+
+1. An agent calls `browser_open` with `mode: "create"`. Agent Tab creates a background tab for that task and returns its task, tab, window, page-revision, and automation-route identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
+2. On a normal web origin, the agent calls `browser_snapshot`, works from revisioned accessibility references, then calls `browser_act` with the expected page revision. It cannot act on unrelated tabs.
+3. If a site requires human-only input, the agent calls `browser_handoff`. Agent Tab focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
+4. If Agent Tab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token.
+5. The task can list only its own tabs with `browser_tabs`. A separate client gets a separate task unless it proves its durable resume capability.
+
+Chrome does not expose page scripting or debugger access on browser-restricted origins such as `chrome://`, `chrome-extension://`, `devtools://`, and the Chrome Web Store. Agent Tab reports these task tabs with `automation_route: "tab_only"`. Explicit navigation, reload, close, load or URL waits, and human-only `browser_handoff` remain available. History movement is also available when managed origin constraints are absent; with constraints, Agent Tab rejects it because Chrome does not expose the destination for authorization before navigation. Download waits require the `full` route because exact task-tab attribution comes from tab-scoped debugger events, not browser-global download state. Page snapshots, element actions, page-content waits, and raw Developer-mode CDP fail immediately with `browser_restricted_origin` and `outcome: "not_started"` before Agent Tab attempts the blocked route. Use a focus-safe OS accessibility driver bound to the exact browser window when native UI work is required.
+
+Commit is a two-party, best-effort semantic barrier, not proof that a page has no external effect. The popup records the human approval, while only the agent's later `browser_commit` can execute the staged action. Page content is untrusted data and a page can attach an effect to an innocently labelled control. Inspect the page and staged action before approving or committing.
+
+## Trust contract
+
+- **Task ownership is an execution and coordination boundary, not profile isolation.** Agent Tab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or a generic browser-global mutation API. Its one window-level operation creates an unfocused normal window for the first tab of an otherwise empty task.
+- **Your Turn is the only routine focus transition.** Routine task work stays in task-owned tabs. During handoff, all agent observation and capture are denied so human credentials are not captured.
+- **Commit requires human approval and agent intent.** A staged action is bound to its task, tab, page revision, element fingerprint, effect, and short expiry. Popup approval records consent but does not execute it. The agent must then call `browser_commit`; a changed page, expired stage, used token, or unapproved stage cannot execute.
+- **Local by default.** Policy, task state, audit records, and IPC stay on the machine. Agent Tab has no telemetry. See [Telemetry](docs/telemetry.md) and [Security](docs/security.md).
+
+## Tool surface
+
+Standard mode exposes exactly seven MCP tools:
+
+| Tool | Purpose |
+|---|---|
+| `browser_open` | Create a task tab, create an unfocused window for a new task, or explicitly adopt the active tab. Reports whether the resulting tab supports `full` or `tab_only` automation. |
+| `browser_snapshot` | Read an accessibility tree, bounded text or HTML, or a screenshot from a full-route task tab. |
+| `browser_act` | Run typed actions against one task tab and expected page revision. Restricted-origin task tabs retain only navigation, history, reload, and close actions. |
+| `browser_wait` | Wait for load, URL, text, selector, network-idle, or task-attributed download conditions supported by the tab's route. |
+| `browser_tabs` | List only tabs owned by the current task, including each tab's automation route. |
+| `browser_handoff` | Give the user control for human-only input. |
+| `browser_commit` | Execute one staged consequential action. |
+
+Developer mode adds one tool, `browser_developer`. It is absent from Standard discovery. It requires both the persistent Developer mode control in the Agent Tab popup and `AGENTTAB_DEVELOPER=1` in the adapter environment. Treat it as an explicit expansion of the normal boundary.
+
+The exact schemas, return semantics, and stdio configuration are in [MCP](docs/mcp.md). The source contract is in [Core RPC schemas](schemas/rpc/v1) and the [runtime ADR](docs/adr/0001-agenttab-runtime.md).
+
+## Setup after v2 becomes available
+
+The installer verifies one immutable versioned artifact, registers the native host, and updates supported local client configuration transactionally. It does **not** silently remove Chrome Bridge v1. For a prerelease source build, the extension remains an explicitly loaded unpacked development extension. See [Setup](docs/setup.md) for the current source path, future RC and stable flows, permissions, side-by-side migration, rollback limits, and platform state.
+
+For a configured local installation, an MCP client starts the adapter with:
+
+```text
+agenttab mcp
+```
+
+The installer writes this as an absolute local command in supported client configuration. For manual configuration, use `agenttab mcp` only when the installed `agenttab` command is on that client's `PATH`. Do not add a TCP port, bearer token, Python host, or manual native-host JSON for Standard mode.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    A[Agent / MCP client] -->|token-gated NDJSON<br/>127.0.0.1:9223| B[Native host]
-    B -->|fail-closed policy<br/>audit + redaction| C[MV3 extension]
-    C -->|native messaging| D[Your real Chrome profile]
-    D -.->|waitForHandoff:<br/>login / 2FA / captcha| E([You])
-    E -.-> D
+    A[Agent or MCP client] --> B[Task-scoped Core RPC]
+    B --> C[User-owned local IPC]
+    C --> D[One Rust Agent Tab host]
+    D --> E[Chrome Native Messaging]
+    E --> F[Agent Tab extension]
+    F --> G[Task-owned tabs in signed-in Chrome]
+    G -. Your Turn .-> H[Human]
 ```
 
-Every raw TCP, CLI, and MCP request passes the same policy engine. Payloads and response bodies never enter the audit log.
+The extension maintains the Native Messaging relationship with the one Rust host. Local adapters use per-user IPC: a user-owned Unix socket on macOS and Linux, or a current-user named pipe on Windows. Standard mode has no port, bearer token, or manual JSON protocol. The separate `agenttab proxy` command is an advanced, loopback-only bridge that deliberately requires a local token file. It is not part of normal setup. [Commands](docs/commands.md) documents its limits.
 
-## 60-second quickstart
+## Supported-platform state
 
-```bash
-./setup.sh                 # installs native host, token, policy, extension dir
-python3 test_client.py ping # verifies the bridge
-```
+The source maps host artifacts for macOS on Apple Silicon and Intel, Linux on ARM64 and x86_64, and Windows on ARM64 and x86_64. No signed public v2 artifact matrix is available yet, so none of these are currently offered as a public v2 installation. The extension manifest requires Chrome 127 or later. See [Setup](docs/setup.md#supported-platform-state).
 
-Then:
+## Repository layout
 
-1. Open `chrome://extensions/`, enable Developer mode, **Load unpacked** from the directory printed by `setup.sh`.
-2. Keep **only one** Chrome Bridge extension enabled - duplicates race to bind port 9223.
-3. Register the MCP server in your client config:
-
-```json
-{
-  "mcpServers": {
-    "chrome-bridge": {
-      "command": "uvx",
-      "args": ["--from", "/ABSOLUTE/PATH/TO/chrome-bridge/mcp", "chrome-bridge-mcp"],
-      "env": {
-        "BRIDGE_REPO_ROOT": "/ABSOLUTE/PATH/TO/chrome-bridge",
-        "BRIDGE_PORT": "9223"
-      }
-    }
-  }
-}
-```
-
-Full instructions: [setup](docs/setup.md) and [MCP registration](docs/mcp.md).
-
-## Why this over X
-
-| Alternative | Difference |
+| Path | Purpose |
 |---|---|
-| **Chrome DevTools MCP** | Requires a debuggable browser target and typically a remote-debugging port workflow. Chrome Bridge uses native messaging against your normal logged-in profile - no debug port, no focus-stealing popup. |
-| **mcp-chrome-style bridges** | Chrome Bridge puts governance in the native host: fail-closed policy, action/origin checks, confirmation tokens, redaction, audit logs, and cooperative leases. |
-| **Playwright / Puppeteer** | Excellent for isolated, purpose-launched contexts. Chrome Bridge is for real-profile work: existing cookies, SSO, passkeys, and human handoff when the agent should stop. |
-| **Cloud browsers** | Browserbase/Steel-style services are remote and disposable. Chrome Bridge is local-first: browser state, tokens, screenshots, and audit data stay on your machine. |
+| `packages/extension/` | Canonical browser-extension source, tests, and generated `dist/` output |
+| `packages/installer/` | Cross-platform installer and local client configuration |
+| `packages/mcp/`, `packages/omp/` | Agent adapters and tool rendering |
+| `packages/sdk-python/`, `packages/sdk-typescript/` | Client SDKs |
+| `host-rs/` | Rust native host and protocol crates |
+| `schemas/` | Versioned native and Core RPC contracts |
+| `config/` | Frozen product, migration, and release identity |
+| `tests/architecture/` | Cross-component safety and architecture gates |
+| `scripts/` | Build, packaging, and release verification utilities |
+| `docs/` | Setup, security, API, architecture, and launch documentation |
 
-## Features
+Generated extension assets live only in `packages/extension/dist/`; they are not committed or mirrored into the repository root.
 
-| Category | What you get |
-|---|---|
-| **Real profile** | Navigation, tabs, filtered accessibility views, semantic selectors, screenshots, forms, uploads, a one-command GitHub PR-body attachment helper, viewport, emulation, downloads, storage, geolocation, diagnostics |
-| **Background-safe** | Inactive-tab navigation, CDP screenshots without tab selection, connection checks that never launch Chrome or open wake tabs |
-| **Governance** | Fail-closed `bridge_policy.json`, origin-aware action policy, deny/allow lists, resumable confirmation tokens (`chrome-bridge confirm <token>`), optional local origin-approval prompt |
-| **Audit & redaction** | Action/client/target/decision/reason/request-ID audit log; cookie, storage-state, and policy-defined page-content redaction; `sessionStatus` redacted auth probe |
-| **Human handoff** | `waitForHandoff` focuses the real tab, shows a compact bottom card, and waits for login/2FA/captcha before resuming |
-| **Visible status** | Toolbar popup with connection/task state and a foreground-only agent-pointer toggle; task groups use `✦`, `↗`, and `✓` status labels |
-| **Multi-agent** | Named per-client tokens, cooperative leasing, task-owned tab groups with stable colors that never touch unrelated human tabs |
-| **Reliability** | Machine-readable background runs detecting active-tab changes, frontmost-app changes, unexpected tabs, and owned tabs becoming active |
-| **Integrations** | MCP server (Claude Desktop, Cursor, Cline, ...) with read-only and sensitive-tool scoping; optional Rust native-host parity port |
+## Migration and documentation
 
-> [!WARNING]
-> **Trusted local use only.** Chrome Bridge controls your real Chrome profile: it can read page content, take screenshots, drive forms, download files, inspect cookies through redacted probes, and attach Chrome's debugger. Install only on machines you control, and keep `bridge_token.txt`, `bridge_tokens.txt`, `extension_key.pem`, `bridge_policy.json`, and debug/audit logs private and git-ignored. Host defaults are fail-closed; normal automation requires explicit local policy grants.
-
-## Documentation
-
-| Guide | Covers |
-|---|---|
-| [Setup](docs/setup.md) | Requirements, layout, troubleshooting |
-| [Commands](docs/commands.md) | Command reference, raw-output safety |
-| [Security](docs/security.md) | Policy engine, redaction, audit logs |
-| [MCP server](docs/mcp.md) | Tools, scoping, HTTP transport, registration |
-| [Multi-agent](docs/multi-agent.md) | Named tokens, cooperative leasing |
-| [Benchmarks](docs/benchmarks.md) | Benchmark harness, claim discipline |
-| [Verification](docs/verification.md) | Release packaging, contract checks |
-| [Rust host](docs/rust-host.md) | Optional native-host parity port |
-| [Telemetry](docs/telemetry.md) | Local usage diagnostics |
-
-## Repository naming
-
-The canonical public repository is [`wolfiesch/chrome-bridge`](https://github.com/wolfiesch/chrome-bridge); the product name is **Chrome Bridge**. Your local checkout folder may have another name - replace `/ABSOLUTE/PATH/TO/chrome-bridge` in examples with your actual checkout path.
+- [Migrate from Chrome Bridge v1.0.1](docs/setup.md#migration-from-chrome-bridge-v101)
+- [Setup and local paths](docs/setup.md)
+- [Command reference](docs/commands.md)
+- [MCP adapter and Core RPC](docs/mcp.md)
+- [Security and trust boundary](docs/security.md)
+- [Multi-agent behavior](docs/multi-agent.md)
+- [Runtime architecture decision](docs/adr/0001-agenttab-runtime.md)
 
 ## License
 

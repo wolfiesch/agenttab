@@ -1,0 +1,112 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "agenttab",
+    },
+    "packages/extension": {
+      "name": "@getagenttab/extension",
+      "version": "2.0.0-rc.1",
+      "devDependencies": {
+        "@types/bun": "^1.2.23",
+        "@types/chrome": "^0.1.36",
+        "typescript": "^5.9.3",
+      },
+    },
+    "packages/installer": {
+      "name": "agenttab",
+      "version": "2.0.0-rc.1",
+      "bin": {
+        "agenttab": "dist/cli.mjs",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.2.23",
+        "@types/node": "^24.5.2",
+        "typescript": "^5.9.3",
+        "yaml": "^2.8.1",
+      },
+    },
+    "packages/mcp": {
+      "name": "agenttab-mcp",
+      "version": "2.0.0-rc.1",
+      "bin": {
+        "agenttab-mcp": "dist/server.mjs",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.2.23",
+        "@types/node": "^24.5.2",
+        "typescript": "^5.9.3",
+      },
+    },
+    "packages/omp": {
+      "name": "@getagenttab/omp",
+      "version": "2.0.0-rc.1",
+      "dependencies": {
+        "typebox": "^1.3.7",
+      },
+      "devDependencies": {
+        "@types/bun": "^1.2.23",
+        "@types/node": "^24.5.2",
+        "typescript": "^5.9.3",
+      },
+    },
+    "packages/sdk-typescript": {
+      "name": "@getagenttab/sdk",
+      "version": "2.0.0-rc.1",
+      "devDependencies": {
+        "@types/bun": "^1.2.23",
+        "@types/node": "^24.5.2",
+        "typescript": "^5.9.3",
+      },
+    },
+    "packages/site": {
+      "name": "@getagenttab/site",
+      "version": "2.0.0-rc.1",
+      "devDependencies": {
+        "@types/bun": "^1.2.23",
+        "@types/node": "^24.5.2",
+        "typescript": "^5.9.3",
+      },
+    },
+  },
+  "packages": {
+    "@getagenttab/extension": ["@getagenttab/extension@workspace:packages/extension"],
+
+    "@getagenttab/omp": ["@getagenttab/omp@workspace:packages/omp"],
+
+    "@getagenttab/sdk": ["@getagenttab/sdk@workspace:packages/sdk-typescript"],
+
+    "@getagenttab/site": ["@getagenttab/site@workspace:packages/site"],
+
+    "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
+
+    "@types/chrome": ["@types/chrome@0.1.43", "", { "dependencies": { "@types/filesystem": "*", "@types/har-format": "*" } }, "sha512-ukH/HhmR6ht+UTX3PLUWJxgJ/RQcK2Foj4lBzsF24SIWsXgqhGuXqjd8FFuwioPP7d/JUKLM4g8GZxw3F4HTcA=="],
+
+    "@types/filesystem": ["@types/filesystem@0.0.36", "", { "dependencies": { "@types/filewriter": "*" } }, "sha512-vPDXOZuannb9FZdxgHnqSwAG/jvdGM8Wq+6N4D/d80z+D4HWH+bItqsZaVRQykAn6WEVeEkLm2oQigyHtgb0RA=="],
+
+    "@types/filewriter": ["@types/filewriter@0.0.33", "", {}, "sha512-xFU8ZXTw4gd358lb2jw25nxY9QAgqn2+bKKjKOYfNCzN4DKCFetK7sPtrlpg66Ywe3vWY9FNxprZawAh9wfJ3g=="],
+
+    "@types/har-format": ["@types/har-format@1.2.16", "", {}, "sha512-fluxdy7ryD3MV6h8pTfTYpy/xQzCFC7m89nOH9y94cNqJ1mDIDPut7MnRHI3F6qRmh/cT2fUjG1MLdCNb4hE9A=="],
+
+    "@types/node": ["@types/node@24.13.3", "", { "dependencies": { "undici-types": "~7.18.0" } }, "sha512-Dh8vAsV36ig5wa9OX4pXvMc9D3Veibfw2wix0CUwYODLD8nkj9UsLjASr49nPg+2eKzxhBV+v7L8pXvT4e639Q=="],
+
+    "agenttab": ["agenttab@workspace:packages/installer"],
+
+    "agenttab-mcp": ["agenttab-mcp@workspace:packages/mcp"],
+
+    "bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "typebox": ["typebox@1.3.22", "", {}, "sha512-YoX6QdtuJR/+YpP/qXf9gJXTxvSuiUlKYgW3AilsOSLlsZe/VH6ILR5vhoJM5QXY//uzIRE7NYij3h2+nG9vRQ=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@7.18.2", "", {}, "sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w=="],
+
+    "yaml": ["yaml@2.9.0", "", { "bin": { "yaml": "bin.mjs" } }, "sha512-2AvhNX3mb8zd6Zy7INTtSpl1F15HW6Wnqj0srWlkKLcpYl/gMIMJiyuGq2KeI2YFxUPjdlB+3Lc10seMLtL4cA=="],
+
+    "bun-types/@types/node": ["@types/node@26.2.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg=="],
+
+    "bun-types/@types/node/undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+  }
+}

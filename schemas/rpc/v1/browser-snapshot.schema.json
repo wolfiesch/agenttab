@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-snapshot.schema.json",
+  "title": "browser_snapshot parameters",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["tab_id", "mode"],
+      "properties": {
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "mode": { "const": "accessibility" },
+        "root_ref": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "max_depth": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "max_nodes": { "type": "integer", "minimum": 1, "maximum": 5000 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["tab_id", "mode"],
+      "properties": {
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "mode": { "enum": ["text", "html"] },
+        "selector": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["tab_id", "mode"],
+      "properties": {
+        "tab_id": { "type": "integer", "minimum": 0 },
+        "mode": { "const": "screenshot" },
+        "selector": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "full_page": { "type": "boolean", "default": false }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

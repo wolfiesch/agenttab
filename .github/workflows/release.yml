@@ -4,70 +4,604 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated vX.Y.Z release tag
+        required: true
+        type: string
+      publish_registries:
+        description: Publish the GitHub release, then npm and PyPI packages after the artifact graph succeeds
+        required: true
+        default: false
+        type: boolean
+      confirm_version:
+        description: Exact release version without v required for registry publication
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: macos-latest
+  prepare:
+    name: Validate release identity
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      python_version: ${{ steps.release.outputs.python_version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      promote: ${{ steps.release.outputs.promote }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+      - id: release
+        name: Verify annotated tag and main reachability
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          PROMOTE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_registries }}
+          CONFIRM_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_version || '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "Release tag must begin with v" >&2; exit 2 ;;
+          esac
+          git fetch --force origin main
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git cat-file -t "refs/tags/${RELEASE_TAG}")" = tag
+          release_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          git merge-base --is-ancestor "$release_commit" origin/main
+          identity="$(python3 scripts/verify_release_identity.py --tag "$RELEASE_TAG" --json)"
+          release_version="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' <<<"$identity")"
+          python_version="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["python_version"])' <<<"$identity")"
+          prerelease=false
+          if [[ "$release_version" == *-* ]]; then prerelease=true; fi
+          if [[ "$PROMOTE_RELEASE" == true && "$CONFIRM_VERSION" != "$release_version" ]]; then
+            echo "confirm_version must exactly match $release_version for publication" >&2
+            exit 2
+          fi
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "version=$release_version"
+            echo "python_version=$python_version"
+            echo "prerelease=$prerelease"
+            echo "promote=$PROMOTE_RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Run exact tag gates
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.11'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Run CI gates
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.3.14'
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - name: Install validation dependencies
         run: |
-          python3 -m pip install -e ./mcp
-          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile bridge.py broker.py bridge_wake.py test_client.py benchmark_harness.py extension_identity.py verify_bridge.py verify_cli_contract.py verify_broker_contract.py verify_github_attachment_contract.py verify_heartbeat_contract.py verify_task_session_contract.py verify_brand_shell_contract.py verify_benchmark_harness.py verify_install_contract.py verify_agent_actions_live.py verify_capability_matrix.py verify_lease_contract.py verify_lease_stress_contract.py verify_mcp_contract.py verify_guardrails_contract.py verify_live_install_smoke.py scripts/background_reliability.py scripts/package_release.py
-          node --check background.js
-          node --check wake.js
-          node --check popup.js
-          diff -q manifest.json extension/manifest.json
-          diff -q background.js extension/background.js
-          diff -q wake.html extension/wake.html
-          diff -q wake.js extension/wake.js
-          diff -q popup.html extension/popup.html
-          diff -q popup.css extension/popup.css
-          diff -q popup.js extension/popup.js
-          diff -qr icons extension/icons
-          PYTHONDONTWRITEBYTECODE=1 ./verify_cli_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_heartbeat_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_broker_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_task_session_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_brand_shell_contract.py
-          node verify_brand_shell_behavior.mjs
-          PYTHONDONTWRITEBYTECODE=1 ./verify_github_attachment_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_bridge.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_mcp_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_moat_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_install_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
-          cargo build --release --manifest-path host-rs/Cargo.toml
-          python3 scripts/package_release.py --version ci --dist /tmp/chrome-bridge-dist
-          PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_lease_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_lease_stress_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_guardrails_contract.py
-          PYTHONDONTWRITEBYTECODE=1 ./verify_benchmark_harness.py
-          python3 benchmark_harness.py run --adapter noop --iterations 2 --output /tmp/chrome-bridge-noop.json
-          python3 benchmark_harness.py compare --input /tmp/chrome-bridge-noop.json --output /tmp/chrome-bridge-report.md --junit-output /tmp/chrome-bridge-benchmark.xml --github-step-summary "$GITHUB_STEP_SUMMARY"
-          grep -q "Claim Discipline" /tmp/chrome-bridge-report.md
-      - name: Package release artifacts
-        run: python3 scripts/package_release.py --version ${{ github.ref_name }} --dist /tmp/chrome-bridge-release-dist
-      - uses: actions/upload-artifact@v4
+          python3 -m pip install jsonschema==4.25.1
+          bun install --frozen-lockfile
+      - name: Run source and runtime gates
+        run: |
+          python3 scripts/verify_release_identity.py --tag '${{ needs.prepare.outputs.tag }}'
+          python3 tests/architecture/verify_identity.py --release
+          bun run workspace:typecheck
+          bun run workspace:test
+          bun run workspace:build
+          PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=packages/sdk-python python3 -m unittest discover -s packages/sdk-python/tests -v
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_protocol_schemas.py
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_identity.py
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_forbidden_surface.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_package_host_archive scripts.test_package_artifact_manifest scripts.test_verify_release_asset_set
+          cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
+
+  build-host:
+    name: Build host (${{ matrix.target }})
+    needs: [prepare, validate]
+    if: ${{ needs.prepare.outputs.promote != 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          name: chrome-native-bridge-source-${{ github.ref_name }}
-          path: /tmp/chrome-bridge-release-dist/chrome-native-bridge-source-${{ github.ref_name }}.zip
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          name: chrome-native-bridge-extension-unpacked-${{ github.ref_name }}
-          path: /tmp/chrome-bridge-release-dist/chrome-native-bridge-extension-unpacked-${{ github.ref_name }}.zip
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          name: bridge-host-${{ runner.os }}-${{ github.ref_name }}
-          path: /tmp/chrome-bridge-release-dist/bridge-host-${{ runner.os }}-${{ github.ref_name }}
+          toolchain: stable
+      - name: Build host and verify deterministic unsigned output
+        env:
+          CARGO_INCREMENTAL: '0'
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path host-rs/Cargo.toml --package agenttab-host --target "$TARGET"
+          binary="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-host"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
+          unsigned_copy="$RUNNER_TEMP/agenttab-host-${TARGET}-unsigned"
+          cp "$binary" "$unsigned_copy"
+          cargo clean --release --locked --manifest-path host-rs/Cargo.toml --package agenttab-host --target "$TARGET"
+          cargo build --release --locked --manifest-path host-rs/Cargo.toml --package agenttab-host --target "$TARGET"
+          cmp "$unsigned_copy" "$binary"
+          rm -f "$unsigned_copy"
+      - name: Sign and notarize macOS host
+        if: ${{ runner.os == 'macOS' }}
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${MACOS_CERTIFICATE_P12_BASE64:?missing MACOS_CERTIFICATE_P12_BASE64}"
+          : "${MACOS_CERTIFICATE_PASSWORD:?missing MACOS_CERTIFICATE_PASSWORD}"
+          : "${MACOS_SIGNING_IDENTITY:?missing MACOS_SIGNING_IDENTITY}"
+          : "${APPLE_NOTARY_KEY_ID:?missing APPLE_NOTARY_KEY_ID}"
+          : "${APPLE_NOTARY_ISSUER_ID:?missing APPLE_NOTARY_ISSUER_ID}"
+          : "${APPLE_NOTARY_KEY_P8_BASE64:?missing APPLE_NOTARY_KEY_P8_BASE64}"
+          certificate="$RUNNER_TEMP/agenttab-signing.p12"
+          notary_key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          keychain="$RUNNER_TEMP/agenttab-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          notarization_zip="$RUNNER_TEMP/agenttab-notarization-${TARGET}.zip"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -f "$certificate" "$notary_key" "$notarization_zip"
+          }
+          trap cleanup EXIT
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | /usr/bin/base64 -D > "$certificate"
+          printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | /usr/bin/base64 -D > "$notary_key"
+          chmod 600 "$certificate" "$notary_key"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security import "$certificate" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          binary="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-host"
+          /usr/bin/codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$MACOS_SIGNING_IDENTITY" "$binary"
+          /usr/bin/codesign --verify --strict --verbose=2 "$binary"
+          /usr/bin/ditto -c -k --keepParent "$binary" "$notarization_zip"
+          xcrun notarytool submit "$notarization_zip" \
+            --key "$notary_key" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait
+      - name: Authenticode-sign Windows host
+        if: ${{ runner.os == 'Windows' }}
+        env:
+          TARGET: ${{ matrix.target }}
+          WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)) {
+            throw "missing WINDOWS_SIGNING_CERTIFICATE_BASE64"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD)) {
+            throw "missing WINDOWS_SIGNING_CERTIFICATE_PASSWORD"
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP "agenttab-signing.pfx"
+          [IO.File]::WriteAllBytes(
+            $certificatePath,
+            [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)
+          )
+          $certificate = $null
+          try {
+            $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = @(Import-PfxCertificate `
+              -FilePath $certificatePath `
+              -CertStoreLocation Cert:\CurrentUser\My `
+              -Password $password)[0]
+            if ($null -eq $certificate) { throw "Windows signing certificate import returned no certificate" }
+            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if ($null -eq $signTool) { throw "signtool.exe was not found" }
+            $binary = Join-Path $env:GITHUB_WORKSPACE "host-rs\target\$env:TARGET\release\agenttab-host.exe"
+            & $signTool.FullName sign /sha1 $certificate.Thumbprint /fd SHA256 `
+              /tr http://timestamp.digicert.com /td SHA256 $binary
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
+            & $signTool.FullName verify /pa /all $binary
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE" }
+          } finally {
+            if ($null -ne $certificate) {
+              Remove-Item "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item $certificatePath -Force -ErrorAction SilentlyContinue
+          }
+      - name: Package signed host
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_DIR: ${{ runner.temp }}/release-host
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-host"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
+          python scripts/package_host_archive.py --version "$RELEASE_VERSION" --target "$TARGET" --binary "$binary" --out-dir "$RELEASE_DIR"
+          archive="$RELEASE_DIR/agenttab-host-v${RELEASE_VERSION}-${TARGET}.$([[ "$TARGET" == *windows-msvc ]] && printf zip || printf tar.gz)"
+          python scripts/verify_release_archives.py --host-archive "$archive" --target "$TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-host-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-host
           if-no-files-found: error
+          retention-days: 14
+
+  package-artifacts:
+    name: Package source artifacts
+    needs: [prepare, validate]
+    if: ${{ needs.prepare.outputs.promote != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.3.14'
+      - name: Build and package release inputs
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_INPUT: ${{ runner.temp }}/release-input
+          AGENTTAB_EXTENSION_CHANNEL: store
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_release_identity.py --tag "$RELEASE_TAG"
+          bun install --frozen-lockfile
+          bun run workspace:build
+          bun run --cwd packages/extension build
+          mkdir -p "$RELEASE_INPUT"
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/sdk-typescript
+          mv "$RELEASE_INPUT/getagenttab-sdk-${RELEASE_VERSION}.tgz" "$RELEASE_INPUT/agenttab-sdk-${RELEASE_VERSION}.tgz"
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/mcp
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/omp
+          mv "$RELEASE_INPUT/getagenttab-omp-${RELEASE_VERSION}.tgz" "$RELEASE_INPUT/agenttab-omp-${RELEASE_VERSION}.tgz"
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/installer
+          python3 -m pip install build==1.3.0
+          python3 -m build --wheel --sdist --outdir "$RELEASE_INPUT" packages/sdk-python
+          python3 scripts/package_extension_store.py \
+            --source packages/extension/dist \
+            --out "$RELEASE_INPUT/agenttab-extension-v${RELEASE_VERSION}.zip" \
+            --check-js
+          python3 scripts/verify_release_archives.py --package-dir "$RELEASE_INPUT" --tag "$RELEASE_TAG"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-source
+          path: ${{ runner.temp }}/release-input
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble release evidence
+    needs: [prepare, build-host, package-artifacts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.3.14'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: ${{ runner.temp }}/release-input
+          merge-multiple: true
+      - name: Assemble, sign, and verify exact release bytes
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_INPUT: ${{ runner.temp }}/release-input
+          RELEASE_DIR: ${{ runner.temp }}/release
+          AGENTTAB_RELEASE_PRIVATE_KEY_BASE64: ${{ secrets.AGENTTAB_RELEASE_PRIVATE_KEY_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${AGENTTAB_RELEASE_PRIVATE_KEY_BASE64:?missing AGENTTAB_RELEASE_PRIVATE_KEY_BASE64}"
+          private_key="$RUNNER_TEMP/agenttab-release-key.pem"
+          cleanup() { rm -f "$private_key"; }
+          trap cleanup EXIT
+          printf '%s' "$AGENTTAB_RELEASE_PRIVATE_KEY_BASE64" | base64 --decode > "$private_key"
+          chmod 600 "$private_key"
+          python3 scripts/package_artifact_manifest.py --tag "$RELEASE_TAG" --input-dir "$RELEASE_INPUT" --out-dir "$RELEASE_DIR"
+          bun run packages/installer/scripts/sign-artifact-manifest.ts \
+            --version "$RELEASE_VERSION" \
+            --assets-dir "$RELEASE_DIR" \
+            --private-key "$private_key"
+          bun run packages/installer/scripts/sign-artifact-manifest.ts \
+            --version "$RELEASE_VERSION" \
+            --assets-dir "$RELEASE_DIR" \
+            --verify-only
+          python3 scripts/verify_release_archives.py --release-dir "$RELEASE_DIR" --tag "$RELEASE_TAG"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-assembled
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pypi-distributions
+          path: |
+            ${{ runner.temp }}/release/agenttab-${{ needs.prepare.outputs.python_version }}-py3-none-any.whl
+            ${{ runner.temp }}/release/agenttab-${{ needs.prepare.outputs.python_version }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    name: Attest release evidence
+    needs: [prepare, assemble]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-assembled
+          path: ${{ runner.temp }}/release
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-name: agenttab-${{ needs.prepare.outputs.tag }}
+          subject-path: ${{ runner.temp }}/release/*
+
+  restore-draft:
+    name: Restore signed draft assets
+    needs: [prepare, validate]
+    if: ${{ needs.prepare.outputs.promote == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.3.14'
+      - name: Download and verify the original draft bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+        shell: bash
+        run: |
+          set -euo pipefail
+          is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+          is_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')"
+          if [[ "$is_draft" != true || "$is_prerelease" != "$PRERELEASE" ]]; then
+            echo "Existing release is not the expected draft" >&2
+            exit 1
+          fi
+          mkdir -p "$RELEASE_DIR"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$RELEASE_DIR"
+          bun run packages/installer/scripts/sign-artifact-manifest.ts \
+            --version "$RELEASE_VERSION" \
+            --assets-dir "$RELEASE_DIR" \
+            --verify-only
+          python3 scripts/verify_release_archives.py --release-dir "$RELEASE_DIR" --tag "$RELEASE_TAG"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-assembled
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pypi-distributions
+          path: |
+            ${{ runner.temp }}/release/agenttab-${{ needs.prepare.outputs.python_version }}-py3-none-any.whl
+            ${{ runner.temp }}/release/agenttab-${{ needs.prepare.outputs.python_version }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Create or publish exact release
+    needs: [prepare, assemble, attest, restore-draft]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        (
+          (needs.prepare.outputs.promote == 'true' && needs.restore-draft.result == 'success') ||
+          (
+            needs.prepare.outputs.promote != 'true' &&
+            needs.assemble.result == 'success' &&
+            needs.attest.result == 'success'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-assembled
+          path: ${{ runner.temp }}/release
+      - name: Create a draft or publish its verified immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          PUBLISH_RELEASE: ${{ needs.prepare.outputs.promote }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [[ "$PUBLISH_RELEASE" != true ]]; then
+              echo "Refusing to replace an existing release or its assets" >&2
+              exit 1
+            fi
+            is_draft="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+            is_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')"
+            if [[ "$is_draft" != true || "$is_prerelease" != "$PRERELEASE" ]]; then
+              echo "Existing release is not the expected draft" >&2
+              exit 1
+            fi
+            existing_dir="$RUNNER_TEMP/release-existing"
+            mkdir -p "$existing_dir"
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$existing_dir"
+            python3 scripts/verify_release_asset_set.py \
+              --expected-dir "$RELEASE_DIR" \
+              --actual-dir "$existing_dir"
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          else
+            args=(release create "$RELEASE_TAG" "$RELEASE_DIR"/* --repo "$GITHUB_REPOSITORY" --title "AgentTab $RELEASE_VERSION" --notes "Verify the attached checksums, SBOM, and provenance before installation.")
+            if [[ "$PUBLISH_RELEASE" != true ]]; then args+=(--draft); fi
+            if [[ "$PRERELEASE" == true ]]; then args+=(--prerelease); fi
+            gh "${args[@]}"
+          fi
+
+  publish-npm:
+    name: Publish npm (${{ matrix.package }})
+    needs: [prepare, release]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: '@getagenttab/sdk'
+            archive: agenttab-sdk
+          - package: agenttab-mcp
+            archive: agenttab-mcp
+          - package: '@getagenttab/omp'
+            archive: agenttab-omp
+          - package: agenttab
+            archive: agenttab
+    if: ${{ needs.prepare.outputs.promote == 'true' }}
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-assembled
+          path: ${{ runner.temp }}/release
+      - name: Publish exact public package archives
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          PACKAGE_ARCHIVE: ${{ matrix.archive }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$NODE_AUTH_TOKEN"
+          channel=latest
+          if [[ "$PRERELEASE" == true ]]; then channel=next; fi
+          npm publish "$RELEASE_DIR/${PACKAGE_ARCHIVE}-${RELEASE_VERSION}.tgz" --access public --tag "$channel" --provenance
+
+  publish-pypi:
+    name: Publish PyPI package
+    needs: [prepare, release]
+    if: ${{ needs.prepare.outputs.promote == 'true' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: pypi-distributions
+          path: ${{ runner.temp }}/pypi
+      - name: Publish exact Python distributions
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          packages-dir: ${{ runner.temp }}/pypi
