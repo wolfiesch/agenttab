@@ -27,6 +27,7 @@ use thiserror::Error;
 use uuid::Uuid;
 const RESPONSE_TASK_BINDING_RESERVE: usize = 512;
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TAB_STAGED_EFFECT: &str = "Close an AgentTab-owned browser tab";
 
 #[derive(Debug, Error)]
 pub enum RuntimeBuildError {
@@ -1090,22 +1091,24 @@ impl Runtime {
                         }
                     };
                 let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
-                if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
-                    let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
-                    let finish = self.journal.finish_staged_commit(&staged.native_token);
-                    return match (cleanup, finish) {
-                        (Ok(()), Ok(())) => {
-                            RpcResponse::failure(request_id, Outcome::NotStarted, error)
-                        }
-                        (Err(cleanup_error), _) => {
-                            RpcResponse::failure(request_id, Outcome::Unknown, cleanup_error)
-                        }
-                        (_, Err(journal_error)) => RpcResponse::failure(
-                            request_id,
-                            Outcome::Unknown,
-                            journal_rpc_error(journal_error),
-                        ),
-                    };
+                if staged_commit_requires_verified_current_tab(&staged.effect, tab_url.as_deref()) {
+                    if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
+                        let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
+                        let finish = self.journal.finish_staged_commit(&staged.native_token);
+                        return match (cleanup, finish) {
+                            (Ok(()), Ok(())) => {
+                                RpcResponse::failure(request_id, Outcome::NotStarted, error)
+                            }
+                            (Err(cleanup_error), _) => {
+                                RpcResponse::failure(request_id, Outcome::Unknown, cleanup_error)
+                            }
+                            (_, Err(journal_error)) => RpcResponse::failure(
+                                request_id,
+                                Outcome::Unknown,
+                                journal_rpc_error(journal_error),
+                            ),
+                        };
+                    }
                 }
                 let origin_policy = self.guardrails.native_origin_policy(staged.tab_id);
                 committed_native_token = Some(staged.native_token.clone());
@@ -1356,6 +1359,18 @@ fn is_tab_only_request(params: &MethodParams) -> bool {
         _ => false,
     }
 }
+fn staged_commit_requires_verified_current_tab(effect: &str, tab_url: Option<&str>) -> bool {
+    if effect != CLOSE_TAB_STAGED_EFFECT {
+        return true;
+    }
+    let Some(raw_url) = tab_url else {
+        return true;
+    };
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return true;
+    };
+    matches!(url.scheme(), "http" | "https") || (url.scheme() == "about" && url.path() == "blank")
+}
 
 fn staged_matches_act(params: &MethodParams, staged: &NativeStagedCommit) -> bool {
     matches!(
@@ -1604,6 +1619,7 @@ mod tests {
     struct FakeNative {
         calls: AtomicUsize,
         staged: Mutex<bool>,
+        staged_effect: Mutex<String>,
         sensitive_error: bool,
         close_task_error: bool,
         current_commit_origin: Mutex<Option<String>>,
@@ -1619,6 +1635,7 @@ mod tests {
             Arc::new(Self {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
+                staged_effect: Mutex::new("submit purchase".into()),
                 sensitive_error: false,
                 close_task_error: false,
                 current_commit_origin: Mutex::new(None),
@@ -1635,6 +1652,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: true,
+                staged_effect: Mutex::new("submit purchase".into()),
                 close_task_error: false,
                 current_commit_origin: Mutex::new(None),
                 executed_commits: AtomicUsize::new(0),
@@ -1650,6 +1668,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(true),
                 sensitive_error: false,
+                staged_effect: Mutex::new("submit purchase".into()),
                 close_task_error: false,
                 current_commit_origin: Mutex::new(None),
                 executed_commits: AtomicUsize::new(0),
@@ -1665,6 +1684,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 staged: Mutex::new(false),
                 sensitive_error: false,
+                staged_effect: Mutex::new("submit purchase".into()),
                 close_task_error: true,
                 current_commit_origin: Mutex::new(None),
                 executed_commits: AtomicUsize::new(0),
@@ -1723,7 +1743,7 @@ mod tests {
                         task_id,
                         tab_id: 3,
                         page_revision: 7,
-                        effect: "submit purchase".into(),
+                        effect: self.staged_effect.lock().clone(),
                         fingerprint: "f".repeat(64),
                         expires_at_ms: current_time_ms() + 60_000,
                     }),
@@ -2487,6 +2507,63 @@ mod tests {
             .approve_popup_staged_commit(task_id, 3, &event.review_handle)
             .is_err());
     }
+    #[test]
+    fn approved_close_commit_executes_on_browser_restricted_tab() {
+        let native = FakeNative::staging();
+        *native.staged_effect.lock() = CLOSE_TAB_STAGED_EFFECT.into();
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let task_id = own_tab(&runtime, &connection, 7);
+        runtime
+            .tab_urls
+            .write()
+            .insert(3, "chrome://settings/".into());
+        let stage = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "stage-restricted-close",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_act",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "actions": [{"kind": "close"}]
+                }
+            }),
+        );
+        assert_eq!(stage["outcome"], "commit_required");
+        let staged_token = stage["result"]["staged_token"].as_str().unwrap().to_owned();
+        let review_handle = native.last_params.lock().as_ref().unwrap()["review_handle"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        *native.staged.lock() = false;
+        let approved = runtime.commit_popup_review(
+            &NativePopupCommitEvent {
+                review_handle,
+                task_id,
+                tab_id: 3,
+            },
+            &Uuid::now_v7().to_string(),
+        );
+        assert_eq!(approved.outcome, Outcome::Completed);
+
+        let committed = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "commit-restricted-close",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_commit",
+                "params": {"staged_token": staged_token}
+            }),
+        );
+        assert_eq!(committed["outcome"], "completed");
+        assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn popup_review_rejects_mismatched_or_unknown_handles_without_execution() {
         let native = FakeNative::staging();
