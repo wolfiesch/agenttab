@@ -2086,7 +2086,13 @@ describe("page revision monotonicity", () => {
                                             ? { name: "mfaCode" }
                                             : objectId.endsWith("-40")
                                               ? { "aria-label": "MFA token" }
-                                              : { name: "multiFactorAuthenticationCode" };
+                                              : objectId.endsWith("-41")
+                                                ? { name: "multiFactorAuthenticationCode" }
+                                                : objectId.endsWith("-42")
+                                                  ? { name: "captcha", "aria-label": "Enter CAPTCHA" }
+                                                  : objectId.endsWith("-43")
+                                                    ? { name: "h-captcha-response" }
+                                                    : { name: "g-recaptcha-response" };
         const target = {
           form: null,
           labels: [],
@@ -2145,6 +2151,9 @@ describe("page revision monotonicity", () => {
       { kind: "fill", ref: `r${pageRevision}-39`, text: "123456" },
       { kind: "fill", ref: `r${pageRevision}-40`, text: "123456" },
       { kind: "fill", ref: `r${pageRevision}-41`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-42`, text: "human-response" },
+      { kind: "fill", ref: `r${pageRevision}-43`, text: "human-response" },
+      { kind: "fill", ref: `r${pageRevision}-44`, text: "human-response" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
