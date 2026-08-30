@@ -39,9 +39,9 @@ def verify(*, release: bool) -> None:
     assert identity["packages"] == {
         "cli": "agenttab",
         "mcp": "agenttab-mcp",
-        "typescript": "@agenttab/sdk",
+        "typescript": "@getagenttab/sdk",
         "python": "agenttab",
-        "omp": "@agenttab/omp",
+        "omp": "@getagenttab/omp",
     }
     development = identity["developmentExtension"]
     assert chrome_id(development["publicKey"]) == development["id"]
@@ -53,7 +53,7 @@ def verify(*, release: bool) -> None:
 
     package_expectations = {
         ROOT / "package.json": ("agenttab", version),
-        ROOT / "packages" / "extension" / "package.json": ("@agenttab/extension", version),
+        ROOT / "packages" / "extension" / "package.json": ("@getagenttab/extension", version),
         ROOT / "packages" / "installer" / "package.json": (identity["packages"]["cli"], version),
         ROOT / "packages" / "mcp" / "package.json": (identity["packages"]["mcp"], version),
         ROOT / "packages" / "omp" / "package.json": (identity["packages"]["omp"], version),

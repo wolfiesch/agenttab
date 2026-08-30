@@ -36,17 +36,6 @@ if (derivedDevelopmentId !== identity.developmentExtension.id) {
   );
 }
 const outputRoot = join(packageRoot, "dist");
-const compatibilityFiles = [
-  "manifest.json",
-  "background.js",
-  "popup.html",
-  "popup.css",
-  "popup.js",
-  "wake.html",
-  "wake.js",
-];
-const iconSource = join(sourceRoot, "icons", "icon-source.svg");
-
 await rm(outputRoot, { recursive: true, force: true });
 await mkdir(outputRoot, { recursive: true });
 
@@ -119,20 +108,6 @@ for (const output of result.outputs) {
     throw new Error(`Dynamic code execution found in ${basename(output.path)}`);
   }
 }
-if (channel === "development") {
-  const extensionMirror = join(repoRoot, "extension");
-  await rm(extensionMirror, { recursive: true, force: true });
-  await mkdir(extensionMirror, { recursive: true });
-  await rm(join(repoRoot, "icons"), { recursive: true, force: true });
-  for (const root of [repoRoot, extensionMirror]) {
-    for (const name of compatibilityFiles) {
-      await cp(join(outputRoot, name), join(root, name));
-    }
-    await cp(join(outputRoot, "icons"), join(root, "icons"), { recursive: true });
-    await cp(iconSource, join(root, "icons", "icon-source.svg"));
-  }
-}
-
 console.log(
   `Built AgentTab ${channel} extension ${String(manifest.version)} for ${channel === "development" ? identity.developmentExtension.id : identity.webStoreExtensionId
   } at ${outputRoot}`,

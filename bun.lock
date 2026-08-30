@@ -6,7 +6,7 @@
       "name": "agenttab",
     },
     "packages/extension": {
-      "name": "@agenttab/extension",
+      "name": "@getagenttab/extension",
       "version": "2.0.0-rc.1",
       "devDependencies": {
         "@types/bun": "^1.2.23",
@@ -40,7 +40,7 @@
       },
     },
     "packages/omp": {
-      "name": "@agenttab/omp",
+      "name": "@getagenttab/omp",
       "version": "2.0.0-rc.1",
       "dependencies": {
         "typebox": "^1.3.7",
@@ -52,7 +52,7 @@
       },
     },
     "packages/sdk-typescript": {
-      "name": "@agenttab/sdk",
+      "name": "@getagenttab/sdk",
       "version": "2.0.0-rc.1",
       "devDependencies": {
         "@types/bun": "^1.2.23",
@@ -61,7 +61,7 @@
       },
     },
     "packages/site": {
-      "name": "@agenttab/site",
+      "name": "@getagenttab/site",
       "version": "2.0.0-rc.1",
       "devDependencies": {
         "@types/bun": "^1.2.23",
@@ -71,13 +71,13 @@
     },
   },
   "packages": {
-    "@agenttab/extension": ["@agenttab/extension@workspace:packages/extension"],
+    "@getagenttab/extension": ["@getagenttab/extension@workspace:packages/extension"],
 
-    "@agenttab/omp": ["@agenttab/omp@workspace:packages/omp"],
+    "@getagenttab/omp": ["@getagenttab/omp@workspace:packages/omp"],
 
-    "@agenttab/sdk": ["@agenttab/sdk@workspace:packages/sdk-typescript"],
+    "@getagenttab/sdk": ["@getagenttab/sdk@workspace:packages/sdk-typescript"],
 
-    "@agenttab/site": ["@agenttab/site@workspace:packages/site"],
+    "@getagenttab/site": ["@getagenttab/site@workspace:packages/site"],
 
     "@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
 

@@ -16,16 +16,14 @@ SEMVER = re.compile(
 )
 PYTHON_PRE_RELEASE = re.compile(r"^(?P<kind>a|alpha|b|beta|rc)[.-]?(?P<number>[0-9]+)$", re.IGNORECASE)
 PACKAGE_MANIFESTS = {
-    "packages/extension/package.json": "@agenttab/extension",
-    "packages/sdk-typescript/package.json": "@agenttab/sdk",
+    "packages/extension/package.json": "@getagenttab/extension",
+    "packages/sdk-typescript/package.json": "@getagenttab/sdk",
     "packages/mcp/package.json": "agenttab-mcp",
-    "packages/omp/package.json": "@agenttab/omp",
+    "packages/omp/package.json": "@getagenttab/omp",
     "packages/installer/package.json": "agenttab",
 }
 EXTENSION_MANIFESTS = (
     "packages/extension/src/manifest.json",
-    "manifest.json",
-    "extension/manifest.json",
 )
 RUST_PACKAGES = {
     "host-rs/crates/agenttab-host/Cargo.toml": "agenttab-host",
@@ -114,9 +112,9 @@ def verify(root: Path, tag: str) -> dict[str, str]:
     for key, expected in {
         "cli": "agenttab",
         "mcp": "agenttab-mcp",
-        "typescript": "@agenttab/sdk",
+        "typescript": "@getagenttab/sdk",
         "python": "agenttab",
-        "omp": "@agenttab/omp",
+        "omp": "@getagenttab/omp",
     }.items():
         expect(errors, packages.get(key), expected, f"config/identity.json:packages.{key}")
 
