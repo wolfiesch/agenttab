@@ -192,12 +192,14 @@
 
     <script>
       (() => {
-        if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        if (
+          matchMedia("(prefers-reduced-motion: reduce)").matches ||
+          !("IntersectionObserver" in window)
+        ) return;
         const targets = document.querySelectorAll(
           ".section-heading, .outcome-card, .step-list li, .boundary-card, .risk-note, .workspace-preview"
         );
         targets.forEach((el) => el.setAttribute("data-reveal", ""));
-        if (!("IntersectionObserver" in window)) return;
         const io = new IntersectionObserver(
           (entries) => {
             for (const entry of entries) {

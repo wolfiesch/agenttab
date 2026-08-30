@@ -57,6 +57,7 @@
 
 html {
   scroll-behavior: smooth;
+  scroll-padding-top: 5.5rem;
 }
 
 body {
@@ -1125,6 +1126,9 @@ nav a[aria-current="page"],
 
   .nav-shell {
     min-height: 0;
+  }
+  html {
+    scroll-padding-top: 8rem;
   }
 
   nav {
