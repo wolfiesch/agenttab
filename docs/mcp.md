@@ -68,7 +68,7 @@ For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. 
 | `browser_wait` | Requires `tab_id` and one load, URL, text, selector, network-idle, or download condition. `timeout_ms` is at most 120 seconds. A `tab_only` route accepts load, URL, and download conditions only. |
 | `browser_tabs` | Takes an empty object and lists only the current task's tabs, including each tab's `automation_route`. |
 | `browser_handoff` | Requires a task tab, expected page revision, prompt, completion condition, and optional timeout. Completion can be navigation, manual completion, a URL, or a selector. It remains available on a `tab_only` route because AgentTab blocks agent observation while the human controls the tab, but selector completion requires the `full` route. |
-| `browser_commit` | Requires the staged token returned by a prior `commit_required` action and executes that one staged operation. |
+| `browser_commit` | Requires the staged token returned by a prior `commit_required` action and executes that one staged operation. On a `tab_only` route, only a staged close can execute; page-dependent staged actions require the `full` route. |
 
 Every existing-page mutation carries its expected page revision. If navigation or document replacement makes that revision stale, AgentTab rejects the operation rather than selecting a new target.
 

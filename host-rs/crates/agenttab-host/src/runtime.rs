@@ -1090,8 +1090,8 @@ impl Runtime {
                             )
                         }
                     };
-                let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
-                if staged_commit_requires_verified_current_tab(&staged.effect, tab_url.as_deref()) {
+                if staged_commit_requires_verified_current_tab(&staged.effect) {
+                    let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
                     if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
                         let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
                         let finish = self.journal.finish_staged_commit(&staged.native_token);
@@ -1359,17 +1359,8 @@ fn is_tab_only_request(params: &MethodParams) -> bool {
         _ => false,
     }
 }
-fn staged_commit_requires_verified_current_tab(effect: &str, tab_url: Option<&str>) -> bool {
-    if effect != CLOSE_TAB_STAGED_EFFECT {
-        return true;
-    }
-    let Some(raw_url) = tab_url else {
-        return true;
-    };
-    let Ok(url) = url::Url::parse(raw_url) else {
-        return true;
-    };
-    matches!(url.scheme(), "http" | "https") || (url.scheme() == "about" && url.path() == "blank")
+fn staged_commit_requires_verified_current_tab(effect: &str) -> bool {
+    effect != CLOSE_TAB_STAGED_EFFECT
 }
 
 fn staged_matches_act(params: &MethodParams, staged: &NativeStagedCommit) -> bool {
@@ -1863,6 +1854,31 @@ mod tests {
         (temp, runtime, connection)
     }
 
+    fn connected_runtime_with_policy(
+        native: Arc<dyn NativeTransport>,
+        policy: &str,
+    ) -> (tempfile::TempDir, Arc<Runtime>, Arc<ConnectionContext>) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
+        paths.prepare().unwrap();
+        std::fs::write(&paths.policy_file, policy).unwrap();
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+        let runtime =
+            Runtime::for_test(&paths, lifecycle, native, Arc::new(HandoffState::default()));
+        let (connection, _) = runtime
+            .connect(ConnectionInit {
+                protocol: RPC_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: ConnectKind::Connect,
+                conversation_id: None,
+                resume_capability: None,
+            })
+            .unwrap();
+        (temp, runtime, connection)
+    }
+
     fn connected_runtime_with_upload_root(
         native: Arc<dyn NativeTransport>,
     ) -> (
@@ -2274,33 +2290,11 @@ mod tests {
     }
     #[test]
     fn commit_rechecks_staged_tab_policy_after_navigation() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
-        paths.prepare().unwrap();
-        std::fs::write(
-            &paths.policy_file,
-            r#"{"denied_origins":["*.example.com"]}"#,
-        )
-        .unwrap();
-        let lifecycle = Arc::new(Lifecycle::default());
-        lifecycle.begin_reconciliation();
-        lifecycle.complete_reconciliation(false);
         let native = FakeNative::staging();
-        let runtime = Runtime::for_test(
-            &paths,
-            lifecycle,
+        let (_temp, runtime, connection) = connected_runtime_with_policy(
             native.clone(),
-            Arc::new(HandoffState::default()),
+            r#"{"denied_origins":["*.example.com"]}"#,
         );
-        let (connection, _) = runtime
-            .connect(ConnectionInit {
-                protocol: RPC_PROTOCOL.into(),
-                version: PROTOCOL_VERSION,
-                kind: ConnectKind::Connect,
-                conversation_id: None,
-                resume_capability: None,
-            })
-            .unwrap();
         let task_id = own_tab(&runtime, &connection, 7);
 
         let staged = runtime.handle(
@@ -2508,15 +2502,18 @@ mod tests {
             .is_err());
     }
     #[test]
-    fn approved_close_commit_executes_on_browser_restricted_tab() {
+    fn approved_close_commit_ignores_stale_denied_cached_url() {
         let native = FakeNative::staging();
         *native.staged_effect.lock() = CLOSE_TAB_STAGED_EFFECT.into();
-        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let (_temp, runtime, connection) = connected_runtime_with_policy(
+            native.clone(),
+            r#"{"denied_origins":["*.example.com"]}"#,
+        );
         let task_id = own_tab(&runtime, &connection, 7);
         runtime
             .tab_urls
             .write()
-            .insert(3, "chrome://settings/".into());
+            .insert(3, "https://private.example.com/stale".into());
         let stage = runtime.handle(
             &connection,
             json!({
@@ -2562,6 +2559,14 @@ mod tests {
         );
         assert_eq!(committed["outcome"], "completed");
         assert_eq!(native.executed_commits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            native.origin_policies.lock().last(),
+            Some(&Some(NativeOriginPolicy {
+                tab_id: 3,
+                allowed_origins: Vec::new(),
+                denied_origins: vec!["*.example.com".into()],
+            }))
+        );
     }
 
     #[test]
