@@ -1296,6 +1296,145 @@ describe("page revision monotonicity", () => {
     expect(debuggerCalls).not.toContain("Input.insertText");
   });
 
+  test("fills contenteditable fields and invokes native input setters", async () => {
+    class SyntheticEvent {
+      readonly bubbles: boolean;
+
+      constructor(
+        readonly type: string,
+        init: Record<string, unknown> = {},
+      ) {
+        this.bubbles = init.bubbles === true;
+      }
+    }
+    class NativeInput {
+      nativeValue = "before";
+      focused = 0;
+      readonly events: Array<{ type: string; bubbles: boolean }> = [];
+
+      get value(): string {
+        return this.nativeValue;
+      }
+
+      set value(value: string) {
+        this.nativeValue = value;
+      }
+
+      getAttribute(): null {
+        return null;
+      }
+
+      focus(): void {
+        this.focused += 1;
+      }
+
+      dispatchEvent(event: SyntheticEvent): boolean {
+        this.events.push({ type: event.type, bubbles: event.bubbles });
+        return true;
+      }
+    }
+    const contenteditable = {
+      isContentEditable: true,
+      textContent: "before",
+      focused: 0,
+      events: [] as Array<{ type: string; bubbles: boolean }>,
+      getAttribute: (): null => null,
+      focus(): void {
+        this.focused += 1;
+      },
+      dispatchEvent(event: SyntheticEvent): boolean {
+        this.events.push({ type: event.type, bubbles: event.bubbles });
+        return true;
+      },
+    };
+    const input = new NativeInput();
+    let interceptedDirectAssignment: string | undefined;
+    Object.defineProperty(input, "value", {
+      configurable: true,
+      set(value: string) {
+        interceptedDirectAssignment = value;
+      },
+    });
+    const globals: Record<string, PropertyDescriptor | undefined> = {
+      Event: Object.getOwnPropertyDescriptor(globalThis, "Event"),
+      InputEvent: Object.getOwnPropertyDescriptor(globalThis, "InputEvent"),
+      HTMLInputElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLInputElement"),
+      HTMLTextAreaElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLTextAreaElement"),
+    };
+    Object.defineProperties(globalThis, {
+      Event: { configurable: true, writable: true, value: SyntheticEvent },
+      InputEvent: { configurable: true, writable: true, value: SyntheticEvent },
+      HTMLInputElement: { configurable: true, writable: true, value: NativeInput },
+      HTMLTextAreaElement: { configurable: true, writable: true, value: class { } },
+    });
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return {
+          result: {
+            value: {
+              tag: "INPUT",
+              role: "textbox",
+              aria_label: "Profile note",
+              name: "note",
+              form_action: "https://example.test/profile",
+              form_method: "get",
+            },
+          },
+        };
+      }
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("agenttab_sensitive_field")
+      ) {
+        const target = String(params.objectId).endsWith("-22") ? contenteditable : input;
+        const declaration = Function(`return (${String(params.functionDeclaration)})`)() as (
+          this: typeof contenteditable | NativeInput,
+          value: string,
+        ) => unknown;
+        const args = Array.isArray(params.arguments) ? params.arguments : [];
+        const argument = args[0];
+        const value =
+          argument !== null && typeof argument === "object" && "value" in argument
+            ? String(argument.value ?? "")
+            : "";
+        return { result: { value: declaration.call(target, value) } };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(63);
+
+    try {
+      await runtime.act(TASK_A, 63, pageRevision, [
+        { kind: "fill", ref: `r${pageRevision}-22`, text: "content replacement" },
+        { kind: "fill", ref: `r${pageRevision}-23`, text: "native setter" },
+      ]);
+    } finally {
+      for (const [key, descriptor] of Object.entries(globals)) {
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+    }
+
+    expect(contenteditable.textContent).toBe("content replacement");
+    expect(contenteditable.focused).toBe(1);
+    expect(contenteditable.events).toEqual([
+      { type: "input", bubbles: true },
+      { type: "change", bubbles: true },
+    ]);
+    expect(input.nativeValue).toBe("native setter");
+    expect(interceptedDirectAssignment).toBeUndefined();
+    expect(input.focused).toBe(1);
+    expect(input.events).toEqual([
+      { type: "input", bubbles: true },
+      { type: "change", bubbles: true },
+    ]);
+  });
+
   test("routes password and payment fields through a human handoff before mutation", async () => {
     let focusCalls = 0;
     debuggerCommandOverride = (method, params) => {
