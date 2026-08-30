@@ -5,6 +5,7 @@ import { NativeBridge, RECONNECT_ALARM } from "../src/native";
 import { OwnershipLedger } from "../src/ownership";
 import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from "../src/protocol";
 import { RevisionTracker } from "../src/revisions";
+import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
 import { MutationScheduler } from "../src/scheduler";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
@@ -13,6 +14,7 @@ const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
 const TASK_A = "018f47b8-2f80-7c20-9c77-f8a38c9e621e";
 const TASK_B = "018f47b8-2f80-7c20-9c77-f8a38c9e621f";
+const TASK_C = "018f47b8-2f80-7c20-9c77-f8a38c9e6220";
 
 interface MockTab {
   id: number;
@@ -67,6 +69,7 @@ let failGrouping: boolean;
 let nextTabId: number;
 let nextGroupId: number;
 let scriptResult: boolean;
+let scriptingCallCount: number;
 let alarmCreates: Array<{ name: string; when: number }>;
 let alarmClears: string[];
 let alarmListeners: Array<(alarm: { name: string }) => void>;
@@ -161,6 +164,7 @@ function installChromeMock(): void {
   nextTabId = 100;
   nextGroupId = 50;
   scriptResult = true;
+  scriptingCallCount = 0;
   alarmCreates = [];
   alarmClears = [];
   alarmListeners = [];
@@ -287,12 +291,13 @@ function installChromeMock(): void {
         onDetached: { addListener() { } },
         SPLIT_VIEW_ID_NONE: -1,
         async get(tabId: number) {
-          return clone(tabStore.get(tabId) ?? {
+          return clone({
             id: tabId,
             windowId: 1,
             groupId: -1,
             status: "complete",
             url: "https://example.test/",
+            ...tabStore.get(tabId),
           });
         },
         async query(query: Record<string, unknown>) {
@@ -366,7 +371,12 @@ function installChromeMock(): void {
         async goForward() { },
         async reload() { },
       },
-      scripting: { async executeScript() { return [{ result: scriptResult }]; } },
+      scripting: {
+        async executeScript() {
+          scriptingCallCount += 1;
+          return [{ result: scriptResult }];
+        },
+      },
       windows: {
         async getAll() {
           return [{ id: 1, tabs: clone([...tabStore.values()]) }];
@@ -681,6 +691,28 @@ describe("native protocol", () => {
       task_id: TASK_A,
       connection_id: NATIVE_CONNECTION_ID,
     })).toThrow("unknown fields");
+  });
+});
+
+describe("automation route classification", () => {
+  test("reserves browser-restricted origins for tab lifecycle controls", () => {
+    for (const url of [
+      "chrome://settings/",
+      "chrome-extension://abcdefghijklmnop/options.html",
+      "devtools://devtools/bundled/inspector.html",
+      "https://chromewebstore.google.com/detail/example",
+      "https://chrome.google.com/webstore/devconsole/example",
+    ]) {
+      expect(automationRoute(url)).toBe("tab_only");
+    }
+    expect(automationRoute("https://example.test/workspace")).toBe("full");
+    expect(normalizeRestrictedOriginError(
+      new Error("Cannot access a chrome:// URL"),
+      "capture a text snapshot",
+    )).toMatchObject({
+      code: "browser_restricted_origin",
+      outcome: "not_started",
+    });
   });
 });
 
@@ -2843,6 +2875,98 @@ describe("extension entrypoint admission boundaries", () => {
       { tab_id: 101, mode: "accessibility" },
     )).toMatchObject({ outcome: "completed" });
     expect((await readState()).automationCleanup.tabIds).toEqual([101]);
+
+    const restricted = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6305",
+      TASK_C,
+      "browser_open",
+      { mode: "create", url: "https://chromewebstore.google.com/devconsole/example" },
+    );
+    expect(restricted).toMatchObject({
+      outcome: "completed",
+      result: {
+        tab_id: 102,
+        automation_route: "tab_only",
+        route_reason: "browser_restricted_origin",
+      },
+    });
+    if (!isRecord(restricted.result) || typeof restricted.result.page_revision !== "number") {
+      throw new Error("restricted task tab did not return a page revision");
+    }
+    const restrictedPageRevision = restricted.result.page_revision;
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6306",
+      TASK_C,
+      "browser_tabs",
+      {},
+    )).toMatchObject({
+      outcome: "completed",
+      result: {
+        tabs: [{
+          tab_id: 102,
+          automation_route: "tab_only",
+          route_reason: "browser_restricted_origin",
+        }],
+      },
+    });
+    const debuggerCommandsBeforeRestrictedSnapshot = debuggerCommands.length;
+    const scriptingCallsBeforeRestrictedSnapshot = scriptingCallCount;
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6307",
+      TASK_C,
+      "browser_snapshot",
+      { tab_id: 102, mode: "text" },
+    )).toMatchObject({
+      outcome: "not_started",
+      error: {
+        code: "browser_restricted_origin",
+        recovery: expect.stringContaining("Do not retry"),
+      },
+    });
+    expect(debuggerCommands).toHaveLength(debuggerCommandsBeforeRestrictedSnapshot);
+    expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6308",
+      TASK_C,
+      "browser_handoff",
+      {
+        tab_id: 102,
+        expected_page_revision: restrictedPageRevision,
+        prompt: "Complete the browser-owned form",
+        completion: { kind: "selector", value: "#complete" },
+        timeout_ms: 1_000,
+      },
+    )).toMatchObject({
+      outcome: "not_started",
+      error: { code: "browser_restricted_origin" },
+    });
+    expect((await readState()).handoff).toEqual({ active: false });
+    expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
+    const restrictedTab = tabStore.get(102);
+    if (!restrictedTab) throw new Error("restricted task tab is unavailable");
+    restrictedTab.url = "chrome://settings/";
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6309",
+      TASK_C,
+      "browser_snapshot",
+      { tab_id: 102, mode: "text" },
+      { tab_id: 102, allowed_origins: [], denied_origins: [] },
+    )).toMatchObject({
+      outcome: "not_started",
+      error: { code: "browser_restricted_origin" },
+    });
+    expect(debuggerCommands).toHaveLength(debuggerCommandsBeforeRestrictedSnapshot);
+    expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6310",
+      TASK_C,
+      "browser_act",
+      {
+        tab_id: 102,
+        expected_page_revision: restrictedPageRevision,
+        actions: [{ kind: "navigate", url: "https://example.test/supported" }],
+      },
+    )).toMatchObject({ outcome: "completed" });
     const detachCountBeforeMove = debuggerCalls.filter((call) => call === "detach").length;
     const movedTab = tabStore.get(101);
     if (!movedTab) throw new Error("task tab for move test is unavailable");

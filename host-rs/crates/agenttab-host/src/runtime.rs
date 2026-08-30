@@ -10,11 +10,11 @@ use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTrans
 use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
-    BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams,
-    ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload, NativeHandoff,
-    NativePopupCommitEvent, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
+    BrowserAction, BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams,
+    BrowserWaitParams, ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload,
+    NativeHandoff, NativePopupCommitEvent, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
     ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest,
-    RpcResponse, TaskBinding, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -942,6 +942,9 @@ impl Runtime {
         self.journal
             .verify_task_tab(task_id, tab_id, expected_page_revision)
             .map_err(journal_rpc_error)?;
+        if is_tab_only_request(params) {
+            return Ok(());
+        }
         let tab_url = self.tab_urls.read().get(&tab_id).cloned();
         self.guardrails.authorize_current_tab(tab_url.as_deref())
     }
@@ -1333,6 +1336,27 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Developer(_) => None,
     }
 }
+fn is_tab_only_request(params: &MethodParams) -> bool {
+    match params {
+        MethodParams::Act(params) => params.actions.iter().all(|action| {
+            matches!(
+                action,
+                BrowserAction::Navigate { .. }
+                    | BrowserAction::GoBack
+                    | BrowserAction::GoForward
+                    | BrowserAction::Reload { .. }
+                    | BrowserAction::Close
+            )
+        }),
+        MethodParams::Wait(params) => matches!(
+            &params.condition,
+            WaitCondition::Load | WaitCondition::Url { .. } | WaitCondition::Download
+        ),
+        MethodParams::Handoff(_) => true,
+        _ => false,
+    }
+}
+
 fn staged_matches_act(params: &MethodParams, staged: &NativeStagedCommit) -> bool {
     matches!(
         params,
@@ -2172,6 +2196,61 @@ mod tests {
                 denied_origins: vec!["*.example.com".into()],
             }))
         );
+        runtime
+            .tab_urls
+            .write()
+            .insert(3, "chrome://settings/".into());
+        let blocked_system_snapshot = runtime.handle(&connection, snapshot("system-snapshot"));
+        assert_eq!(blocked_system_snapshot["error"]["code"], "scheme_denied");
+        let navigate_away = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "system-navigate",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_act",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "actions": [{"kind": "navigate", "url": "https://allowed.test/recovered"}]
+                }
+            }),
+        );
+        assert_eq!(navigate_away["outcome"], "completed");
+        let wait_for_system_url = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "system-url-wait",
+                "method": "browser_wait",
+                "params": {
+                    "tab_id": 3,
+                    "condition": {"kind": "url", "value": "chrome://settings/"},
+                    "timeout_ms": 100
+                }
+            }),
+        );
+        assert_eq!(wait_for_system_url["outcome"], "completed");
+        let system_handoff = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "system-handoff",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_handoff",
+                "params": {
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "prompt": "Inspect browser settings",
+                    "completion": {"kind": "manual_done"},
+                    "timeout_ms": 1000
+                }
+            }),
+        );
+        assert_eq!(system_handoff["outcome"], "completed", "{system_handoff}");
     }
     #[test]
     fn commit_rechecks_staged_tab_policy_after_navigation() {

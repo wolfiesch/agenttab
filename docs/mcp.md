@@ -62,15 +62,17 @@ For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. 
 
 | Tool | Required input and behavior |
 |---|---|
-| `browser_open` | `mode: "create"` optionally accepts an `http`, `https`, or `about` URL, `background`, and `placement`. The default `placement: "task"` creates a tab in the task's existing window when possible. `placement: "new_window"` creates the first tab of an otherwise empty task in a separate unfocused normal window and rejects `background: false`. `mode: "adopt_active"` explicitly adopts only the currently active tab. The result includes task, tab, window, and page-revision identifiers. |
-| `browser_snapshot` | Requires `tab_id`. Modes are `accessibility`, `text`, `html`, and `screenshot`. Only accessibility snapshots return revisioned node references. |
-| `browser_act` | Requires `tab_id`, `expected_page_revision`, and one to 64 typed actions. Actions are click, type, fill, select, scroll, drag, navigate, history movement, reload, close, dialog decision, and staged file upload. No coordinate action exists in Standard mode. |
-| `browser_wait` | Requires `tab_id` and one load, URL, text, selector, network-idle, or download condition. `timeout_ms` is at most 120 seconds. |
-| `browser_tabs` | Takes an empty object and lists only the current task's tabs. |
-| `browser_handoff` | Requires a task tab, expected page revision, prompt, completion condition, and optional timeout. Completion can be navigation, manual completion, a URL, or a selector. |
+| `browser_open` | `mode: "create"` optionally accepts an `http`, `https`, or `about` URL, `background`, and `placement`. The default `placement: "task"` creates a tab in the task's existing window when possible. `placement: "new_window"` creates the first tab of an otherwise empty task in a separate unfocused normal window and rejects `background: false`. `mode: "adopt_active"` explicitly adopts only the currently active tab. The result includes task, tab, window, page-revision, and `automation_route` identifiers. |
+| `browser_snapshot` | Requires `tab_id`. Modes are `accessibility`, `text`, `html`, and `screenshot`. Only accessibility snapshots return revisioned node references. Snapshots require the `full` automation route. |
+| `browser_act` | Requires `tab_id`, `expected_page_revision`, and one to 64 typed actions. Actions are click, type, fill, select, scroll, drag, navigate, history movement, reload, close, dialog decision, and staged file upload. No coordinate action exists in Standard mode. A `tab_only` route accepts navigation, history movement, reload, and close only. |
+| `browser_wait` | Requires `tab_id` and one load, URL, text, selector, network-idle, or download condition. `timeout_ms` is at most 120 seconds. A `tab_only` route accepts load, URL, and download conditions only. |
+| `browser_tabs` | Takes an empty object and lists only the current task's tabs, including each tab's `automation_route`. |
+| `browser_handoff` | Requires a task tab, expected page revision, prompt, completion condition, and optional timeout. Completion can be navigation, manual completion, a URL, or a selector. It remains available on a `tab_only` route because AgentTab blocks agent observation while the human controls the tab, but selector completion requires the `full` route. |
 | `browser_commit` | Requires the staged token returned by a prior `commit_required` action and executes that one staged operation. |
 
 Every existing-page mutation carries its expected page revision. If navigation or document replacement makes that revision stale, AgentTab rejects the operation rather than selecting a new target.
+
+`automation_route` is `full` for ordinary HTTP, HTTPS, and `about:blank` tabs. It is `tab_only` with `route_reason: "browser_restricted_origin"` for Chrome system pages, extension pages, DevTools, the Chrome Web Store, malformed URLs, and unknown schemes. Page inspection or interaction requested on a `tab_only` tab returns `browser_restricted_origin` with `outcome: "not_started"` and recovery that explicitly says not to retry the same AgentTab route. This is a browser platform boundary, not a policy denial and not permission that can be granted through AgentTab.
 
 ### Developer mode
 

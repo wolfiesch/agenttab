@@ -1,3 +1,43 @@
+// src/routes.ts
+var RESTRICTED_ERROR_PATTERNS = [
+  /the extensions gallery cannot be scripted/i,
+  /cannot access a chrome(?:-extension)?:\/\/ url/i,
+  /cannot access contents of (?:the )?url/i
+];
+function automationRoute(rawUrl) {
+  if (rawUrl === undefined || rawUrl.length === 0)
+    return "tab_only";
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return "tab_only";
+  }
+  if (url.hostname === "chromewebstore.google.com" || url.hostname === "chrome.google.com" && (url.pathname === "/webstore" || url.pathname.startsWith("/webstore/"))) {
+    return "tab_only";
+  }
+  if (url.protocol === "http:" || url.protocol === "https:")
+    return "full";
+  if (url.protocol === "about:" && url.pathname === "blank")
+    return "full";
+  return "tab_only";
+}
+function automationRouteFields(rawUrl) {
+  const route = automationRoute(rawUrl);
+  return route === "full" ? { automation_route: route } : { automation_route: route, route_reason: "browser_restricted_origin" };
+}
+function restrictedOriginError(operation) {
+  return Object.assign(new Error(`AgentTab cannot ${operation} on a browser-restricted origin`), {
+    code: "browser_restricted_origin",
+    outcome: "not_started",
+    recovery: "Do not retry this AgentTab route. Use browser_handoff for the exact task tab, or navigate the task tab to a supported origin."
+  });
+}
+function normalizeRestrictedOriginError(error, operation) {
+  const message = error instanceof Error ? error.message : String(error);
+  return RESTRICTED_ERROR_PATTERNS.some((pattern) => pattern.test(message)) ? restrictedOriginError(operation) : error;
+}
+
 // src/type-guards.ts
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -827,6 +867,26 @@ function mutateState(mutator) {
 // src/browser.ts
 var DEBUGGER_VERSION = "1.3";
 var DEBUGGER_IDLE_MS = 30000;
+var TAB_ONLY_ACTIONS = {
+  navigate: true,
+  go_back: true,
+  go_forward: true,
+  reload: true,
+  close: true
+};
+var TAB_ONLY_WAIT_CONDITIONS = {
+  load: true,
+  url: true,
+  download: true
+};
+var SUPPORTED_WAIT_CONDITIONS = {
+  load: true,
+  url: true,
+  text: true,
+  selector: true,
+  network_idle: true,
+  download: true
+};
 
 class StandardBrowserRuntime {
   revisions;
@@ -1015,16 +1075,23 @@ class StandardBrowserRuntime {
     else
       this.expectedDetaches.set(tabId, pendingExpected - 1);
   }
+  async requireFullAutomationRoute(tabId, operation) {
+    const tab = await chrome.tabs.get(tabId);
+    if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") {
+      throw restrictedOriginError(operation);
+    }
+  }
   async snapshot(tabId, params) {
     await this.authorizeDebuggerUse(tabId);
     const mode = params.mode;
+    if (mode !== "text" && mode !== "html" && mode !== "screenshot" && mode !== "accessibility") {
+      throw Object.assign(new Error("Unsupported snapshot mode"), { code: "invalid_request" });
+    }
+    await this.requireFullAutomationRoute(tabId, `capture a ${mode} snapshot`);
     if (mode === "text" || mode === "html")
       return this.scriptSnapshot(tabId, mode, params);
     if (mode === "screenshot")
       return this.screenshot(tabId, params);
-    if (mode !== "accessibility") {
-      throw Object.assign(new Error("Unsupported snapshot mode"), { code: "invalid_request" });
-    }
     const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
     const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
     const before = await this.pageIdentity(tabId);
@@ -1072,6 +1139,9 @@ class StandardBrowserRuntime {
         throw Object.assign(new Error("Each browser action requires a kind"), { code: "invalid_request" });
       }
       validated.push(action);
+    }
+    if (validated.some((action) => TAB_ONLY_ACTIONS[String(action.kind)] !== true)) {
+      await this.requireFullAutomationRoute(tabId, "perform page actions");
     }
     const completedActions = [];
     for (const [index, action] of validated.entries()) {
@@ -1247,6 +1317,9 @@ class StandardBrowserRuntime {
       });
       throw Object.assign(new Error("Staged operation is malformed"), { code: "staged_commit_mismatch" });
     }
+    if (TAB_ONLY_ACTIONS[action.kind] !== true) {
+      await this.requireFullAutomationRoute(tabId, "commit a page action");
+    }
     const stagedTarget = isRecord(staged.preview.target) ? staged.preview.target : null;
     const fingerprint = stagedTarget ? await this.stageFingerprint(taskId, staged.tab_id, staged.page_revision, action, stagedTarget) : "";
     if (fingerprint !== staged.fingerprint) {
@@ -1292,6 +1365,16 @@ class StandardBrowserRuntime {
       throw Object.assign(new Error("browser_wait requires a condition"), { code: "invalid_request" });
     }
     const condition = params.condition;
+    const conditionKind = String(condition.kind);
+    if (SUPPORTED_WAIT_CONDITIONS[conditionKind] !== true) {
+      throw Object.assign(new Error(`Unsupported wait condition: ${conditionKind}`), {
+        code: "invalid_request"
+      });
+    }
+    await this.authorizeDebuggerUse(tabId);
+    if (TAB_ONLY_WAIT_CONDITIONS[conditionKind] !== true) {
+      await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
+    }
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30000;
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
@@ -1306,7 +1389,7 @@ class StandardBrowserRuntime {
         return {
           tab_id: tabId,
           page_revision: await this.revisions.current(tabId),
-          condition: condition.kind,
+          condition: conditionKind,
           matched: true
         };
       }
@@ -1327,6 +1410,7 @@ class StandardBrowserRuntime {
         code: "invalid_request"
       });
     }
+    await this.requireFullAutomationRoute(tabId, `run ${action}`);
     return this.send(tabId, action, params);
   }
   async scriptSnapshot(tabId, mode, params) {
@@ -3101,13 +3185,15 @@ class OwnershipLedger {
     const tab = await chrome.tabs.get(tabId);
     const state = await readState();
     const owner = Object.values(state.tasks).find((task) => task.tabIds.includes(tabId));
+    const url = tab.pendingUrl ?? tab.url ?? "";
     return {
       tab_id: tabId,
       window_id: tab.windowId,
       group_id: tab.groupId,
-      url: tab.url ?? "",
+      url,
       page_revision: await this.revisions.current(tabId),
-      tab_count: owner?.tabIds.length ?? 0
+      tab_count: owner?.tabIds.length ?? 0,
+      ...automationRouteFields(url)
     };
   }
   async emitInventory() {
@@ -3430,6 +3516,9 @@ async function assertCurrentOrigin(tabId2, policy) {
       code: "origin_unavailable"
     });
   }
+  if (automationRoute(rawUrl) === "tab_only" && url.protocol !== "http:" && url.protocol !== "https:") {
+    return;
+  }
   if (url.protocol === "about:")
     return;
   if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -3446,6 +3535,16 @@ async function assertCurrentOrigin(tabId2, policy) {
     throw Object.assign(new Error(`AgentTab policy does not allow ${url.origin}`), {
       code: "origin_not_allowed"
     });
+  }
+}
+async function assertHandoffRoute(targetTabId, params, policy) {
+  await assertCurrentOrigin(targetTabId, policy);
+  const completion = params.completion;
+  if (!isRecord(completion) || completion.kind !== "selector")
+    return;
+  const tab = await chrome.tabs.get(targetTabId);
+  if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") {
+    throw restrictedOriginError("wait for a handoff selector");
   }
 }
 function errorCode(error) {
@@ -3498,14 +3597,14 @@ async function dispatch(command) {
     if (command.method === "browser_tabs") {
       const result = await scheduler.enqueueGlobal(() => ownership.inventory());
       return completed(command.request_id, {
-        tabs: result.filter((tab) => tab.task_id === command.task_id)
+        tabs: result.filter((tab) => tab.task_id === command.task_id).map((tab) => ({ ...tab, ...automationRouteFields(typeof tab.url === "string" ? tab.url : undefined) }))
       });
     }
     if (command.method === "browser_handoff") {
       if (!scheduler.isAccepting() || (await readState()).paused) {
         throw scheduler.notStarted("AgentTab is paused");
       }
-      return needsUser(command.request_id, await handoff.begin(command.task_id, params, () => assertCurrentOrigin(tabId(params), command.origin_policy)));
+      return needsUser(command.request_id, await handoff.begin(command.task_id, params, () => assertHandoffRoute(tabId(params), params, command.origin_policy)));
     }
     if (command.method === "browser_commit") {
       const targetTabId2 = await browser.stagedTabId(command.task_id, params.native_token);
@@ -3575,8 +3674,9 @@ async function dispatch(command) {
       code: "unsupported_method"
     });
   } catch (error) {
-    const code = error instanceof NotStartedError ? error.code : errorCode(error);
-    return failed(command.request_id, code, error instanceof Error ? error.message : String(error), errorOutcome(error, mutating, code), errorRecovery(error), isRecord(error) && typeof error.currentPageRevision === "number" ? { current_page_revision: error.currentPageRevision } : undefined);
+    const normalized = normalizeRestrictedOriginError(error, command.method);
+    const code = normalized instanceof NotStartedError ? normalized.code : errorCode(normalized);
+    return failed(command.request_id, code, normalized instanceof Error ? normalized.message : String(normalized), errorOutcome(normalized, mutating, code), errorRecovery(normalized), isRecord(normalized) && typeof normalized.currentPageRevision === "number" ? { current_page_revision: normalized.currentPageRevision } : undefined);
   }
 }
 nativeBridge = new NativeBridge(scheduler, ownership, dispatch, (event, eventId) => void handoff.acknowledgeEvent(event, eventId), () => handoff.restore(), async (nativeTokens) => {

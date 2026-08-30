@@ -34,6 +34,12 @@ The manifest declares `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `stora
 
 `debugger` is retained because the current task-scoped implementation needs Chrome's accessibility tree, ref-based action support, inactive captures, dialog handling, and network-idle observation. Attachments are lazy, limited to owned tabs, reused briefly, and detached after idle work or optional `scripting` revocation. The permission is not evidence that Standard mode grants generic debugging access.
 
+## Browser-restricted origins
+
+Chrome refuses extension page scripting or debugger access on browser-owned surfaces, including `chrome://`, `chrome-extension://`, `devtools://`, and the Chrome Web Store. Local host policy and extension permissions cannot remove that platform boundary.
+
+AgentTab classifies every opened or listed task tab as `automation_route: "full"` or `"tab_only"`. Ownership remains required for both routes. On `tab_only`, agent-driven controls are limited to tab-lifecycle operations that Chrome still exposes: navigation, history movement, reload, close, and load, URL, or download waits. `browser_handoff` remains available because AgentTab blacks out observation while the human controls the task tab. Snapshot, page-content wait, element action, Commit, and raw Developer-mode CDP requests fail before script or debugger execution with `browser_restricted_origin` and `outcome: "not_started"`. Managed origin policy still validates HTTP and HTTPS tab-only pages and every navigation target. Browser-owned non-HTTP pages cannot match an origin allowlist, so AgentTab admits only the same tab-only recovery operations there. In-page interaction requires an exact-tab human handoff; do not escalate to desktop-wide or browser-window-scoped input.
+
 ## Ownership, revisions, and human control
 
 A tab becomes owned only when AgentTab creates it, when Chrome reports it as a child of an owned opener, or through `browser_open` with `mode: "adopt_active"`. The visible Chrome group is evidence of that ownership, not an authority grant by itself. Moving or ungrouping a tab revokes ownership and cancels queued work. A grouping failure rolls creation or adoption back rather than retaining invisible ownership. A caller may request `placement: "new_window"`, but the extension derives eligibility from its stored task record: the task must own no tabs, the window is created unfocused in normal state, and a failed group grant removes the created tab. A client-supplied ownership claim cannot authorize an existing window.

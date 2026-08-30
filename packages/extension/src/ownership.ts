@@ -1,5 +1,6 @@
 import { MutationScheduler } from "./scheduler";
 import { mutateState, readState, type TaskColor, type TaskRecord } from "./storage";
+import { automationRouteFields } from "./routes";
 import { RevisionTracker } from "./revisions";
 
 const GROUP_COLORS: readonly TaskColor[] = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
@@ -574,13 +575,15 @@ export class OwnershipLedger {
     const tab = (await chrome.tabs.get(tabId)) as TabLike;
     const state = await readState();
     const owner = Object.values(state.tasks).find((task) => task.tabIds.includes(tabId));
+    const url = tab.pendingUrl ?? tab.url ?? "";
     return {
       tab_id: tabId,
       window_id: tab.windowId,
       group_id: tab.groupId,
-      url: tab.url ?? "",
+      url,
       page_revision: await this.revisions.current(tabId),
       tab_count: owner?.tabIds.length ?? 0,
+      ...automationRouteFields(url),
     };
   }
 
