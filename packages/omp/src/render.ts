@@ -57,6 +57,16 @@ export interface OperationCard {
 
 const SENSITIVE_KEY = /(authorization|cookie|credential|password|secret|token)/i;
 const MAX_EXPANDED_LINES = 160;
+const STATUS_LABEL: Readonly<Record<OperationCardStatus, string>> = {
+  planned: "🧭 Plan",
+  running: "🔄 Working",
+  awaiting_user: "👤 Your turn",
+  awaiting_approval: "🔒 Review",
+  executed: "🚀 Executed",
+  observed: "🔎 Observed",
+  uncertain: "🤔 Uncertain",
+  blocked: "🛑 Blocked",
+};
 
 export function createCallComponent(method: ToolMethod, args: unknown, theme: RenderTheme): RenderComponent {
   return operationCardComponent(createCallCard(method, args), false, theme);
@@ -469,17 +479,7 @@ function renderSteps(steps: readonly OperationCardStep[]): string {
 }
 
 function statusLabel(status: OperationCardStatus): string {
-  const labels: Record<OperationCardStatus, string> = {
-    planned: "Plan",
-    running: "Working",
-    awaiting_user: "Your turn",
-    awaiting_approval: "Review",
-    executed: "Executed",
-    observed: "Observed",
-    blocked: "Blocked",
-    uncertain: "Uncertain",
-  };
-  return labels[status];
+  return STATUS_LABEL[status];
 }
 
 function sensitiveInputNotices(args: Record<string, unknown>): string[] {
