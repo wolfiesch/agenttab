@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyTransaction } from "../src/transaction";
@@ -50,5 +50,22 @@ describe("file transaction", () => {
     } finally {
       fileHandlePrototype.sync = originalSync;
     }
+  });
+
+  test("repairs mode drift when file content is unchanged", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(join(tmpdir(), "agenttab-transaction-mode-test-"));
+    temporaryRoots.push(root);
+    const destination = join(root, "config.json");
+    await writeFile(destination, "unchanged");
+    await chmod(destination, 0o644);
+
+    const result = await applyTransaction([
+      { path: destination, content: "unchanged", mode: 0o600, label: "config" },
+    ]);
+
+    expect(result.changed).toEqual([destination]);
+    expect(result.unchanged).toEqual([]);
+    expect((await stat(destination)).mode & 0o777).toBe(0o600);
   });
 });

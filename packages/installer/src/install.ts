@@ -14,7 +14,8 @@ import { existsSync } from "node:fs";
 import { arch as currentArch, homedir, platform as currentPlatform, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { inflateRawSync } from "node:zlib";
-import { AgentTabClient } from "../../sdk-typescript/src/index";
+import { setTimeout as delay } from "node:timers/promises";
+import { AgentTabClient, type ConnectionAck } from "../../sdk-typescript/src/index";
 import identityJson from "../../../config/identity.json" with { type: "json" };
 import trustJson from "../../../config/release-trust.json" with { type: "json" };
 import migrationJson from "../../../config/migration-v1.json" with { type: "json" };
@@ -214,7 +215,6 @@ export function targetTriple(platform: NodeJS.Platform = currentPlatform(), arch
     "darwin/x64": "x86_64-apple-darwin",
     "linux/arm64": "aarch64-unknown-linux-gnu",
     "linux/x64": "x86_64-unknown-linux-gnu",
-    "win32/arm64": "aarch64-pc-windows-msvc",
     "win32/x64": "x86_64-pc-windows-msvc",
   };
   const target = targets[key];
@@ -647,10 +647,27 @@ async function runReadiness(openBrowser: boolean, platform: NodeJS.Platform): Pr
       break;
     } catch (error) {
       connectError = error;
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+      await delay(250);
     }
   }
   if (!client) {
+    throw new InstallError("ipc", connectError instanceof Error ? connectError.message : "AgentTab host did not become ready", "agenttab doctor --layer ipc");
+  }
+  let lifecycleState: ConnectionAck["state"] = client.connection.state;
+  while (lifecycleState !== "ready" && Date.now() < deadline) {
+    try {
+      const status = await client.call<"agenttab.status", { state?: unknown }>("agenttab.status", {});
+      lifecycleState = typeof status.state === "string"
+        ? status.state as ConnectionAck["state"]
+        : undefined;
+      connectError = new Error(`AgentTab host is ${lifecycleState ?? "in an unknown lifecycle state"}`);
+    } catch (error) {
+      connectError = error;
+    }
+    if (lifecycleState !== "ready") await delay(250);
+  }
+  if (lifecycleState !== "ready") {
+    client.close();
     throw new InstallError("ipc", connectError instanceof Error ? connectError.message : "AgentTab host did not become ready", "agenttab doctor --layer ipc");
   }
   let tabId: number | undefined;
