@@ -1,5 +1,5 @@
 {
-  "name": "@agenttab/sdk",
+  "name": "@getagenttab/sdk",
   "version": "2.0.0-rc.1",
   "description": "Typed local AgentTab Core RPC client",
   "type": "module",

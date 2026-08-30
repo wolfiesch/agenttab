@@ -186,10 +186,10 @@ def smoke_packages(directory: Path, root: Path, tag: str, temporary_root: Path) 
         cwd=temporary_root,
         env=env,
     )
-    run([node, "--input-type=module", "--eval", "await import('@agenttab/sdk');"], cwd=npm_root, env=env)
+    run([node, "--input-type=module", "--eval", "await import('@getagenttab/sdk');"], cwd=npm_root, env=env)
     for relative in (
         "node_modules/agenttab-mcp/dist/server.mjs",
-        "node_modules/@agenttab/omp/dist/index.mjs",
+        "node_modules/@getagenttab/omp/dist/index.mjs",
         "node_modules/agenttab/dist/cli.mjs",
     ):
         run([node, "--check", relative], cwd=npm_root, env=env)

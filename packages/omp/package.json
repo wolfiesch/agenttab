@@ -1,5 +1,5 @@
 {
-  "name": "@agenttab/omp",
+  "name": "@getagenttab/omp",
   "version": "2.0.0-rc.1",
   "description": "Native OMP and Pi adapter for AgentTab",
   "type": "module",

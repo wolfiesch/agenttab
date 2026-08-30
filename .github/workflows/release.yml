@@ -303,9 +303,12 @@ jobs:
           bun run workspace:build
           bun run --cwd packages/extension build
           mkdir -p "$RELEASE_INPUT"
-          for package in packages/sdk-typescript packages/mcp packages/omp packages/installer; do
-            npm pack --pack-destination "$RELEASE_INPUT" "./$package"
-          done
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/sdk-typescript
+          mv "$RELEASE_INPUT/getagenttab-sdk-${RELEASE_VERSION}.tgz" "$RELEASE_INPUT/agenttab-sdk-${RELEASE_VERSION}.tgz"
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/mcp
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/omp
+          mv "$RELEASE_INPUT/getagenttab-omp-${RELEASE_VERSION}.tgz" "$RELEASE_INPUT/agenttab-omp-${RELEASE_VERSION}.tgz"
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/installer
           python3 -m pip install build==1.3.0
           python3 -m build --wheel --sdist --outdir "$RELEASE_INPUT" packages/sdk-python
           python3 scripts/package_extension_store.py \
@@ -464,11 +467,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - package: '@agenttab/sdk'
+          - package: '@getagenttab/sdk'
             archive: agenttab-sdk
           - package: agenttab-mcp
             archive: agenttab-mcp
-          - package: '@agenttab/omp'
+          - package: '@getagenttab/omp'
             archive: agenttab-omp
           - package: agenttab
             archive: agenttab
