@@ -152,7 +152,7 @@ class ClientTests(unittest.TestCase):
                 self.timeouts.append(timeout)
                 raise TimeoutError("stalled named pipe")
 
-            def write(self, payload: bytes) -> int:
+            def write(self, payload: bytes, _timeout: float | None = None) -> int:
                 return len(payload)
 
             def flush(self) -> None:
@@ -171,6 +171,39 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(stream.timeouts), 1)
         self.assertLessEqual(stream.timeouts[0] or 0, 0.05)
 
+    def test_windows_named_pipe_write_deadline_is_classified_without_a_worker(self) -> None:
+        class StalledWindowsPipe:
+            _agenttab_windows_pipe = True
+
+            def __init__(self) -> None:
+                self.timeouts: list[float | None] = []
+                self.closed = False
+                self.read_called = False
+
+            def read(self, _size: int, _timeout: float | None = None) -> bytes:
+                self.read_called = True
+                return b""
+
+            def write(self, _payload: bytes, timeout: float | None = None) -> int:
+                self.timeouts.append(timeout)
+                raise TimeoutError("stalled named-pipe write")
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        stream = StalledWindowsPipe()
+        client = AgentTabClient(stream, {}, request_timeout=0.05)
+        with self.assertRaises(AgentTabTransportError) as raised:
+            client.request("browser_tabs", {})
+        self.assertEqual(raised.exception.code, "request_timeout")
+        self.assertTrue(client._closed)
+        self.assertTrue(stream.closed)
+        self.assertFalse(stream.read_called)
+        self.assertEqual(stream.timeouts, [0.05])
+
     def test_windows_named_pipe_negotiation_read_uses_connect_deadline(self) -> None:
         class StalledWindowsPipe:
             _agenttab_windows_pipe = True
@@ -183,7 +216,7 @@ class ClientTests(unittest.TestCase):
                 self.timeouts.append(timeout)
                 raise TimeoutError("stalled named pipe")
 
-            def write(self, payload: bytes) -> int:
+            def write(self, payload: bytes, _timeout: float | None = None) -> int:
                 return len(payload)
 
             def flush(self) -> None:

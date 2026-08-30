@@ -19,6 +19,7 @@ declare const AGENTTAB_NATIVE_HOST: string;
 const NATIVE_HOST = typeof AGENTTAB_NATIVE_HOST === "string" ? AGENTTAB_NATIVE_HOST : "dev.agenttab.host";
 const RECONNECT_ALARM = "agenttab-native-reconnect";
 const RECONNECT_MAX_MS = 30_000;
+const NATIVE_URL_MAX_CHARS = 16_384;
 type CommandHandler = (command: NativeDispatchCommand) => Promise<NativeResponse>;
 type StageDiscarder = (nativeTokens: readonly string[]) => Promise<void>;
 interface PendingEventAck {
@@ -39,14 +40,17 @@ interface NativePort {
 }
 
 function nativeInventory(inventory: Array<Record<string, unknown>>): NativeTab[] {
-  return inventory.map((tab) => ({
-    tab_id: Number(tab.tab_id),
-    window_id: Number(tab.window_id),
-    group_id: Number(tab.group_id),
-    url: String(tab.url ?? ""),
-    page_revision: Number(tab.page_revision),
-    ...(typeof tab.task_id === "string" ? { task_id: tab.task_id } : {}),
-  }));
+  return inventory.map((tab) => {
+    const url = String(tab.url ?? "");
+    return {
+      tab_id: Number(tab.tab_id),
+      window_id: Number(tab.window_id),
+      group_id: Number(tab.group_id),
+      url: url.length <= NATIVE_URL_MAX_CHARS ? url : "",
+      page_revision: Number(tab.page_revision),
+      ...(typeof tab.task_id === "string" ? { task_id: tab.task_id } : {}),
+    };
+  });
 }
 
 export class NativeBridge {

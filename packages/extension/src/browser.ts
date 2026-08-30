@@ -1155,6 +1155,12 @@ export class StandardBrowserRuntime {
     if (kind === "load") return (await chrome.tabs.get(tabId)).status === "complete";
     if (kind === "url") return (await chrome.tabs.get(tabId)).url === condition.value;
     if (kind === "text" || kind === "selector") {
+      const before = await this.pageIdentity(tabId);
+      const matchedRevision = await this.revisions.observeDocument(
+        tabId,
+        before.documentId,
+        before.loaderId,
+      );
       const [{ result }] = await chrome.scripting.executeScript({
         target: { tabId },
         func: (conditionKind: string, value: string) =>
@@ -1163,7 +1169,18 @@ export class StandardBrowserRuntime {
             : document.querySelector(value) !== null,
         args: [kind, String(condition.value ?? "")],
       });
-      return result === true;
+      if (result !== true) return false;
+      const after = await this.pageIdentity(tabId);
+      const currentRevision = await this.revisions.observeDocument(
+        tabId,
+        after.documentId,
+        after.loaderId,
+      );
+      return (
+        before.documentId === after.documentId &&
+        before.loaderId === after.loaderId &&
+        matchedRevision === currentRevision
+      );
     }
     if (kind === "network_idle") {
       const session = debuggerSession;

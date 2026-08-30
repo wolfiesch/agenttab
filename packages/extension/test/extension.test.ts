@@ -1147,6 +1147,38 @@ describe("page revision monotonicity", () => {
     await runtime.detach(61);
   });
 
+  test("retries a content match when navigation replaces the probed document", async () => {
+    tabStore.set(61, {
+      id: 61,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    let documentReads = 0;
+    debuggerCommandOverride = (method) => {
+      if (method !== "DOM.getDocument") return undefined;
+      documentReads += 1;
+      const backendNodeId = documentReads === 1 ? 1 : 2;
+      return { root: { nodeId: backendNodeId, backendNodeId } };
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.wait(61, {
+      condition: { kind: "selector", value: "#ready" },
+      timeout_ms: 500,
+    });
+
+    expect(scriptingCallCount).toBe(2);
+    expect(result).toMatchObject({ matched: true, page_revision: 2 });
+    await runtime.detach(61);
+  });
+
   test("serializes concurrent attachment and keeps a failed detach recoverable", async () => {
     const runtime = new StandardBrowserRuntime(
       new RevisionTracker(),
@@ -2646,6 +2678,42 @@ describe("native bridge transport", () => {
       request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e6230",
       outcome: "completed",
     });
+  });
+
+  test("omits oversized URLs from inventory events without disconnecting", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const port = new MockNativePort();
+    nativePort = port;
+    const bridge = new NativeBridge(scheduler, ownership, async () => {
+      throw new Error("command handler must not run");
+    });
+    await bridge.connect();
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+    await waitForCondition(() => alarmClears.includes(RECONNECT_ALARM));
+
+    bridge.sendEvent("inventory", {
+      inventory: [{
+        tab_id: 44,
+        window_id: 1,
+        group_id: 12,
+        url: `https://example.test/${"x".repeat(16_384)}`,
+        page_revision: 1,
+      }],
+    });
+
+    expect(port.posted.at(-1)).toMatchObject({
+      kind: "event",
+      event: "inventory",
+      payload: { inventory: [{ tab_id: 44, url: "" }] },
+    });
+    expect(port.disconnectCount).toBe(0);
   });
 
 

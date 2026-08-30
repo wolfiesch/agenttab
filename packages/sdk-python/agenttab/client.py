@@ -195,7 +195,7 @@ class _WindowsNamedPipe:
                 self._kernel32.CancelIoEx(self._handle, self._ctypes.byref(overlapped))
                 self.close()
                 self._kernel32.WaitForSingleObject(event, 0xFFFFFFFF)
-                raise TimeoutError("AgentTab named-pipe read timed out")
+                raise TimeoutError("AgentTab named-pipe I/O timed out")
             if wait != 0:
                 raise self._ctypes.WinError(self._ctypes.get_last_error())
             transferred = self._wintypes.DWORD()
@@ -220,11 +220,11 @@ class _WindowsNamedPipe:
         transferred = self._transfer(self._kernel32.ReadFile, buffer, size, timeout)
         return buffer.raw[:transferred]
 
-    def write(self, payload: bytes) -> int:
+    def write(self, payload: bytes, timeout: float | None = None) -> int:
         if not payload:
             return 0
         buffer = self._ctypes.create_string_buffer(payload, len(payload))
-        return self._transfer(self._kernel32.WriteFile, buffer, len(payload), None)
+        return self._transfer(self._kernel32.WriteFile, buffer, len(payload), timeout)
 
     def flush(self) -> None:
         return None
@@ -659,11 +659,24 @@ class AgentTabClient:
         if resume_capability:
             request["resume_capability"] = resume_capability
         try:
-            cls._write(stream, encode_frame(request))
-            connection = read_frame(
-                stream,
-                timeout=connect_timeout if _uses_windows_named_pipe(stream) else None,
+            negotiation_deadline = (
+                time.monotonic() + connect_timeout
+                if _uses_windows_named_pipe(stream)
+                else None
             )
+            cls._write(
+                stream,
+                encode_frame(request),
+                timeout=connect_timeout if negotiation_deadline is not None else None,
+            )
+            remaining = (
+                negotiation_deadline - time.monotonic()
+                if negotiation_deadline is not None
+                else None
+            )
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("AgentTab named-pipe connection negotiation timed out")
+            connection = read_frame(stream, timeout=remaining)
             if (
                 connection.get("protocol") != RPC_PROTOCOL
                 or connection.get("version") != RPC_VERSION
@@ -686,9 +699,18 @@ class AgentTabClient:
         return stream, connection
 
     @staticmethod
-    def _write(stream: BinaryIO | socket.socket, payload: bytes) -> None:
+    def _write(
+        stream: BinaryIO | socket.socket,
+        payload: bytes,
+        *,
+        timeout: float | None = None,
+    ) -> None:
         if isinstance(stream, socket.socket):
             stream.sendall(payload)
+        elif _uses_windows_named_pipe(stream):
+            written = stream.write(payload, timeout)  # type: ignore[call-arg]
+            if written != len(payload):
+                raise EOFError("AgentTab connection closed during a frame")
         else:
             stream.write(payload)
             stream.flush()
@@ -731,15 +753,17 @@ class AgentTabClient:
     def _exchange(self, payload: bytes) -> JsonObject:
         if isinstance(self._stream, socket.socket) or _uses_windows_named_pipe(self._stream):
             with self._lock:
+                if _uses_windows_named_pipe(self._stream):
+                    deadline = time.monotonic() + self.request_timeout
+                    self._write(self._stream, payload, timeout=self.request_timeout)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"AgentTab request timed out after {self.request_timeout} seconds"
+                        )
+                    return read_frame(self._stream, timeout=remaining)
                 self._write(self._stream, payload)
-                return read_frame(
-                    self._stream,
-                    timeout=(
-                        self.request_timeout
-                        if _uses_windows_named_pipe(self._stream)
-                        else None
-                    ),
-                )
+                return read_frame(self._stream)
 
         responses: list[JsonObject] = []
         failures: list[Exception] = []
@@ -781,26 +805,27 @@ class AgentTabClient:
         if not isinstance(connection_id, str):
             raise RuntimeError("AgentTab resumed connection is missing its connection_id")
         with self._lock:
-            self._write(
-                self._stream,
-                encode_frame(
-                    {
-                        "protocol": RPC_PROTOCOL,
-                        "version": RPC_VERSION,
-                        "kind": "resume_confirm",
-                        "connection_id": connection_id,
-                        "resume_capability": candidate,
-                    }
-                ),
+            payload = encode_frame(
+                {
+                    "protocol": RPC_PROTOCOL,
+                    "version": RPC_VERSION,
+                    "kind": "resume_confirm",
+                    "connection_id": connection_id,
+                    "resume_capability": candidate,
+                }
             )
-            acknowledgement = read_frame(
-                self._stream,
-                timeout=(
-                    self.request_timeout
-                    if _uses_windows_named_pipe(self._stream)
-                    else None
-                ),
-            )
+            if _uses_windows_named_pipe(self._stream):
+                deadline = time.monotonic() + self.request_timeout
+                self._write(self._stream, payload, timeout=self.request_timeout)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"AgentTab request timed out after {self.request_timeout} seconds"
+                    )
+                acknowledgement = read_frame(self._stream, timeout=remaining)
+            else:
+                self._write(self._stream, payload)
+                acknowledgement = read_frame(self._stream)
         if (
             acknowledgement.get("protocol") != RPC_PROTOCOL
             or acknowledgement.get("version") != RPC_VERSION
