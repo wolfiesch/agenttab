@@ -70,7 +70,14 @@ export class NativeBridge {
     }
     this.port = port;
     this.ready = false;
-    port.onMessage.addListener((message: unknown) => void this.onMessage(port, message));
+    let inboundQueue = Promise.resolve();
+    port.onMessage.addListener((message: unknown) => {
+      inboundQueue = inboundQueue
+        .then(() => this.onMessage(port, message))
+        .catch(() => {
+          if (this.port === port) port.disconnect();
+        });
+    });
     port.onDisconnect.addListener(() => void this.onDisconnect(port));
     try {
       const state = await readState();
@@ -188,6 +195,7 @@ export class NativeBridge {
     await this.connect();
   }
   private async onMessage(port: NativePort, message: unknown): Promise<void> {
+    if (this.port !== port) return;
     let parsed: NativeInboundMessage;
     try {
       parsed = parseInboundNativeMessage(message);
@@ -219,6 +227,7 @@ export class NativeBridge {
     if (parsed.kind === "ready") {
       try {
         await this.discardStages(parsed.discard_staged_tokens ?? []);
+        if (this.port !== port) return;
       } catch {
         if (this.port === port) port.disconnect();
         return;
@@ -226,15 +235,20 @@ export class NativeBridge {
       this.ready = true;
       this.reconnectAttempt = 0;
       await chrome.alarms.clear(RECONNECT_ALARM);
+      if (this.port !== port) return;
       if (parsed.state === "paused") {
         await this.scheduler.pause();
+        if (this.port !== port) return;
         await mutateState((state) => {
           state.paused = true;
         });
+        if (this.port !== port) return;
         await this.onReady();
+        if (this.port !== port) return;
         return;
       }
       const state = await readState();
+      if (this.port !== port) return;
       if (!state.paused && !state.handoff.active) this.scheduler.resume();
       await this.onReady();
       return;

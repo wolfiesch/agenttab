@@ -2198,6 +2198,69 @@ describe("native bridge transport", () => {
     expect(alarmCreates.at(-1)?.when).toBeLessThanOrEqual(Date.now() + 1_000);
   });
 
+  test("serializes commands behind ready reconciliation", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const port = new MockNativePort();
+    nativePort = port;
+    const reconciliationStarted = Promise.withResolvers<void>();
+    const allowReconciliation = Promise.withResolvers<void>();
+    const handledRequests: string[] = [];
+    const bridge = new NativeBridge(
+      scheduler,
+      ownership,
+      async (command) => {
+        handledRequests.push(command.request_id);
+        return {
+          protocol: "agenttab.native",
+          version: 1,
+          kind: "response",
+          request_id: command.request_id,
+          outcome: "completed",
+          result: {},
+        };
+      },
+      undefined,
+      undefined,
+      async () => {
+        reconciliationStarted.resolve();
+        await allowReconciliation.promise;
+      },
+    );
+    await bridge.connect();
+
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+      discard_staged_tokens: [],
+    });
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "command",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e6230",
+      task_id: TASK_A,
+      connection_id: NATIVE_CONNECTION_ID,
+      method: "browser_tabs",
+      params: {},
+    });
+    await reconciliationStarted.promise;
+    expect(handledRequests).toEqual([]);
+    expect(port.disconnectCount).toBe(0);
+
+    allowReconciliation.resolve();
+    await waitForCondition(() => handledRequests.length === 1);
+    expect(handledRequests).toEqual(["018f47b8-2f80-7c20-9c77-f8a38c9e6230"]);
+    expect(port.posted.at(-1)).toMatchObject({
+      kind: "response",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e6230",
+      outcome: "completed",
+    });
+  });
+
 
   test("sends a popup approval by opaque review handle and requires a host acknowledgment", async () => {
     const scheduler = new MutationScheduler();
@@ -2215,7 +2278,7 @@ describe("native bridge transport", () => {
       host_version: "0.2.0",
       state: "ready",
     });
-    await waitForCondition(() => scheduler.isAccepting());
+    await waitForCondition(() => alarmClears.includes(RECONNECT_ALARM));
 
     const approval = bridge.approvePopupCommit("review-handle-opaque", TASK_A, 44);
     const event = port.posted.at(-1) as Record<string, unknown>;
@@ -2257,7 +2320,7 @@ describe("native bridge transport", () => {
       unexpected: true,
     });
 
-    expect(port.disconnectCount).toBe(1);
+    await waitForCondition(() => port.disconnectCount === 1);
     expect(scheduler.isAccepting()).toBe(false);
   });
 });
