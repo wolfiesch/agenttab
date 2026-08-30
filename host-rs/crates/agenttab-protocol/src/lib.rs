@@ -321,6 +321,20 @@ impl MethodParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserOpenPlacement {
+    #[default]
+    Task,
+    NewWindow,
+}
+
+impl BrowserOpenPlacement {
+    fn is_task(&self) -> bool {
+        matches!(self, Self::Task)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserOpenParams {
@@ -329,6 +343,8 @@ pub enum BrowserOpenParams {
         url: Option<String>,
         #[serde(default = "default_true")]
         background: bool,
+        #[serde(default, skip_serializing_if = "BrowserOpenPlacement::is_task")]
+        placement: BrowserOpenPlacement,
     },
     AdoptActive,
 }
@@ -501,13 +517,26 @@ pub struct BrowserDeveloperParams {
 impl MethodParams {
     fn validate(&self, method: RpcMethod) -> Result<(), ProtocolError> {
         match self {
-            Self::Open(BrowserOpenParams::Create { url: Some(url), .. }) => {
-                require_len(method, url, 1, MAX_URL_CHARS, "url")?;
-                require(
-                    method,
-                    valid_url(url),
-                    "url must use http, https, or about without whitespace",
-                )?;
+            Self::Open(BrowserOpenParams::Create {
+                url,
+                background,
+                placement,
+            }) => {
+                if let Some(url) = url {
+                    require_len(method, url, 1, MAX_URL_CHARS, "url")?;
+                    require(
+                        method,
+                        valid_url(url),
+                        "url must use http, https, or about without whitespace",
+                    )?;
+                }
+                if matches!(placement, BrowserOpenPlacement::NewWindow) {
+                    require(
+                        method,
+                        *background,
+                        "background must be true when placement is new_window",
+                    )?;
+                }
             }
             Self::Snapshot(BrowserSnapshotParams::Accessibility {
                 root_ref,
@@ -629,10 +658,7 @@ impl MethodParams {
                 require_len(method, &params.action, 1, 128, "action")?;
                 validate_developer_params(method, &params.params)?;
             }
-            Self::Open(BrowserOpenParams::Create { url: None, .. })
-            | Self::Open(BrowserOpenParams::AdoptActive)
-            | Self::Tabs(_)
-            | Self::Status(_) => {}
+            Self::Open(BrowserOpenParams::AdoptActive) | Self::Tabs(_) | Self::Status(_) => {}
         }
         Ok(())
     }
@@ -1682,6 +1708,41 @@ mod tests {
             true,
         ))
         .is_ok());
+    }
+
+    #[test]
+    fn dedicated_task_windows_are_background_only() {
+        let (_, params) = RpcRequest::parse(request(
+            "browser_open",
+            json!({
+                "mode": "create",
+                "url": "https://example.com/workspace",
+                "placement": "new_window"
+            }),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(
+            params,
+            MethodParams::Open(BrowserOpenParams::Create {
+                background: true,
+                placement: BrowserOpenPlacement::NewWindow,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            RpcRequest::parse(request(
+                "browser_open",
+                json!({
+                    "mode": "create",
+                    "placement": "new_window",
+                    "background": false
+                }),
+                true,
+            )),
+            Err(ProtocolError::InvalidParamConstraint { .. })
+        ));
     }
 
     #[test]

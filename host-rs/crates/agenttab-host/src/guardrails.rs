@@ -518,7 +518,7 @@ fn sensitive_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agenttab_protocol::{BrowserDeveloperParams, BrowserOpenParams};
+    use agenttab_protocol::{BrowserDeveloperParams, BrowserOpenParams, BrowserOpenPlacement};
     use serde_json::{json, Map};
 
     #[test]
@@ -582,6 +582,7 @@ mod tests {
         let open = MethodParams::Open(BrowserOpenParams::Create {
             url: Some("https://private.example.com/path".into()),
             background: true,
+            placement: BrowserOpenPlacement::Task,
         });
         assert_eq!(
             guardrails

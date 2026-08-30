@@ -22,7 +22,7 @@ The command has no path, token, or shell-specific argument and is suitable for P
 
 ## A task-owned workflow
 
-1. An agent calls `browser_open` with `mode: "create"`. AgentTab creates a background tab for that task and returns its task, tab, and page-revision identifiers.
+1. An agent calls `browser_open` with `mode: "create"`. AgentTab creates a background tab for that task and returns its task, tab, window, and page-revision identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
 2. The agent calls `browser_snapshot`, works from revisioned accessibility references, then calls `browser_act` with the expected page revision. It cannot act on unrelated tabs.
 3. If a site requires human-only input, the agent calls `browser_handoff`. AgentTab focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
 4. If AgentTab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token.
@@ -32,7 +32,7 @@ Commit is a two-party, best-effort semantic barrier, not proof that a page has n
 
 ## Trust contract
 
-- **Task ownership is an execution and coordination boundary, not profile isolation.** AgentTab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or browser-global mutation.
+- **Task ownership is an execution and coordination boundary, not profile isolation.** AgentTab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or a generic browser-global mutation API. Its one window-level operation creates an unfocused normal window for the first tab of an otherwise empty task.
 - **Your Turn is the only routine focus transition.** Routine task work stays in task-owned tabs. During handoff, all agent observation and capture are denied so human credentials are not captured.
 - **Commit requires human approval and agent intent.** A staged action is bound to its task, tab, page revision, element fingerprint, effect, and short expiry. Popup approval records consent but does not execute it. The agent must then call `browser_commit`; a changed page, expired stage, used token, or unapproved stage cannot execute.
 - **Local by default.** Policy, task state, audit records, and IPC stay on the machine. AgentTab has no telemetry. See [Telemetry](docs/telemetry.md) and [Security](docs/security.md).
@@ -43,7 +43,7 @@ Standard mode exposes exactly seven MCP tools:
 
 | Tool | Purpose |
 |---|---|
-| `browser_open` | Create a task tab or explicitly adopt the active tab. |
+| `browser_open` | Create a task tab, create an unfocused window for a new task, or explicitly adopt the active tab. |
 | `browser_snapshot` | Read an accessibility tree, bounded text or HTML, or a screenshot from a task tab. |
 | `browser_act` | Run typed actions against one task tab and expected page revision. |
 | `browser_wait` | Wait for load, URL, text, selector, network-idle, or download conditions. |

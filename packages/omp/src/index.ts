@@ -30,7 +30,7 @@ interface ZodApi {
   boolean(): SchemaNode;
   union(schemas: SchemaNode[]): SchemaNode;
   enum(values: readonly string[]): SchemaNode;
-  literal(value: string): SchemaNode;
+  literal(value: string | boolean): SchemaNode;
   number(): SchemaNode;
   object(properties: Record<string, SchemaNode>): SchemaNode;
   record(key: SchemaNode, value: SchemaNode): SchemaNode;
@@ -57,13 +57,20 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_open",
       label: "Browser Open",
-      description: "Create a background tab in this task workspace or explicitly adopt the active tab.",
+      description: "Create a task tab, create an unfocused task-owned window, or explicitly adopt the active tab.",
       approval: "write",
       schema: (z) => z.union([
         z.object({
           mode: z.literal("create"),
           url: z.string().regex(/^(https?:\/\/|about:)[^\s]+$/).optional(),
+          placement: z.literal("task").optional(),
           background: z.boolean().optional(),
+        }).strict(),
+        z.object({
+          mode: z.literal("create"),
+          url: z.string().regex(/^(https?:\/\/|about:)[^\s]+$/).optional(),
+          placement: z.literal("new_window"),
+          background: z.literal(true).optional(),
         }).strict(),
         z.object({ mode: z.literal("adopt_active") }).strict(),
       ]),

@@ -23,6 +23,12 @@ describe("AgentTab MCP surface", () => {
     expect(listedTools(false).some((tool) => tool.name === DEVELOPER_TOOL.name)).toBe(false);
   });
 
+  test("browser_open advertises task-owned background window creation", () => {
+    const openTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_open")!;
+    expect(JSON.stringify(openTool.inputSchema)).toContain("\"new_window\"");
+    expect(JSON.stringify(openTool.inputSchema)).toContain("\"background\":{\"const\":true}");
+  });
+
   test("browser_act advertises no press action", () => {
     const actionTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_act")!;
     expect(actionTool.inputSchema).not.toHaveProperty("$defs.press");

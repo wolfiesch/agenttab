@@ -75,6 +75,12 @@ test("Standard OMP actions expose no direct focus transition", () => {
   expect(registered.literalValues).not.toContain("focus");
 });
 
+test("Standard browser_open exposes background-only task window creation", () => {
+  const registered = register(false);
+  expect(registered.literalValues).toContain("new_window");
+  expect(registered.literalValues).toContain(true);
+});
+
 test("developer mode adds only browser_developer", () => {
   expect(register(true).tools.map((tool) => tool.name)).toEqual([
     "browser_open",

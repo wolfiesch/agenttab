@@ -9,8 +9,20 @@
       "properties": {
         "mode": { "const": "create" },
         "url": { "type": "string", "maxLength": 2048, "pattern": "^(https?://|about:)[^\\s]+$" },
-        "background": { "type": "boolean", "default": true }
+        "background": { "type": "boolean", "default": true },
+        "placement": { "enum": ["task", "new_window"], "default": "task" }
       },
+      "allOf": [
+        {
+          "if": {
+            "required": ["placement"],
+            "properties": { "placement": { "const": "new_window" } }
+          },
+          "then": {
+            "properties": { "background": { "const": true } }
+          }
+        }
+      ],
       "additionalProperties": false
     },
     {

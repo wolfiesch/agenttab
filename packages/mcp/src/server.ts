@@ -101,7 +101,7 @@ const schema = (value: Record<string, unknown>): Record<string, unknown> => {
 export const STANDARD_TOOLS: readonly Tool[] = [
   {
     name: "browser_open",
-    description: "Create a background tab in this task workspace or explicitly adopt the active tab.",
+    description: "Create a task tab, create an unfocused task-owned window, or explicitly adopt the active tab.",
     inputSchema: schema(openSchema),
   },
   {

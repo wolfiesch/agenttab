@@ -62,7 +62,7 @@ For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. 
 
 | Tool | Required input and behavior |
 |---|---|
-| `browser_open` | `mode: "create"` optionally accepts an `http`, `https`, or `about` URL and `background`; it creates a task tab. `mode: "adopt_active"` explicitly adopts only the currently active tab. It returns task, tab, and page-revision identifiers. |
+| `browser_open` | `mode: "create"` optionally accepts an `http`, `https`, or `about` URL, `background`, and `placement`. The default `placement: "task"` creates a tab in the task's existing window when possible. `placement: "new_window"` creates the first tab of an otherwise empty task in a separate unfocused normal window and rejects `background: false`. `mode: "adopt_active"` explicitly adopts only the currently active tab. The result includes task, tab, window, and page-revision identifiers. |
 | `browser_snapshot` | Requires `tab_id`. Modes are `accessibility`, `text`, `html`, and `screenshot`. Only accessibility snapshots return revisioned node references. |
 | `browser_act` | Requires `tab_id`, `expected_page_revision`, and one to 64 typed actions. Actions are click, type, fill, select, scroll, drag, navigate, history movement, reload, close, dialog decision, and staged file upload. No coordinate action exists in Standard mode. |
 | `browser_wait` | Requires `tab_id` and one load, URL, text, selector, network-idle, or download condition. `timeout_ms` is at most 120 seconds. |

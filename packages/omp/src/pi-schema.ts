@@ -15,7 +15,14 @@ const schemas: Record<ToolMethod, unknown> = {
     object({
       mode: Type.Literal("create"),
       url: Type.Optional(Type.String({ pattern: "^(https?://|about:)[^\\s]+$" })),
+      placement: Type.Optional(Type.Literal("task")),
       background: Type.Optional(Type.Boolean()),
+    }),
+    object({
+      mode: Type.Literal("create"),
+      url: Type.Optional(Type.String({ pattern: "^(https?://|about:)[^\\s]+$" })),
+      placement: Type.Literal("new_window"),
+      background: Type.Optional(Type.Literal(true)),
     }),
     object({ mode: Type.Literal("adopt_active") }),
   ]),

@@ -193,13 +193,18 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
     case "browser_open":
       return fieldString(args, "mode") === "adopt_active"
         ? { title: "Adopt active tab", meta: "explicit task ownership" }
-        : {
-          title: "Open task tab",
-          meta: joinMeta(
-            safeUrl(fieldString(args, "url")),
-            fieldBoolean(args, "background") === false ? "foreground" : "background",
-          ),
-        };
+        : fieldString(args, "placement") === "new_window"
+          ? {
+            title: "Open task window",
+            meta: joinMeta(safeUrl(fieldString(args, "url")), "background"),
+          }
+          : {
+            title: "Open task tab",
+            meta: joinMeta(
+              safeUrl(fieldString(args, "url")),
+              fieldBoolean(args, "background") === false ? "foreground" : "background",
+            ),
+          };
     case "browser_snapshot":
       return {
         title: `Snapshot ${fieldString(args, "mode") ?? "page"}`,
@@ -299,7 +304,11 @@ function summarizeResult(
   }
   switch (method) {
     case "browser_open":
-      return fieldString(args, "mode") === "adopt_active" ? "Active tab adopted" : "Task tab opened";
+      return fieldString(args, "mode") === "adopt_active"
+        ? "Active tab adopted"
+        : fieldString(args, "placement") === "new_window"
+          ? "Task window opened"
+          : "Task tab opened";
     case "browser_snapshot": {
       const mode = fieldString(args, "mode");
       if (mode === "accessibility") return countSummary(observationItems(details), "node");
