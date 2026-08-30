@@ -2071,7 +2071,13 @@ describe("page revision monotonicity", () => {
                                 ? { "aria-label": "Card expiration month" }
                                 : objectId.endsWith("-34")
                                   ? { name: "cardExpiryYear" }
-                                  : { type: "text", name: "security_code" };
+                                  : objectId.endsWith("-35")
+                                    ? { type: "text", name: "security_code" }
+                                    : objectId.endsWith("-36")
+                                      ? { name: "cvv2" }
+                                      : objectId.endsWith("-37")
+                                        ? { name: "cid" }
+                                        : { name: "cardVerificationValue" };
         const target = {
           form: null,
           labels: [],
@@ -2124,6 +2130,9 @@ describe("page revision monotonicity", () => {
       { kind: "select", ref: `r${pageRevision}-33`, value: "08" },
       { kind: "fill", ref: `r${pageRevision}-35`, text: "123" },
       { kind: "select", ref: `r${pageRevision}-34`, value: "2030" },
+      { kind: "fill", ref: `r${pageRevision}-36`, text: "123" },
+      { kind: "fill", ref: `r${pageRevision}-37`, text: "123" },
+      { kind: "fill", ref: `r${pageRevision}-38`, text: "123" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
