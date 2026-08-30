@@ -1485,11 +1485,11 @@ describe("ownership and task isolation", () => {
   });
 
 
-  test("publishes a loading tab's pending URL in native inventory", async () => {
+  test("publishes a loading tab's pending URL instead of its previous URL", async () => {
     await seedTask(TASK_A, [31], 7);
     const tab = tabStore.get(31);
     if (!tab) throw new Error("missing test tab");
-    delete tab.url;
+    tab.url = "https://example.test/previous";
     tab.pendingUrl = "https://example.test/loading";
     const ownership = new OwnershipLedger(
       new MutationScheduler(),

@@ -150,7 +150,7 @@ export class OwnershipLedger {
       for (const tabId of task.tabIds) {
         const tab = byId.get(tabId);
         if (!tab || tab.groupId !== task.groupId || !Number.isInteger(tab.windowId)) continue;
-        const url = tab.url || tab.pendingUrl;
+        const url = tab.pendingUrl || tab.url;
         if (!url) continue;
         inventory.push({
           tab_id: tabId,
