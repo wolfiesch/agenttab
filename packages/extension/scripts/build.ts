@@ -85,7 +85,7 @@ if (channel === "development") {
   }
   delete manifest.key;
 }
-const required = ["nativeMessaging", "debugger", "tabs", "tabGroups", "storage", "alarms", "downloads"];
+const required = ["nativeMessaging", "debugger", "tabs", "tabGroups", "storage", "alarms"];
 const optional = ["scripting"];
 const forbiddenKeys = ["content_scripts", "web_accessible_resources", "externally_connectable", "side_panel", "commands"];
 for (const key of forbiddenKeys) {

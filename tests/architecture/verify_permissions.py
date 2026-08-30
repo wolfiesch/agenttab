@@ -54,7 +54,6 @@ REQUIRED_PERMISSIONS = (
     "tabGroups",
     "storage",
     "alarms",
-    "downloads",
 )
 OPTIONAL_PERMISSIONS = ("scripting",)
 REMOVED_PERMISSIONS = (

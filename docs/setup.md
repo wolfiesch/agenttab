@@ -61,7 +61,7 @@ The installer deliberately stages the extension but does not silently install or
 5. Open the AgentTab popup and choose **Enable AgentTab automation**. Chrome requests the optional `scripting` permission. The required `debugger` permission is already present from extension installation; both capabilities are required for Standard browser automation.
 6. Run `agenttab doctor --layer extension` after the extension is enabled. Use `agenttab doctor --layer ipc` to check the local host path.
 
-The manifest keeps `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, `alarms`, and `downloads` as required permissions because Chrome rejects `debugger` in `optional_permissions`. `scripting` is optional and is requested only from the user-facing popup. Removing it disables automation and detaches active task debugger sessions until it is enabled again.
+The manifest keeps `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, and `alarms` as required permissions because Chrome rejects `debugger` in `optional_permissions`. `scripting` is optional and is requested only from the user-facing popup. Removing it disables automation and detaches active task debugger sessions until it is enabled again.
 
 ## Native identity, registration, and local paths
 

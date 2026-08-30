@@ -1378,6 +1378,27 @@ describe("page revision monotonicity", () => {
     await expect(waiting).rejects.toMatchObject({ code: "browser_restricted_origin" });
     expect(scriptingCallCount).toBe(probesBeforeNavigation);
   });
+  test("rejects download waits on browser-restricted routes before debugger attachment", async () => {
+    await seedTask(TASK_A, [61], 5);
+    const tab = tabStore.get(61);
+    if (!tab) throw new Error("missing task tab");
+    tab.pendingUrl = "chrome://settings/";
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const debuggerCallsBeforeWait = debuggerCalls.length;
+    const scriptingCallsBeforeWait = scriptingCallCount;
+
+    await expect(runtime.wait(61, {
+      condition: { kind: "download" },
+      timeout_ms: 1_000,
+    })).rejects.toMatchObject({ code: "browser_restricted_origin" });
+    expect(debuggerCalls).toHaveLength(debuggerCallsBeforeWait);
+    expect(scriptingCallCount).toBe(scriptingCallsBeforeWait);
+  });
 
 
   test("types into a background field through one DOM mutation", async () => {
