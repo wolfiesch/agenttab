@@ -1120,9 +1120,13 @@ export class StandardBrowserRuntime {
       return Boolean(session && session.inflight.size === 0 && Date.now() - session.lastNetworkActivity >= 500);
     }
     if (kind === "download") {
-      const downloads = await chrome.downloads.search({ state: "complete", limit: 1, orderBy: ["-endTime"] });
-      const completedAtMs = Date.parse(downloads[0]?.endTime ?? "");
-      return Number.isFinite(completedAtMs) && completedAtMs >= waitStartedAtMs;
+      const downloads = await chrome.downloads.search({ state: "complete" });
+      return downloads.some((download) => {
+        const completedAtMs = Date.parse(download.endTime ?? "");
+        return download.tabId === tabId
+          && Number.isFinite(completedAtMs)
+          && completedAtMs >= waitStartedAtMs;
+      });
     }
     throw Object.assign(new Error(`Unsupported wait condition: ${String(kind)}`), {
       code: "invalid_request",

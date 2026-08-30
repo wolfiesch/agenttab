@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
@@ -1175,35 +1175,83 @@ describe("page revision monotonicity", () => {
   });
 
   test("matches only downloads completed after the wait starts", async () => {
-    completedDownloads = [{
-      id: 1,
-      state: "complete",
-      endTime: new Date(Date.now() - 60_000).toISOString(),
-    }];
-    const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const clockStart = new Date("2026-08-30T00:00:00.000Z").getTime();
+    const scheduledTimers: Array<() => void> = [];
+    let timerScheduled = Promise.withResolvers<void>();
+    const originalSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((callback: unknown) => {
+      if (typeof callback !== "function") throw new Error("browser wait timer must be a callback");
+      scheduledTimers.push(() => callback());
+      timerScheduled.resolve();
+      return 0;
+    }) as typeof setTimeout;
+    const takeScheduledTimer = (): (() => void) => {
+      const timer = scheduledTimers.shift();
+      if (!timer) throw new Error("expected browser wait timer");
+      return timer;
+    };
+    setSystemTime(clockStart);
+    try {
+      completedDownloads = [{
+        id: 1,
+        state: "complete",
+        tabId: 61,
+        endTime: new Date(Date.now() - 60_000).toISOString(),
+      }];
+      const revisions = new RevisionTracker();
+      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
 
-    await expect(runtime.wait(61, {
-      condition: { kind: "download" },
-      timeout_ms: 1,
-    })).rejects.toMatchObject({ code: "wait_timeout" });
+      const staleWait = runtime.wait(61, {
+        condition: { kind: "download" },
+        timeout_ms: 1,
+      });
+      await timerScheduled.promise;
+      setSystemTime(clockStart + 100);
+      takeScheduledTimer()();
+      await expect(staleWait).rejects.toMatchObject({ code: "wait_timeout" });
 
-    completedDownloads = [];
-    const waiting = runtime.wait(61, {
-      condition: { kind: "download" },
-      timeout_ms: 500,
-    });
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    completedDownloads = [{
-      id: 2,
-      state: "complete",
-      endTime: new Date().toISOString(),
-    }];
-    await expect(waiting).resolves.toMatchObject({
-      tab_id: 61,
-      condition: "download",
-      matched: true,
-    });
+      completedDownloads = [];
+      timerScheduled = Promise.withResolvers<void>();
+      const waiting = runtime.wait(61, {
+        condition: { kind: "download" },
+        timeout_ms: 500,
+      });
+      await timerScheduled.promise;
+      setSystemTime(clockStart + 101);
+      completedDownloads = [{
+        id: 2,
+        state: "complete",
+        tabId: 62,
+        endTime: new Date().toISOString(),
+      }];
+      const outcome = waiting.then(
+        () => "matched",
+        () => "rejected",
+      );
+      timerScheduled = Promise.withResolvers<void>();
+      setSystemTime(clockStart + 200);
+      takeScheduledTimer()();
+      expect(await Promise.race([
+        timerScheduled.promise.then(() => "pending"),
+        outcome,
+      ])).toBe("pending");
+      setSystemTime(clockStart + 201);
+      completedDownloads = [{
+        id: 3,
+        state: "complete",
+        tabId: 61,
+        endTime: new Date().toISOString(),
+      }];
+      takeScheduledTimer()();
+      await expect(waiting).resolves.toMatchObject({
+        tab_id: 61,
+        condition: "download",
+        matched: true,
+      });
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      setSystemTime();
+    }
   });
 
   test("stops a browser wait after the user moves its tab out of the task group", async () => {
