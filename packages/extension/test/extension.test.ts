@@ -1440,7 +1440,7 @@ describe("page revision monotonicity", () => {
     expect(debuggerCalls).not.toContain("Input.insertText");
   });
 
-  test("fills contenteditable fields and invokes native input setters", async () => {
+  test("fills contenteditable fields and uses native setters for fill and type", async () => {
     class SyntheticEvent {
       readonly bubbles: boolean;
 
@@ -1455,6 +1455,9 @@ describe("page revision monotonicity", () => {
       nativeValue = "before";
       focused = 0;
       readonly events: Array<{ type: string; bubbles: boolean }> = [];
+      selectionStart = 2;
+      selectionEnd = 4;
+      readonly selectionUpdates: Array<[number, number]> = [];
 
       get value(): string {
         return this.nativeValue;
@@ -1470,6 +1473,12 @@ describe("page revision monotonicity", () => {
 
       focus(): void {
         this.focused += 1;
+      }
+
+      setSelectionRange(start: number, end: number): void {
+        this.selectionStart = start;
+        this.selectionEnd = end;
+        this.selectionUpdates.push([start, end]);
       }
 
       dispatchEvent(event: SyntheticEvent): boolean {
@@ -1492,13 +1501,16 @@ describe("page revision monotonicity", () => {
       },
     };
     const input = new NativeInput();
-    let interceptedDirectAssignment: string | undefined;
-    Object.defineProperty(input, "value", {
-      configurable: true,
-      set(value: string) {
-        interceptedDirectAssignment = value;
-      },
-    });
+    const typedInput = new NativeInput();
+    const interceptedDirectAssignments: string[] = [];
+    for (const target of [input, typedInput]) {
+      Object.defineProperty(target, "value", {
+        configurable: true,
+        set(value: string) {
+          interceptedDirectAssignments.push(value);
+        },
+      });
+    }
     const globals: Record<string, PropertyDescriptor | undefined> = {
       Event: Object.getOwnPropertyDescriptor(globalThis, "Event"),
       InputEvent: Object.getOwnPropertyDescriptor(globalThis, "InputEvent"),
@@ -1533,7 +1545,11 @@ describe("page revision monotonicity", () => {
         method === "Runtime.callFunctionOn" &&
         String(params.functionDeclaration).includes("agenttab_sensitive_field")
       ) {
-        const target = String(params.objectId).endsWith("-22") ? contenteditable : input;
+        const target = String(params.objectId).endsWith("-22")
+          ? contenteditable
+          : String(params.objectId).endsWith("-23")
+            ? input
+            : typedInput;
         const declaration = Function(`return (${String(params.functionDeclaration)})`)() as (
           this: typeof contenteditable | NativeInput,
           value: string,
@@ -1556,6 +1572,7 @@ describe("page revision monotonicity", () => {
       await runtime.act(TASK_A, 63, pageRevision, [
         { kind: "fill", ref: `r${pageRevision}-22`, text: "content replacement" },
         { kind: "fill", ref: `r${pageRevision}-23`, text: "native setter" },
+        { kind: "type", ref: `r${pageRevision}-24`, text: "X" },
       ]);
     } finally {
       for (const [key, descriptor] of Object.entries(globals)) {
@@ -1571,11 +1588,17 @@ describe("page revision monotonicity", () => {
       { type: "change", bubbles: true },
     ]);
     expect(input.nativeValue).toBe("native setter");
-    expect(interceptedDirectAssignment).toBeUndefined();
+    expect(typedInput.nativeValue).toBe("beXre");
+    expect(typedInput.selectionUpdates).toEqual([[3, 3]]);
+    expect(interceptedDirectAssignments).toEqual([]);
     expect(input.focused).toBe(1);
     expect(input.events).toEqual([
       { type: "input", bubbles: true },
       { type: "change", bubbles: true },
+    ]);
+    expect(typedInput.focused).toBe(1);
+    expect(typedInput.events).toEqual([
+      { type: "input", bubbles: true },
     ]);
   });
 
