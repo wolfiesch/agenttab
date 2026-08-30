@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   AgentTabClient,
   AgentTabError,
@@ -267,9 +268,9 @@ export function makeExtension(clientFactory?: ClientFactory) {
       const conversationId = process.env.AGENTTAB_CONVERSATION_ID;
       return AgentTabClient.connect({
         conversationId,
-        capabilityStore: conversationId
-          ? createResumeCapabilityStore(isOmp ? "omp" : "pi", { scope: conversationId })
-          : undefined,
+        capabilityStore: createResumeCapabilityStore(isOmp ? "omp" : "pi", {
+          scope: conversationId ?? `session-${randomUUID()}`,
+        }),
       });
     });
     let client: AgentTabClient | undefined;

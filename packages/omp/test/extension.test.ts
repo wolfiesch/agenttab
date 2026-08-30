@@ -1,5 +1,14 @@
 import { afterEach, expect, test } from "bun:test";
-import { AgentTabTransportError, type AgentTabClient } from "../../sdk-typescript/src/index";
+import { mkdtempSync, rmSync } from "node:fs";
+import { createServer, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  AgentTabTransportError,
+  FrameDecoder,
+  encodeFrame,
+  type AgentTabClient,
+} from "../../sdk-typescript/src/index";
 import { makeExtension, type AgentApi } from "../src/index";
 
 const originalDeveloper = process.env.AGENTTAB_DEVELOPER;
@@ -47,10 +56,13 @@ function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
   return { tools, calls, literalValues: [...literalValues] };
 }
 
-async function executeTool(tool: Record<string, unknown> | undefined): Promise<Record<string, unknown>> {
+async function executeTool(
+  tool: Record<string, unknown> | undefined,
+  args: Record<string, unknown> = {},
+): Promise<Record<string, unknown>> {
   const execute = tool?.execute;
   if (typeof execute !== "function") throw new Error("Registered tool has no execute function.");
-  const value: unknown = await execute("call-1", {});
+  const value: unknown = await execute("call-1", args);
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Registered tool returned a non-object result.");
   }
@@ -103,6 +115,98 @@ test("registered tools call Core RPC without TCP or lease verbs", async () => {
     tabs: [],
     _agenttab: { outcome: "committed", task_id: "task-test-1234" },
   });
+});
+
+test("default OMP and Pi sessions confirm the initial capability before the next tool call", async () => {
+  for (const runtime of ["omp", "pi"] as const) {
+    const root = mkdtempSync(join(tmpdir(), `agenttab-${runtime}-`));
+    const endpoint = join(root, "agenttab.sock");
+    const previousSocket = process.env.AGENTTAB_SOCKET;
+    const previousStateDir = process.env.AGENTTAB_STATE_DIR;
+    const previousConversationId = process.env.AGENTTAB_CONVERSATION_ID;
+    const methods: string[] = [];
+    let confirmed = false;
+    let activeSocket: Socket | undefined;
+    const nativeServer = createServer((socket) => {
+      activeSocket = socket;
+      const decoder = new FrameDecoder();
+      socket.on("data", (chunk) => {
+        for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+          if (value.kind === "connect") {
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da43",
+              resumed: false,
+              state: "ready",
+            }));
+          } else if (value.kind === "resume_confirm") {
+            confirmed = value.resume_capability === "a".repeat(32);
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "resume_confirmed",
+              connection_id: value.connection_id,
+            }));
+          } else {
+            methods.push(String(value.method));
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              request_id: value.request_id,
+              ok: true,
+              outcome: "completed",
+              result: value.method === "browser_tabs" ? { tabs: [] } : { tab_id: 1 },
+              ...(methods.length === 1
+                ? {
+                  task: {
+                    task_id: "018f22b2-4126-7c1a-8c31-3f45a783da44",
+                    resume_capability: "a".repeat(32),
+                  },
+                }
+                : {}),
+            }));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      nativeServer.once("error", reject);
+      nativeServer.listen(endpoint, resolve);
+    });
+
+    try {
+      process.env.AGENTTAB_SOCKET = endpoint;
+      process.env.AGENTTAB_STATE_DIR = join(root, "state");
+      delete process.env.AGENTTAB_CONVERSATION_ID;
+      const tools: Array<Record<string, unknown>> = [];
+      const api = {
+        ...(runtime === "omp" ? { zod } : {}),
+        registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+      };
+      makeExtension()(api as unknown as AgentApi);
+      const first = await executeTool(
+        tools.find((tool) => tool.name === "browser_open"),
+        { mode: "create" },
+      );
+      expect(first.structuredContent).toEqual({ tab_id: 1 });
+      expect(confirmed).toBe(true);
+      const second = await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
+      expect(second.structuredContent).toEqual({ tabs: [] });
+      expect(methods).toEqual(["browser_open", "browser_tabs"]);
+    } finally {
+      activeSocket?.destroy();
+      await new Promise<void>((resolve) => nativeServer.close(() => resolve()));
+      if (previousSocket === undefined) delete process.env.AGENTTAB_SOCKET;
+      else process.env.AGENTTAB_SOCKET = previousSocket;
+      if (previousStateDir === undefined) delete process.env.AGENTTAB_STATE_DIR;
+      else process.env.AGENTTAB_STATE_DIR = previousStateDir;
+      if (previousConversationId === undefined) delete process.env.AGENTTAB_CONVERSATION_ID;
+      else process.env.AGENTTAB_CONVERSATION_ID = previousConversationId;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
 });
 
 test("OMP reconnects after a closed client fails without replaying and reports the new task id", async () => {
