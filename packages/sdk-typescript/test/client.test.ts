@@ -172,6 +172,67 @@ test("does not create a new task when a stored resume capability is rejected", a
   expect(connections).toBe(1);
 });
 
+test("retries the active capability after a pending replacement is rejected", async () => {
+  const activeCapability = "a".repeat(32);
+  const pendingCapability = "b".repeat(32);
+  const replacementCapability = "c".repeat(32);
+  const attempted: string[] = [];
+  let activated: string | undefined;
+  let connectionIndex = 0;
+  const endpoint = await listen((socket) => {
+    const index = connectionIndex++;
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          attempted.push(String(value.resume_capability));
+          if (index === 0) {
+            socket.end(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da41",
+              resumed: false,
+              state: "ready",
+            }, 1024 * 1024));
+          } else {
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da42",
+              resumed: true,
+              task_id: "018f22b2-4126-7c1a-8c31-3f45a783da43",
+              resume_capability: replacementCapability,
+              state: "ready",
+            }, 1024 * 1024));
+          }
+        } else if (value.kind === "resume_confirm") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "resume_confirmed",
+            connection_id: value.connection_id,
+          }, 1024 * 1024));
+        }
+      }
+    });
+  });
+  const store = {
+    path: "memory",
+    load: async () => activeCapability,
+    loadPending: async () => pendingCapability,
+    save: async () => undefined,
+    prepareReplacement: async () => undefined,
+    activateReplacement: async (capability: string) => { activated = capability; },
+  };
+
+  const client = await AgentTabClient.connect({ endpoint, capabilityStore: store });
+  expect(attempted).toEqual([pendingCapability, activeCapability]);
+  expect(activated).toBe(replacementCapability);
+  client.close();
+});
+
 test("durably stages and confirms resumed capability rotation before returning", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "agenttab-sdk-state-"));
   roots.push(stateDir);

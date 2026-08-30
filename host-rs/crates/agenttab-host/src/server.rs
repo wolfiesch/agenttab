@@ -510,22 +510,22 @@ where
     let (connection, ack) = runtime
         .connect(init)
         .map_err(|error| io::Error::other(error.to_string()))?;
-    if resume_capability_supplied && !ack.resumed {
-        let _ = runtime.disconnect(&connection);
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            INVALID_RESUME_CAPABILITY_ERROR,
-        ));
-    }
     if let Err(error) = write_frame_async(
         &mut stream,
-        &serde_json::to_value(ack)?,
+        &serde_json::to_value(&ack)?,
         HOST_TO_CLIENT_MAX_BYTES,
     )
     .await
     {
         let _ = runtime.disconnect(&connection);
         return Err(error);
+    }
+    if resume_capability_supplied && !ack.resumed {
+        let _ = runtime.disconnect(&connection);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            INVALID_RESUME_CAPABILITY_ERROR,
+        ));
     }
     if connection.resume_confirmation_required() {
         let confirmation_value = match read_frame_async(&mut stream, CLIENT_TO_HOST_MAX_BYTES).await
@@ -889,6 +889,12 @@ mod tests {
         .unwrap();
         write_browser_open(&mut client, "pipelined-browser-open").await;
 
+        let rejected = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected["kind"], "connected");
+        assert_eq!(rejected["resumed"], false);
         assert!(read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
             .await
             .unwrap()
@@ -998,6 +1004,12 @@ mod tests {
         .await
         .unwrap();
         write_browser_open(&mut expired_client, "expired-browser-open").await;
+        let rejected = read_frame_async(&mut expired_client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected["kind"], "connected");
+        assert_eq!(rejected["resumed"], false);
         assert!(
             read_frame_async(&mut expired_client, HOST_TO_CLIENT_MAX_BYTES)
                 .await

@@ -1110,10 +1110,17 @@ impl Runtime {
                 committed_uploads = staged.upload_paths;
                 origin_policy
             } else {
-                params_value
-                    .get("tab_id")
-                    .and_then(Value::as_u64)
-                    .and_then(|tab_id| self.guardrails.native_origin_policy(tab_id))
+                match params {
+                    MethodParams::Developer(developer) => developer
+                        .params
+                        .get("tab_id")
+                        .and_then(Value::as_u64)
+                        .and_then(|tab_id| self.guardrails.native_origin_policy(tab_id)),
+                    _ => params_value
+                        .get("tab_id")
+                        .and_then(Value::as_u64)
+                        .and_then(|tab_id| self.guardrails.native_origin_policy(tab_id)),
+                }
             };
         let staged_uploads =
             match self
@@ -2085,7 +2092,7 @@ mod tests {
         paths.prepare().unwrap();
         std::fs::write(
             &paths.policy_file,
-            r#"{"denied_origins":["*.example.com"]}"#,
+            r#"{"developer_enabled":true,"denied_origins":["*.example.com"]}"#,
         )
         .unwrap();
         let lifecycle = Arc::new(Lifecycle::default());
@@ -2142,6 +2149,29 @@ mod tests {
         );
         assert_eq!(allowed["outcome"], "completed");
         assert_eq!(native.calls.load(Ordering::Relaxed), 1);
+        let developer = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "developer",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_developer",
+                "params": {
+                    "action": "Runtime.evaluate",
+                    "params": {"tab_id": 3, "expression": "document.title"}
+                }
+            }),
+        );
+        assert_eq!(developer["outcome"], "completed");
+        assert_eq!(
+            native.origin_policies.lock().last(),
+            Some(&Some(NativeOriginPolicy {
+                tab_id: 3,
+                allowed_origins: Vec::new(),
+                denied_origins: vec!["*.example.com".into()],
+            }))
+        );
     }
     #[test]
     fn commit_rechecks_staged_tab_policy_after_navigation() {

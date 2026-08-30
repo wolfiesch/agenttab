@@ -45,6 +45,7 @@ const compatibilityFiles = [
   "wake.html",
   "wake.js",
 ];
+const iconSource = join(sourceRoot, "icons", "icon-source.svg");
 
 await rm(outputRoot, { recursive: true, force: true });
 await mkdir(outputRoot, { recursive: true });
@@ -128,6 +129,7 @@ if (channel === "development") {
       await cp(join(outputRoot, name), join(root, name));
     }
     await cp(join(outputRoot, "icons"), join(root, "icons"), { recursive: true });
+    await cp(iconSource, join(root, "icons", "icon-source.svg"));
   }
 }
 

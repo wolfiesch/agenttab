@@ -1,8 +1,13 @@
 {
   "name": "@agenttab/omp",
   "version": "2.0.0-rc.1",
-  "private": true,
+  "description": "Native OMP adapter for AgentTab",
   "type": "module",
+  "exports": "./dist/index.mjs",
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "bun run scripts/build.ts",
     "typecheck": "tsc --noEmit",
