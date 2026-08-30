@@ -1371,8 +1371,9 @@ class StandardBrowserRuntime {
         code: "invalid_request"
       });
     }
+    const requiresFullAutomationRoute = TAB_ONLY_WAIT_CONDITIONS[conditionKind] !== true;
     await this.authorizeDebuggerUse(tabId);
-    if (TAB_ONLY_WAIT_CONDITIONS[conditionKind] !== true) {
+    if (requiresFullAutomationRoute) {
       await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
     }
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30000;
@@ -1382,6 +1383,9 @@ class StandardBrowserRuntime {
       await this.authorizeDebuggerUse(tabId);
       if (revalidate)
         await revalidate();
+      if (requiresFullAutomationRoute) {
+        await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
+      }
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
       if (revalidate)
         await revalidate();
@@ -2776,7 +2780,7 @@ class OwnershipLedger {
         const tab = byId.get(tabId);
         if (!tab || tab.groupId !== task.groupId || !Number.isInteger(tab.windowId))
           continue;
-        const url = tab.url || tab.pendingUrl;
+        const url = tab.pendingUrl || tab.url;
         if (!url)
           continue;
         inventory.push({
