@@ -8,9 +8,9 @@
   "packages": {
     "cli": "agenttab",
     "mcp": "agenttab-mcp",
-    "typescript": "@agenttab/sdk",
+    "typescript": "@getagenttab/sdk",
     "python": "agenttab",
-    "omp": "@agenttab/omp"
+    "omp": "@getagenttab/omp"
   },
   "environmentPrefix": "AGENTTAB_",
   "manifestName": "AgentTab",

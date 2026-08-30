@@ -1,5 +1,5 @@
 {
-  "name": "@agenttab/site",
+  "name": "@getagenttab/site",
   "version": "2.0.0-rc.1",
   "private": true,
   "description": "Static AgentTab landing and privacy site",
