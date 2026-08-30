@@ -130,6 +130,28 @@ describe("AgentTab operation card rendering", () => {
     expect(rendered).not.toContain("Executed ·");
   });
 
+  test("unknown failures warn that execution may have occurred", () => {
+    const component = createResultComponent(
+      "browser_act",
+      {
+        content: [{ type: "text", text: "Connection closed after dispatch" }],
+        isError: true,
+        details: {
+          code: "transport_closed",
+          outcome: "unknown",
+        },
+      },
+      { expanded: false },
+      theme,
+      { tab_id: 18, expected_page_revision: 4, actions: [{ kind: "click", ref: "ref=e3" }] },
+    );
+    const rendered = component.render(120).join("\n");
+    expect(rendered).toContain("Uncertain · Connection closed after dispatch · tab 18 · rev 4 · task-owned");
+    expect(rendered).toContain("✓ Intent  ? Execute  ▶ Reconcile");
+    expect(rendered).toContain("Execution may have occurred; inspect live state before retrying");
+    expect(rendered).not.toContain("Blocked ·");
+  });
+
   test("handoff cards distinguish waiting from completed user work", () => {
     const args = {
       tab_id: 18,
@@ -148,6 +170,24 @@ describe("AgentTab operation card rendering", () => {
       "Your turn · Waiting for user · tab 18 · rev 5 · task-owned",
       "  Flow · ✓ Intent  ▶ Human  · Resume",
     ]);
+    const activated = createResultComponent(
+      "browser_handoff",
+      {
+        details: {
+          tab_id: 18,
+          page_revision: 6,
+          _agenttab: { outcome: "needs_user", task_id: "task-7" },
+        },
+      },
+      { expanded: false },
+      theme,
+      args,
+    );
+    expect(activated.render(120)).toEqual([
+      "Your turn · Waiting for user · task task-7 · tab 18 · rev 6 · task-owned",
+      "  Flow · ✓ Intent  ▶ Human  · Resume",
+    ]);
+
 
     const completed = createResultComponent(
       "browser_handoff",
