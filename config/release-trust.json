@@ -3,5 +3,5 @@
   "repository": "wolfiesch/agenttab",
   "algorithm": "ed25519",
   "developmentPublicKeyPem": null,
-  "stablePublicKeyPem": null
+  "stablePublicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA/JoP8x6Yo2pszU5QPmPMEUjM54HqK7xk91ERNRn/oQ4=\n-----END PUBLIC KEY-----\n"
 }
