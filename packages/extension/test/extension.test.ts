@@ -1931,8 +1931,73 @@ describe("page revision monotonicity", () => {
     ]);
   });
 
-  test("routes password and payment fields through a human handoff before mutation", async () => {
-    let focusCalls = 0;
+  test("routes password and payment fields through a human handoff before staging", async () => {
+    let mutationCalls = 0;
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        const objectId = String(params.objectId);
+        const attributes: Record<string, string> = objectId.endsWith("-22")
+          ? { type: "password" }
+          : objectId.endsWith("-23")
+            ? { autocomplete: "section-checkout billing cc-number" }
+            : { autocomplete: "cc-exp-month" };
+        const target = {
+          form: null,
+          labels: [],
+          options: [],
+          tagName: objectId.endsWith("-24") ? "SELECT" : "INPUT",
+          innerText: "",
+          textContent: "",
+          id: "",
+          getAttribute(name: string) {
+            return attributes[name] ?? "";
+          },
+        };
+        const declaration = Function(`return (${String(params.functionDeclaration)})`)() as (
+          this: typeof target,
+          value: string,
+        ) => unknown;
+        const args = Array.isArray(params.arguments) ? params.arguments : [];
+        const argument = args[0];
+        const value =
+          argument !== null && typeof argument === "object" && "value" in argument
+            ? String(argument.value ?? "")
+            : "";
+        return { result: { value: declaration.call(target, value) } };
+      }
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("agenttab_sensitive_field")
+      ) {
+        mutationCalls += 1;
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(63);
+
+    for (const action of [
+      { kind: "type", ref: `r${pageRevision}-22`, text: "password" },
+      { kind: "fill", ref: `r${pageRevision}-23`, text: "4111111111111111" },
+      { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
+    ]) {
+      await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
+        code: "sensitive_field_requires_handoff",
+        recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
+      });
+    }
+
+    expect(mutationCalls).toBe(0);
+    expect((await readState()).stagedCommits).toEqual({});
+  });
+
+  test("rechecks select sensitivity immediately before mutation", async () => {
+    let assignments = 0;
+    let dispatchedEvents = 0;
     debuggerCommandOverride = (method, params) => {
       if (
         method === "Runtime.callFunctionOn" &&
@@ -1941,10 +2006,10 @@ describe("page revision monotonicity", () => {
         return {
           result: {
             value: {
-              tag: "INPUT",
-              role: "textbox",
-              aria_label: "Account note",
-              name: "note",
+              tag: "SELECT",
+              role: "combobox",
+              aria_label: "Expiration month",
+              autocomplete: "",
               form_action: "https://example.test/profile",
               form_method: "get",
             },
@@ -1955,15 +2020,15 @@ describe("page revision monotonicity", () => {
         method === "Runtime.callFunctionOn" &&
         String(params.functionDeclaration).includes("agenttab_sensitive_field")
       ) {
-        const attributes = String(params.objectId).endsWith("-22")
-          ? { type: "password" }
-          : { autocomplete: "section-checkout billing cc-number" };
         const target = {
           getAttribute(name: string) {
-            return attributes[name as keyof typeof attributes] ?? null;
+            return name === "autocomplete" ? "section-checkout cc-exp-month" : "";
           },
-          focus() {
-            focusCalls += 1;
+          set value(_value: string) {
+            assignments += 1;
+          },
+          dispatchEvent() {
+            dispatchedEvents += 1;
           },
         };
         const declaration = Function(`return (${String(params.functionDeclaration)})`)() as (
@@ -1984,23 +2049,16 @@ describe("page revision monotonicity", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(63);
 
-    for (const action of [
-      { kind: "type", ref: `r${pageRevision}-22`, text: "password" },
-      { kind: "fill", ref: `r${pageRevision}-23`, text: "4111111111111111" },
-    ]) {
-      await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
-        code: "sensitive_field_requires_handoff",
-        recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
-      });
-    }
-    expect(focusCalls).toBe(0);
-    expect(
-      debuggerCommands.filter(
-        ({ method, params }) =>
-          method === "Runtime.callFunctionOn" &&
-          String(params.functionDeclaration).includes("agenttab_sensitive_field"),
-      ),
-    ).toHaveLength(2);
+    await expect(
+      runtime.act(TASK_A, 63, pageRevision, [
+        { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
+      ]),
+    ).rejects.toMatchObject({
+      code: "sensitive_field_requires_handoff",
+      recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
+    });
+    expect(assignments).toBe(0);
+    expect(dispatchedEvents).toBe(0);
   });
 
   test("rejects a page action that raises in the target document", async () => {

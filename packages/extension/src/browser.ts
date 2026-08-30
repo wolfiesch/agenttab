@@ -987,12 +987,18 @@ export class StandardBrowserRuntime {
     const described = await this.send(tabId, "Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
       functionDeclaration:
-        "function(requestedValue){const f=this.form;const text=node=>String(node&&((node.innerText??node.textContent)??'')||'').trim();const ids=String(this.getAttribute('aria-labelledby')||'')+' '+String(this.getAttribute('aria-describedby')||'');const associated=(this.labels?Array.from(this.labels):[]).map(text).filter(Boolean);const accessible=[this.getAttribute('aria-label'),...ids.trim().split(/\\s+/).filter(Boolean).map(id=>text(document.getElementById(id)))].filter(value=>typeof value==='string'&&value.trim());const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_value:requestedValue,requested_option_label:option?String(option.label||option.textContent||'').trim():null}}",
+        "function(requestedValue){const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);if(requestedValue!==null&&(type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-')))){return {agenttab_sensitive_field:true}}const f=this.form;const text=node=>String(node&&((node.innerText??node.textContent)??'')||'').trim();const ids=String(this.getAttribute('aria-labelledby')||'')+' '+String(this.getAttribute('aria-describedby')||'');const associated=(this.labels?Array.from(this.labels):[]).map(text).filter(Boolean);const accessible=[this.getAttribute('aria-label'),...ids.trim().split(/\\s+/).filter(Boolean).map(id=>text(document.getElementById(id)))].filter(value=>typeof value==='string'&&value.trim());const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_value:requestedValue,requested_option_label:option?String(option.label||option.textContent||'').trim():null}}",
       arguments: [{ value: requestedValue }],
       returnByValue: true,
     });
     if (!isRecord(described.result) || !isRecord(described.result.value)) {
       throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
+    }
+    if (described.result.value.agenttab_sensitive_field === true) {
+      throw Object.assign(new Error("Sensitive fields require a human Your Turn handoff"), {
+        code: "sensitive_field_requires_handoff",
+        recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
+      });
     }
     return described.result.value;
   }
@@ -1107,7 +1113,7 @@ export class StandardBrowserRuntime {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        "function(value){this.value=value;this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}))}",
+        "function(value){const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);if(type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))){return {agenttab_sensitive_field:true}}this.value=value;this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}))}",
         [{ value: String(action.value ?? "") }],
       );
     } else if (kind === "scroll") {
