@@ -25,7 +25,12 @@ async function readToken(path: string): Promise<string> {
   return token;
 }
 
-function authenticate(socket: Socket, expectedToken: string, endpoint: string): void {
+function authenticate(
+  socket: Socket,
+  expectedToken: string,
+  endpoint: string,
+  connectUpstream: (endpoint: string) => Socket,
+): void {
   let buffered: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   const fail = (message: string) => {
     socket.write(encodeFrame({ protocol: "agenttab.proxy", version: 1, ok: false, error: message }, AUTH_MAX_BYTES));
@@ -61,7 +66,8 @@ function authenticate(socket: Socket, expectedToken: string, endpoint: string): 
       return;
     }
     const remaining = buffered.subarray(4 + declared);
-    const upstream = createConnection(endpoint);
+    socket.pause();
+    const upstream = connectUpstream(endpoint);
     const onConnectError = () => fail("local AgentTab IPC unavailable");
     upstream.once("error", onConnectError);
     upstream.once("connect", () => {
@@ -71,6 +77,7 @@ function authenticate(socket: Socket, expectedToken: string, endpoint: string): 
       if (remaining.byteLength) upstream.write(remaining);
       socket.pipe(upstream);
       upstream.pipe(socket);
+      socket.resume();
     });
     socket.once("close", () => upstream.destroy());
   };
@@ -88,14 +95,14 @@ export async function startProxyServer(options: {
   port?: number;
   host?: string;
   endpoint?: string;
-}): Promise<ProxyServer> {
+}, connectUpstream: (endpoint: string) => Socket = createConnection): Promise<ProxyServer> {
   const host = options.host ?? "127.0.0.1";
   if (host !== "127.0.0.1" && host !== "::1") throw new Error("AgentTab proxy may bind only to loopback");
   const port = options.port ?? 9224;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("proxy port must be 0 to 65535");
   const token = await readToken(options.tokenFile);
   const endpoint = options.endpoint ?? resolveEndpoint();
-  const server = createServer((socket) => authenticate(socket, token, endpoint));
+  const server = createServer((socket) => authenticate(socket, token, endpoint, connectUpstream));
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, () => resolve());

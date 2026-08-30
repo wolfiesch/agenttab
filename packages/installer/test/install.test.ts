@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { deflateRawSync } from "node:zlib";
 import {
   detectLegacy,
@@ -423,5 +423,26 @@ describe("end-to-end development install", () => {
     const report = detectLegacy(root, process.platform);
     expect(report.recoveryTag).toBe("v1.0.1");
     expect(report.unpackedExtensionStatus).toBe("manual_check_required");
+  });
+});
+
+describe("installer build", () => {
+  test("always embeds the development extension when the release channel is store", async () => {
+    const packageRoot = fileURLToPath(new URL("..", import.meta.url));
+    const build = Bun.spawn([process.execPath, "run", "scripts/build.ts"], {
+      cwd: packageRoot,
+      env: { ...process.env, AGENTTAB_EXTENSION_CHANNEL: "store" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stderr] = await Promise.all([
+      build.exited,
+      new Response(build.stderr).text(),
+    ]);
+    if (exitCode !== 0) throw new Error(`installer build failed: ${stderr}`);
+
+    const manifest = JSON.parse(await readFile(join(packageRoot, "dist", "extension", "manifest.json"), "utf8"));
+    expect(typeof manifest.key).toBe("string");
+    expect(manifest.key.length).toBeGreaterThan(0);
   });
 });
