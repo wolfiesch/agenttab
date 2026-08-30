@@ -4,12 +4,24 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#0b0a12" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#f7f6fc" media="(prefers-color-scheme: light)">
     <meta name="description" content="AgentTab is a local browser runtime for AI agents with visible task workspaces, human handoff, and staged review.">
+    <meta property="og:title" content="AgentTab | Local browser runtime for AI agents">
+    <meta property="og:description" content="Any agent. Your browser. Your rules. Give an agent a tab, not the keys to your browser.">
+    <meta property="og:type" content="website">
     <title>AgentTab | Local browser runtime for AI agents</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237249e8'/%3E%3Cstop offset='1' stop-color='%230d978d'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='url(%23g)'/%3E%3Cpath d='M32 12l3.6 14.4L50 30l-14.4 3.6L32 48l-3.6-14.4L14 30l14.4-3.6z' fill='%23fff'/%3E%3C/svg%3E">
     <link rel="stylesheet" href="./styles.css">
   </head>
   <body>
     <a class="skip-link" href="#main-content">Skip to content</a>
+
+    <div class="backdrop" aria-hidden="true">
+      <span class="glow glow-violet"></span>
+      <span class="glow glow-teal"></span>
+      <span class="grid-lines"></span>
+    </div>
 
     <header class="site-header">
       <div class="shell nav-shell">
@@ -30,12 +42,12 @@
       <section class="hero shell" aria-labelledby="agenttab-title">
         <div class="hero-copy">
           <p class="eyebrow">Local browser runtime for AI agents</p>
-          <h1 id="agenttab-title">AgentTab</h1>
-          <p class="tagline">Any agent. Your browser. Your rules.</p>
+          <h1 id="agenttab-title">Agent<span class="text-gradient">Tab</span></h1>
+          <p class="tagline">Any agent. Your browser. <span class="text-gradient">Your rules.</span></p>
           <p class="hero-promise">Give an agent a tab, not the keys to your browser.</p>
-          <p class="release-status"><strong>Unreleased:</strong> AgentTab v2.0.0-rc.1 is under review. No v2 installation is available from this site.</p>
+          <p class="release-status"><span class="status-dot" aria-hidden="true"></span><strong>Unreleased:</strong>&nbsp;AgentTab v2.0.0-rc.1 is under review. No v2 installation is available from this site.</p>
           <div class="hero-actions">
-            <a class="button button-primary" href="#trust">Explore the trust boundary</a>
+            <a class="button button-primary" href="#trust">Explore the trust boundary <span aria-hidden="true">→</span></a>
             <a class="button button-secondary" href="./privacy/">Read the privacy policy</a>
           </div>
         </div>
@@ -51,7 +63,7 @@
               <div class="preview-task">
                 <span class="task-spark" aria-hidden="true"></span>
                 <span>Research assistant</span>
-                <span class="task-state">Working</span>
+                <span class="task-state"><span class="pulse" aria-hidden="true"></span>Working</span>
               </div>
               <div class="preview-line preview-line-wide"></div>
               <div class="preview-line"></div>
@@ -177,5 +189,28 @@
         <a href="./support/">Support</a>
       </div>
     </footer>
+
+    <script>
+      (() => {
+        if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        const targets = document.querySelectorAll(
+          ".section-heading, .outcome-card, .step-list li, .boundary-card, .risk-note, .workspace-preview"
+        );
+        targets.forEach((el) => el.setAttribute("data-reveal", ""));
+        if (!("IntersectionObserver" in window)) return;
+        const io = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) {
+                entry.target.setAttribute("data-revealed", "");
+                io.unobserve(entry.target);
+              }
+            }
+          },
+          { rootMargin: "0px 0px -8% 0px", threshold: 0.08 }
+        );
+        targets.forEach((el) => io.observe(el));
+      })();
+    </script>
   </body>
 </html>
