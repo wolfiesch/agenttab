@@ -193,10 +193,28 @@ const DEVELOPER = {
   }).strict(),
 };
 
-function success(value: unknown): Record<string, unknown> {
+function success(
+  value: unknown,
+  presentation: { outcome: string; taskId?: string },
+): Record<string, unknown> {
+  const details = value !== null && typeof value === "object" && !Array.isArray(value)
+    ? {
+      ...(value as Record<string, unknown>),
+      _agenttab: {
+        outcome: presentation.outcome,
+        ...(presentation.taskId ? { task_id: presentation.taskId } : {}),
+      },
+    }
+    : {
+      value,
+      _agenttab: {
+        outcome: presentation.outcome,
+        ...(presentation.taskId ? { task_id: presentation.taskId } : {}),
+      },
+    };
   return {
     content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
-    details: value,
+    details,
     structuredContent: value,
   };
 }
@@ -235,6 +253,7 @@ export function makeExtension(clientFactory?: ClientFactory) {
       });
     });
     let client: AgentTabClient | undefined;
+    let taskId: string | undefined;
     const register = (definition: (typeof DEFINITIONS)[number] | typeof DEVELOPER) => {
       const renderers = isOmp
         ? {
@@ -267,11 +286,14 @@ export function makeExtension(clientFactory?: ClientFactory) {
         execute: async (_id: string, params: Record<string, unknown>) => {
           try {
             client ??= await connectClient();
-            const result = await client.call(
+            taskId ??= client.connection.task_id;
+            const response = await client.request(
               definition.name,
               params as MethodParams[ToolMethod],
             );
-            return success(result);
+            taskId = response.task?.task_id ?? taskId;
+            if (!response.ok) throw new AgentTabError(response);
+            return success(response.result, { outcome: response.outcome, taskId });
           } catch (error) {
             return failure(error);
           }

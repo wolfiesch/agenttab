@@ -26,9 +26,15 @@ function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
   const tools: Array<Record<string, unknown>> = [];
   const calls: unknown[] = [];
   const client = {
-    call: async (method: string, params: unknown) => {
+    connection: { task_id: "task-test-1234" },
+    request: async (method: string, params: unknown) => {
       calls.push({ method, params });
-      return { tabs: [] };
+      return {
+        ok: true,
+        outcome: "committed",
+        request_id: "request-test",
+        result: { tabs: [] },
+      };
     },
   } as unknown as AgentTabClient;
   const api = {
@@ -87,6 +93,10 @@ test("registered tools call Core RPC without TCP or lease verbs", async () => {
   const result = await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
   expect(calls).toEqual([{ method: "browser_tabs", params: {} }]);
   expect(result.structuredContent).toEqual({ tabs: [] });
+  expect(result.details).toEqual({
+    tabs: [],
+    _agenttab: { outcome: "committed", task_id: "task-test-1234" },
+  });
 });
 
 test("OMP tools expose compact and expanded custom renderers", () => {
