@@ -3,7 +3,7 @@ import { copyFile, mkdir, rm } from "node:fs/promises";
 const packageRoot = new URL("../", import.meta.url);
 const sourceRoot = new URL("src/", packageRoot);
 const outputRoot = new URL("dist/", packageRoot);
-const staticFiles = ["index.html", "privacy/index.html", "styles.css"] as const;
+const staticFiles = ["index.html", "privacy/index.html", "support/index.html", "styles.css"] as const;
 
 await rm(outputRoot, { recursive: true, force: true });
 
