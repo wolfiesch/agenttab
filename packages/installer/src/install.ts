@@ -14,6 +14,7 @@ import { existsSync } from "node:fs";
 import { arch as currentArch, homedir, platform as currentPlatform, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { inflateRawSync } from "node:zlib";
+import { setTimeout as delay } from "node:timers/promises";
 import { AgentTabClient, type ConnectionAck } from "../../sdk-typescript/src/index";
 import identityJson from "../../../config/identity.json" with { type: "json" };
 import trustJson from "../../../config/release-trust.json" with { type: "json" };
@@ -633,12 +634,6 @@ function startBrowser(platform: NodeJS.Platform): void {
   } else {
     execFile("google-chrome", ["--no-first-run"], () => undefined);
   }
-}
-
-function delay(milliseconds: number): Promise<void> {
-  const { promise, resolve: resolveDelay } = Promise.withResolvers<void>();
-  setTimeout(resolveDelay, milliseconds);
-  return promise;
 }
 
 async function runReadiness(openBrowser: boolean, platform: NodeJS.Platform): Promise<void> {
