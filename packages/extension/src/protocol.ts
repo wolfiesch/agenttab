@@ -402,11 +402,17 @@ function assertCommitReviewParams(
 function validateParams(method: NativeMethod, value: unknown): Record<string, unknown> {
   switch (method) {
     case "browser_open": {
-      const params = assertExactObject(value, ["mode"], ["url", "background"], "browser_open parameters");
+      const params = assertExactObject(value, ["mode"], ["url", "background", "placement"], "browser_open parameters");
       if (params.mode === "create") {
-        assertExactObject(params, ["mode"], ["url", "background"], "browser_open create parameters");
+        assertExactObject(params, ["mode"], ["url", "background", "placement"], "browser_open create parameters");
         if (params.url !== undefined) assertUrl(params.url);
         if (params.background !== undefined && typeof params.background !== "boolean") commandError("background must be a boolean");
+        if (params.placement !== undefined && params.placement !== "task" && params.placement !== "new_window") {
+          commandError("placement must be task or new_window");
+        }
+        if (params.placement === "new_window" && params.background === false) {
+          commandError("background must be true when placement is new_window");
+        }
         return params;
       }
       if (params.mode === "adopt_active") {

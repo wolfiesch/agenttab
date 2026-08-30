@@ -263,13 +263,19 @@ function assertCommitReviewParams(value, method) {
 function validateParams(method, value) {
   switch (method) {
     case "browser_open": {
-      const params = assertExactObject(value, ["mode"], ["url", "background"], "browser_open parameters");
+      const params = assertExactObject(value, ["mode"], ["url", "background", "placement"], "browser_open parameters");
       if (params.mode === "create") {
-        assertExactObject(params, ["mode"], ["url", "background"], "browser_open create parameters");
+        assertExactObject(params, ["mode"], ["url", "background", "placement"], "browser_open create parameters");
         if (params.url !== undefined)
           assertUrl(params.url);
         if (params.background !== undefined && typeof params.background !== "boolean")
           commandError("background must be a boolean");
+        if (params.placement !== undefined && params.placement !== "task" && params.placement !== "new_window") {
+          commandError("placement must be task or new_window");
+        }
+        if (params.placement === "new_window" && params.background === false) {
+          commandError("background must be true when placement is new_window");
+        }
         return params;
       }
       if (params.mode === "adopt_active") {
@@ -2771,20 +2777,43 @@ class OwnershipLedger {
         code: "invalid_request"
       });
     }
+    const placement = params.placement ?? "task";
+    if (placement !== "task" && placement !== "new_window") {
+      throw Object.assign(new Error("browser_open placement must be task or new_window"), {
+        code: "invalid_request"
+      });
+    }
+    if (placement === "new_window" && params.background === false) {
+      throw Object.assign(new Error("A new task window must open in the background"), {
+        code: "invalid_request",
+        recovery: "Use browser_handoff when the human needs to focus the task tab."
+      });
+    }
     const url = typeof params.url === "string" ? params.url : "about:blank";
     const active = params.background === false;
     const existingTask = (await readState()).tasks[taskId];
-    let taskWindowId;
-    if (existingTask && existingTask.groupId !== null) {
-      for (const tabId of existingTask.tabIds) {
-        const candidate = await chrome.tabs.get(tabId).catch(() => null);
-        if (candidate?.groupId === existingTask.groupId && Number.isInteger(candidate.windowId)) {
-          taskWindowId = candidate.windowId;
-          break;
+    let tab;
+    if (placement === "new_window") {
+      if (existingTask && existingTask.tabIds.length > 0) {
+        throw Object.assign(new Error("A task window can be created only before the task owns tabs"), {
+          code: "task_window_conflict",
+          recovery: "Use placement task for this task, or create a new task for a separate window."
+        });
+      }
+      tab = await this.createTabInDedicatedWindow(url);
+    } else {
+      let taskWindowId;
+      if (existingTask && existingTask.groupId !== null) {
+        for (const tabId of existingTask.tabIds) {
+          const candidate = await chrome.tabs.get(tabId).catch(() => null);
+          if (candidate?.groupId === existingTask.groupId && Number.isInteger(candidate.windowId)) {
+            taskWindowId = candidate.windowId;
+            break;
+          }
         }
       }
+      tab = await this.createTabInUsableWindow(url, active, taskWindowId);
     }
-    const tab = await this.createTabInUsableWindow(url, active, taskWindowId);
     const createdTabId = tab.id;
     if (createdTabId === undefined)
       throw new Error("Chrome did not return a created tab ID");
@@ -3009,6 +3038,45 @@ class OwnershipLedger {
       tab_count: (await readState()).tasks[taskId]?.tabIds.length ?? 0
     });
     await this.emitInventory();
+  }
+  async createTabInDedicatedWindow(url) {
+    let windowId;
+    let tabId;
+    try {
+      const createdWindow = await chrome.windows.create({
+        url,
+        focused: false,
+        type: "normal",
+        state: "normal"
+      });
+      if (!createdWindow)
+        throw new Error("Chrome did not return a created window");
+      windowId = createdWindow.id;
+      const tab = createdWindow.tabs?.[0];
+      tabId = tab?.id;
+      if (!Number.isInteger(windowId) || !Number.isInteger(tabId)) {
+        throw new Error("Chrome did not return a window and tab ID");
+      }
+      await chrome.windows.update(windowId, {
+        focused: false,
+        state: "normal"
+      });
+      return tab;
+    } catch (error) {
+      if (tabId !== undefined) {
+        await chrome.tabs.remove(tabId).catch(() => {
+          return;
+        });
+      } else if (windowId !== undefined) {
+        await chrome.windows.remove(windowId).catch(() => {
+          return;
+        });
+      }
+      throw Object.assign(new Error(`Could not create a background task window: ${String(error)}`), {
+        code: "window_creation_failed",
+        recovery: "Retry with placement task, or create a new task window after Chrome can open a normal window."
+      });
+    }
   }
   async createTabInUsableWindow(url, active, preferredWindowId) {
     if (preferredWindowId !== undefined) {

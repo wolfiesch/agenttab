@@ -53,7 +53,7 @@ Standard mode MUST NOT expose:
 - coordinate-based actions
 - generic Chrome APIs
 - network interception
-- browser-global mutations
+- general-purpose browser-global mutations; Standard `browser_open` MAY create one unfocused normal window for the first tab of an empty task
 
 Developer mode is a persistent, explicit opt-in and MUST remain visibly indicated on every task while enabled. Managed policy and developer configuration MAY expose internals, but Standard mode MUST remain closed.
 
@@ -109,6 +109,8 @@ Ownership can be granted only by:
 3. explicit `browser_open({ mode: "adopt_active" })`
 
 Adoption MUST be visible. It groups the active tab and shows a brief non-blocking indicator. If grouping fails, creation or adoption rolls back with `outcome: "not_started"`. AgentTab MUST NOT retain invisible ownership with `groupId: null`.
+
+Dedicated-window eligibility MUST be derived from the persisted task record, never from a caller-supplied ownership claim. `placement: "new_window"` MUST fail after the task owns a tab, MUST reject foreground creation, and MUST roll back the created tab if visible grouping fails. Standard mode MUST NOT expose generic focus, resize, move, state-change, or close-window operations. `browser_handoff` remains the sole normal focus transition.
 
 Tab groups are display-only. Manual grouping never grants ownership. Ungrouping or moving a tab out of its task group immediately revokes ownership, cancels queued mutations, and notifies the host.
 

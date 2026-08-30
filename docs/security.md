@@ -24,7 +24,7 @@ Standard mode exposes exactly these seven MCP tools:
 
 Developer mode additionally exposes `browser_developer`. It is disabled by default in the host's local managed policy and is visibly marked on a task. Developer mode is intentionally a broader trust decision.
 
-Standard mode has no raw CDP method, arbitrary JavaScript API, raw cookie or storage API, coordinate action, browser-global mutation API, or password-value API. Internally, the extension uses Chrome debugging APIs for task-scoped accessibility snapshots and precise ref-based actions. That implementation detail is not a Standard-mode escape hatch.
+Standard mode has no raw CDP method, arbitrary JavaScript API, raw cookie or storage API, coordinate action, generic browser-global mutation API, or password-value API. The narrow exception is `browser_open` with `placement: "new_window"`, which creates one unfocused normal window for the first tab of an empty task. Internally, the extension uses Chrome debugging APIs for task-scoped accessibility snapshots and precise ref-based actions. That implementation detail is not a Standard-mode escape hatch.
 
 Sensitive password, passkey, one-time-code, payment, and similar fields require `browser_handoff`. The human enters the value in Chrome; the value is not placed in an AgentTab request.
 
@@ -36,7 +36,7 @@ The manifest declares `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `stora
 
 ## Ownership, revisions, and human control
 
-A tab becomes owned only when AgentTab creates it, when Chrome reports it as a child of an owned opener, or through `browser_open` with `mode: "adopt_active"`. The visible Chrome group is evidence of that ownership, not an authority grant by itself. Moving or ungrouping a tab revokes ownership and cancels queued work. A grouping failure rolls creation or adoption back rather than retaining invisible ownership.
+A tab becomes owned only when AgentTab creates it, when Chrome reports it as a child of an owned opener, or through `browser_open` with `mode: "adopt_active"`. The visible Chrome group is evidence of that ownership, not an authority grant by itself. Moving or ungrouping a tab revokes ownership and cancels queued work. A grouping failure rolls creation or adoption back rather than retaining invisible ownership. A caller may request `placement: "new_window"`, but the extension derives eligibility from its stored task record: the task must own no tabs, the window is created unfocused in normal state, and a failed group grant removes the created tab. A client-supplied ownership claim cannot authorize an existing window.
 
 Actions that operate on an existing page carry an expected page revision. Navigation and document replacement advance that revision; stale refs and stale revisions fail instead of being applied to a later document.
 

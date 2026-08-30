@@ -24,6 +24,8 @@ Only three paths can grant tab ownership:
 
 AgentTab gives owned tabs a visible task group. The group makes work legible to the user, but group membership alone never grants authority. Manual grouping does not adopt a tab. If Chrome cannot create or preserve the group, creation or adoption fails rather than keeping hidden ownership.
 
+`browser_open` defaults to placing a new tab in the task's existing window. `placement: "new_window"` is intentionally narrower than a general window-control capability: it is accepted only while the task owns no tabs, it always creates an unfocused normal window, and the extension grants ownership from the persisted task record. It cannot focus, resize, move, change, or close an unrelated window. `browser_handoff` remains the sole normal focus transition.
+
 Moving an owned tab out of its task group, ungrouping it, closing it, or finding inconsistent ownership immediately revokes it. Revocation increments the tab generation and rejects queued work before it is dispatched. A child-popup grouping race does not give AgentTab authority to close a user tab.
 
 ## Ordering and concurrency

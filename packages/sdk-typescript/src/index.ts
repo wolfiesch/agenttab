@@ -14,7 +14,8 @@ export const HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024;
 export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
 
 export type BrowserOpenParams =
-  | { mode: "create"; url?: string; background?: boolean }
+  | { mode: "create"; url?: string; placement?: "task"; background?: boolean }
+  | { mode: "create"; url?: string; placement: "new_window"; background?: true }
   | { mode: "adopt_active" };
 
 export type BrowserSnapshotParams =
@@ -312,9 +313,8 @@ function capabilityPersistenceError(response: RpcResponse, error: unknown): Agen
     outcome: response.outcome,
     error: {
       code: "capability_persistence_failed",
-      message: `AgentTab completed the RPC but could not persist its rotated resume capability: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
+      message: `AgentTab completed the RPC but could not persist its rotated resume capability: ${error instanceof Error ? error.message : String(error)
+        }`,
       recovery: "Repair the owner-only AgentTab client state directory before restarting or retrying.",
     },
   });
@@ -594,8 +594,7 @@ export class AgentTabClient {
       } catch (error) {
         socket.destroy();
         throw new Error(
-          `AgentTab could not complete durable resume-capability rotation: ${
-            error instanceof Error ? error.message : String(error)
+          `AgentTab could not complete durable resume-capability rotation: ${error instanceof Error ? error.message : String(error)
           }`,
         );
       }

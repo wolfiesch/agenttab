@@ -74,6 +74,8 @@ let nativePort: MockNativePort | null;
 let tabRemovalProbe: (() => void | Promise<void>) | null;
 let normalizeStoredObjectKeys: boolean;
 let focusedWindowUpdates: number[];
+let createdWindowOptions: Array<Record<string, unknown>>;
+let windowUpdates: Array<{ windowId: number; changes: Record<string, unknown> }>;
 let focusStealOnClickTabId: number | null;
 let callFunctionException: boolean;
 let debuggerCommandOverride:
@@ -166,6 +168,8 @@ function installChromeMock(): void {
   tabRemovalProbe = null;
   normalizeStoredObjectKeys = false;
   focusedWindowUpdates = [];
+  createdWindowOptions = [];
+  windowUpdates = [];
   focusStealOnClickTabId = null;
   debuggerCommands = [];
   debuggerDetachFailures = 0;
@@ -368,8 +372,10 @@ function installChromeMock(): void {
           return [{ id: 1, tabs: clone([...tabStore.values()]) }];
         },
         async create(options: Record<string, unknown>) {
+          createdWindowOptions.push(clone(options));
           return {
             id: 2,
+            state: typeof options.state === "string" ? options.state : "normal",
             tabs: [clone(createTab(
               typeof options.url === "string" ? options.url : "about:blank",
               options.focused === true,
@@ -378,7 +384,14 @@ function installChromeMock(): void {
           };
         },
         async update(windowId: number, changes: Record<string, unknown>) {
+          windowUpdates.push({ windowId, changes: clone(changes) });
           if (changes.focused === true) focusedWindowUpdates.push(windowId);
+          return { id: windowId, state: changes.state ?? "normal" };
+        },
+        async remove(windowId: number) {
+          for (const [tabId, tab] of tabStore) {
+            if (tab.windowId === windowId) tabStore.delete(tabId);
+          }
         },
       },
       tabGroups: {
@@ -592,6 +605,34 @@ describe("native protocol", () => {
         denied_origins: [],
       },
     })).toThrow("non-empty strings");
+  });
+
+  test("accepts only background creation for a dedicated task window", () => {
+    const command = {
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "command",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621d",
+      task_id: TASK_A,
+      connection_id: NATIVE_CONNECTION_ID,
+      method: "browser_open",
+      params: {
+        mode: "create",
+        url: "https://example.test/workspace",
+        placement: "new_window",
+        background: true,
+      },
+    };
+
+    expect(parseCommand(command).params).toEqual(command.params);
+    expect(() => parseCommand({
+      ...command,
+      params: { ...command.params, background: false },
+    })).toThrow("background must be true");
+    expect(() => parseCommand({
+      ...command,
+      params: { ...command.params, placement: "unowned_window" },
+    })).toThrow("placement must be task or new_window");
   });
 
   test("rejects removed focus and prompt-input action capabilities", () => {
@@ -1333,6 +1374,43 @@ describe("ownership and task isolation", () => {
 
     expect(removedTabIds).toEqual([100]);
     expect((await readState()).tasks).toEqual({});
+  });
+
+  test("creates an unfocused normal window only for an empty task", async () => {
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    const opened = await ownership.open(TASK_A, {
+      mode: "create",
+      url: "https://example.test/workspace",
+      placement: "new_window",
+    });
+
+    expect(opened).toMatchObject({ window_id: 2, group_id: 50, tab_count: 1 });
+    expect(createdWindowOptions).toEqual([{
+      url: "https://example.test/workspace",
+      focused: false,
+      type: "normal",
+      state: "normal",
+    }]);
+    expect(windowUpdates).toEqual([{
+      windowId: 2,
+      changes: { focused: false, state: "normal" },
+    }]);
+    expect(focusedWindowUpdates).toEqual([]);
+    expect(tabStore.get(100)).toMatchObject({ windowId: 2, groupId: 50, active: false });
+
+    await expect(ownership.open(TASK_A, {
+      mode: "create",
+      placement: "new_window",
+    })).rejects.toMatchObject({
+      code: "task_window_conflict",
+      recovery: "Use placement task for this task, or create a new task for a separate window.",
+    });
+    expect(createdWindowOptions).toHaveLength(1);
   });
   test("creates additional task tabs in the existing task window", async () => {
     await seedTask(TASK_A, [31], 7);
