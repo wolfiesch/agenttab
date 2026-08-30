@@ -2057,7 +2057,9 @@ describe("page revision monotonicity", () => {
                   ? { name: "otp", "aria-label": "Verification code", inputmode: "numeric" }
                   : objectId.endsWith("-27")
                     ? { type: "number", name: "pin" }
-                    : { "aria-label": "Passcode" };
+                    : objectId.endsWith("-28")
+                      ? { "aria-label": "Passcode" }
+                      : { type: "text", name: "password" };
         const target = {
           form: null,
           labels: [],
@@ -2103,6 +2105,7 @@ describe("page revision monotonicity", () => {
       { kind: "type", ref: `r${pageRevision}-26`, text: "123456" },
       { kind: "fill", ref: `r${pageRevision}-27`, text: "1234" },
       { kind: "type", ref: `r${pageRevision}-28`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-29`, text: "password" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
@@ -2607,15 +2610,15 @@ describe("handoff and pause barriers", () => {
     expect(events.filter((event) => event === "handoff_changed")).toHaveLength(2);
   });
 
-  test("clears handoffs when their owned tab or task disappears", async () => {
+  test("requires acknowledgment when an owned handoff tab or task disappears", async () => {
     await seedTask(TASK_A, [33]);
     await seedTask(TASK_B, [34], 6);
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
-    const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const events: Array<{ event: string; payload: Record<string, unknown>; eventId?: string }> = [];
     const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
-    const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload) => {
-      events.push({ event, payload });
+    const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload, eventId) => {
+      events.push({ event, payload, eventId });
     });
     const firstRevision = await revisions.ensure(33);
     await handoff.begin(TASK_A, {
@@ -2627,6 +2630,16 @@ describe("handoff and pause barriers", () => {
 
     expect(await handoff.cancelForTab(999)).toBe(false);
     expect(await handoff.cancelForTab(33)).toBe(true);
+    const firstPending = (await readState()).handoff;
+    expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
+    expect(scheduler.isAccepting()).toBe(false);
+    const firstClearEventId = events.at(-1)?.eventId;
+    if (!firstPending.active || !firstPending.pendingClearEventId || !firstClearEventId) {
+      throw new Error("tab cancellation did not create a pending handoff event");
+    }
+    expect(typeof firstPending.pendingClearEventId).toBe("string");
+    expect(firstClearEventId).toBe(firstPending.pendingClearEventId);
+    await handoff.acknowledgeEvent("handoff_changed", firstClearEventId);
     expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]?.state).toBe("working");
     expect(scheduler.isAccepting()).toBe(true);
@@ -2641,13 +2654,23 @@ describe("handoff and pause barriers", () => {
 
     expect(await handoff.cancelForTask(TASK_A)).toBe(false);
     expect(await handoff.cancelForTask(TASK_B)).toBe(true);
+    const secondPending = (await readState()).handoff;
+    expect((await readState()).tasks[TASK_B]?.state).toBe("needs_user");
+    expect(scheduler.isAccepting()).toBe(false);
+    const secondClearEventId = events.at(-1)?.eventId;
+    if (!secondPending.active || !secondPending.pendingClearEventId || !secondClearEventId) {
+      throw new Error("task cancellation did not create a pending handoff event");
+    }
+    expect(typeof secondPending.pendingClearEventId).toBe("string");
+    expect(secondClearEventId).toBe(secondPending.pendingClearEventId);
+    await handoff.acknowledgeEvent("handoff_changed", secondClearEventId);
     expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_B]?.state).toBe("working");
     expect(scheduler.isAccepting()).toBe(true);
-    expect(events.filter(({ event, payload }) =>
-      event === "handoff_changed" && payload.active === false
+    expect(events.filter(({ event, payload, eventId }) =>
+      event === "handoff_changed" && payload.active === false && typeof eventId === "string"
     )).toHaveLength(2);
-    expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(2);
+    expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(4);
   });
 
   test("clears a restored handoff for a tab revoked during initial reconciliation", async () => {
@@ -2655,7 +2678,10 @@ describe("handoff and pause barriers", () => {
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
     const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
-    const handoff = new HandoffController(scheduler, revisions, ownership, () => undefined);
+    const clearEventIds: string[] = [];
+    const handoff = new HandoffController(scheduler, revisions, ownership, (event, _payload, eventId) => {
+      if (event === "handoff_changed" && eventId) clearEventIds.push(eventId);
+    });
     const pageRevision = await revisions.ensure(35);
     await handoff.begin(TASK_A, {
       tab_id: 35,
@@ -2670,6 +2696,16 @@ describe("handoff and pause barriers", () => {
     await handoff.restore();
 
     expect(revokedTabIds).toEqual([35]);
+    const pending = (await readState()).handoff;
+    expect(scheduler.isAccepting()).toBe(false);
+    const clearEventId = clearEventIds.at(-1);
+    if (!pending.active || !pending.pendingClearEventId || !clearEventId) {
+      throw new Error("startup reconciliation did not create a pending handoff event");
+    }
+    expect(typeof pending.pendingClearEventId).toBe("string");
+    expect(clearEventIds).toEqual([pending.pendingClearEventId, pending.pendingClearEventId]);
+    expect(clearEventId).toBe(pending.pendingClearEventId);
+    await handoff.acknowledgeEvent("handoff_changed", clearEventId);
     expect((await readState()).handoff).toEqual({ active: false });
     expect(scheduler.isAccepting()).toBe(true);
     expect(alarmClears).toContain(HANDOFF_ALARM);

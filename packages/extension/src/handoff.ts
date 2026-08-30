@@ -232,23 +232,17 @@ export class HandoffController {
   private async cancelMatchingNow(
     matches: (handoff: Extract<HandoffRecord, { active: true }>) => boolean,
   ): Promise<boolean> {
-    const cleared = await mutateState((state) => {
+    const eventId = crypto.randomUUID();
+    const pendingEventId = await mutateState((state) => {
       const active = state.handoff;
       if (!active.active || !matches(active)) return null;
-      state.handoff = { active: false };
-      const task = state.tasks[active.taskId];
-      if (task) {
-        task.state = "working";
-        task.updatedAt = Date.now();
-      }
-      return { taskId: active.taskId };
+      if (active.pendingClearEventId) return active.pendingClearEventId;
+      state.handoff = { ...active, pendingClearEventId: eventId };
+      return eventId;
     });
-    if (!cleared) return false;
+    if (!pendingEventId) return false;
     await chrome.alarms.clear(HANDOFF_ALARM);
-    await this.ownership.setTaskState(cleared.taskId, "working");
-    this.emit("handoff_changed", { active: false });
-    const current = await readState();
-    if (!current.paused && !current.handoff.active) this.scheduler.resume();
+    this.emit("handoff_changed", { active: false }, pendingEventId);
     return true;
   }
 
