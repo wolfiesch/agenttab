@@ -1934,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_closes_a_task_whose_capability_was_not_delivered() {
+    fn disconnect_closes_a_task_whose_capability_was_not_confirmed() {
         let native = FakeNative::normal();
         let (_temp, runtime, connection) = connected_runtime(native.clone());
         let response = runtime.handle(
@@ -1956,6 +1956,8 @@ mod tests {
             .unwrap()
             .parse::<Uuid>()
             .unwrap();
+        connection.finish_new_capability_delivery(true);
+        assert!(connection.resume_confirmation_required());
 
         runtime.disconnect(&connection).unwrap();
 

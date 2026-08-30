@@ -94,7 +94,6 @@ impl ConnectionContext {
             return;
         }
         if delivered {
-            state.capability_pending = false;
             state.capability_confirmation_pending = true;
         }
         state.capability_in_flight = false;
@@ -199,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    fn task_capability_remains_pending_until_delivery_succeeds() {
+    fn task_capability_remains_pending_until_confirmation_succeeds() {
         let temp = tempfile::tempdir().unwrap();
         let journal = Arc::new(Journal::open(&temp.path().join("state.sqlite3")).unwrap());
         let (connection, ack) =
@@ -218,6 +217,7 @@ mod tests {
         let delivered = connection.reserve_new_capability().unwrap().unwrap();
         connection.finish_new_capability_delivery(true);
         assert!(connection.resume_confirmation_required());
+        assert_eq!(connection.undelivered_new_task_id(), Some(task_id));
         assert!(matches!(
             connection.confirm_resume_capability(
                 &confirmation(connection.connection_id, "x".repeat(32)),
