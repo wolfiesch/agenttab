@@ -145,6 +145,8 @@ export class StandardBrowserRuntime {
         ) {
           session.inflight.delete(params.requestId);
           session.lastNetworkActivity = Date.now();
+          // chrome.downloads has no initiator tab. Debugger events are scoped by source.tabId,
+          // so a matching Page GUID is the only completion proof accepted here.
         } else if (method === "Page.downloadWillBegin" && typeof params.guid === "string") {
           session.downloads.set(params.guid, { startedAt: Date.now() });
         } else if (method === "Page.downloadProgress" && typeof params.guid === "string") {
