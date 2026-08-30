@@ -39,6 +39,14 @@ export class HandoffController {
   finish(completed: boolean): Promise<{ completed: boolean; reason?: string }> {
     return this.serialize(() => this.finishNow(completed));
   }
+  cancelForTab(tabId: number): Promise<boolean> {
+    return this.serialize(() => this.cancelMatchingNow((handoff) => handoff.tabId === tabId));
+  }
+
+  cancelForTask(taskId: string): Promise<boolean> {
+    return this.serialize(() => this.cancelMatchingNow((handoff) => handoff.taskId === taskId));
+  }
+
 
   acknowledgeEvent(event: string, eventId: string): Promise<void> {
     return this.serialize(() => this.acknowledgeEventNow(event, eventId));
@@ -219,6 +227,26 @@ export class HandoffController {
     await this.ownership.setTaskState(handoff.taskId, "working");
     const current = await readState();
     if (!current.paused && !current.handoff.active) this.scheduler.resume();
+  }
+
+  private async cancelMatchingNow(
+    matches: (handoff: Extract<HandoffRecord, { active: true }>) => boolean,
+  ): Promise<boolean> {
+    const handoff = (await readState()).handoff;
+    if (!handoff.active || !matches(handoff)) return false;
+    await this.scrubber?.();
+    const eventId = crypto.randomUUID();
+    const pendingEventId = await mutateState((state) => {
+      const active = state.handoff;
+      if (!active.active || !matches(active)) return null;
+      if (active.pendingClearEventId) return active.pendingClearEventId;
+      state.handoff = { ...active, pendingClearEventId: eventId };
+      return eventId;
+    });
+    if (!pendingEventId) return false;
+    await chrome.alarms.clear(HANDOFF_ALARM);
+    this.emit("handoff_changed", { active: false }, pendingEventId);
+    return true;
   }
 
   private async pauseNow(): Promise<void> {

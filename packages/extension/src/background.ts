@@ -345,6 +345,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
   if (command.kind === "close_task") {
     try {
       const closedTabIds = await ownership.closeTask(command.task_id);
+      await handoff.cancelForTask(command.task_id);
       return completed(command.request_id, {
         task_id: command.task_id,
         closed_tab_ids: closedTabIds,
@@ -528,6 +529,7 @@ function start(): Promise<void> {
     scheduler.setInitialPaused(state.paused || state.handoff.active);
     if (!(await automationEnabled())) scheduler.revokePermissions();
     const revokedTabIds = await ownership.reconcile();
+    await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
     await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
     await browser.expireCommits();
     await handoff.restore();
@@ -544,6 +546,7 @@ function start(): Promise<void> {
 
 async function reconcileOwnership(): Promise<void> {
   const revokedTabIds = await ownership.reconcile();
+  await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
   await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
 }
 
@@ -552,6 +555,7 @@ chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) =
 });
 chrome.tabs.onRemoved.addListener((removedTabId: number) => {
   void start().then(async () => {
+    await handoff.cancelForTab(removedTabId);
     await browser.detach(removedTabId);
     await ownership.revoke(removedTabId, "tab_removed");
   });
@@ -566,7 +570,10 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
     }
     if ("groupId" in changeInfo) {
       const revoked = await ownership.revokeIfMoved(updatedTabId);
-      if (revoked) await browser.detach(updatedTabId);
+      if (revoked) {
+        await handoff.cancelForTab(updatedTabId);
+        await browser.detach(updatedTabId);
+      }
     }
     if (typeof changeInfo.url === "string" || changeInfo.status === "complete") {
       await ownership.publishInventory();
@@ -702,6 +709,7 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
   }
   if (message.kind === "close_task" && typeof message.task_id === "string") {
     await ownership.closeTask(message.task_id);
+    await handoff.cancelForTask(message.task_id);
     return { closed: true };
   }
   throw new Error("Unsupported popup message");

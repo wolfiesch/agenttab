@@ -49,6 +49,7 @@ class MockNativePort {
 
   postMessage(message: unknown): void {
     this.posted.push(clone(message));
+    nativePostProbe?.(message);
   }
 
   disconnect(): void {
@@ -75,6 +76,7 @@ let alarmClears: string[];
 let alarmListeners: Array<(alarm: { name: string }) => void>;
 let nativePort: MockNativePort | null;
 let tabRemovalProbe: (() => void | Promise<void>) | null;
+let nativePostProbe: ((message: unknown) => void) | null;
 let normalizeStoredObjectKeys: boolean;
 let focusedWindowUpdates: number[];
 let activeWindowId: number;
@@ -306,6 +308,7 @@ function installChromeMock(): void {
   alarmListeners = [];
   nativePort = null;
   tabRemovalProbe = null;
+  nativePostProbe = null;
   normalizeStoredObjectKeys = false;
   focusedWindowUpdates = [];
   activeWindowId = 1;
@@ -2049,12 +2052,53 @@ describe("page revision monotonicity", () => {
           ? { type: "password" }
           : objectId.endsWith("-23")
             ? { autocomplete: "section-checkout billing cc-number" }
-            : { autocomplete: "cc-exp-month" };
+            : objectId.endsWith("-24")
+              ? { autocomplete: "cc-exp-month" }
+              : objectId.endsWith("-25")
+                ? { name: "card-number", "aria-label": "Card number", inputmode: "numeric" }
+                : objectId.endsWith("-26")
+                  ? { name: "otp", "aria-label": "Verification code", inputmode: "numeric" }
+                  : objectId.endsWith("-27")
+                    ? { type: "number", name: "pin" }
+                    : objectId.endsWith("-28")
+                      ? { "aria-label": "Passcode" }
+                      : objectId.endsWith("-29")
+                        ? { type: "text", name: "password" }
+                        : objectId.endsWith("-30")
+                          ? { name: "totp" }
+                          : objectId.endsWith("-31")
+                            ? { "aria-label": "2FA code" }
+                            : objectId.endsWith("-32")
+                              ? { placeholder: "Two-factor code" }
+                              : objectId.endsWith("-33")
+                                ? { "aria-label": "Card expiration month" }
+                                : objectId.endsWith("-34")
+                                  ? { name: "cardExpiryYear" }
+                                  : objectId.endsWith("-35")
+                                    ? { type: "text", name: "security_code" }
+                                    : objectId.endsWith("-36")
+                                      ? { name: "cvv2" }
+                                      : objectId.endsWith("-37")
+                                        ? { name: "cid" }
+                                        : objectId.endsWith("-38")
+                                          ? { name: "cardVerificationValue" }
+                                          : objectId.endsWith("-39")
+                                            ? { name: "mfaCode" }
+                                            : objectId.endsWith("-40")
+                                              ? { "aria-label": "MFA token" }
+                                              : objectId.endsWith("-41")
+                                                ? { name: "multiFactorAuthenticationCode" }
+                                                : objectId.endsWith("-42")
+                                                  ? { name: "captcha", "aria-label": "Enter CAPTCHA" }
+                                                  : objectId.endsWith("-43")
+                                                    ? { name: "h-captcha-response" }
+                                                    : { name: "g-recaptcha-response" };
         const target = {
           form: null,
           labels: [],
           options: [],
-          tagName: objectId.endsWith("-24") ? "SELECT" : "INPUT",
+          ownerDocument: { getElementById() { return null; } },
+          tagName: objectId.endsWith("-24") || objectId.endsWith("-33") || objectId.endsWith("-34") ? "SELECT" : "INPUT",
           innerText: "",
           textContent: "",
           id: "",
@@ -2090,6 +2134,26 @@ describe("page revision monotonicity", () => {
       { kind: "type", ref: `r${pageRevision}-22`, text: "password" },
       { kind: "fill", ref: `r${pageRevision}-23`, text: "4111111111111111" },
       { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
+      { kind: "fill", ref: `r${pageRevision}-25`, text: "4111111111111111" },
+      { kind: "type", ref: `r${pageRevision}-26`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-27`, text: "1234" },
+      { kind: "type", ref: `r${pageRevision}-28`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-29`, text: "password" },
+      { kind: "type", ref: `r${pageRevision}-30`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-31`, text: "123456" },
+      { kind: "type", ref: `r${pageRevision}-32`, text: "123456" },
+      { kind: "select", ref: `r${pageRevision}-33`, value: "08" },
+      { kind: "fill", ref: `r${pageRevision}-35`, text: "123" },
+      { kind: "select", ref: `r${pageRevision}-34`, value: "2030" },
+      { kind: "fill", ref: `r${pageRevision}-36`, text: "123" },
+      { kind: "fill", ref: `r${pageRevision}-37`, text: "123" },
+      { kind: "fill", ref: `r${pageRevision}-38`, text: "123" },
+      { kind: "fill", ref: `r${pageRevision}-39`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-40`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-41`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-42`, text: "human-response" },
+      { kind: "fill", ref: `r${pageRevision}-43`, text: "human-response" },
+      { kind: "fill", ref: `r${pageRevision}-44`, text: "human-response" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
@@ -2101,7 +2165,7 @@ describe("page revision monotonicity", () => {
     expect((await readState()).stagedCommits).toEqual({});
   });
 
-  test("rechecks select sensitivity immediately before mutation", async () => {
+  test("rechecks inferred sensitivity immediately before mutation", async () => {
     let assignments = 0;
     let dispatchedEvents = 0;
     debuggerCommandOverride = (method, params) => {
@@ -2112,9 +2176,9 @@ describe("page revision monotonicity", () => {
         return {
           result: {
             value: {
-              tag: "SELECT",
-              role: "combobox",
-              aria_label: "Expiration month",
+              tag: "INPUT",
+              role: "textbox",
+              aria_label: "Account reference",
               autocomplete: "",
               form_action: "https://example.test/profile",
               form_method: "get",
@@ -2127,8 +2191,13 @@ describe("page revision monotonicity", () => {
         String(params.functionDeclaration).includes("agenttab_sensitive_field")
       ) {
         const target = {
+          tagName: "INPUT",
+          id: "",
+          labels: [],
+          ownerDocument: { getElementById() { return null; } },
           getAttribute(name: string) {
-            return name === "autocomplete" ? "section-checkout cc-exp-month" : "";
+            if (name === "aria-label") return "Passcode";
+            return "";
           },
           set value(_value: string) {
             assignments += 1;
@@ -2157,7 +2226,7 @@ describe("page revision monotonicity", () => {
 
     await expect(
       runtime.act(TASK_A, 63, pageRevision, [
-        { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
+        { kind: "fill", ref: `r${pageRevision}-24`, text: "4111111111111111" },
       ]),
     ).rejects.toMatchObject({
       code: "sensitive_field_requires_handoff",
@@ -2587,6 +2656,117 @@ describe("handoff and pause barriers", () => {
     expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]?.state).toBe("working");
     expect(events.filter((event) => event === "handoff_changed")).toHaveLength(2);
+  });
+
+  test("requires acknowledgment when an owned handoff tab or task disappears", async () => {
+    await seedTask(TASK_A, [33]);
+    await seedTask(TASK_B, [34], 6);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const events: Array<{ event: string; payload: Record<string, unknown>; eventId?: string }> = [];
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload, eventId) => {
+      events.push({ event, payload, eventId });
+    });
+    let scrubCalls = 0;
+    handoff.setScrubber(async () => {
+      scrubCalls += 1;
+    });
+    const firstRevision = await revisions.ensure(33);
+    await handoff.begin(TASK_A, {
+      tab_id: 33,
+      expected_page_revision: firstRevision,
+      prompt: "Complete authentication",
+      completion: { kind: "manual_done" },
+    });
+
+    expect(await handoff.cancelForTab(999)).toBe(false);
+    expect(await handoff.cancelForTab(33)).toBe(true);
+    const firstPending = (await readState()).handoff;
+    expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
+    expect(scheduler.isAccepting()).toBe(false);
+    const firstClearEventId = events.at(-1)?.eventId;
+    if (!firstPending.active || !firstPending.pendingClearEventId || !firstClearEventId) {
+      throw new Error("tab cancellation did not create a pending handoff event");
+    }
+    expect(typeof firstPending.pendingClearEventId).toBe("string");
+    expect(firstClearEventId).toBe(firstPending.pendingClearEventId);
+    await handoff.acknowledgeEvent("handoff_changed", firstClearEventId);
+    expect((await readState()).handoff).toEqual({ active: false });
+    expect((await readState()).tasks[TASK_A]?.state).toBe("working");
+    expect(scheduler.isAccepting()).toBe(true);
+
+    const secondRevision = await revisions.ensure(34);
+    await handoff.begin(TASK_B, {
+      tab_id: 34,
+      expected_page_revision: secondRevision,
+      prompt: "Complete payment",
+      completion: { kind: "manual_done" },
+    });
+
+    expect(await handoff.cancelForTask(TASK_A)).toBe(false);
+    expect(await handoff.cancelForTask(TASK_B)).toBe(true);
+    const secondPending = (await readState()).handoff;
+    expect((await readState()).tasks[TASK_B]?.state).toBe("needs_user");
+    expect(scheduler.isAccepting()).toBe(false);
+    const secondClearEventId = events.at(-1)?.eventId;
+    if (!secondPending.active || !secondPending.pendingClearEventId || !secondClearEventId) {
+      throw new Error("task cancellation did not create a pending handoff event");
+    }
+    expect(typeof secondPending.pendingClearEventId).toBe("string");
+    expect(secondClearEventId).toBe(secondPending.pendingClearEventId);
+    await handoff.acknowledgeEvent("handoff_changed", secondClearEventId);
+    expect((await readState()).handoff).toEqual({ active: false });
+    expect((await readState()).tasks[TASK_B]?.state).toBe("working");
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(events.filter(({ event, payload, eventId }) =>
+      event === "handoff_changed" && payload.active === false && typeof eventId === "string"
+    )).toHaveLength(2);
+    expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(4);
+    expect(scrubCalls).toBe(2);
+  });
+
+  test("clears a restored handoff for a tab revoked during initial reconciliation", async () => {
+    await seedTask(TASK_A, [35]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const clearEventIds: string[] = [];
+    const handoff = new HandoffController(scheduler, revisions, ownership, (event, _payload, eventId) => {
+      if (event === "handoff_changed" && eventId) clearEventIds.push(eventId);
+    });
+    let scrubCalls = 0;
+    handoff.setScrubber(async () => {
+      scrubCalls += 1;
+    });
+    const pageRevision = await revisions.ensure(35);
+    await handoff.begin(TASK_A, {
+      tab_id: 35,
+      expected_page_revision: pageRevision,
+      prompt: "Complete authentication",
+      completion: { kind: "manual_done" },
+    });
+    tabStore.delete(35);
+
+    const revokedTabIds = await ownership.reconcile();
+    await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
+    await handoff.restore();
+
+    expect(revokedTabIds).toEqual([35]);
+    const pending = (await readState()).handoff;
+    expect(scheduler.isAccepting()).toBe(false);
+    const clearEventId = clearEventIds.at(-1);
+    if (!pending.active || !pending.pendingClearEventId || !clearEventId) {
+      throw new Error("startup reconciliation did not create a pending handoff event");
+    }
+    expect(typeof pending.pendingClearEventId).toBe("string");
+    expect(clearEventIds).toEqual([pending.pendingClearEventId, pending.pendingClearEventId]);
+    expect(clearEventId).toBe(pending.pendingClearEventId);
+    await handoff.acknowledgeEvent("handoff_changed", clearEventId);
+    expect((await readState()).handoff).toEqual({ active: false });
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scrubCalls).toBe(1);
+    expect(alarmClears).toContain(HANDOFF_ALARM);
   });
 
   test("requires acknowledgment to clear an expired handoff without resuming manual Pause", async () => {
@@ -3800,6 +3980,38 @@ describe("extension entrypoint admission boundaries", () => {
     expect(Object.values((await readState()).stagedCommits)).toContainEqual(
       expect.objectContaining({ task_id: TASK_A, tab_id: 100 }),
     );
+    const closingHandoff = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6241",
+      TASK_A,
+      "browser_handoff",
+      {
+        tab_id: 100,
+        expected_page_revision: 1,
+        prompt: "Finish before closing",
+        completion: { kind: "manual_done" },
+      },
+    );
+    expect(closingHandoff).toMatchObject({ outcome: "needs_user" });
+    let handoffClearPostedAfterTabRemoval = false;
+    nativePostProbe = (message) => {
+      if (
+        isRecord(message) &&
+        message.kind === "event" &&
+        message.event === "handoff_changed" &&
+        typeof message.event_id === "string" &&
+        isRecord(message.payload) &&
+        message.payload.active === false
+      ) {
+        handoffClearPostedAfterTabRemoval = removedTabIds.includes(100);
+        port.receive({
+          protocol: "agenttab.native",
+          version: 1,
+          kind: "event_ack",
+          event: "handoff_changed",
+          event_id: message.event_id,
+        });
+      }
+    };
     let taskDeletedBeforeRemove = false;
     tabRemovalProbe = async () => {
       taskDeletedBeforeRemove = (await readState()).tasks[TASK_A] === undefined;
@@ -3813,6 +4025,11 @@ describe("extension entrypoint admission boundaries", () => {
       result: { task_id: TASK_A, closed_tab_ids: [100] },
     });
     expect(removedTabIds).toContain(100);
+    expect(handoffClearPostedAfterTabRemoval).toBe(true);
+    for (let attempt = 0; attempt < 20 && (await readState()).handoff.active; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
     expect(Object.values((await readState()).stagedCommits)).not.toContainEqual(
       expect.objectContaining({ task_id: TASK_A }),
@@ -3829,6 +4046,10 @@ describe("extension entrypoint admission boundaries", () => {
     });
     expect(taskDeletedBeforeRemove).toBe(true);
     expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
+    debuggerAttachedTabIds.add(101);
+    await mutateState((state) => {
+      state.automationCleanup.tabIds = [101];
+    });
     const detachCountBeforeRevocation = debuggerCalls.filter((call) => call === "detach").length;
     debuggerDetachFailures = 2;
     automationPermission = false;
