@@ -15,7 +15,7 @@ import { arch as currentArch, homedir, platform as currentPlatform, tmpdir } fro
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { inflateRawSync } from "node:zlib";
 import { setTimeout as delay } from "node:timers/promises";
-import { AgentTabClient, type ConnectionAck } from "../../sdk-typescript/src/index";
+import { AgentTabClient, AgentTabError, type ConnectionAck } from "../../sdk-typescript/src/index";
 import identityJson from "../../../config/identity.json" with { type: "json" };
 import trustJson from "../../../config/release-trust.json" with { type: "json" };
 import migrationJson from "../../../config/migration-v1.json" with { type: "json" };
@@ -215,6 +215,8 @@ export function targetTriple(platform: NodeJS.Platform = currentPlatform(), arch
     "darwin/x64": "x86_64-apple-darwin",
     "linux/arm64": "aarch64-unknown-linux-gnu",
     "linux/x64": "x86_64-unknown-linux-gnu",
+    // Windows on ARM runs the signed x64 host through built-in application emulation.
+    "win32/arm64": "x86_64-pc-windows-msvc",
     "win32/x64": "x86_64-pc-windows-msvc",
   };
   const target = targets[key];
@@ -636,6 +638,12 @@ function startBrowser(platform: NodeJS.Platform): void {
   }
 }
 
+function isRetryableReadinessError(error: unknown): error is AgentTabError {
+  return error instanceof AgentTabError
+    && error.code === "runtime_not_ready"
+    && error.outcome === "not_started";
+}
+
 async function runReadiness(openBrowser: boolean, platform: NodeJS.Platform): Promise<void> {
   if (openBrowser) startBrowser(platform);
   const deadline = Date.now() + 20_000;
@@ -673,10 +681,22 @@ async function runReadiness(openBrowser: boolean, platform: NodeJS.Platform): Pr
   let tabId: number | undefined;
   let revision: number | undefined;
   try {
-    const opened = await client.call<Record<string, unknown> extends never ? never : "browser_open", Record<string, unknown>>(
-      "browser_open",
-      { mode: "create", url: "about:blank", background: true },
-    );
+    let opened: Record<string, unknown> | undefined;
+    while (opened === undefined && Date.now() < deadline) {
+      try {
+        opened = await client.call<"browser_open", Record<string, unknown>>(
+          "browser_open",
+          { mode: "create", url: "about:blank", background: true },
+        );
+      } catch (error) {
+        if (!isRetryableReadinessError(error)) throw error;
+        const remaining = deadline - Date.now();
+        if (remaining > 0) await delay(Math.min(250, remaining));
+      }
+    }
+    if (opened === undefined) {
+      throw new Error("AgentTab extension did not become ready before the readiness deadline");
+    }
     tabId = Number(opened.tab_id);
     revision = Number(opened.page_revision);
     if (!Number.isInteger(tabId) || !Number.isInteger(revision)) throw new Error("browser_open did not return tab_id and page_revision");

@@ -77,6 +77,7 @@ let nativePort: MockNativePort | null;
 let tabRemovalProbe: (() => void | Promise<void>) | null;
 let normalizeStoredObjectKeys: boolean;
 let focusedWindowUpdates: number[];
+let activeWindowId: number;
 let createdWindowOptions: Array<Record<string, unknown>>;
 let windowUpdates: Array<{ windowId: number; changes: Record<string, unknown> }>;
 let focusStealOnClickTabId: number | null;
@@ -172,6 +173,7 @@ function installChromeMock(): void {
   tabRemovalProbe = null;
   normalizeStoredObjectKeys = false;
   focusedWindowUpdates = [];
+  activeWindowId = 1;
   createdWindowOptions = [];
   windowUpdates = [];
   focusStealOnClickTabId = null;
@@ -395,7 +397,10 @@ function installChromeMock(): void {
         },
         async update(windowId: number, changes: Record<string, unknown>) {
           windowUpdates.push({ windowId, changes: clone(changes) });
-          if (changes.focused === true) focusedWindowUpdates.push(windowId);
+          if (changes.focused === true) {
+            focusedWindowUpdates.push(windowId);
+            activeWindowId = windowId;
+          }
           return { id: windowId, state: changes.state ?? "normal" };
         },
         async remove(windowId: number) {
@@ -1562,7 +1567,7 @@ describe("ownership and task isolation", () => {
     expect(events).toContain("ownership_revoked");
   });
 
-  test("inherits opener ownership across popup windows and restores the destination selection", async () => {
+  test("inherits opener ownership across popup windows without changing the active Chrome window", async () => {
     await seedTask(TASK_A, [21]);
     tabStore.set(20, {
       id: 20,
@@ -1571,6 +1576,14 @@ describe("ownership and task isolation", () => {
       active: true,
       url: "https://example.test/active",
     });
+    tabStore.set(30, {
+      id: 30,
+      windowId: 3,
+      groupId: -1,
+      active: true,
+      url: "https://example.test/user",
+    });
+    activeWindowId = 3;
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
     const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
@@ -1587,7 +1600,8 @@ describe("ownership and task isolation", () => {
     expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21, 22]);
     expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 5, active: false });
     expect(tabStore.get(20)?.active).toBe(true);
-    expect(focusedWindowUpdates).toEqual([1]);
+    expect(focusedWindowUpdates).toEqual([]);
+    expect(activeWindowId).toBe(3);
     let taskDeletedBeforeRemove = false;
     tabRemovalProbe = async () => {
       taskDeletedBeforeRemove = (await readState()).tasks[TASK_A] === undefined;

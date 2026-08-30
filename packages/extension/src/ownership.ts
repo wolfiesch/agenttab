@@ -357,7 +357,6 @@ export class OwnershipLedger {
         if (Number.isInteger(activeDestination?.id)) {
           await chrome.tabs.update(activeDestination.id as number, { active: true }).catch(() => undefined);
         }
-        await chrome.windows.update(parent.windowId as number, { focused: true }).catch(() => undefined);
       }
       await this.grant(ownedParent.taskId, childTabId, ownedParent.name);
     } catch {
