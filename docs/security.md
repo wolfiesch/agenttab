@@ -70,7 +70,7 @@ These checks limit accidental path selection. They do not establish that a permi
 
 ## Resume capabilities and durable state
 
-A Core connection receives a task lazily on first browser work. A resume capability is a 256-bit random bearer secret: the host returns it once, persists only its SHA-256 hash, rotates it after a successful resume, and requires acknowledgement of the rotated value. `conversation_id` is metadata only and never authorizes a task.
+A Core connection receives a task lazily on first browser work. A resume capability is a 256-bit random bearer secret: the host returns it once and persists only its SHA-256 hash, and the client must durably persist and confirm it before another RPC. A successful resume returns a rotated capability under the same persist-then-confirm barrier. `conversation_id` is metadata only and never authorizes a task.
 
 Adapters must store a capability in owner-only private state and must not log, display, or share it. Losing it does not expose a task, but reconnecting without it creates a new task. Treat a capability like a local session secret.
 

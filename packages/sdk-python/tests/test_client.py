@@ -7,12 +7,13 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agenttab import AgentTabClient, AgentTabTransportError, encode_frame, read_frame, uuid7
+from agenttab import AgentTabClient, AgentTabError, AgentTabTransportError, encode_frame, read_frame, uuid7
 from agenttab.client import create_resume_capability_store
 
 
@@ -138,6 +139,75 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(raised.exception.outcome, "unknown")
         self.assertIsNone(raised.exception.idempotency_key)
         self.assertTrue(client._closed)
+
+    def test_windows_named_pipe_read_deadline_is_classified_without_a_worker(self) -> None:
+        class StalledWindowsPipe:
+            _agenttab_windows_pipe = True
+
+            def __init__(self) -> None:
+                self.timeouts: list[float | None] = []
+                self.closed = False
+
+            def read(self, _size: int, timeout: float | None = None) -> bytes:
+                self.timeouts.append(timeout)
+                raise TimeoutError("stalled named pipe")
+
+            def write(self, payload: bytes) -> int:
+                return len(payload)
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        stream = StalledWindowsPipe()
+        client = AgentTabClient(stream, {}, request_timeout=0.05)
+        with self.assertRaises(AgentTabTransportError) as raised:
+            client.request("browser_tabs", {})
+        self.assertEqual(raised.exception.code, "request_timeout")
+        self.assertTrue(client._closed)
+        self.assertTrue(stream.closed)
+        self.assertEqual(len(stream.timeouts), 1)
+        self.assertLessEqual(stream.timeouts[0] or 0, 0.05)
+
+    def test_windows_named_pipe_negotiation_read_uses_connect_deadline(self) -> None:
+        class StalledWindowsPipe:
+            _agenttab_windows_pipe = True
+
+            def __init__(self) -> None:
+                self.timeouts: list[float | None] = []
+                self.closed = False
+
+            def read(self, _size: int, timeout: float | None = None) -> bytes:
+                self.timeouts.append(timeout)
+                raise TimeoutError("stalled named pipe")
+
+            def write(self, payload: bytes) -> int:
+                return len(payload)
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        stream = StalledWindowsPipe()
+        with patch("agenttab.client.os.name", "nt"), patch(
+            "agenttab.client._open_windows_named_pipe",
+            return_value=stream,
+        ):
+            with self.assertRaises(TimeoutError):
+                AgentTabClient._negotiate_connection(
+                    r"\\.\pipe\agenttab-test",
+                    conversation_id=None,
+                    resume_capability=None,
+                    connect_timeout=0.05,
+                    request_timeout=1.0,
+                )
+        self.assertTrue(stream.closed)
+        self.assertEqual(len(stream.timeouts), 1)
+        self.assertLessEqual(stream.timeouts[0] or 0, 0.05)
 
     def test_generated_mutation_key_survives_timeout_and_reuses(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -349,6 +419,115 @@ class ClientTests(unittest.TestCase):
                 client.request("browser_tabs", {})
             client.confirm_resume_capability()
             self.assertEqual(client.resume_capability, candidate)
+            client.close()
+            worker.join(timeout=2)
+            server.close()
+
+    def test_failed_initial_capability_save_retains_a_confirmable_recovery_path(
+        self,
+    ) -> None:
+        class FailOnceStore:
+            path = Path("memory")
+
+            def __init__(self) -> None:
+                self.capability: str | None = None
+                self.saves = 0
+
+            def load(self) -> str | None:
+                return self.capability
+
+            def load_pending(self) -> str | None:
+                return None
+
+            def save(self, capability: str) -> None:
+                self.saves += 1
+                if self.saves == 1:
+                    raise OSError("fsync failed")
+                self.capability = capability
+
+            def prepare_replacement(self, _current: str, _replacement: str) -> None:
+                return None
+
+            def activate_replacement(self, _replacement: str) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(endpoint)
+            server.listen(1)
+            capability = "c" * 32
+            confirmations = 0
+            methods: list[str] = []
+
+            def serve() -> None:
+                nonlocal confirmations
+                connection, _ = server.accept()
+                try:
+                    read_frame(connection)
+                    connection.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "kind": "connected",
+                        "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                        "resumed": False,
+                        "state": "ready",
+                    }, 1024 * 1024))
+                    first = read_frame(connection)
+                    methods.append(str(first["method"]))
+                    connection.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "request_id": first["request_id"],
+                        "ok": True,
+                        "outcome": "completed",
+                        "result": {"created": True},
+                        "task": {
+                            "task_id": "018f22b2-4126-7c1a-8c31-3f45a783da43",
+                            "resume_capability": capability,
+                        },
+                    }, 1024 * 1024))
+                    confirmation = read_frame(connection)
+                    self.assertEqual(confirmation["kind"], "resume_confirm")
+                    self.assertEqual(confirmation["resume_capability"], capability)
+                    confirmations += 1
+                    connection.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "kind": "resume_confirmed",
+                        "connection_id": confirmation["connection_id"],
+                    }, 1024 * 1024))
+                    second = read_frame(connection)
+                    methods.append(str(second["method"]))
+                    connection.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "request_id": second["request_id"],
+                        "ok": True,
+                        "outcome": "completed",
+                        "result": {"recovered": True},
+                    }, 1024 * 1024))
+                finally:
+                    connection.close()
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            store = FailOnceStore()
+            client = AgentTabClient.connect(endpoint=endpoint, capability_store=store)
+            with self.assertRaises(AgentTabError) as raised:
+                client.call("browser_open", {"mode": "create"})
+            self.assertEqual(raised.exception.code, "capability_persistence_failed")
+            self.assertEqual(confirmations, 0)
+            self.assertEqual(client.pending_resume_capability, capability)
+            self.assertIsNone(client.resume_capability)
+
+            store.save(capability)
+            client.confirm_resume_capability()
+            self.assertEqual(confirmations, 1)
+            self.assertEqual(client.resume_capability, capability)
+            self.assertIsNone(client.pending_resume_capability)
+            self.assertEqual(client.call("browser_tabs", {}), {"recovered": True})
+            self.assertEqual(methods, ["browser_open", "browser_tabs"])
             client.close()
             worker.join(timeout=2)
             server.close()

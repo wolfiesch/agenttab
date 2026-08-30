@@ -10,7 +10,7 @@ A fresh adapter connection therefore gets a distinct task. Adapters that need to
 
 ## Resume capabilities
 
-A resume capability is a 256-bit random bearer secret. The host persists only its hash. On successful resume it returns a replacement capability, then requires a confirmation bound to the new connection before finalizing the rotation. If delivery fails, the prior capability remains recoverable; once acknowledged, the old capability no longer resumes the task.
+A resume capability is a 256-bit random bearer secret. The host persists only its hash. A client must durably persist and confirm an initial capability before the host accepts another RPC. On successful resume the host returns a replacement capability under the same persist-then-confirm barrier; if delivery or confirmation fails, a durably retained capability remains recoverable. Once a replacement is confirmed, the old capability no longer resumes the task.
 
 Store the capability only in adapter-owned private state. Never put it in prompts, page content, logs, task titles, or shared configuration. A missing or invalid capability creates a new task rather than recovering another agent's task.
 

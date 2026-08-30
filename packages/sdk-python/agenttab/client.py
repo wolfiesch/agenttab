@@ -80,11 +80,190 @@ def encode_frame(value: Mapping[str, Any], limit: int = CLIENT_TO_HOST_MAX_BYTES
     return struct.pack("<I", len(payload)) + payload
 
 
-def _read_exact(stream: BinaryIO | socket.socket, size: int) -> bytes:
+class _WindowsNamedPipe:
+    _agenttab_windows_pipe = True
+
+    def __init__(self, address: str) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_size_t),
+                ("InternalHigh", ctypes.c_size_t),
+                ("Offset", wintypes.DWORD),
+                ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE),
+            ]
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._overlapped_type = Overlapped
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        self._kernel32.CreateFileW.restype = wintypes.HANDLE
+        self._kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        self._kernel32.CreateEventW.restype = wintypes.HANDLE
+        self._kernel32.ReadFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(Overlapped),
+        ]
+        self._kernel32.ReadFile.restype = wintypes.BOOL
+        self._kernel32.WriteFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            ctypes.POINTER(Overlapped),
+        ]
+        self._kernel32.WriteFile.restype = wintypes.BOOL
+        self._kernel32.GetOverlappedResult.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(Overlapped),
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.BOOL,
+        ]
+        self._kernel32.GetOverlappedResult.restype = wintypes.BOOL
+        self._kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self._kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._kernel32.CancelIoEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(Overlapped),
+        ]
+        self._kernel32.CancelIoEx.restype = wintypes.BOOL
+        self._handle: int | None = self._kernel32.CreateFileW(
+            address,
+            0xC0000000,
+            0,
+            None,
+            3,
+            0x40000000,
+            None,
+        )
+        if self._handle == ctypes.c_void_p(-1).value:
+            self._handle = None
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _transfer(
+        self,
+        operation: Any,
+        buffer: Any,
+        size: int,
+        timeout: float | None,
+    ) -> int:
+        if self._handle is None:
+            raise OSError("AgentTab named pipe is closed")
+        event = self._kernel32.CreateEventW(None, True, False, None)
+        if not event:
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        try:
+            overlapped = self._overlapped_type()
+            overlapped.hEvent = event
+            if not operation(
+                self._handle,
+                self._ctypes.byref(buffer),
+                size,
+                None,
+                self._ctypes.byref(overlapped),
+            ):
+                error = self._ctypes.get_last_error()
+                if error not in (997,):
+                    if error in (109, 232, 233):
+                        raise EOFError("AgentTab connection closed during a frame")
+                    raise self._ctypes.WinError(error)
+            wait_timeout = 0xFFFFFFFF if timeout is None else max(1, int(timeout * 1000))
+            wait = self._kernel32.WaitForSingleObject(event, wait_timeout)
+            if wait == 0x00000102:
+                self._kernel32.CancelIoEx(self._handle, self._ctypes.byref(overlapped))
+                self.close()
+                self._kernel32.WaitForSingleObject(event, 0xFFFFFFFF)
+                raise TimeoutError("AgentTab named-pipe read timed out")
+            if wait != 0:
+                raise self._ctypes.WinError(self._ctypes.get_last_error())
+            transferred = self._wintypes.DWORD()
+            if not self._kernel32.GetOverlappedResult(
+                self._handle,
+                self._ctypes.byref(overlapped),
+                self._ctypes.byref(transferred),
+                False,
+            ):
+                error = self._ctypes.get_last_error()
+                if error in (109, 232, 233):
+                    raise EOFError("AgentTab connection closed during a frame")
+                raise self._ctypes.WinError(error)
+            return int(transferred.value)
+        finally:
+            self._kernel32.CloseHandle(event)
+
+    def read(self, size: int, timeout: float | None = None) -> bytes:
+        if size == 0:
+            return b""
+        buffer = self._ctypes.create_string_buffer(size)
+        transferred = self._transfer(self._kernel32.ReadFile, buffer, size, timeout)
+        return buffer.raw[:transferred]
+
+    def write(self, payload: bytes) -> int:
+        if not payload:
+            return 0
+        buffer = self._ctypes.create_string_buffer(payload, len(payload))
+        return self._transfer(self._kernel32.WriteFile, buffer, len(payload), None)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        handle, self._handle = self._handle, None
+        self._kernel32.CloseHandle(handle)
+
+
+def _open_windows_named_pipe(address: str) -> _WindowsNamedPipe:
+    return _WindowsNamedPipe(address)
+
+
+def _uses_windows_named_pipe(stream: object) -> bool:
+    return bool(getattr(stream, "_agenttab_windows_pipe", False))
+
+
+def _read_exact(
+    stream: BinaryIO | socket.socket,
+    size: int,
+    deadline: float | None = None,
+) -> bytes:
     chunks: list[bytes] = []
     remaining = size
     while remaining:
-        chunk = stream.recv(remaining) if isinstance(stream, socket.socket) else stream.read(remaining)
+        if isinstance(stream, socket.socket):
+            chunk = stream.recv(remaining)
+        elif _uses_windows_named_pipe(stream):
+            if deadline is None:
+                timeout = None
+            else:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError("AgentTab named-pipe read timed out")
+            chunk = stream.read(remaining, timeout)  # type: ignore[call-arg]
+        else:
+            chunk = stream.read(remaining)
         if not chunk:
             raise EOFError("AgentTab connection closed during a frame")
         chunks.append(chunk)
@@ -95,11 +274,14 @@ def _read_exact(stream: BinaryIO | socket.socket, size: int) -> bytes:
 def read_frame(
     stream: BinaryIO | socket.socket,
     limit: int = HOST_TO_CLIENT_MAX_BYTES,
+    *,
+    timeout: float | None = None,
 ) -> JsonObject:
-    declared = struct.unpack("<I", _read_exact(stream, 4))[0]
+    deadline = None if timeout is None else time.monotonic() + timeout
+    declared = struct.unpack("<I", _read_exact(stream, 4, deadline))[0]
     if declared > limit:
         raise ValueError(f"AgentTab frame declares {declared} bytes; limit is {limit}")
-    value = json.loads(_read_exact(stream, declared).decode("utf-8"))
+    value = json.loads(_read_exact(stream, declared, deadline).decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("AgentTab frame must contain a JSON object")
     return value
@@ -360,7 +542,7 @@ class AgentTabClient:
         self._capability_store = capability_store
         candidate = connection.get("resume_capability")
         self.pending_resume_capability = candidate if connection.get("resumed") else None
-        self.resume_capability = None if connection.get("resumed") else candidate
+        self.resume_capability = None
         self._lock = threading.Lock()
         self._closed = False
 
@@ -443,14 +625,11 @@ class AgentTabClient:
                         "AgentTab could not complete durable resume-capability rotation: "
                         f"{error}"
                     ) from error
-        elif capability_store is not None and isinstance(
-            connection.get("resume_capability"), str
-        ):
-            try:
-                capability_store.save(connection["resume_capability"])
-            except Exception:
-                client.close()
-                raise
+        elif connection.get("resume_capability") is not None:
+            client.close()
+            raise RuntimeError(
+                "AgentTab returned an initial resume capability before creating a task"
+            )
         return client
 
     @classmethod
@@ -464,7 +643,7 @@ class AgentTabClient:
         request_timeout: float,
     ) -> tuple[BinaryIO | socket.socket, JsonObject]:
         if os.name == "nt":
-            stream: BinaryIO | socket.socket = open(address, "r+b", buffering=0)
+            stream: BinaryIO | socket.socket = _open_windows_named_pipe(address)
         else:
             unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             unix_socket.settimeout(connect_timeout)
@@ -481,7 +660,10 @@ class AgentTabClient:
             request["resume_capability"] = resume_capability
         try:
             cls._write(stream, encode_frame(request))
-            connection = read_frame(stream)
+            connection = read_frame(
+                stream,
+                timeout=connect_timeout if _uses_windows_named_pipe(stream) else None,
+            )
             if (
                 connection.get("protocol") != RPC_PROTOCOL
                 or connection.get("version") != RPC_VERSION
@@ -547,10 +729,17 @@ class AgentTabClient:
             pass
 
     def _exchange(self, payload: bytes) -> JsonObject:
-        if isinstance(self._stream, socket.socket):
+        if isinstance(self._stream, socket.socket) or _uses_windows_named_pipe(self._stream):
             with self._lock:
                 self._write(self._stream, payload)
-                return read_frame(self._stream)
+                return read_frame(
+                    self._stream,
+                    timeout=(
+                        self.request_timeout
+                        if _uses_windows_named_pipe(self._stream)
+                        else None
+                    ),
+                )
 
         responses: list[JsonObject] = []
         failures: list[Exception] = []
@@ -604,7 +793,14 @@ class AgentTabClient:
                     }
                 ),
             )
-            acknowledgement = read_frame(self._stream)
+            acknowledgement = read_frame(
+                self._stream,
+                timeout=(
+                    self.request_timeout
+                    if _uses_windows_named_pipe(self._stream)
+                    else None
+                ),
+            )
         if (
             acknowledgement.get("protocol") != RPC_PROTOCOL
             or acknowledgement.get("version") != RPC_VERSION
@@ -664,10 +860,11 @@ class AgentTabClient:
             raise RuntimeError("AgentTab response request_id did not match the request")
         task = response.get("task")
         if isinstance(task, Mapping) and isinstance(task.get("resume_capability"), str):
-            rotated = task["resume_capability"]
+            capability = task["resume_capability"]
+            self.pending_resume_capability = capability
             if self._capability_store is not None:
                 try:
-                    self._capability_store.save(rotated)
+                    self._capability_store.save(capability)
                 except Exception as error:
                     raise AgentTabError(
                         {
@@ -680,7 +877,7 @@ class AgentTabClient:
                                 "code": "capability_persistence_failed",
                                 "message": (
                                     "AgentTab completed the RPC but could not persist its "
-                                    f"rotated resume capability: {error}"
+                                    f"resume capability: {error}"
                                 ),
                                 "recovery": (
                                     "Repair the owner-only AgentTab client state directory "
@@ -689,7 +886,7 @@ class AgentTabClient:
                             },
                         }
                     ) from error
-            self.resume_capability = rotated
+                self.confirm_resume_capability()
         return response
 
     def call(

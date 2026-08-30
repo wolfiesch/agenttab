@@ -68,7 +68,7 @@ let removedTabIds: number[];
 let failGrouping: boolean;
 let nextTabId: number;
 let nextGroupId: number;
-let scriptResult: boolean;
+let scriptResult: unknown;
 let scriptingCallCount: number;
 let alarmCreates: Array<{ name: string; when: number }>;
 let alarmClears: string[];
@@ -119,9 +119,129 @@ let permissionAddedListeners: PermissionAddedListener[];
 let tabUpdatedListeners: TabUpdatedListener[];
 let debuggerEventListeners: Array<(...args: unknown[]) => void>;
 let debuggerDetachListeners: Array<(...args: unknown[]) => void>;
+let popupRuntimeHandler: (message: Record<string, unknown>) => unknown | Promise<unknown>;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+class PopupTestElement {
+  textContent = "";
+  hidden = false;
+  className = "";
+  title = "";
+  type = "";
+  disabled = false;
+  checked = false;
+  readonly dataset: Record<string, string> = {};
+  readonly style = { setProperty() { } };
+  private readonly listeners = new Map<string, Array<() => void>>();
+
+  addEventListener(type: string, listener: () => void): void {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  dispatch(type: string): void {
+    for (const listener of this.listeners.get(type) ?? []) listener();
+  }
+
+  append(..._children: PopupTestElement[]): void { }
+  replaceChildren(..._children: PopupTestElement[]): void { }
+  setAttribute(_name: string, _value: string): void { }
+  focus(): void { }
+}
+
+class PopupTestSpanElement extends PopupTestElement { }
+class PopupTestButtonElement extends PopupTestElement { }
+class PopupTestParagraphElement extends PopupTestElement { }
+class PopupTestInputElement extends PopupTestElement { }
+class PopupTestDivElement extends PopupTestElement { }
+class PopupTestListElement extends PopupTestElement { }
+
+interface PopupTestSurface {
+  get(id: string): PopupTestElement;
+}
+
+let popupModuleNonce = 0;
+
+function installPopupDocument(): PopupTestSurface {
+  const nodes = new Map<string, PopupTestElement>();
+  const add = <T extends PopupTestElement>(id: string, Element: new () => T): void => {
+    nodes.set(id, new Element());
+  };
+  add("status", PopupTestSpanElement);
+  add("developer-chip", PopupTestSpanElement);
+  add("automation-detail", PopupTestElement);
+  add("pause", PopupTestButtonElement);
+  add("runtime-error", PopupTestParagraphElement);
+  add("permission", PopupTestElement);
+  add("enable", PopupTestButtonElement);
+  add("permission-error", PopupTestParagraphElement);
+  add("automation-setting", PopupTestDivElement);
+  add("disable", PopupTestButtonElement);
+  add("developer", PopupTestElement);
+  add("developer-off", PopupTestButtonElement);
+  add("handoff", PopupTestElement);
+  add("handoff-prompt", PopupTestParagraphElement);
+  add("handoff-cancel", PopupTestButtonElement);
+  add("handoff-done", PopupTestButtonElement);
+  add("handoff-error", PopupTestParagraphElement);
+  add("task-count", PopupTestSpanElement);
+  add("tasks", PopupTestListElement);
+  add("task-error", PopupTestParagraphElement);
+  add("pointer", PopupTestInputElement);
+  add("pointer-detail", PopupTestElement);
+  add("settings-error", PopupTestParagraphElement);
+  add("reviews", PopupTestElement);
+  add("review-list", PopupTestListElement);
+  add("review-error", PopupTestParagraphElement);
+  Object.assign(globalThis as Record<string, unknown>, {
+    document: {
+      body: new PopupTestElement(),
+      getElementById(id: string) {
+        return nodes.get(id) ?? null;
+      },
+      createElement() {
+        return new PopupTestElement();
+      },
+    },
+    HTMLElement: PopupTestElement,
+    HTMLSpanElement: PopupTestSpanElement,
+    HTMLButtonElement: PopupTestButtonElement,
+    HTMLParagraphElement: PopupTestParagraphElement,
+    HTMLInputElement: PopupTestInputElement,
+    HTMLDivElement: PopupTestDivElement,
+    HTMLUListElement: PopupTestListElement,
+  });
+  return {
+    get(id: string): PopupTestElement {
+      const element = nodes.get(id);
+      if (!element) throw new Error(`popup test element "${id}" is missing`);
+      return element;
+    },
+  };
+}
+
+async function loadPopup(): Promise<PopupTestSurface> {
+  const surface = installPopupDocument();
+  // Each test needs a distinct evaluation of this side-effecting popup module.
+  await import(`../src/popup.ts?popup-test=${popupModuleNonce += 1}`);
+  await flushPromiseQueue();
+  return surface;
+}
+
+function popupUiState(paused = false): Record<string, unknown> {
+  return {
+    automation_enabled: true,
+    paused,
+    developer_mode: false,
+    show_agent_pointer: false,
+    handoff: null,
+    tasks: [],
+    reviews: [],
+  };
 }
 
 function recursivelySortObjectKeys(value: unknown): unknown {
@@ -208,6 +328,7 @@ function installChromeMock(): void {
   permissionRemovedListeners = [];
   debuggerEventListeners = [];
   debuggerDetachListeners = [];
+  popupRuntimeHandler = () => popupUiState();
   const listeners = {
     detach: debuggerDetachListeners,
     event: debuggerEventListeners,
@@ -236,6 +357,7 @@ function installChromeMock(): void {
             for (const key of Array.isArray(keys) ? keys : [keys]) delete persisted[key];
           },
         },
+        onChanged: { addListener() { } },
       },
       debugger: {
         onDetach: { addListener(listener: (...args: unknown[]) => void) { listeners.detach.push(listener); } },
@@ -473,6 +595,10 @@ function installChromeMock(): void {
           if (!nativePort) throw new Error("native host unavailable");
           return nativePort;
         },
+        async sendMessage(message: unknown) {
+          if (!isRecord(message)) throw new Error("popup message must be a record");
+          return popupRuntimeHandler(message);
+        },
         onMessage: {
           addListener(listener: PopupMessageListener) {
             popupMessageListeners.push(listener);
@@ -598,6 +724,42 @@ async function sendPopupMessage(message: unknown): Promise<unknown> {
 }
 
 beforeEach(installChromeMock);
+
+describe("popup background responses", () => {
+  test("accepts successful popup response records", async () => {
+    let paused = false;
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "get_ui_state") return popupUiState(paused);
+      if (message.kind === "pause") {
+        paused = true;
+        return { paused: true };
+      }
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    popup.get("pause").dispatch("click");
+    await flushPromiseQueue();
+
+    expect(popup.get("status").textContent).toBe("Paused");
+    expect(popup.get("runtime-error").hidden).toBe(true);
+  });
+
+  test("displays background error records through the popup guard", async () => {
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "get_ui_state") return popupUiState();
+      if (message.kind === "pause") return { error: "Native host disconnected." };
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    popup.get("pause").dispatch("click");
+    await flushPromiseQueue();
+
+    expect(popup.get("runtime-error").hidden).toBe(false);
+    expect(popup.get("runtime-error").textContent).toBe("Native host disconnected.");
+  });
+});
 
 describe("native protocol", () => {
   test("accepts only strict versioned Core commands", () => {
@@ -1273,6 +1435,41 @@ describe("page revision monotonicity", () => {
     expect(debuggerCalls).toContain("Page.getLayoutMetrics");
     expect(debuggerCalls.filter((call) => call === "Page.captureScreenshot")).toHaveLength(1);
     expect((await readState()).revisions["61"]).toMatchObject({ floor: 2, current: 2 });
+  });
+
+  test("rejects text and HTML snapshots when the document changes during capture", async () => {
+    for (const [index, mode] of (["text", "html"] as const).entries()) {
+      const tabId = 68 + index;
+      let frameTreeReads = 0;
+      scriptResult = mode === "text" ? "captured text" : "<main>captured html</main>";
+      debuggerCommandOverride = (method) => {
+        if (method === "Page.getFrameTree") {
+          frameTreeReads += 1;
+          return {
+            frameTree: {
+              frame: { loaderId: frameTreeReads === 1 ? "loader-before" : "loader-after" },
+            },
+          };
+        }
+        return undefined;
+      };
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      const scriptCalls = scriptingCallCount;
+
+      await expect(runtime.snapshot(tabId, { mode })).rejects.toMatchObject({
+        code: "stale_revision",
+        currentPageRevision: 2,
+      });
+
+      expect(scriptingCallCount).toBe(scriptCalls + 1);
+      expect((await readState()).revisions[String(tabId)]).toMatchObject({ floor: 2, current: 2 });
+      await runtime.detach(tabId);
+    }
   });
 
   test("matches only tab-scoped downloads completed after the wait starts", async () => {

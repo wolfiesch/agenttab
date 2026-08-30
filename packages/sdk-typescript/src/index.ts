@@ -345,7 +345,7 @@ function capabilityPersistenceError(response: RpcResponse, error: unknown): Agen
     outcome: response.outcome,
     error: {
       code: "capability_persistence_failed",
-      message: `AgentTab completed the RPC but could not persist its rotated resume capability: ${error instanceof Error ? error.message : String(error)
+      message: `AgentTab completed the RPC but could not persist its resume capability: ${error instanceof Error ? error.message : String(error)
         }`,
       recovery: "Repair the owner-only AgentTab client state directory before restarting or retrying.",
     },
@@ -450,6 +450,12 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
   method: RpcMethod;
   idempotencyKey?: string;
+}
+
+interface PendingCapabilityConfirmation {
+  resolve(): void;
+  reject(error: Error): void;
+  timer: NodeJS.Timeout;
 }
 
 interface NegotiatedConnection {
@@ -568,10 +574,10 @@ export class AgentTabClient {
   #pending = new Map<string, PendingRequest>();
   #requestTimeoutMs: number;
   #resumeCapability?: string;
+  #pendingResumeCapability?: string;
   #capabilityStore?: ResumeCapabilityStore;
-  #capabilityWrites: Promise<void> = Promise.resolve();
+  #capabilityConfirmation?: PendingCapabilityConfirmation;
   #closed = false;
-
   private constructor(
     socket: Socket,
     connection: ConnectionAck,
@@ -632,13 +638,9 @@ export class AgentTabClient {
           }`,
         );
       }
-    } else if (connected.resume_capability && store) {
-      try {
-        await store.save(connected.resume_capability);
-      } catch (error) {
-        socket.destroy();
-        throw error;
-      }
+    } else if (connected.resume_capability) {
+      socket.destroy();
+      throw new Error("AgentTab returned an initial resume capability before creating a task");
     }
     const client = new AgentTabClient(
       socket,
@@ -658,12 +660,32 @@ export class AgentTabClient {
     return this.#resumeCapability;
   }
 
+  get pendingResumeCapability(): string | undefined {
+    return this.#pendingResumeCapability;
+  }
+
+  async confirmResumeCapability(): Promise<void> {
+    const capability = this.#pendingResumeCapability;
+    if (!capability) {
+      throw new Error("AgentTab has no pending resume capability to confirm");
+    }
+    if (this.#closed) throw new Error("AgentTab client is closed");
+    await this.#confirmPendingCapability(capability);
+    this.#resumeCapability = capability;
+    this.#pendingResumeCapability = undefined;
+  }
+
   async request<M extends RpcMethod, T = unknown>(
     method: M,
     params: MethodParams[M],
     options: { timeoutMs?: number; idempotencyKey?: string } = {},
   ): Promise<RpcResponse<T>> {
     if (this.#closed) throw new Error("AgentTab client is closed");
+    if (this.#pendingResumeCapability) {
+      throw new Error(
+        "Persist pendingResumeCapability durably, then call confirmResumeCapability before RPC",
+      );
+    }
     const requestId = randomUUID();
     const timeoutMs = options.timeoutMs ?? this.#requestTimeoutMs;
     const idempotencyKey = MUTATIONS.has(method)
@@ -721,6 +743,7 @@ export class AgentTabClient {
     if (this.#closed) return;
     this.#closed = true;
     this.#socket.end();
+    this.#rejectCapabilityConfirmation(new Error("AgentTab client closed"));
     this.#rejectPending(new Error("AgentTab client closed"));
   }
 
@@ -740,29 +763,83 @@ export class AgentTabClient {
   }
 
   #handleResponse(value: unknown): void {
+    if (isResumeCapabilityConfirmed(value, this.connection.connection_id)) {
+      const confirmation = this.#capabilityConfirmation;
+      if (!confirmation) {
+        throw new Error("AgentTab confirmed an unexpected resume capability");
+      }
+      clearTimeout(confirmation.timer);
+      this.#capabilityConfirmation = undefined;
+      confirmation.resolve();
+      return;
+    }
     if (!isRpcResponse(value)) throw new Error("AgentTab sent an invalid RPC response");
     const pending = this.#pending.get(value.request_id);
     if (!pending) return;
     this.#pending.delete(value.request_id);
     clearTimeout(pending.timer);
-    const rotated = value.task?.resume_capability;
-    if (!rotated || !this.#capabilityStore) {
-      if (rotated) this.#resumeCapability = rotated;
+    const capability = value.task?.resume_capability;
+    if (!capability) {
       pending.resolve(value);
       return;
     }
-    this.#resumeCapability = rotated;
-    this.#capabilityWrites = this.#capabilityWrites.then(() => this.#capabilityStore!.save(rotated));
-    void this.#capabilityWrites.then(
-      () => pending.resolve(value),
-      (error) => pending.reject(capabilityPersistenceError(value, error)),
-    );
+    if (this.#pendingResumeCapability) {
+      throw new Error("AgentTab delivered multiple unconfirmed resume capabilities");
+    }
+    this.#pendingResumeCapability = capability;
+    if (!this.#capabilityStore) {
+      pending.resolve(value);
+      return;
+    }
+    void (async () => {
+      try {
+        await this.#capabilityStore!.save(capability);
+      } catch (error) {
+        pending.reject(capabilityPersistenceError(value, error));
+        return;
+      }
+      try {
+        await this.confirmResumeCapability();
+        pending.resolve(value);
+      } catch (error) {
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    })();
+  }
+
+  #confirmPendingCapability(capability: string): Promise<void> {
+    if (this.#capabilityConfirmation) {
+      throw new Error("AgentTab resume capability confirmation is already pending");
+    }
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#failTransport(
+          new Error(`Timed out after ${this.#requestTimeoutMs} ms confirming the AgentTab resume capability`),
+          "request_timeout",
+        );
+      }, this.#requestTimeoutMs);
+      this.#capabilityConfirmation = { resolve, reject, timer };
+      try {
+        this.#socket.write(encodeFrame({
+          protocol: RPC_PROTOCOL,
+          version: RPC_VERSION,
+          kind: "resume_confirm",
+          connection_id: this.connection.connection_id,
+          resume_capability: capability,
+        }), (error) => {
+          if (error) this.#failTransport(error, "transport_error");
+        });
+      } catch (error) {
+        this.#failTransport(error, "transport_error");
+      }
+    });
   }
 
   #failTransport(error: unknown, code: AgentTabTransportErrorCode): void {
     if (this.#closed) return;
     this.#closed = true;
     this.#socket.destroy();
+    this.#rejectCapabilityConfirmation(error);
     this.#rejectPending(error, code);
   }
 
@@ -776,6 +853,14 @@ export class AgentTabClient {
       ...(pending.idempotencyKey !== undefined ? { idempotencyKey: pending.idempotencyKey } : {}),
       cause,
     });
+  }
+
+  #rejectCapabilityConfirmation(cause: unknown): void {
+    const confirmation = this.#capabilityConfirmation;
+    if (!confirmation) return;
+    this.#capabilityConfirmation = undefined;
+    clearTimeout(confirmation.timer);
+    confirmation.reject(cause instanceof Error ? cause : new Error(String(cause)));
   }
 
   #rejectPending(cause: unknown, code?: AgentTabTransportErrorCode): void {

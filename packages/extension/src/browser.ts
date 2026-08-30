@@ -730,6 +730,8 @@ export class StandardBrowserRuntime {
     await this.authorizeDebuggerUse(tabId);
     const selector = typeof params.selector === "string" ? params.selector : null;
     const maxBytes = typeof params.max_bytes === "number" ? params.max_bytes : 256_000;
+    const before = await this.pageIdentity(tabId);
+    const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
       func: (snapshotMode: "text" | "html", targetSelector: string | null) => {
@@ -739,7 +741,18 @@ export class StandardBrowserRuntime {
       },
       args: [mode, selector],
     });
-    const pageRevision = await this.revisions.current(tabId);
+    const after = await this.pageIdentity(tabId);
+    const currentPageRevision = await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
+    if (
+      before.documentId !== after.documentId ||
+      before.loaderId !== after.loaderId ||
+      currentPageRevision !== pageRevision
+    ) {
+      throw Object.assign(new Error(`Page changed while the ${mode} snapshot was captured`), {
+        code: "stale_revision",
+        currentPageRevision,
+      });
+    }
     const bytes = new TextEncoder().encode(String(result ?? ""));
     const bounded = bytes.length > maxBytes ? new TextDecoder().decode(bytes.slice(0, maxBytes)) : String(result ?? "");
     return {

@@ -228,13 +228,39 @@ function hostAssetName(version: string, target: string, platform: NodeJS.Platfor
   return `agenttab-host-v${version}-${target}.${platform === "win32" ? "zip" : "tar.gz"}`;
 }
 
+const GITHUB_RELEASE_ASSET_HOSTS: Record<string, true> = {
+  "objects.githubusercontent.com": true,
+  "release-assets.githubusercontent.com": true,
+};
+
+function trustedReleaseSource(url: URL): boolean {
+  if (url.protocol !== "https:" || url.port || url.username || url.password) return false;
+  if (url.hostname === "github.com") {
+    return url.pathname.startsWith(`/${trust.repository}/releases/download/`) && !url.pathname.includes("/latest");
+  }
+  return GITHUB_RELEASE_ASSET_HOSTS[url.hostname] === true
+    && url.pathname.startsWith("/github-production-release-asset-");
+}
+
+function releaseSourceDescription(url: URL): string {
+  return `${url.protocol}//${url.host}${url.pathname}`;
+}
+
 async function fetchBytes(url: string, development: boolean): Promise<Buffer> {
   if (url.startsWith("file:")) {
     if (!development) throw new Error("file URLs are allowed only for a development install");
     return readFile(fileURLToPath(url));
   }
   if (!url.startsWith("https://")) throw new Error(`installer URL must use HTTPS: ${url}`);
-  const response = await fetch(url, { redirect: "error" });
+  const requestedUrl = new URL(url);
+  if (!development && !trustedReleaseSource(requestedUrl)) {
+    throw new Error(`installer URL must be a trusted GitHub release source: ${releaseSourceDescription(requestedUrl)}`);
+  }
+  const response = await fetch(url, { redirect: "follow" });
+  const finalUrl = new URL(response.url);
+  if (!development && !trustedReleaseSource(finalUrl)) {
+    throw new Error(`download resolved outside trusted GitHub release sources: ${releaseSourceDescription(finalUrl)}`);
+  }
   if (!response.ok) throw new Error(`download failed with HTTP ${response.status}: ${url}`);
   return Buffer.from(await response.arrayBuffer());
 }

@@ -1600,7 +1600,7 @@ mod tests {
     use super::*;
     use agenttab_protocol::{
         ConnectKind, NativeOriginPolicy, NativeResponse, NativeResponseKind, NativeStagedCommit,
-        NativeTab, RPC_PROTOCOL,
+        NativeTab, ResumeCapabilityConfirm, ResumeCapabilityConfirmKind, RPC_PROTOCOL,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -1989,8 +1989,33 @@ mod tests {
         assert!(runtime.journal.resume_task(&capability).unwrap().is_some());
     }
 
+    fn confirm_new_capability(
+        runtime: &Runtime,
+        connection: &ConnectionContext,
+        resume_capability: String,
+    ) {
+        connection.finish_new_capability_delivery(true);
+        connection
+            .confirm_resume_capability(
+                &ResumeCapabilityConfirm {
+                    protocol: RPC_PROTOCOL.into(),
+                    version: PROTOCOL_VERSION,
+                    kind: ResumeCapabilityConfirmKind::ResumeConfirm,
+                    connection_id: connection.connection_id,
+                    resume_capability,
+                },
+                &runtime.journal,
+            )
+            .unwrap();
+    }
+
     fn own_tab(runtime: &Runtime, connection: &ConnectionContext, page_revision: u64) -> Uuid {
         let task_id = connection.ensure_task(&runtime.journal).unwrap();
+        let capability = connection
+            .reserve_new_capability()
+            .unwrap()
+            .expect("new task capability must be delivered before browser work");
+        confirm_new_capability(runtime, connection, capability.resume_capability);
         runtime
             .journal
             .reconcile_inventory(&[NativeTab {
@@ -2027,13 +2052,14 @@ mod tests {
         assert_eq!(first["outcome"], "completed");
         let capability = first["task"]["resume_capability"]
             .as_str()
-            .expect("first response must carry the new task capability");
+            .expect("first response must carry the new task capability")
+            .to_string();
         assert!(!capability.is_empty());
         assert!(!first["result"]["body"]
             .as_str()
             .unwrap()
             .contains("123-45-6789"));
-        connection.finish_new_capability_delivery(true);
+        confirm_new_capability(&runtime, &connection, capability);
         runtime.lifecycle.set_paused(true);
         let mut retry = request;
         retry["request_id"] = json!("retry");

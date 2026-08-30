@@ -127,6 +127,13 @@ async function send(message: Record<string, unknown>): Promise<Record<string, un
       `AgentTab's background runtime did not answer "${String(message.kind)}". Reload AgentTab from chrome://extensions, then try again.`,
     );
   }
+  if ("error" in response) {
+    throw new Error(
+      typeof response.error === "string" && response.error.trim() !== ""
+        ? response.error
+        : `AgentTab's background runtime could not complete "${String(message.kind)}".`,
+    );
+  }
   return response;
 }
 

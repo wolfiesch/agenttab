@@ -67,12 +67,14 @@ async function signedArchiveFixture(
     platformSignature: signatureType,
     target,
     version = "2.0.0-rc.1",
+    assetUrl,
   }: {
     archive: Buffer;
     assetName: string;
     platformSignature: "apple_code_signing" | "authenticode" | "signed_manifest";
     target: string;
     version?: string;
+    assetUrl?: string;
   },
 ) {
   const archivePath = join(root, assetName);
@@ -89,7 +91,7 @@ async function signedArchiveFixture(
       sha256: sha256(archive),
       bytes: archive.byteLength,
       platformSignature: signatureType,
-      url: pathToFileURL(archivePath).href,
+      url: assetUrl ?? pathToFileURL(archivePath).href,
     }],
   };
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
@@ -194,7 +196,7 @@ async function addPowerShellShim(root: string): Promise<() => void> {
   };
 }
 
-async function signedFixture(root: string, version = "2.0.0-rc.1") {
+async function signedFixture(root: string, version = "2.0.0-rc.1", assetUrl?: string) {
   const target = targetTriple();
   const assetName = `agenttab-host-v${version}-${target}.tar.gz`;
   const source = join(root, "source");
@@ -210,8 +212,61 @@ async function signedFixture(root: string, version = "2.0.0-rc.1") {
     platformSignature: platformSignature(),
     target,
     version,
+    assetUrl,
   });
 }
+function responseAt(url: string, bytes: Buffer): Response {
+  return {
+    ok: true,
+    status: 200,
+    url,
+    arrayBuffer: async () => Uint8Array.from(bytes).buffer,
+  } as Response;
+}
+
+function mockReleaseDownloads(downloads: Record<string, Buffer>, finalUrl: string) {
+  const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit | BunFetchRequestInit) => {
+    if (init?.redirect !== "follow") throw new Error("release downloads must follow redirects");
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const bytes = downloads[requestUrl];
+    if (!bytes) throw new Error(`unexpected release download: ${requestUrl}`);
+    return responseAt(finalUrl, bytes);
+  }) as typeof fetch;
+  return spyOn(globalThis, "fetch").mockImplementation(mockFetch);
+}
+
+async function releaseDownloadFixture(root: string) {
+  const version = "2.0.0-rc.1";
+  const target = targetTriple();
+  const assetName = `agenttab-host-v${version}-${target}.tar.gz`;
+  const releaseUrl = `https://github.com/wolfiesch/agenttab/releases/download/v${version}`;
+  const fixture = await signedFixture(root, version, `${releaseUrl}/${assetName}`);
+  const manifestUrl = `${releaseUrl}/artifact-manifest.json`;
+  return {
+    version,
+    publicKeyPem: fixture.publicKeyPem,
+    downloads: {
+      [manifestUrl]: fixture.manifestBytes,
+      [`${manifestUrl}.sig`]: Buffer.from(`${fixture.signature.toString("base64")}\n`),
+      [`${releaseUrl}/${assetName}`]: await readFile(join(root, assetName)),
+    },
+  };
+}
+
+async function productionInstallOptions(root: string, version: string, publicKeyPem: string) {
+  const home = join(root, "home");
+  return {
+    version,
+    publicKeyPem,
+    home,
+    stateDir: join(home, ".agenttab"),
+    runtimeAssets: await runtimeAssets(root),
+    dryRun: true,
+    openBrowser: false,
+    print: () => undefined,
+  };
+}
+
 
 describe("release trust", () => {
   test("accepts an exact Ed25519 signature and rejects tampering", async () => {
@@ -221,6 +276,44 @@ describe("release trust", () => {
     const tampered = Buffer.from(fixture.manifestBytes);
     tampered[tampered.byteLength - 2] ^= 1;
     expect(() => verifySignedManifest(tampered, Buffer.from(fixture.signature.toString("base64")), fixture.publicKeyPem)).toThrow("signature verification failed");
+  });
+
+  test("follows GitHub release asset redirects after verifying the signed manifest", async () => {
+    const root = await temporaryRoot();
+    const fixture = await releaseDownloadFixture(root);
+    const options = await productionInstallOptions(root, fixture.version, fixture.publicKeyPem);
+    for (const finalUrl of [
+      "https://objects.githubusercontent.com/github-production-release-asset-2e65be/asset",
+      "https://release-assets.githubusercontent.com/github-production-release-asset-2e65be/asset",
+    ]) {
+      const fetchMock = mockReleaseDownloads(fixture.downloads, finalUrl);
+      try {
+        const result = await install(options);
+        expect(result.readiness).toEqual({ passed: false, skipped: true, reason: "dry_run" });
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+      } finally {
+        fetchMock.mockRestore();
+      }
+    }
+  });
+
+  test("rejects insecure and untrusted release redirect destinations", async () => {
+    const root = await temporaryRoot();
+    const fixture = await releaseDownloadFixture(root);
+    const options = await productionInstallOptions(root, fixture.version, fixture.publicKeyPem);
+    for (const finalUrl of [
+      "http://objects.githubusercontent.com/github-production-release-asset-2e65be/asset",
+      "https://untrusted.example/github-production-release-asset/asset",
+    ]) {
+      const fetchMock = mockReleaseDownloads(fixture.downloads, finalUrl);
+      try {
+        await expect(install(options)).rejects.toThrow(
+          `download resolved outside trusted GitHub release sources: ${finalUrl}`,
+        );
+      } finally {
+        fetchMock.mockRestore();
+      }
+    }
   });
 
   test("maps every supported host target explicitly", () => {

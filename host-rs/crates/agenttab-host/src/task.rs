@@ -14,6 +14,7 @@ struct ConnectionTaskState {
     lease: Option<TaskLease>,
     capability_pending: bool,
     capability_in_flight: bool,
+    capability_confirmation_pending: bool,
     resume_rotation_pending: bool,
 }
 
@@ -55,6 +56,7 @@ impl ConnectionContext {
                 lease: resumed_lease,
                 capability_pending: false,
                 capability_in_flight: false,
+                capability_confirmation_pending: false,
                 resume_rotation_pending: resumed,
             }),
             cancelled: AtomicBool::new(false),
@@ -76,7 +78,10 @@ impl ConnectionContext {
 
     pub fn reserve_new_capability(&self) -> Result<Option<TaskLease>, JournalError> {
         let mut state = self.task.lock();
-        if !state.capability_pending || state.capability_in_flight {
+        if !state.capability_pending
+            || state.capability_in_flight
+            || state.capability_confirmation_pending
+        {
             return Ok(None);
         }
         state.capability_in_flight = true;
@@ -90,6 +95,7 @@ impl ConnectionContext {
         }
         if delivered {
             state.capability_pending = false;
+            state.capability_confirmation_pending = true;
         }
         state.capability_in_flight = false;
     }
@@ -103,7 +109,10 @@ impl ConnectionContext {
     }
 
     pub fn resume_confirmation_required(&self) -> bool {
-        self.task.lock().resume_rotation_pending
+        let state = self.task.lock();
+        state.resume_rotation_pending
+            || state.capability_confirmation_pending
+            || state.capability_in_flight
     }
 
     pub fn confirm_resume_capability(
@@ -112,15 +121,25 @@ impl ConnectionContext {
         journal: &Journal,
     ) -> Result<ResumeCapabilityConfirmed, JournalError> {
         let mut state = self.task.lock();
-        if !state.resume_rotation_pending || confirmation.connection_id != self.connection_id {
+        if confirmation.connection_id != self.connection_id {
             return Err(JournalError::ResumeRotationLost);
         }
         let lease = state.lease.as_ref().ok_or(JournalError::MissingTask)?;
         if confirmation.resume_capability != lease.resume_capability {
             return Err(JournalError::ResumeRotationLost);
         }
-        journal.acknowledge_resume_capability(lease.task_id, &lease.resume_capability)?;
-        state.resume_rotation_pending = false;
+        if state.resume_rotation_pending {
+            journal.acknowledge_resume_capability(lease.task_id, &lease.resume_capability)?;
+            state.resume_rotation_pending = false;
+        } else if state.capability_confirmation_pending
+            || (state.capability_pending && state.capability_in_flight)
+        {
+            state.capability_pending = false;
+            state.capability_in_flight = false;
+            state.capability_confirmation_pending = false;
+        } else {
+            return Err(JournalError::ResumeRotationLost);
+        }
         Ok(ResumeCapabilityConfirmed {
             protocol: RPC_PROTOCOL.into(),
             version: PROTOCOL_VERSION,
@@ -196,8 +215,23 @@ mod tests {
         assert_eq!(connection.undelivered_new_task_id(), Some(task_id));
 
         connection.finish_new_capability_delivery(false);
-        assert!(connection.reserve_new_capability().unwrap().is_some());
+        let delivered = connection.reserve_new_capability().unwrap().unwrap();
         connection.finish_new_capability_delivery(true);
+        assert!(connection.resume_confirmation_required());
+        assert!(matches!(
+            connection.confirm_resume_capability(
+                &confirmation(connection.connection_id, "x".repeat(32)),
+                &journal
+            ),
+            Err(JournalError::ResumeRotationLost)
+        ));
+        connection
+            .confirm_resume_capability(
+                &confirmation(connection.connection_id, delivered.resume_capability),
+                &journal,
+            )
+            .unwrap();
+        assert!(!connection.resume_confirmation_required());
         assert!(connection.reserve_new_capability().unwrap().is_none());
         assert_eq!(connection.undelivered_new_task_id(), None);
     }

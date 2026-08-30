@@ -593,6 +593,23 @@ where
             Ok(Some(request)) => request,
             Ok(None) | Err(_) => break,
         };
+        if request.get("kind").and_then(Value::as_str) == Some("resume_confirm") {
+            let confirmation = match ResumeCapabilityConfirm::parse(request) {
+                Ok(confirmation) => confirmation,
+                Err(_) => break,
+            };
+            let confirmed = match runtime.confirm_resume_capability(&connection, &confirmation) {
+                Ok(confirmed) => confirmed,
+                Err(_) => break,
+            };
+            if response_sender.send(confirmed.value()).await.is_err() {
+                break;
+            }
+            continue;
+        }
+        if connection.resume_confirmation_required() {
+            break;
+        }
         let Ok(permit) = request_permits.clone().try_acquire_owned() else {
             let request_id = request
                 .get("request_id")
@@ -903,6 +920,74 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), INVALID_RESUME_CAPABILITY_ERROR);
         assert_eq!(task_count(&paths), 0);
+    }
+    #[tokio::test]
+    async fn initial_capability_confirmation_unlocks_follow_up_rpcs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, paths) = test_runtime(&temp);
+        let (mut client, server) = start_test_connection(runtime).await;
+        write_frame_async(
+            &mut client,
+            &serde_json::to_value(connection_init(None)).unwrap(),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let acknowledgement = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        write_browser_open(&mut client, "create-task").await;
+        let created = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        let capability = created["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        write_frame_async(
+            &mut client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "resume_confirm",
+                "connection_id": acknowledgement["connection_id"],
+                "resume_capability": capability
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let confirmed = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed["kind"], "resume_confirmed");
+        assert_eq!(confirmed["connection_id"], acknowledgement["connection_id"]);
+
+        write_frame_async(
+            &mut client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "confirmed-status",
+                "method": "agenttab.status",
+                "params": {}
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let status = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status["outcome"], serde_json::json!(Outcome::Completed));
+        assert_eq!(task_count(&paths), 1);
+        drop(client);
+        assert!(server.await.unwrap().is_ok());
     }
 
     #[tokio::test]
