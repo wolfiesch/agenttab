@@ -1861,6 +1861,66 @@ describe("page revision monotonicity", () => {
         return true;
       },
     };
+    const formattedChild = { textContent: "formatted" };
+    const insertedNodes: Array<{ textContent: string }> = [];
+    const rangeCalls: string[] = [];
+    const range = {
+      commonAncestorContainer: formattedChild,
+      deleteContents(): void {
+        rangeCalls.push("deleteContents");
+      },
+      insertNode(node: { textContent: string }): void {
+        rangeCalls.push("insertNode");
+        insertedNodes.push(node);
+      },
+      setStartAfter(node: { textContent: string }): void {
+        rangeCalls.push(`setStartAfter:${node.textContent}`);
+      },
+      collapse(toStart: boolean): void {
+        rangeCalls.push(`collapse:${toStart}`);
+      },
+    };
+    const selectionCalls: string[] = [];
+    const selection = {
+      rangeCount: 1,
+      getRangeAt: (): typeof range => range,
+      removeAllRanges(): void {
+        selectionCalls.push("removeAllRanges");
+      },
+      addRange(added: typeof range): void {
+        if (added !== range) throw new Error("unexpected contenteditable range");
+        selectionCalls.push("addRange");
+      },
+    };
+    const typedContenteditable = {
+      isContentEditable: true,
+      childNodes: [formattedChild],
+      focused: 0,
+      events: [] as Array<{ type: string; bubbles: boolean }>,
+      getAttribute: (): null => null,
+      ownerDocument: {
+        getSelection: (): typeof selection => selection,
+        createRange: (): typeof range => range,
+        createTextNode: (textContent: string): { textContent: string } => ({ textContent }),
+      },
+      contains(node: unknown): boolean {
+        return node === formattedChild;
+      },
+      focus(): void {
+        this.focused += 1;
+      },
+      dispatchEvent(event: SyntheticEvent): boolean {
+        this.events.push({ type: event.type, bubbles: event.bubbles });
+        return true;
+      },
+    };
+    Object.defineProperty(typedContenteditable, "textContent", {
+      configurable: true,
+      get: () => "formatted",
+      set: () => {
+        throw new Error("type must preserve contenteditable child DOM");
+      },
+    });
     const input = new NativeInput();
     const typedInput = new NativeInput();
     const interceptedDirectAssignments: string[] = [];
@@ -1910,9 +1970,11 @@ describe("page revision monotonicity", () => {
           ? contenteditable
           : String(params.objectId).endsWith("-23")
             ? input
-            : typedInput;
+            : String(params.objectId).endsWith("-24")
+              ? typedInput
+              : typedContenteditable;
         const declaration = Function(`return (${String(params.functionDeclaration)})`)() as (
-          this: typeof contenteditable | NativeInput,
+          this: typeof contenteditable | typeof typedContenteditable | NativeInput,
           value: string,
         ) => unknown;
         const args = Array.isArray(params.arguments) ? params.arguments : [];
@@ -1934,6 +1996,7 @@ describe("page revision monotonicity", () => {
         { kind: "fill", ref: `r${pageRevision}-22`, text: "content replacement" },
         { kind: "fill", ref: `r${pageRevision}-23`, text: "native setter" },
         { kind: "type", ref: `r${pageRevision}-24`, text: "X" },
+        { kind: "type", ref: `r${pageRevision}-25`, text: " at caret" },
       ]);
     } finally {
       for (const [key, descriptor] of Object.entries(globals)) {
@@ -1951,6 +2014,17 @@ describe("page revision monotonicity", () => {
     expect(input.nativeValue).toBe("native setter");
     expect(typedInput.nativeValue).toBe("beXre");
     expect(typedInput.selectionUpdates).toEqual([[3, 3]]);
+    expect(typedContenteditable.childNodes).toEqual([formattedChild]);
+    expect(insertedNodes).toEqual([{ textContent: " at caret" }]);
+    expect(rangeCalls).toEqual([
+      "deleteContents",
+      "insertNode",
+      "setStartAfter: at caret",
+      "collapse:true",
+    ]);
+    expect(selectionCalls).toEqual(["removeAllRanges", "addRange"]);
+    expect(typedContenteditable.focused).toBe(1);
+    expect(typedContenteditable.events).toEqual([{ type: "input", bubbles: true }]);
     expect(interceptedDirectAssignments).toEqual([]);
     expect(input.focused).toBe(1);
     expect(input.events).toEqual([
