@@ -2262,6 +2262,89 @@ describe("native bridge transport", () => {
   });
 
 
+  test("processes event acknowledgments while a command remains in flight", async () => {
+    const scheduler = new MutationScheduler();
+    scheduler.disconnect();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const port = new MockNativePort();
+    nativePort = port;
+    const commandStarted = Promise.withResolvers<void>();
+    const releaseCommand = Promise.withResolvers<void>();
+    const requestId = "018f47b8-2f80-7c20-9c77-f8a38c9e6231";
+    const bridge = new NativeBridge(scheduler, ownership, async (command) => {
+      commandStarted.resolve();
+      await releaseCommand.promise;
+      return {
+        protocol: "agenttab.native",
+        version: 1,
+        kind: "response",
+        request_id: command.request_id,
+        outcome: "completed",
+        result: {},
+      };
+    });
+    await bridge.connect();
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+    await waitForCondition(() => alarmClears.includes(RECONNECT_ALARM));
+
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "command",
+      request_id: requestId,
+      task_id: TASK_A,
+      connection_id: NATIVE_CONNECTION_ID,
+      method: "browser_wait",
+      params: { tab_id: 44, condition: { kind: "load" } },
+    });
+    await commandStarted.promise;
+    const approval = bridge.approvePopupCommit("review-handle-while-waiting", TASK_A, 44);
+    const event = port.posted.at(-1) as Record<string, unknown>;
+    const eventId = event.event_id;
+    if (typeof eventId !== "string") throw new Error("popup approval event id is missing");
+    let approvalSettled = false;
+    const settledApproval = approval.then((result) => {
+      approvalSettled = true;
+      return result;
+    });
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "event_ack",
+      event: "popup_commit_approved",
+      event_id: eventId,
+      outcome: "completed",
+      result: { receipt_id: "receipt-while-waiting" },
+    });
+
+    await waitForCondition(() => approvalSettled);
+    await expect(settledApproval).resolves.toEqual({ receipt_id: "receipt-while-waiting" });
+    expect(port.posted.some(
+      (message) =>
+        message !== null &&
+        typeof message === "object" &&
+        (message as Record<string, unknown>).kind === "response" &&
+        (message as Record<string, unknown>).request_id === requestId,
+    )).toBe(false);
+
+    releaseCommand.resolve();
+    await waitForCondition(() =>
+      port.posted.some(
+        (message) =>
+          message !== null &&
+          typeof message === "object" &&
+          (message as Record<string, unknown>).kind === "response" &&
+          (message as Record<string, unknown>).request_id === requestId,
+      ),
+    );
+  });
+
   test("sends a popup approval by opaque review handle and requires a host acknowledgment", async () => {
     const scheduler = new MutationScheduler();
     const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);

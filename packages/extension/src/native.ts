@@ -26,6 +26,10 @@ interface PendingEventAck {
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
 }
+interface ReadyReconciliation {
+  port: NativePort;
+  promise: Promise<void>;
+}
 
 interface NativePort {
   postMessage(message: unknown): void;
@@ -50,6 +54,7 @@ export class NativeBridge {
   private ready = false;
   private reconnectAttempt = 0;
   private readonly pendingEventAcks = new Map<string, PendingEventAck>();
+  private readyReconciliation: ReadyReconciliation | null = null;
   constructor(
     private readonly scheduler: MutationScheduler,
     private readonly ownership: OwnershipLedger,
@@ -70,13 +75,11 @@ export class NativeBridge {
     }
     this.port = port;
     this.ready = false;
-    let inboundQueue = Promise.resolve();
+    this.readyReconciliation = null;
     port.onMessage.addListener((message: unknown) => {
-      inboundQueue = inboundQueue
-        .then(() => this.onMessage(port, message))
-        .catch(() => {
-          if (this.port === port) port.disconnect();
-        });
+      void this.onMessage(port, message).catch(() => {
+        if (this.port === port) port.disconnect();
+      });
     });
     port.onDisconnect.addListener(() => void this.onDisconnect(port));
     try {
@@ -225,33 +228,24 @@ export class NativeBridge {
       return;
     }
     if (parsed.kind === "ready") {
+      if (this.readyReconciliation?.port === port) {
+        port.disconnect();
+        return;
+      }
+      const promise = this.reconcileReady(port, parsed);
+      const reconciliation = { port, promise };
+      this.readyReconciliation = reconciliation;
       try {
-        await this.discardStages(parsed.discard_staged_tokens ?? []);
-        if (this.port !== port) return;
-      } catch {
-        if (this.port === port) port.disconnect();
-        return;
+        await promise;
+      } finally {
+        if (this.readyReconciliation === reconciliation) this.readyReconciliation = null;
       }
-      this.ready = true;
-      this.reconnectAttempt = 0;
-      await chrome.alarms.clear(RECONNECT_ALARM);
-      if (this.port !== port) return;
-      if (parsed.state === "paused") {
-        await this.scheduler.pause();
-        if (this.port !== port) return;
-        await mutateState((state) => {
-          state.paused = true;
-        });
-        if (this.port !== port) return;
-        await this.onReady();
-        if (this.port !== port) return;
-        return;
-      }
-      const state = await readState();
-      if (this.port !== port) return;
-      if (!state.paused && !state.handoff.active) this.scheduler.resume();
-      await this.onReady();
       return;
+    }
+    const reconciliation = this.readyReconciliation;
+    if (reconciliation?.port === port) {
+      await reconciliation.promise;
+      if (this.port !== port) return;
     }
     if (!this.ready) {
       if (this.port === port) port.disconnect();
@@ -276,10 +270,42 @@ export class NativeBridge {
     }
   }
 
+  private async reconcileReady(
+    port: NativePort,
+    parsed: Extract<NativeInboundMessage, { kind: "ready" }>,
+  ): Promise<void> {
+    try {
+      await this.discardStages(parsed.discard_staged_tokens ?? []);
+      if (this.port !== port) return;
+    } catch {
+      if (this.port === port) port.disconnect();
+      return;
+    }
+    this.ready = true;
+    this.reconnectAttempt = 0;
+    await chrome.alarms.clear(RECONNECT_ALARM);
+    if (this.port !== port) return;
+    if (parsed.state === "paused") {
+      await this.scheduler.pause();
+      if (this.port !== port) return;
+      await mutateState((state) => {
+        state.paused = true;
+      });
+      if (this.port !== port) return;
+      await this.onReady();
+      return;
+    }
+    const state = await readState();
+    if (this.port !== port) return;
+    if (!state.paused && !state.handoff.active) this.scheduler.resume();
+    await this.onReady();
+  }
+
   private onDisconnect(port: NativePort): void {
     if (this.port !== port) return;
     this.port = null;
     this.ready = false;
+    this.readyReconciliation = null;
     for (const [eventId, pending] of this.pendingEventAcks) {
       clearTimeout(pending.timeout);
       pending.reject(Object.assign(new Error("AgentTab host disconnected before acknowledging the staged action"), {
