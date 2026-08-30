@@ -1228,6 +1228,29 @@ describe("page revision monotonicity", () => {
     await expect(waiting).rejects.toMatchObject({ code: "ownership_revoked" });
     expect(ownershipChecks).toBeGreaterThan(2);
   });
+  test("stops a page-content wait before probing a newly restricted route", async () => {
+    await seedTask(TASK_A, [61], 5);
+    scriptResult = false;
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const waiting = runtime.wait(61, {
+      condition: { kind: "selector", value: "#never" },
+      timeout_ms: 1_000,
+    });
+    await waitForCondition(() => scriptingCallCount >= 1);
+    const probesBeforeNavigation = scriptingCallCount;
+    const tab = tabStore.get(61);
+    if (!tab) throw new Error("missing task tab");
+    tab.pendingUrl = "chrome://settings/";
+
+    await expect(waiting).rejects.toMatchObject({ code: "browser_restricted_origin" });
+    expect(scriptingCallCount).toBe(probesBeforeNavigation);
+  });
+
 
   test("types into a background field through one DOM mutation", async () => {
     debuggerCommandOverride = (method, params) => {

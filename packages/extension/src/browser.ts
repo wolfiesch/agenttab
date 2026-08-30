@@ -645,8 +645,9 @@ export class StandardBrowserRuntime {
         code: "invalid_request",
       });
     }
+    const requiresFullAutomationRoute = TAB_ONLY_WAIT_CONDITIONS[conditionKind] !== true;
     await this.authorizeDebuggerUse(tabId);
-    if (TAB_ONLY_WAIT_CONDITIONS[conditionKind] !== true) {
+    if (requiresFullAutomationRoute) {
       await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
     }
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30_000;
@@ -655,6 +656,9 @@ export class StandardBrowserRuntime {
     do {
       await this.authorizeDebuggerUse(tabId);
       if (revalidate) await revalidate();
+      if (requiresFullAutomationRoute) {
+        await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
+      }
       const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
       if (revalidate) await revalidate();
       if (matched) {
