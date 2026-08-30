@@ -7,7 +7,9 @@ use agenttab_protocol::{
 use agenttab_protocol::{PROTOCOL_VERSION, RPC_PROTOCOL};
 #[cfg(unix)]
 use fs2::FileExt;
-use parking_lot::{Condvar, Mutex};
+#[cfg(test)]
+use parking_lot::Condvar;
+use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -20,7 +22,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Notify, Semaphore};
 use tokio::task::JoinSet;
 
 const MAX_CONNECTIONS: usize = 64;
@@ -439,16 +441,26 @@ fn sid_for_windows_process(process: windows_sys::Win32::Foundation::HANDLE) -> i
     result
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct OrderedQueue {
     state: Mutex<OrderedQueueState>,
-    ready: Condvar,
+    ready: watch::Sender<u64>,
 }
 
 #[derive(Debug, Default)]
 struct OrderedQueueState {
     issued: u64,
     serving: u64,
+}
+
+impl Default for OrderedQueue {
+    fn default() -> Self {
+        let (ready, _) = watch::channel(0);
+        Self {
+            state: Mutex::new(OrderedQueueState::default()),
+            ready,
+        }
+    }
 }
 
 impl OrderedQueue {
@@ -462,13 +474,18 @@ impl OrderedQueue {
         ticket
     }
 
-    fn wait_turn(self: &Arc<Self>, ticket: u64) -> OrderedQueueGuard {
-        let mut state = self.state.lock();
-        while state.serving != ticket {
-            self.ready.wait(&mut state);
-        }
-        OrderedQueueGuard {
-            queue: Arc::clone(self),
+    async fn wait_turn(self: &Arc<Self>, ticket: u64) -> OrderedQueueGuard {
+        let mut ready = self.ready.subscribe();
+        loop {
+            if *ready.borrow_and_update() == ticket {
+                return OrderedQueueGuard {
+                    queue: Arc::clone(self),
+                };
+            }
+            ready
+                .changed()
+                .await
+                .expect("connection request queue sender dropped");
         }
     }
 }
@@ -479,12 +496,15 @@ struct OrderedQueueGuard {
 
 impl Drop for OrderedQueueGuard {
     fn drop(&mut self) {
-        let mut state = self.queue.state.lock();
-        state.serving = state
-            .serving
-            .checked_add(1)
-            .expect("connection request ticket overflow");
-        self.queue.ready.notify_all();
+        let serving = {
+            let mut state = self.queue.state.lock();
+            state.serving = state
+                .serving
+                .checked_add(1)
+                .expect("connection request ticket overflow");
+            state.serving
+        };
+        self.queue.ready.send_replace(serving);
     }
 }
 
@@ -630,7 +650,7 @@ where
                 break;
             }
             bootstrap_complete = true;
-            bootstrap_notify.notify_waiters();
+            bootstrap_notify.notify_one();
             continue;
         }
         let Ok(permit) = request_permits.clone().try_acquire_owned() else {
@@ -679,12 +699,7 @@ where
         requests.spawn(async move {
             let _permit = permit;
             let bootstrap_guard = match bootstrap_turn {
-                Some((queue, ticket)) => {
-                    match tokio::task::spawn_blocking(move || queue.wait_turn(ticket)).await {
-                        Ok(guard) => Some(guard),
-                        Err(_) => return,
-                    }
-                }
+                Some((queue, ticket)) => Some(queue.wait_turn(ticket).await),
                 None => None,
             };
             if bootstrap_guard.is_some() {
@@ -697,8 +712,9 @@ where
                 }
             }
             let blocking_connection = request_connection.clone();
+            let queue_guard = queue.wait_turn(ticket).await;
             let response = tokio::task::spawn_blocking(move || {
-                let _turn = queue.wait_turn(ticket);
+                let _turn = queue_guard;
                 request_runtime.handle(&blocking_connection, request)
             })
             .await;
@@ -792,32 +808,32 @@ async fn write_frame_async<W: AsyncWrite + Unpin>(
 mod queue_tests {
     use super::*;
 
-    #[test]
-    fn ordered_queue_runs_workers_in_issue_order() {
+    #[tokio::test]
+    async fn ordered_queue_runs_workers_in_issue_order() {
         let queue = Arc::new(OrderedQueue::default());
         let first_ticket = queue.issue();
         let second_ticket = queue.issue();
         let order = Arc::new(Mutex::new(Vec::new()));
-        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (started_sender, started_receiver) = oneshot::channel();
 
         let second_queue = queue.clone();
         let second_order = order.clone();
-        let second = std::thread::spawn(move || {
+        let second = tokio::spawn(async move {
             started_sender.send(()).unwrap();
-            let _turn = second_queue.wait_turn(second_ticket);
+            let _turn = second_queue.wait_turn(second_ticket).await;
             second_order.lock().push(second_ticket);
         });
-        started_receiver.recv().unwrap();
+        started_receiver.await.unwrap();
 
         let first_queue = queue.clone();
         let first_order = order.clone();
-        let first = std::thread::spawn(move || {
-            let _turn = first_queue.wait_turn(first_ticket);
+        let first = tokio::spawn(async move {
+            let _turn = first_queue.wait_turn(first_ticket).await;
             first_order.lock().push(first_ticket);
         });
 
-        first.join().unwrap();
-        second.join().unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
         assert_eq!(*order.lock(), vec![first_ticket, second_ticket]);
     }
 }
