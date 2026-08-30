@@ -133,6 +133,17 @@ impl Guardrails {
                 for action in &params.actions {
                     match action {
                         BrowserAction::Navigate { url } => self.authorize_url(url)?,
+                        BrowserAction::GoBack | BrowserAction::GoForward
+                            if self.has_origin_constraints() =>
+                        {
+                            return Err(RpcError::new(
+                                "history_origin_unverified",
+                                "AgentTab cannot authorize a browser history destination before navigation",
+                            )
+                            .with_recovery(
+                                "Navigate explicitly to an allowed URL, or remove the managed origin restriction.",
+                            ));
+                        }
                         BrowserAction::UploadFile { files, .. } => {
                             for file in files {
                                 self.authorize_file(Path::new(file))?;
@@ -590,6 +601,18 @@ mod tests {
                 .unwrap_err()
                 .code,
             "origin_denied"
+        );
+        let history = MethodParams::Act(agenttab_protocol::BrowserActParams {
+            tab_id: 1,
+            expected_page_revision: 2,
+            actions: vec![BrowserAction::GoBack],
+        });
+        assert_eq!(
+            guardrails
+                .authorize(RpcMethod::BrowserAct, &history)
+                .unwrap_err()
+                .code,
+            "history_origin_unverified"
         );
 
         let mut value = json!({

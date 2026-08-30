@@ -2503,6 +2503,24 @@ describe("extension entrypoint admission boundaries", () => {
     });
     expect(debuggerCommands).toHaveLength(commandsBeforeRedirectRejection);
     openedTab.url = "https://example.test/workspace";
+    const historyDestinationUnverified = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6400",
+      TASK_A,
+      "browser_act",
+      {
+        tab_id: 100,
+        expected_page_revision: 1,
+        actions: [{ kind: "go_back" }],
+      },
+      currentOriginPolicy,
+    );
+    expect(historyDestinationUnverified).toMatchObject({
+      outcome: "not_started",
+      error: {
+        code: "history_origin_unverified",
+        recovery: expect.stringContaining("Navigate explicitly"),
+      },
+    });
 
     automationPermission = false;
     const deniedBeforePermission = debuggerCommands.length;

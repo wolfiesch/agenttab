@@ -55,6 +55,7 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   origin_unavailable: true,
   origin_policy_mismatch: true,
   scheme_denied: true,
+  history_origin_unverified: true,
   sensitive_field_requires_handoff: true,
 };
 
@@ -233,6 +234,32 @@ function originMatches(pattern: string, url: URL): boolean {
   if (!pattern.startsWith("*.")) return false;
   const suffix = pattern.slice(2);
   return url.hostname !== suffix && url.hostname.endsWith(`.${suffix}`);
+}
+
+function assertHistoryOriginKnown(
+  actions: unknown,
+  policy: NativeOriginPolicy | undefined,
+): void {
+  if (
+    policy === undefined ||
+    (policy.allowed_origins.length === 0 && policy.denied_origins.length === 0) ||
+    !Array.isArray(actions)
+  ) {
+    return;
+  }
+  if (
+    actions.some((action) =>
+      isRecord(action) && (action.kind === "go_back" || action.kind === "go_forward")
+    )
+  ) {
+    throw Object.assign(
+      new Error("AgentTab cannot authorize a browser history destination before navigation"),
+      {
+        code: "history_origin_unverified",
+        recovery: "Navigate explicitly to an allowed URL, or remove the managed origin restriction.",
+      },
+    );
+  }
 }
 
 async function assertCurrentOrigin(tabId: number, policy: NativeOriginPolicy | undefined): Promise<void> {
@@ -437,6 +464,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     if (command.method === "browser_act") {
       const execution = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
         await ownership.assertOwned(command.task_id, targetTabId);
+        assertHistoryOriginKnown(params.actions, command.origin_policy);
         await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
       });
