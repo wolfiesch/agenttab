@@ -232,6 +232,9 @@ export class HandoffController {
   private async cancelMatchingNow(
     matches: (handoff: Extract<HandoffRecord, { active: true }>) => boolean,
   ): Promise<boolean> {
+    const handoff = (await readState()).handoff;
+    if (!handoff.active || !matches(handoff)) return false;
+    await this.scrubber?.();
     const eventId = crypto.randomUUID();
     const pendingEventId = await mutateState((state) => {
       const active = state.handoff;

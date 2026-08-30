@@ -2059,7 +2059,13 @@ describe("page revision monotonicity", () => {
                     ? { type: "number", name: "pin" }
                     : objectId.endsWith("-28")
                       ? { "aria-label": "Passcode" }
-                      : { type: "text", name: "password" };
+                      : objectId.endsWith("-29")
+                        ? { type: "text", name: "password" }
+                        : objectId.endsWith("-30")
+                          ? { name: "totp" }
+                          : objectId.endsWith("-31")
+                            ? { "aria-label": "2FA code" }
+                            : { placeholder: "Two-factor code" };
         const target = {
           form: null,
           labels: [],
@@ -2106,6 +2112,9 @@ describe("page revision monotonicity", () => {
       { kind: "fill", ref: `r${pageRevision}-27`, text: "1234" },
       { kind: "type", ref: `r${pageRevision}-28`, text: "123456" },
       { kind: "fill", ref: `r${pageRevision}-29`, text: "password" },
+      { kind: "type", ref: `r${pageRevision}-30`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-31`, text: "123456" },
+      { kind: "type", ref: `r${pageRevision}-32`, text: "123456" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
@@ -2620,6 +2629,10 @@ describe("handoff and pause barriers", () => {
     const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload, eventId) => {
       events.push({ event, payload, eventId });
     });
+    let scrubCalls = 0;
+    handoff.setScrubber(async () => {
+      scrubCalls += 1;
+    });
     const firstRevision = await revisions.ensure(33);
     await handoff.begin(TASK_A, {
       tab_id: 33,
@@ -2671,6 +2684,7 @@ describe("handoff and pause barriers", () => {
       event === "handoff_changed" && payload.active === false && typeof eventId === "string"
     )).toHaveLength(2);
     expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(4);
+    expect(scrubCalls).toBe(2);
   });
 
   test("clears a restored handoff for a tab revoked during initial reconciliation", async () => {
@@ -2681,6 +2695,10 @@ describe("handoff and pause barriers", () => {
     const clearEventIds: string[] = [];
     const handoff = new HandoffController(scheduler, revisions, ownership, (event, _payload, eventId) => {
       if (event === "handoff_changed" && eventId) clearEventIds.push(eventId);
+    });
+    let scrubCalls = 0;
+    handoff.setScrubber(async () => {
+      scrubCalls += 1;
     });
     const pageRevision = await revisions.ensure(35);
     await handoff.begin(TASK_A, {
@@ -2708,6 +2726,7 @@ describe("handoff and pause barriers", () => {
     await handoff.acknowledgeEvent("handoff_changed", clearEventId);
     expect((await readState()).handoff).toEqual({ active: false });
     expect(scheduler.isAccepting()).toBe(true);
+    expect(scrubCalls).toBe(1);
     expect(alarmClears).toContain(HANDOFF_ALARM);
   });
 
