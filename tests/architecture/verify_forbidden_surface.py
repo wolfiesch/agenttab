@@ -47,8 +47,6 @@ RUNTIME_ROOTS = (
     "host-rs/crates",
     "schemas",
     "scripts",
-    "background.js",
-    "extension/background.js",
 )
 
 TEXT_SUFFIXES = {

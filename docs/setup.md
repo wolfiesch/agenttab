@@ -24,7 +24,7 @@ bun run workspace:build
 cargo build --locked --manifest-path host-rs/Cargo.toml
 ```
 
-`bun run extension:build` creates the canonical unpacked development extension in `packages/extension/dist/` and synchronizes compatibility output trees. `bun run workspace:build` builds the TypeScript adapter and installer packages. The Rust command builds the host workspace.
+`bun run extension:build` creates the unpacked development extension in `packages/extension/dist/` from the canonical source in `packages/extension/src/`. `bun run workspace:build` builds the TypeScript adapters, installer packages, and site. The Rust command builds the host workspace.
 
 These commands do **not** create a public release, verify a signed artifact, register a complete consumer installation, or make the extension available through the Chrome Web Store. This repository does not publish a manual source host-registration recipe. The supported consumer path must be the artifact-verifying installer once an RC is available.
 
