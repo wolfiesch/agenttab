@@ -49,6 +49,7 @@ class MockNativePort {
 
   postMessage(message: unknown): void {
     this.posted.push(clone(message));
+    nativePostProbe?.(message);
   }
 
   disconnect(): void {
@@ -75,6 +76,7 @@ let alarmClears: string[];
 let alarmListeners: Array<(alarm: { name: string }) => void>;
 let nativePort: MockNativePort | null;
 let tabRemovalProbe: (() => void | Promise<void>) | null;
+let nativePostProbe: ((message: unknown) => void) | null;
 let normalizeStoredObjectKeys: boolean;
 let focusedWindowUpdates: number[];
 let activeWindowId: number;
@@ -306,6 +308,7 @@ function installChromeMock(): void {
   alarmListeners = [];
   nativePort = null;
   tabRemovalProbe = null;
+  nativePostProbe = null;
   normalizeStoredObjectKeys = false;
   focusedWindowUpdates = [];
   activeWindowId = 1;
@@ -3968,6 +3971,38 @@ describe("extension entrypoint admission boundaries", () => {
     expect(Object.values((await readState()).stagedCommits)).toContainEqual(
       expect.objectContaining({ task_id: TASK_A, tab_id: 100 }),
     );
+    const closingHandoff = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6241",
+      TASK_A,
+      "browser_handoff",
+      {
+        tab_id: 100,
+        expected_page_revision: 1,
+        prompt: "Finish before closing",
+        completion: { kind: "manual_done" },
+      },
+    );
+    expect(closingHandoff).toMatchObject({ outcome: "needs_user" });
+    let handoffClearPostedAfterTabRemoval = false;
+    nativePostProbe = (message) => {
+      if (
+        isRecord(message) &&
+        message.kind === "event" &&
+        message.event === "handoff_changed" &&
+        typeof message.event_id === "string" &&
+        isRecord(message.payload) &&
+        message.payload.active === false
+      ) {
+        handoffClearPostedAfterTabRemoval = removedTabIds.includes(100);
+        port.receive({
+          protocol: "agenttab.native",
+          version: 1,
+          kind: "event_ack",
+          event: "handoff_changed",
+          event_id: message.event_id,
+        });
+      }
+    };
     let taskDeletedBeforeRemove = false;
     tabRemovalProbe = async () => {
       taskDeletedBeforeRemove = (await readState()).tasks[TASK_A] === undefined;
@@ -3981,6 +4016,11 @@ describe("extension entrypoint admission boundaries", () => {
       result: { task_id: TASK_A, closed_tab_ids: [100] },
     });
     expect(removedTabIds).toContain(100);
+    expect(handoffClearPostedAfterTabRemoval).toBe(true);
+    for (let attempt = 0; attempt < 20 && (await readState()).handoff.active; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
     expect(Object.values((await readState()).stagedCommits)).not.toContainEqual(
       expect.objectContaining({ task_id: TASK_A }),
@@ -3997,6 +4037,10 @@ describe("extension entrypoint admission boundaries", () => {
     });
     expect(taskDeletedBeforeRemove).toBe(true);
     expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
+    debuggerAttachedTabIds.add(101);
+    await mutateState((state) => {
+      state.automationCleanup.tabIds = [101];
+    });
     const detachCountBeforeRevocation = debuggerCalls.filter((call) => call === "detach").length;
     debuggerDetachFailures = 2;
     automationPermission = false;

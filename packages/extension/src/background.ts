@@ -345,8 +345,8 @@ function errorOutcome(error: unknown, mutating: boolean, code: string): Outcome 
 async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse> {
   if (command.kind === "close_task") {
     try {
-      await handoff.cancelForTask(command.task_id);
       const closedTabIds = await ownership.closeTask(command.task_id);
+      await handoff.cancelForTask(command.task_id);
       return completed(command.request_id, {
         task_id: command.task_id,
         closed_tab_ids: closedTabIds,
@@ -709,8 +709,8 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
     }
   }
   if (message.kind === "close_task" && typeof message.task_id === "string") {
-    await handoff.cancelForTask(message.task_id);
     await ownership.closeTask(message.task_id);
+    await handoff.cancelForTask(message.task_id);
     return { closed: true };
   }
   throw new Error("Unsupported popup message");
