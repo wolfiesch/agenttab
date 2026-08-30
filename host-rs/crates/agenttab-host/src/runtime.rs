@@ -1803,6 +1803,32 @@ mod tests {
             Err(NativeError::Timeout)
         }
     }
+
+    #[derive(Debug)]
+    struct OversizedNative;
+
+    impl NativeTransport for OversizedNative {
+        fn dispatch(
+            &self,
+            _connection_id: Uuid,
+            _task_id: Uuid,
+            _method: &str,
+            _params: Value,
+            _origin_policy: Option<NativeOriginPolicy>,
+            _timeout: Duration,
+        ) -> Result<NativeResponse, NativeError> {
+            Ok(NativeResponse {
+                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: NativeResponseKind::Response,
+                request_id: Uuid::new_v4(),
+                outcome: Outcome::Completed,
+                result: Some(json!({"body": "x".repeat(HOST_TO_CLIENT_MAX_BYTES)})),
+                error: None,
+                staged: None,
+            })
+        }
+    }
     #[derive(Debug)]
     struct RejectedHandoffNative;
 
@@ -1931,6 +1957,25 @@ mod tests {
         );
         assert_eq!(response["request_id"], "invalid-request");
         assert_eq!(response["error"]["code"], "invalid_request");
+    }
+
+    #[test]
+    fn oversized_response_still_carries_the_initial_resume_capability() {
+        let (_temp, runtime, connection) = connected_runtime(Arc::new(OversizedNative));
+        let response = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "oversized-tabs",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(response["error"]["code"], "response_too_large");
+        assert!(response["task"]["resume_capability"].is_string());
+        assert!(connection.resume_confirmation_required());
     }
 
     #[test]
