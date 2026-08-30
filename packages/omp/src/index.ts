@@ -4,30 +4,62 @@ import {
   STANDARD_ACTION_VALUE_MAX_CHARS,
   createResumeCapabilityStore,
   type MethodParams,
-  type RpcMethod,
 } from "../../sdk-typescript/src/index";
+import { piSchema } from "./pi-schema";
+import {
+  createCallComponent,
+  createResultComponent,
+  type RenderOptions,
+  type RenderTheme,
+  type ToolResult,
+} from "./render";
+import type { ToolMethod } from "./tool-method";
 
-interface OmpApi {
-  zod: any;
+
+interface SchemaNode {
+  int(): SchemaNode;
+  max(value: number): SchemaNode;
+  min(value: number): SchemaNode;
+  optional(): SchemaNode;
+  regex(pattern: RegExp): SchemaNode;
+  strict(): SchemaNode;
+}
+
+interface ZodApi {
+  array(schema: SchemaNode): SchemaNode;
+  boolean(): SchemaNode;
+  union(schemas: SchemaNode[]): SchemaNode;
+  enum(values: readonly string[]): SchemaNode;
+  literal(value: string): SchemaNode;
+  number(): SchemaNode;
+  object(properties: Record<string, SchemaNode>): SchemaNode;
+  record(key: SchemaNode, value: SchemaNode): SchemaNode;
+  string(): SchemaNode;
+  unknown(): SchemaNode;
+}
+
+export interface AgentApi {
+  zod?: ZodApi;
   setLabel?(label: string): void;
   registerTool(tool: Record<string, unknown>): void;
 }
 
+
 type ClientFactory = () => Promise<AgentTabClient>;
 
 const DEFINITIONS: ReadonlyArray<{
-  name: RpcMethod;
+  name: ToolMethod;
   label: string;
   description: string;
   approval: "read" | "write";
-  schema(z: any): any;
+  schema(z: ZodApi): SchemaNode;
 }> = [
     {
       name: "browser_open",
       label: "Browser Open",
       description: "Create a background tab in this task workspace or explicitly adopt the active tab.",
       approval: "write",
-      schema: (z) => z.discriminatedUnion("mode", [
+      schema: (z) => z.union([
         z.object({
           mode: z.literal("create"),
           url: z.string().regex(/^(https?:\/\/|about:)[^\s]+$/).optional(),
@@ -41,7 +73,7 @@ const DEFINITIONS: ReadonlyArray<{
       label: "Browser Snapshot",
       description: "Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab.",
       approval: "read",
-      schema: (z) => z.discriminatedUnion("mode", [
+      schema: (z) => z.union([
         z.object({
           tab_id: z.number().int().min(0),
           mode: z.literal("accessibility"),
@@ -70,7 +102,7 @@ const DEFINITIONS: ReadonlyArray<{
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);
-        const action = z.discriminatedUnion("kind", [
+        const action = z.union([
           z.object({ kind: z.literal("click"), ref }).strict(),
           z.object({ kind: z.literal("type"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
           z.object({ kind: z.literal("fill"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
@@ -111,7 +143,7 @@ const DEFINITIONS: ReadonlyArray<{
       approval: "read",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
-        condition: z.discriminatedUnion("kind", [
+        condition: z.union([
           z.object({ kind: z.enum(["load", "network_idle", "download"]) }).strict(),
           z.object({ kind: z.enum(["url", "text", "selector"]), value: z.string().min(1).max(65_536) }).strict(),
         ]),
@@ -134,7 +166,7 @@ const DEFINITIONS: ReadonlyArray<{
         tab_id: z.number().int().min(0),
         expected_page_revision: z.number().int().min(0),
         prompt: z.string().min(1).max(2000),
-        completion: z.discriminatedUnion("kind", [
+        completion: z.union([
           z.object({ kind: z.enum(["navigation", "manual_done"]) }).strict(),
           z.object({ kind: z.enum(["url", "selector"]), value: z.string().min(1).max(65_536) }).strict(),
         ]),
@@ -155,7 +187,7 @@ const DEVELOPER = {
   label: "Browser Developer",
   description: "Run an explicitly enabled developer-mode action outside the Standard tool surface.",
   approval: "write" as const,
-  schema: (z: any) => z.object({
+  schema: (z: ZodApi) => z.object({
     action: z.string().min(1).max(128),
     params: z.record(z.string(), z.unknown()),
   }).strict(),
@@ -189,34 +221,55 @@ function failure(error: unknown): Record<string, unknown> {
 }
 
 export function makeExtension(clientFactory?: ClientFactory) {
-  const connectClient = clientFactory ?? (() => {
-    const conversationId = process.env.AGENTTAB_CONVERSATION_ID;
-    return AgentTabClient.connect({
-      conversationId,
-      capabilityStore: conversationId
-        ? createResumeCapabilityStore("omp", { scope: conversationId })
-        : undefined,
+  return function agentTabExtension(pi: AgentApi): void {
+    const zod = pi.zod;
+    const isOmp = zod !== undefined;
+    if (isOmp) pi.setLabel?.("AgentTab");
+    const connectClient = clientFactory ?? (() => {
+      const conversationId = process.env.AGENTTAB_CONVERSATION_ID;
+      return AgentTabClient.connect({
+        conversationId,
+        capabilityStore: conversationId
+          ? createResumeCapabilityStore(isOmp ? "omp" : "pi", { scope: conversationId })
+          : undefined,
+      });
     });
-  });
-  return function agentTabExtension(pi: OmpApi): void {
-    if (!pi.zod) throw new Error("AgentTab's OMP adapter requires the OMP Zod extension API.");
-    pi.setLabel?.("AgentTab");
     let client: AgentTabClient | undefined;
     const register = (definition: (typeof DEFINITIONS)[number] | typeof DEVELOPER) => {
+      const renderers = isOmp
+        ? {
+          renderCall: (args: unknown, _options: RenderOptions, theme: RenderTheme) =>
+            createCallComponent(definition.name, args, theme),
+          renderResult: (result: ToolResult, options: RenderOptions, theme: RenderTheme, args: unknown) =>
+            createResultComponent(definition.name, result, options, theme, args),
+        }
+        : {
+          renderCall: (args: unknown, theme: RenderTheme) =>
+            createCallComponent(definition.name, args, theme),
+          renderResult: (
+            result: ToolResult,
+            options: RenderOptions,
+            theme: RenderTheme,
+            context: { args?: unknown },
+          ) => createResultComponent(definition.name, result, options, theme, context.args),
+        };
       pi.registerTool({
         name: definition.name,
         label: definition.label,
         description: definition.description,
-        loadMode: "discoverable",
-        approval: definition.approval,
-        strict: true,
-        parameters: definition.schema(pi.zod),
+        ...(isOmp ? {
+          loadMode: "discoverable",
+          approval: definition.approval,
+          strict: true,
+        } : {}),
+        parameters: isOmp ? definition.schema(zod) : piSchema(definition.name),
+        ...renderers,
         execute: async (_id: string, params: Record<string, unknown>) => {
           try {
             client ??= await connectClient();
             const result = await client.call(
               definition.name,
-              params as MethodParams[RpcMethod],
+              params as MethodParams[ToolMethod],
             );
             return success(result);
           } catch (error) {

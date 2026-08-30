@@ -46,7 +46,7 @@ The package coordinate for the direct stdio binary is `agenttab-mcp`; its execut
 
 The same `agenttab mcp` entry is the manual shape for Claude Desktop, Cursor, Windsurf, and another stdio-MCP client. Do not put a profile path, port, token, or `AGENTTAB_SOCKET` override in routine client configuration.
 
-For OMP, the private package coordinate is `@agenttab/omp`. The installer adds its local built extension path to OMP `config.yml` when that file or its parent exists and parses as valid YAML. The OMP adapter registers the same seven Standard tools. There is no OMP package publication claim or separate network endpoint.
+For OMP and Pi, the private package coordinate is `@agenttab/omp`. The package advertises both `omp.extensions` and `pi.extensions`, each pointing to the same built adapter. OMP receives native Zod schemas, approval metadata, and discoverable strict tools; Pi receives native TypeBox schemas. Both runtimes register the same seven Standard tools and render compact action cards with expandable, redacted structured results. The installer adds the local built extension path to OMP `config.yml` when that file or its parent exists and parses as valid YAML. There is no package publication claim or separate network endpoint.
 
 ## Connection and durable resume
 
@@ -56,7 +56,7 @@ Set `AGENTTAB_CONVERSATION_ID` only when the MCP client can provide one stable, 
 
 `AGENTTAB_CONVERSATION_ID` is non-authoritative metadata. The opaque resume capability is the authorization proof and must never be copied into a client config, prompt, log, or shared state. Without a valid capability, a new connection receives a new task; the previous task is not silently shared. The host can rotate a capability with task responses, and the adapter persists the replacement before resolving that response to the caller.
 
-For MCP, the capability store namespace is `mcp`; for OMP it is `omp`. Both hash the supplied conversation scope into the owner-only filename. See [Commands](commands.md#adapter-environment) for environment variables and [Core RPC connection schema](../schemas/rpc/v1/connection.schema.json) for the connection envelope.
+For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. Each hashes the supplied conversation scope into the owner-only filename. See [Commands](commands.md#adapter-environment) for environment variables and [Core RPC connection schema](../schemas/rpc/v1/connection.schema.json) for the connection envelope.
 
 ## Seven Standard tools
 

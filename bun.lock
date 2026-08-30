@@ -7,7 +7,7 @@
     },
     "packages/extension": {
       "name": "@agenttab/extension",
-      "version": "0.2.0",
+      "version": "2.0.0-rc.1",
       "devDependencies": {
         "@types/bun": "^1.2.23",
         "@types/chrome": "^0.1.36",
@@ -16,7 +16,7 @@
     },
     "packages/installer": {
       "name": "agenttab",
-      "version": "0.2.0",
+      "version": "2.0.0-rc.1",
       "bin": {
         "agenttab": "dist/cli.mjs",
       },
@@ -29,7 +29,7 @@
     },
     "packages/mcp": {
       "name": "agenttab-mcp",
-      "version": "0.2.0",
+      "version": "2.0.0-rc.1",
       "bin": {
         "agenttab-mcp": "dist/server.mjs",
       },
@@ -41,7 +41,10 @@
     },
     "packages/omp": {
       "name": "@agenttab/omp",
-      "version": "0.2.0",
+      "version": "2.0.0-rc.1",
+      "dependencies": {
+        "typebox": "^1.3.7",
+      },
       "devDependencies": {
         "@types/bun": "^1.2.23",
         "@types/node": "^24.5.2",
@@ -50,7 +53,7 @@
     },
     "packages/sdk-typescript": {
       "name": "@agenttab/sdk",
-      "version": "0.2.0",
+      "version": "2.0.0-rc.1",
       "devDependencies": {
         "@types/bun": "^1.2.23",
         "@types/node": "^24.5.2",
@@ -93,6 +96,8 @@
     "agenttab-mcp": ["agenttab-mcp@workspace:packages/mcp"],
 
     "bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "typebox": ["typebox@1.3.22", "", {}, "sha512-YoX6QdtuJR/+YpP/qXf9gJXTxvSuiUlKYgW3AilsOSLlsZe/VH6ILR5vhoJM5QXY//uzIRE7NYij3h2+nG9vRQ=="],
 
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
