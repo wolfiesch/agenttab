@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { AgentTabTransportError, type AgentTabClient } from "../../sdk-typescript/src/index";
+import { mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  AgentTabTransportError,
+  FrameDecoder,
+  encodeFrame,
+  type AgentTabClient,
+} from "../../sdk-typescript/src/index";
 import {
   DEVELOPER_TOOL,
   McpServer,
@@ -74,6 +83,98 @@ describe("AgentTab MCP surface", () => {
     const entries = [];
     for await (const entry of readBoundedLines(chunks(), 8)) entries.push(entry);
     expect(entries).toEqual([{ line: "12345678" }]);
+  });
+
+  test("default session confirms its initial resume capability before the next tool call", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agenttab-mcp-"));
+    const endpoint = join(root, "agenttab.sock");
+    const previousSocket = process.env.AGENTTAB_SOCKET;
+    const previousStateDir = process.env.AGENTTAB_STATE_DIR;
+    const previousConversationId = process.env.AGENTTAB_CONVERSATION_ID;
+    const methods: string[] = [];
+    let confirmed = false;
+    const nativeServer = createServer((socket) => {
+      const decoder = new FrameDecoder();
+      socket.on("data", (chunk) => {
+        for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+          if (value.kind === "connect") {
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da43",
+              resumed: false,
+              state: "ready",
+            }));
+          } else if (value.kind === "resume_confirm") {
+            confirmed = value.resume_capability === "a".repeat(32);
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "resume_confirmed",
+              connection_id: value.connection_id,
+            }));
+          } else {
+            methods.push(String(value.method));
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              request_id: value.request_id,
+              ok: true,
+              outcome: "completed",
+              result: value.method === "browser_tabs" ? { tabs: [] } : { tab_id: 1 },
+              ...(methods.length === 1
+                ? {
+                  task: {
+                    task_id: "018f22b2-4126-7c1a-8c31-3f45a783da44",
+                    resume_capability: "a".repeat(32),
+                  },
+                }
+                : {}),
+            }));
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      nativeServer.once("error", reject);
+      nativeServer.listen(endpoint, resolve);
+    });
+
+    let server: McpServer | undefined;
+    try {
+      process.env.AGENTTAB_SOCKET = endpoint;
+      process.env.AGENTTAB_STATE_DIR = join(root, "state");
+      delete process.env.AGENTTAB_CONVERSATION_ID;
+      server = new McpServer();
+      const first = await server.handle({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "browser_open", arguments: { mode: "create" } },
+      }) as Record<string, unknown>;
+      expect(first.structuredContent).toEqual({ tab_id: 1 });
+      expect(confirmed).toBe(true);
+
+      const second = await server.handle({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "browser_tabs", arguments: {} },
+      }) as Record<string, unknown>;
+      expect(second.structuredContent).toEqual({ tabs: [] });
+      expect(methods).toEqual(["browser_open", "browser_tabs"]);
+    } finally {
+      server?.close();
+      await new Promise<void>((resolve) => nativeServer.close(() => resolve()));
+      if (previousSocket === undefined) delete process.env.AGENTTAB_SOCKET;
+      else process.env.AGENTTAB_SOCKET = previousSocket;
+      if (previousStateDir === undefined) delete process.env.AGENTTAB_STATE_DIR;
+      else process.env.AGENTTAB_STATE_DIR = previousStateDir;
+      if (previousConversationId === undefined) delete process.env.AGENTTAB_CONVERSATION_ID;
+      else process.env.AGENTTAB_CONVERSATION_ID = previousConversationId;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("evicts a closed client after a failed tool call and reconnects without replaying", async () => {

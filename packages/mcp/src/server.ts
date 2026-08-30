@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { stdin, stdout } from "node:process";
 import {
   AgentTabClient,
@@ -225,9 +226,9 @@ export class McpServer {
       return;
     }
     const conversationId = process.env.AGENTTAB_CONVERSATION_ID;
-    const capabilityStore = conversationId
-      ? createResumeCapabilityStore("mcp", { scope: conversationId })
-      : undefined;
+    const capabilityStore = createResumeCapabilityStore("mcp", {
+      scope: conversationId ?? `session-${randomUUID()}`,
+    });
     this.#clientFactory = () => AgentTabClient.connect({
       conversationId,
       capabilityStore,
