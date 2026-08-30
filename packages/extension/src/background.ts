@@ -87,7 +87,6 @@ let browser: StandardBrowserRuntime;
 browser = new StandardBrowserRuntime(
   revisions,
   async (tabId) => {
-    await handoff.cancelForTab(tabId);
     await ownership.revoke(tabId, "tab_removed");
     await browser.detach(tabId);
     await chrome.tabs.remove(tabId);
