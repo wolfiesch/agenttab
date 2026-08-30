@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use tokio::task::JoinSet;
 
 const MAX_CONNECTIONS: usize = 64;
@@ -462,20 +462,22 @@ impl OrderedQueue {
         ticket
     }
 
-    fn wait_turn(&self, ticket: u64) -> OrderedQueueGuard<'_> {
+    fn wait_turn(self: &Arc<Self>, ticket: u64) -> OrderedQueueGuard {
         let mut state = self.state.lock();
         while state.serving != ticket {
             self.ready.wait(&mut state);
         }
-        OrderedQueueGuard { queue: self }
+        OrderedQueueGuard {
+            queue: Arc::clone(self),
+        }
     }
 }
 
-struct OrderedQueueGuard<'a> {
-    queue: &'a OrderedQueue,
+struct OrderedQueueGuard {
+    queue: Arc<OrderedQueue>,
 }
 
-impl Drop for OrderedQueueGuard<'_> {
+impl Drop for OrderedQueueGuard {
     fn drop(&mut self) {
         let mut state = self.queue.state.lock();
         state.serving = state
@@ -483,6 +485,20 @@ impl Drop for OrderedQueueGuard<'_> {
             .checked_add(1)
             .expect("connection request ticket overflow");
         self.queue.ready.notify_all();
+    }
+}
+
+struct PendingResponse {
+    value: Value,
+    delivery: Option<oneshot::Sender<bool>>,
+}
+
+impl PendingResponse {
+    fn untracked(value: Value) -> Self {
+        Self {
+            value,
+            delivery: None,
+        }
     }
 }
 
@@ -562,25 +578,29 @@ where
         }
     }
 
+    let mut bootstrap_complete = ack.resumed;
+    let bootstrap_queue = Arc::new(OrderedQueue::default());
+    let bootstrap_notify = Arc::new(Notify::new());
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let (response_sender, mut response_receiver) = mpsc::channel::<Value>(CONNECTION_QUEUE);
+    let (response_sender, mut response_receiver) =
+        mpsc::channel::<PendingResponse>(CONNECTION_QUEUE);
     let writer_runtime = runtime.clone();
     let writer_connection = connection.clone();
     let writer = tokio::spawn(async move {
-        while let Some(response) = response_receiver.recv().await {
-            let carries_capability = response_carries_new_capability(&response);
-            if write_frame_async(&mut writer, &response, HOST_TO_CLIENT_MAX_BYTES)
+        while let Some(PendingResponse { value, delivery }) = response_receiver.recv().await {
+            let carries_capability = response_carries_new_capability(&value);
+            let delivered = write_frame_async(&mut writer, &value, HOST_TO_CLIENT_MAX_BYTES)
                 .await
-                .is_err()
-            {
-                if carries_capability {
-                    writer_connection.finish_new_capability_delivery(false);
-                }
+                .is_ok();
+            if carries_capability {
+                writer_connection.finish_new_capability_delivery(delivered);
+            }
+            if let Some(delivery) = delivery {
+                let _ = delivery.send(delivered);
+            }
+            if !delivered {
                 let _ = writer_runtime.disconnect(&writer_connection);
                 break;
-            }
-            if carries_capability {
-                writer_connection.finish_new_capability_delivery(true);
             }
         }
     });
@@ -602,13 +622,16 @@ where
                 Ok(confirmed) => confirmed,
                 Err(_) => break,
             };
-            if response_sender.send(confirmed.value()).await.is_err() {
+            if response_sender
+                .send(PendingResponse::untracked(confirmed.value()))
+                .await
+                .is_err()
+            {
                 break;
             }
+            bootstrap_complete = true;
+            bootstrap_notify.notify_waiters();
             continue;
-        }
-        if connection.resume_confirmation_required() {
-            break;
         }
         let Ok(permit) = request_permits.clone().try_acquire_owned() else {
             let request_id = request
@@ -627,10 +650,20 @@ where
                 .with_recovery("Wait for an in-flight request to finish before retrying."),
             )
             .value();
-            if response_sender.send(response).await.is_err() {
+            if response_sender
+                .send(PendingResponse::untracked(response))
+                .await
+                .is_err()
+            {
                 break;
             }
             continue;
+        };
+        let bootstrap_turn = if bootstrap_complete {
+            None
+        } else {
+            let ticket = bootstrap_queue.issue();
+            Some((bootstrap_queue.clone(), ticket))
         };
         request_queues.retain(|_, queue| Arc::strong_count(queue) > 1);
         let queue = request_queues
@@ -642,17 +675,56 @@ where
         let request_connection = connection.clone();
         let request_responses = response_sender.clone();
         let delivery_connection = connection.clone();
+        let request_bootstrap_notify = bootstrap_notify.clone();
         requests.spawn(async move {
             let _permit = permit;
+            let bootstrap_guard = match bootstrap_turn {
+                Some((queue, ticket)) => {
+                    match tokio::task::spawn_blocking(move || queue.wait_turn(ticket)).await {
+                        Ok(guard) => Some(guard),
+                        Err(_) => return,
+                    }
+                }
+                None => None,
+            };
+            if bootstrap_guard.is_some() {
+                loop {
+                    let notified = request_bootstrap_notify.notified();
+                    if !request_connection.resume_confirmation_required() {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
+            let blocking_connection = request_connection.clone();
             let response = tokio::task::spawn_blocking(move || {
                 let _turn = queue.wait_turn(ticket);
-                request_runtime.handle(&request_connection, request)
+                request_runtime.handle(&blocking_connection, request)
             })
             .await;
             if let Ok(response) = response {
                 let carries_capability = response_carries_new_capability(&response);
-                if request_responses.send(response).await.is_err() && carries_capability {
-                    delivery_connection.finish_new_capability_delivery(false);
+                let (delivery, receipt) = if bootstrap_guard.is_some() {
+                    let (delivery, receipt) = oneshot::channel();
+                    (Some(delivery), Some(receipt))
+                } else {
+                    (None, None)
+                };
+                if request_responses
+                    .send(PendingResponse {
+                        value: response,
+                        delivery,
+                    })
+                    .await
+                    .is_err()
+                {
+                    if carries_capability {
+                        delivery_connection.finish_new_capability_delivery(false);
+                    }
+                    return;
+                }
+                if let Some(receipt) = receipt {
+                    let _ = receipt.await;
                 }
             }
         });
@@ -812,7 +884,7 @@ mod tests {
     use crate::lifecycle::Lifecycle;
     use crate::native::{NativeError, NativeTransport};
     use crate::paths::AgentTabPaths;
-    use agenttab_protocol::{NativeResponse, Outcome};
+    use agenttab_protocol::{NativeResponse, NativeResponseKind, Outcome, NATIVE_PROTOCOL};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -833,17 +905,77 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct BlockingOpenNative {
+        state: Mutex<BlockingOpenState>,
+        ready: Condvar,
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingOpenState {
+        started: bool,
+        released: bool,
+    }
+
+    impl BlockingOpenNative {
+        fn wait_until_started(&self) {
+            let mut state = self.state.lock();
+            while !state.started {
+                self.ready.wait(&mut state);
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock();
+            state.released = true;
+            self.ready.notify_all();
+        }
+    }
+
+    impl NativeTransport for BlockingOpenNative {
+        fn dispatch(
+            &self,
+            _connection_id: Uuid,
+            _task_id: Uuid,
+            method: &str,
+            _params: Value,
+            _origin_policy: Option<agenttab_protocol::NativeOriginPolicy>,
+            _timeout: Duration,
+        ) -> Result<NativeResponse, NativeError> {
+            if method == "browser_open" {
+                let mut state = self.state.lock();
+                state.started = true;
+                self.ready.notify_all();
+                while !state.released {
+                    self.ready.wait(&mut state);
+                }
+            }
+            Ok(NativeResponse {
+                protocol: NATIVE_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: NativeResponseKind::Response,
+                request_id: Uuid::now_v7(),
+                outcome: Outcome::Completed,
+                result: Some(serde_json::json!({"tab_id": 1})),
+                error: None,
+                staged: None,
+            })
+        }
+    }
+
     fn test_runtime(temp: &tempfile::TempDir) -> (Arc<Runtime>, AgentTabPaths) {
+        test_runtime_with_native(temp, Arc::new(UnusedNative))
+    }
+
+    fn test_runtime_with_native(
+        temp: &tempfile::TempDir,
+        native: Arc<dyn NativeTransport>,
+    ) -> (Arc<Runtime>, AgentTabPaths) {
         let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
         let lifecycle = Arc::new(Lifecycle::default());
         lifecycle.complete_reconciliation(false);
-        let runtime = Runtime::open(
-            &paths,
-            lifecycle,
-            Arc::new(UnusedNative),
-            Arc::new(HandoffState::default()),
-        )
-        .unwrap();
+        let runtime =
+            Runtime::open(&paths, lifecycle, native, Arc::new(HandoffState::default())).unwrap();
         (runtime, paths)
     }
 
@@ -920,6 +1052,95 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), INVALID_RESUME_CAPABILITY_ERROR);
         assert_eq!(task_count(&paths), 0);
+    }
+
+    #[tokio::test]
+    async fn pipelined_rpcs_wait_for_initial_capability_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let native = Arc::new(BlockingOpenNative::default());
+        let (runtime, paths) = test_runtime_with_native(&temp, native.clone());
+        let (mut client, server) = start_test_connection(runtime).await;
+        write_frame_async(
+            &mut client,
+            &serde_json::to_value(connection_init(None)).unwrap(),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let acknowledgement = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+
+        write_browser_open(&mut client, "create-task").await;
+        write_frame_async(
+            &mut client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "pipelined-snapshot",
+                "method": "browser_snapshot",
+                "params": {"mode": "text", "tab_id": 999}
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let waiting_native = native.clone();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || waiting_native.wait_until_started()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let premature = tokio::time::timeout(
+            Duration::from_millis(150),
+            read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES),
+        )
+        .await;
+        native.release();
+        assert!(
+            premature.is_err(),
+            "a pipelined request completed before the initial capability was delivered"
+        );
+
+        let created = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created["request_id"], "create-task");
+        let capability = created["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        write_frame_async(
+            &mut client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "resume_confirm",
+                "connection_id": acknowledgement["connection_id"],
+                "resume_capability": capability
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        let confirmed = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed["kind"], "resume_confirmed");
+        let deferred = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred["request_id"], "pipelined-snapshot");
+        assert_eq!(task_count(&paths), 1);
+        drop(client);
+        assert!(server.await.unwrap().is_ok());
     }
     #[tokio::test]
     async fn initial_capability_confirmation_unlocks_follow_up_rpcs() {
