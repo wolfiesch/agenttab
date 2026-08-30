@@ -2069,7 +2069,9 @@ describe("page revision monotonicity", () => {
                               ? { placeholder: "Two-factor code" }
                               : objectId.endsWith("-33")
                                 ? { "aria-label": "Card expiration month" }
-                                : { name: "cardExpiryYear" };
+                                : objectId.endsWith("-34")
+                                  ? { name: "cardExpiryYear" }
+                                  : { type: "text", name: "security_code" };
         const target = {
           form: null,
           labels: [],
@@ -2120,6 +2122,7 @@ describe("page revision monotonicity", () => {
       { kind: "fill", ref: `r${pageRevision}-31`, text: "123456" },
       { kind: "type", ref: `r${pageRevision}-32`, text: "123456" },
       { kind: "select", ref: `r${pageRevision}-33`, value: "08" },
+      { kind: "fill", ref: `r${pageRevision}-35`, text: "123" },
       { kind: "select", ref: `r${pageRevision}-34`, value: "2030" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
