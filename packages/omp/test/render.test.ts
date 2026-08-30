@@ -18,7 +18,7 @@ describe("AgentTab operation card rendering", () => {
       actions: [{ kind: "fill", ref: "ref=e5", text: "private@example.com" }],
     }, theme);
     const rendered = component.render(120).join("\n");
-    expect(rendered).toContain("Plan · Fill · e5 · 19 characters · tab 12 · rev 4 · task-owned");
+    expect(rendered).toContain("🧭 Plan · Fill · e5 · 19 characters · tab 12 · rev 4 · task-owned");
     expect(rendered).toContain("▶ Intent  · Decision  · Execute  · Observe");
     expect(rendered).toContain("Privacy · 1 sensitive input hidden");
     expect(rendered).not.toContain("private@example.com");
@@ -30,7 +30,7 @@ describe("AgentTab operation card rendering", () => {
       condition: { kind: "text", value: "Publish app" },
     }, theme);
     expect(component.render(120)).toEqual([
-      "Plan · Wait for Text · “Publish app” · tab 7 · task-owned",
+      "🧭 Plan · Wait for Text · “Publish app” · tab 7 · task-owned",
       "  Flow · ▶ Intent  · Decision  · Execute  · Observe",
     ]);
   });
@@ -51,7 +51,7 @@ describe("AgentTab operation card rendering", () => {
     );
     const rendered = component.render(120).join("\n");
     expect(rendered).toContain(
-      "Review · Human approval required · task task-ope…3456 · tab 12 · task-owned",
+      "🔒 Review · Human approval required · task task-ope…3456 · tab 12 · task-owned",
     );
     expect(rendered).toContain("▶ Approval  · Execute  · Observe");
     expect(rendered).toContain("Policy · Consequential action paused before execution");
@@ -81,7 +81,7 @@ describe("AgentTab operation card rendering", () => {
     );
     const rendered = component.render(120).join("\n");
     expect(rendered).toContain(
-      "Executed · 2 browser actions executed · task task-7 · tab 18 · rev 5 · task-owned",
+      "🚀 Executed · 2 browser actions executed · task task-7 · tab 18 · rev 5 · task-owned",
     );
     expect(rendered).toContain("✓ Execute  ▶ Observe");
     expect(rendered).toContain("Evidence · 1 new tab");
@@ -104,7 +104,7 @@ describe("AgentTab operation card rendering", () => {
       {},
     );
     expect(component.render(120)).toEqual([
-      "Observed · 2 task tabs · task task-7 · task-owned",
+      "🔎 Observed · 2 task tabs · task task-7 · task-owned",
     ]);
   });
 
@@ -124,7 +124,7 @@ describe("AgentTab operation card rendering", () => {
       { tab_id: 18, expected_page_revision: 4, actions: [{ kind: "click", ref: "ref=e3" }] },
     );
     const rendered = component.render(120).join("\n");
-    expect(rendered).toContain("Blocked · Page revision mismatch · tab 18 · rev 4 · task-owned");
+    expect(rendered).toContain("🛑 Blocked · Page revision mismatch · tab 18 · rev 4 · task-owned");
     expect(rendered).toContain("× Operation");
     expect(rendered).toContain("Observe the page again.");
     expect(rendered).not.toContain("Executed ·");
@@ -146,7 +146,7 @@ describe("AgentTab operation card rendering", () => {
       { tab_id: 18, expected_page_revision: 4, actions: [{ kind: "click", ref: "ref=e3" }] },
     );
     const rendered = component.render(120).join("\n");
-    expect(rendered).toContain("Uncertain · Connection closed after dispatch · tab 18 · rev 4 · task-owned");
+    expect(rendered).toContain("🤔 Uncertain · Connection closed after dispatch · tab 18 · rev 4 · task-owned");
     expect(rendered).toContain("✓ Intent  ? Execute  ▶ Reconcile");
     expect(rendered).toContain("Execution may have occurred; inspect live state before retrying");
     expect(rendered).not.toContain("Blocked ·");
@@ -167,7 +167,7 @@ describe("AgentTab operation card rendering", () => {
       args,
     );
     expect(waiting.render(120)).toEqual([
-      "Your turn · Waiting for user · tab 18 · rev 5 · task-owned",
+      "👤 Your turn · Waiting for user · tab 18 · rev 5 · task-owned",
       "  Flow · ✓ Intent  ▶ Human  · Resume",
     ]);
     const activated = createResultComponent(
@@ -184,7 +184,7 @@ describe("AgentTab operation card rendering", () => {
       args,
     );
     expect(activated.render(120)).toEqual([
-      "Your turn · Waiting for user · task task-7 · tab 18 · rev 6 · task-owned",
+      "👤 Your turn · Waiting for user · task task-7 · tab 18 · rev 6 · task-owned",
       "  Flow · ✓ Intent  ▶ Human  · Resume",
     ]);
 
@@ -197,7 +197,7 @@ describe("AgentTab operation card rendering", () => {
       args,
     );
     expect(completed.render(120)).toEqual([
-      "Observed · User handoff completed · tab 18 · rev 6 · task-owned",
+      "🔎 Observed · User handoff completed · tab 18 · rev 6 · task-owned",
     ]);
   });
 
@@ -209,6 +209,6 @@ describe("AgentTab operation card rendering", () => {
       theme,
       { mode: "accessibility" },
     );
-    expect(component.render(120)).toEqual(["Working · Working… · task-owned"]);
+    expect(component.render(120)).toEqual(["🔄 Working · Working… · task-owned"]);
   });
 });
