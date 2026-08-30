@@ -95,12 +95,14 @@ export async function applyTransaction(
   for (const file of files) {
     const bytes = Buffer.isBuffer(file.content) ? file.content : Buffer.from(file.content, "utf8");
     const original = await readOptional(file.path);
-    if (original?.equals(bytes)) {
+    const originalMode = original && process.platform !== "win32"
+      ? (await stat(file.path)).mode & 0o777
+      : undefined;
+    const modeMatches = file.mode === undefined || originalMode === undefined || originalMode === file.mode;
+    if (original?.equals(bytes) && modeMatches) {
       unchanged.push(file.path);
       continue;
     }
-    let originalMode: number | undefined;
-    if (original) originalMode = (await stat(file.path)).mode & 0o777;
     options.printDiff?.(file.semanticDiff ?? renderDiff(file.label, original, bytes));
     prepared.push({
       ...file,

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -15,6 +15,7 @@ import {
   type RuntimeAssets,
 } from "../src/install";
 import { applyTransaction } from "../src/transaction";
+import { AgentTabClient } from "../../sdk-typescript/src/index";
 
 const temporaryRoots: string[] = [];
 
@@ -227,7 +228,7 @@ describe("release trust", () => {
     expect(targetTriple("darwin", "x64")).toBe("x86_64-apple-darwin");
     expect(targetTriple("linux", "arm64")).toBe("aarch64-unknown-linux-gnu");
     expect(targetTriple("linux", "x64")).toBe("x86_64-unknown-linux-gnu");
-    expect(targetTriple("win32", "arm64")).toBe("aarch64-pc-windows-msvc");
+    expect(() => targetTriple("win32", "arm64")).toThrow("does not publish");
     expect(targetTriple("win32", "x64")).toBe("x86_64-pc-windows-msvc");
     expect(() => targetTriple("freebsd", "x64")).toThrow("does not publish");
   });
@@ -416,6 +417,55 @@ describe("end-to-end development install", () => {
     expect(existsSync(stateDir)).toBe(false);
     expect(result.extension.status).toBe("planned");
     expect(result.readiness).toEqual({ passed: false, skipped: true, reason: "dry_run" });
+  });
+
+  test("waits for the ready lifecycle before probing the extension", async () => {
+    const root = await temporaryRoot();
+    const fixture = await signedFixture(root);
+    const calls: string[] = [];
+    let statusCalls = 0;
+    const fakeClient = {
+      connection: { state: "starting" },
+      call: async (method: string): Promise<Record<string, unknown>> => {
+        calls.push(method);
+        if (method === "agenttab.status") {
+          statusCalls += 1;
+          return { state: statusCalls === 1 ? "reconciling" : "ready" };
+        }
+        if (method === "browser_open") return { tab_id: 41, page_revision: 7 };
+        if (method === "browser_snapshot") return { page_revision: 8 };
+        if (method === "browser_act") return {};
+        throw new Error(`unexpected readiness method: ${method}`);
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const connect = spyOn(AgentTabClient, "connect").mockResolvedValue(fakeClient);
+
+    try {
+      const result = await install({
+        version: "2.0.0-rc.1",
+        development: true,
+        manifestUrl: fixture.manifestUrl,
+        signatureUrl: fixture.signatureUrl,
+        publicKeyPem: fixture.publicKeyPem,
+        home: join(root, "ready-home"),
+        stateDir: join(root, "ready-home", ".agenttab"),
+        runtimeAssets: await runtimeAssets(root),
+        verifyReadiness: true,
+        openBrowser: false,
+        print: () => undefined,
+      });
+      expect(result.readiness).toEqual({ passed: true, skipped: false });
+      expect(calls).toEqual([
+        "agenttab.status",
+        "agenttab.status",
+        "browser_open",
+        "browser_snapshot",
+        "browser_act",
+      ]);
+    } finally {
+      connect.mockRestore();
+    }
   });
 
   test("reports the frozen v1 recovery identity without mutating it", async () => {
