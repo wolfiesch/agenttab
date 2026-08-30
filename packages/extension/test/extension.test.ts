@@ -2053,7 +2053,11 @@ describe("page revision monotonicity", () => {
               ? { autocomplete: "cc-exp-month" }
               : objectId.endsWith("-25")
                 ? { name: "card-number", "aria-label": "Card number", inputmode: "numeric" }
-                : { name: "otp", "aria-label": "Verification code", inputmode: "numeric" };
+                : objectId.endsWith("-26")
+                  ? { name: "otp", "aria-label": "Verification code", inputmode: "numeric" }
+                  : objectId.endsWith("-27")
+                    ? { type: "number", name: "pin" }
+                    : { "aria-label": "Passcode" };
         const target = {
           form: null,
           labels: [],
@@ -2097,6 +2101,8 @@ describe("page revision monotonicity", () => {
       { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
       { kind: "fill", ref: `r${pageRevision}-25`, text: "4111111111111111" },
       { kind: "type", ref: `r${pageRevision}-26`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-27`, text: "1234" },
+      { kind: "type", ref: `r${pageRevision}-28`, text: "123456" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
@@ -2139,9 +2145,7 @@ describe("page revision monotonicity", () => {
           labels: [],
           ownerDocument: { getElementById() { return null; } },
           getAttribute(name: string) {
-            if (name === "name") return "card-number";
-            if (name === "aria-label") return "Card number";
-            if (name === "inputmode") return "numeric";
+            if (name === "aria-label") return "Passcode";
             return "";
           },
           set value(_value: string) {
@@ -2644,6 +2648,31 @@ describe("handoff and pause barriers", () => {
       event === "handoff_changed" && payload.active === false
     )).toHaveLength(2);
     expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(2);
+  });
+
+  test("clears a restored handoff for a tab revoked during initial reconciliation", async () => {
+    await seedTask(TASK_A, [35]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership, () => undefined);
+    const pageRevision = await revisions.ensure(35);
+    await handoff.begin(TASK_A, {
+      tab_id: 35,
+      expected_page_revision: pageRevision,
+      prompt: "Complete authentication",
+      completion: { kind: "manual_done" },
+    });
+    tabStore.delete(35);
+
+    const revokedTabIds = await ownership.reconcile();
+    await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
+    await handoff.restore();
+
+    expect(revokedTabIds).toEqual([35]);
+    expect((await readState()).handoff).toEqual({ active: false });
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(alarmClears).toContain(HANDOFF_ALARM);
   });
 
   test("requires acknowledgment to clear an expired handoff without resuming manual Pause", async () => {

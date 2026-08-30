@@ -530,6 +530,7 @@ function start(): Promise<void> {
     scheduler.setInitialPaused(state.paused || state.handoff.active);
     if (!(await automationEnabled())) scheduler.revokePermissions();
     const revokedTabIds = await ownership.reconcile();
+    await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
     await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
     await browser.expireCommits();
     await handoff.restore();
