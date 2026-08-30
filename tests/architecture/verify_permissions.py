@@ -45,8 +45,8 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ROOT_MANIFEST = ROOT / "manifest.json"
-MIRROR_MANIFEST = ROOT / "extension" / "manifest.json"
+SOURCE_MANIFEST = ROOT / "packages" / "extension" / "src" / "manifest.json"
+EXTENSION_SOURCE = ROOT / "packages" / "extension" / "src"
 REQUIRED_PERMISSIONS = (
     "nativeMessaging",
     "debugger",
@@ -117,21 +117,8 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
 
 
 def verify_extension_permission_contract() -> None:
-    """Check the built Automation control cannot dynamically toggle debugger."""
-    pairs = (
-        (ROOT / "background.js", ROOT / "extension" / "background.js"),
-        (ROOT / "popup.js", ROOT / "extension" / "popup.js"),
-        (ROOT / "popup.css", ROOT / "extension" / "popup.css"),
-    )
-    for root_path, mirror_path in pairs:
-        root_payload = manifest_bytes(root_path)
-        mirror_payload = manifest_bytes(mirror_path)
-        if root_payload != mirror_payload:
-            raise GateFailure(
-                f"{root_path.relative_to(ROOT)} and {mirror_path.relative_to(ROOT)} differ"
-            )
-
-    background = manifest_bytes(ROOT / "background.js").decode("utf-8")
+    """Check the canonical Automation source cannot dynamically toggle debugger."""
+    background = manifest_bytes(EXTENSION_SOURCE / "background.ts").decode("utf-8")
     for required in (
         "automationEnabled",
         "clearAutomationRuntime",
@@ -146,7 +133,7 @@ def verify_extension_permission_contract() -> None:
     if debugger_mutation.search(background):
         raise GateFailure("background must not dynamically request or remove debugger")
 
-    popup = manifest_bytes(ROOT / "popup.js").decode("utf-8")
+    popup = manifest_bytes(EXTENSION_SOURCE / "popup.ts").decode("utf-8")
     for required in (
         "changeOptionalScriptingPermission",
         'permissions: ["scripting"]',
@@ -161,13 +148,10 @@ def verify_extension_permission_contract() -> None:
 
 def verify() -> dict[str, Any]:
     """Run the side-effect-free PR1 manifest decision gate."""
-    root_bytes = manifest_bytes(ROOT_MANIFEST)
-    mirror_bytes = manifest_bytes(MIRROR_MANIFEST)
-    if root_bytes != mirror_bytes:
-        raise GateFailure("manifest.json and extension/manifest.json differ")
+    source_bytes = manifest_bytes(SOURCE_MANIFEST)
     verify_extension_permission_contract()
 
-    source = parse_manifest(ROOT_MANIFEST, root_bytes)
+    source = parse_manifest(SOURCE_MANIFEST, source_bytes)
     if source.get("manifest_version") != 3:
         raise GateFailure("permission gate requires a Manifest V3 source")
 
@@ -210,7 +194,7 @@ def verify() -> dict[str, Any]:
         "debugger_required_at_install": True,
         "scripting_optional_at_runtime": True,
         "active_tab_retained": False,
-        "source_manifest_sha256": hashlib.sha256(root_bytes).hexdigest(),
+        "source_manifest_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "staged_manifest_sha256": hashlib.sha256(staged_bytes).hexdigest(),
     }
 

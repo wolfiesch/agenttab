@@ -24,8 +24,6 @@ PACKAGE_MANIFESTS = {
 }
 EXTENSION_MANIFESTS = (
     "packages/extension/src/manifest.json",
-    "manifest.json",
-    "extension/manifest.json",
 )
 RUST_PACKAGES = {
     "host-rs/crates/agenttab-host/Cargo.toml": "agenttab-host",
