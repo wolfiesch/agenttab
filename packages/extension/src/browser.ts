@@ -16,7 +16,6 @@ const TAB_ONLY_ACTIONS: Readonly<Record<string, true>> = {
 const TAB_ONLY_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   load: true,
   url: true,
-  download: true,
 };
 const SUPPORTED_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   load: true,
@@ -39,6 +38,11 @@ interface PendingWindowOpen {
   expiresAt: number;
 }
 
+interface TrackedDownload {
+  startedAt: number;
+  completedAt?: number;
+}
+
 interface DebugSession {
   attached: boolean;
   attachPromise?: Promise<void>;
@@ -48,6 +52,7 @@ interface DebugSession {
   inflight: Set<string>;
   lastNetworkActivity: number;
   pageLoadInFlight: boolean;
+  downloads: Map<string, TrackedDownload>;
   dialogGeneration: number;
   dialog?: JavaScriptDialog;
   pendingWindowOpen?: PendingWindowOpen;
@@ -140,6 +145,15 @@ export class StandardBrowserRuntime {
         ) {
           session.inflight.delete(params.requestId);
           session.lastNetworkActivity = Date.now();
+        } else if (method === "Page.downloadWillBegin" && typeof params.guid === "string") {
+          session.downloads.set(params.guid, { startedAt: Date.now() });
+        } else if (method === "Page.downloadProgress" && typeof params.guid === "string") {
+          const download = session.downloads.get(params.guid);
+          if (params.state === "completed" && download) {
+            download.completedAt = Date.now();
+          } else if (params.state === "canceled") {
+            session.downloads.delete(params.guid);
+          }
         } else if (method === "Page.javascriptDialogOpening") {
           session.dialogGeneration += 1;
           session.dialog = {
@@ -1127,13 +1141,15 @@ export class StandardBrowserRuntime {
       return session.inflight.size === 0 && Date.now() - session.lastNetworkActivity >= 500;
     }
     if (kind === "download") {
-      const downloads = await chrome.downloads.search({ state: "complete" });
-      return downloads.some((download) => {
-        const completedAtMs = Date.parse(download.endTime ?? "");
-        return download.tabId === tabId
-          && Number.isFinite(completedAtMs)
-          && completedAtMs >= waitStartedAtMs;
-      });
+      await this.ensureAttached(tabId);
+      const session = this.sessions.get(tabId);
+      if (!session) return false;
+      for (const [guid, download] of session.downloads) {
+        if (download.completedAt === undefined) continue;
+        session.downloads.delete(guid);
+        if (download.completedAt >= waitStartedAtMs) return true;
+      }
+      return false;
     }
     throw Object.assign(new Error(`Unsupported wait condition: ${String(kind)}`), {
       code: "invalid_request",
@@ -1286,6 +1302,7 @@ export class StandardBrowserRuntime {
         inflight: new Set(),
         lastNetworkActivity: Date.now(),
         pageLoadInFlight: false,
+        downloads: new Map(),
         dialogGeneration: 0,
       };
       this.sessions.set(tabId, session);

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, setSystemTime, test, vi } from "bun:test";
+import { beforeEach, describe, expect, test, vi } from "bun:test";
 import { StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
@@ -1260,83 +1260,72 @@ describe("page revision monotonicity", () => {
     expect((await readState()).revisions["61"]).toMatchObject({ floor: 2, current: 2 });
   });
 
-  test("matches only downloads completed after the wait starts", async () => {
-    const clockStart = new Date("2026-08-30T00:00:00.000Z").getTime();
-    const scheduledTimers: Array<() => void> = [];
-    let timerScheduled = Promise.withResolvers<void>();
-    const originalSetTimeout = globalThis.setTimeout;
-    globalThis.setTimeout = ((callback: unknown) => {
-      if (typeof callback !== "function") throw new Error("browser wait timer must be a callback");
-      scheduledTimers.push(() => callback());
-      timerScheduled.resolve();
-      return 0;
-    }) as typeof setTimeout;
-    const takeScheduledTimer = (): (() => void) => {
-      const timer = scheduledTimers.shift();
-      if (!timer) throw new Error("expected browser wait timer");
-      return timer;
-    };
-    setSystemTime(clockStart);
+  test("matches only tab-scoped downloads completed after the wait starts", async () => {
+    vi.useFakeTimers();
     try {
+      const flushPromiseQueue = async (): Promise<void> => {
+        for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+      };
+      const advanceTimers = async (milliseconds: number): Promise<void> => {
+        for (let elapsed = 0; elapsed < milliseconds; elapsed += 50) {
+          vi.advanceTimersByTime(Math.min(50, milliseconds - elapsed));
+          await flushPromiseQueue();
+        }
+      };
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      await runtime.snapshot(61, { mode: "accessibility" });
+
       completedDownloads = [{
         id: 1,
         state: "complete",
-        tabId: 61,
         endTime: new Date(Date.now() - 60_000).toISOString(),
       }];
-      const revisions = new RevisionTracker();
-      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
-
+      emitDebuggerEvent(61, "Page.downloadWillBegin", { guid: "stale" });
+      emitDebuggerEvent(61, "Page.downloadProgress", { guid: "stale", state: "completed" });
+      vi.advanceTimersByTime(1);
       const staleWait = runtime.wait(61, {
         condition: { kind: "download" },
         timeout_ms: 1,
       });
-      await timerScheduled.promise;
-      setSystemTime(clockStart + 100);
-      takeScheduledTimer()();
+      await flushPromiseQueue();
+      await advanceTimers(100);
       await expect(staleWait).rejects.toMatchObject({ code: "wait_timeout" });
 
-      completedDownloads = [];
-      timerScheduled = Promise.withResolvers<void>();
+      let settled = false;
       const waiting = runtime.wait(61, {
         condition: { kind: "download" },
-        timeout_ms: 500,
+        timeout_ms: 1_000,
+      }).then((result) => {
+        settled = true;
+        return result;
       });
-      await timerScheduled.promise;
-      setSystemTime(clockStart + 101);
+      await flushPromiseQueue();
       completedDownloads = [{
         id: 2,
         state: "complete",
-        tabId: 62,
         endTime: new Date().toISOString(),
       }];
-      const outcome = waiting.then(
-        () => "matched",
-        () => "rejected",
-      );
-      timerScheduled = Promise.withResolvers<void>();
-      setSystemTime(clockStart + 200);
-      takeScheduledTimer()();
-      expect(await Promise.race([
-        timerScheduled.promise.then(() => "pending"),
-        outcome,
-      ])).toBe("pending");
-      setSystemTime(clockStart + 201);
-      completedDownloads = [{
-        id: 3,
-        state: "complete",
-        tabId: 61,
-        endTime: new Date().toISOString(),
-      }];
-      takeScheduledTimer()();
+      emitDebuggerEvent(62, "Page.downloadWillBegin", { guid: "other-tab" });
+      emitDebuggerEvent(62, "Page.downloadProgress", { guid: "other-tab", state: "completed" });
+      await advanceTimers(100);
+      expect(settled).toBe(false);
+
+      emitDebuggerEvent(61, "Page.downloadWillBegin", { guid: "target-tab" });
+      emitDebuggerEvent(61, "Page.downloadProgress", { guid: "target-tab", state: "completed" });
+      await advanceTimers(100);
       await expect(waiting).resolves.toMatchObject({
         tab_id: 61,
         condition: "download",
         matched: true,
       });
+      await runtime.detach(61);
     } finally {
-      globalThis.setTimeout = originalSetTimeout;
-      setSystemTime();
+      vi.useRealTimers();
     }
   });
 
