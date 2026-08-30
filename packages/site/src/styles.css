@@ -1085,6 +1085,13 @@ nav a[aria-current="page"],
     transform: none;
     transition: none;
   }
+
+  .text-gradient {
+    background: none;
+    -webkit-background-clip: border-box;
+    background-clip: border-box;
+    color: var(--ink);
+  }
 }
 
 @media (max-width: 54rem) {
