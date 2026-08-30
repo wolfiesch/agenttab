@@ -28,11 +28,12 @@ export type OperationCardStatus =
   | "awaiting_approval"
   | "executed"
   | "observed"
+  | "uncertain"
   | "blocked";
 
 export interface OperationCardStep {
   label: string;
-  state: "done" | "active" | "pending" | "blocked";
+  state: "done" | "active" | "pending" | "uncertain" | "blocked";
 }
 
 export interface OperationCard {
@@ -132,7 +133,7 @@ export function renderOperationCard(
   const color = card.status === "blocked"
     ? "error"
     : card.status === "planned" || card.status === "running" || card.status === "awaiting_user" ||
-      card.status === "awaiting_approval"
+      card.status === "awaiting_approval" || card.status === "uncertain"
       ? "warning"
       : card.status === "observed"
         ? "success"
@@ -144,7 +145,7 @@ export function renderOperationCard(
   if (card.status === "running") return lines;
   const showLifecycle = expanded || card.status === "planned" ||
     card.status === "awaiting_user" || card.status === "awaiting_approval" ||
-    card.status === "blocked";
+    card.status === "uncertain" || card.status === "blocked";
   if (showLifecycle) {
     lines.push(fg(theme, "dim", truncate(`  Flow · ${renderSteps(card.steps)}`, Math.max(1, safeWidth - 2))));
   }
@@ -319,6 +320,9 @@ function resultStatus(
   options: RenderOptions,
   details: Record<string, unknown>,
 ): OperationCardStatus {
+  const outcome = fieldString(toRecord(details._agenttab), "outcome") ?? fieldString(details, "outcome");
+  if (outcome === "unknown") return "uncertain";
+  if (method === "browser_handoff" && outcome === "needs_user") return "awaiting_user";
   if (options.isPartial === true) return method === "browser_handoff" ? "awaiting_user" : "running";
   if (result.isError === true) return "blocked";
   if (typeof details.staged_token === "string" || details.awaiting_human_approval === true) {
@@ -438,6 +442,12 @@ function operationSteps(status: OperationCardStatus, method: ToolMethod): readon
         { label: "Execute", state: "done" },
         { label: "Observe", state: "done" },
       ];
+    case "uncertain":
+      return [
+        { label: "Intent", state: "done" },
+        { label: "Execute", state: "uncertain" },
+        { label: "Reconcile", state: "active" },
+      ];
     case "blocked":
       return [
         { label: "Intent", state: "done" },
@@ -453,6 +463,7 @@ function renderSteps(steps: readonly OperationCardStep[]): string {
     active: "▶",
     pending: "·",
     blocked: "×",
+    uncertain: "?",
   };
   return steps.map((step) => `${marker[step.state]} ${step.label}`).join("  ");
 }
@@ -466,6 +477,7 @@ function statusLabel(status: OperationCardStatus): string {
     executed: "Executed",
     observed: "Observed",
     blocked: "Blocked",
+    uncertain: "Uncertain",
   };
   return labels[status];
 }
@@ -487,6 +499,9 @@ function resultNotices(status: OperationCardStatus, details: Record<string, unkn
   const notices: string[] = [];
   if (status === "awaiting_approval") {
     notices.push("Policy · Consequential action paused before execution");
+  }
+  if (status === "uncertain") {
+    notices.push("Safety · Execution may have occurred; inspect live state before retrying");
   }
   if (status === "blocked") {
     const code = fieldString(details, "code");
