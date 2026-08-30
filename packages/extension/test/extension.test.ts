@@ -2065,13 +2065,17 @@ describe("page revision monotonicity", () => {
                           ? { name: "totp" }
                           : objectId.endsWith("-31")
                             ? { "aria-label": "2FA code" }
-                            : { placeholder: "Two-factor code" };
+                            : objectId.endsWith("-32")
+                              ? { placeholder: "Two-factor code" }
+                              : objectId.endsWith("-33")
+                                ? { "aria-label": "Card expiration month" }
+                                : { name: "cardExpiryYear" };
         const target = {
           form: null,
           labels: [],
           options: [],
           ownerDocument: { getElementById() { return null; } },
-          tagName: objectId.endsWith("-24") ? "SELECT" : "INPUT",
+          tagName: objectId.endsWith("-24") || objectId.endsWith("-33") || objectId.endsWith("-34") ? "SELECT" : "INPUT",
           innerText: "",
           textContent: "",
           id: "",
@@ -2115,6 +2119,8 @@ describe("page revision monotonicity", () => {
       { kind: "type", ref: `r${pageRevision}-30`, text: "123456" },
       { kind: "fill", ref: `r${pageRevision}-31`, text: "123456" },
       { kind: "type", ref: `r${pageRevision}-32`, text: "123456" },
+      { kind: "select", ref: `r${pageRevision}-33`, value: "08" },
+      { kind: "select", ref: `r${pageRevision}-34`, value: "2030" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
