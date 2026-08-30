@@ -2077,7 +2077,13 @@ describe("page revision monotonicity", () => {
                                       ? { name: "cvv2" }
                                       : objectId.endsWith("-37")
                                         ? { name: "cid" }
-                                        : { name: "cardVerificationValue" };
+                                        : objectId.endsWith("-38")
+                                          ? { name: "cardVerificationValue" }
+                                          : objectId.endsWith("-39")
+                                            ? { name: "mfaCode" }
+                                            : objectId.endsWith("-40")
+                                              ? { "aria-label": "MFA token" }
+                                              : { name: "multiFactorAuthenticationCode" };
         const target = {
           form: null,
           labels: [],
@@ -2133,6 +2139,9 @@ describe("page revision monotonicity", () => {
       { kind: "fill", ref: `r${pageRevision}-36`, text: "123" },
       { kind: "fill", ref: `r${pageRevision}-37`, text: "123" },
       { kind: "fill", ref: `r${pageRevision}-38`, text: "123" },
+      { kind: "fill", ref: `r${pageRevision}-39`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-40`, text: "123456" },
+      { kind: "fill", ref: `r${pageRevision}-41`, text: "123456" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
