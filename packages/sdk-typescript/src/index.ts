@@ -135,6 +135,38 @@ export class AgentTabError extends Error {
   }
 }
 
+export type AgentTabTransportErrorCode =
+  | "request_timeout"
+  | "connection_closed"
+  | "transport_error";
+
+export class AgentTabTransportError extends Error {
+  readonly code: AgentTabTransportErrorCode;
+  readonly method: RpcMethod;
+  readonly outcome = "unknown" as const;
+  readonly idempotencyKey?: string;
+
+  constructor(
+    method: RpcMethod,
+    options: {
+      code?: AgentTabTransportErrorCode;
+      idempotencyKey?: string;
+      cause?: unknown;
+    } = {},
+  ) {
+    const message = options.cause instanceof Error
+      ? options.cause.message
+      : "AgentTab transport failure";
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "AgentTabTransportError";
+    this.code = options.code ?? "transport_error";
+    this.method = method;
+    if (options.idempotencyKey !== undefined) {
+      this.idempotencyKey = options.idempotencyKey;
+    }
+  }
+}
+
 export interface ResumeCapabilityStore {
   readonly path: string;
   load(): Promise<string | undefined>;
@@ -416,6 +448,8 @@ interface PendingRequest {
   resolve(response: RpcResponse): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
+  method: RpcMethod;
+  idempotencyKey?: string;
 }
 
 interface NegotiatedConnection {
@@ -616,6 +650,10 @@ export class AgentTabClient {
     return client;
   }
 
+  get closed(): boolean {
+    return this.#closed;
+  }
+
   get resumeCapability(): string | undefined {
     return this.#resumeCapability;
   }
@@ -628,28 +666,44 @@ export class AgentTabClient {
     if (this.#closed) throw new Error("AgentTab client is closed");
     const requestId = randomUUID();
     const timeoutMs = options.timeoutMs ?? this.#requestTimeoutMs;
+    const idempotencyKey = MUTATIONS.has(method)
+      ? options.idempotencyKey ?? createUuidV7()
+      : undefined;
+    const request = {
+      protocol: RPC_PROTOCOL,
+      version: RPC_VERSION,
+      request_id: requestId,
+      ...(idempotencyKey !== undefined ? { idempotency_key: idempotencyKey } : {}),
+      method,
+      params,
+    };
+    const frame = encodeFrame(request);
     const response = new Promise<RpcResponse<T>>((resolve, reject) => {
       const timer = setTimeout(() => {
+        const pending = this.#pending.get(requestId);
+        if (!pending) return;
         this.#pending.delete(requestId);
-        reject(new Error(`AgentTab ${method} timed out after ${timeoutMs} ms`));
+        pending.reject(this.#transportError(
+          pending,
+          new Error(`AgentTab ${method} timed out after ${timeoutMs} ms`),
+          "request_timeout",
+        ));
       }, timeoutMs);
       this.#pending.set(requestId, {
         resolve: resolve as (response: RpcResponse) => void,
         reject,
         timer,
+        method,
+        ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
       });
     });
-    const request = {
-      protocol: RPC_PROTOCOL,
-      version: RPC_VERSION,
-      request_id: requestId,
-      ...(MUTATIONS.has(method)
-        ? { idempotency_key: options.idempotencyKey ?? createUuidV7() }
-        : {}),
-      method,
-      params,
-    };
-    this.#socket.write(encodeFrame(request));
+    try {
+      this.#socket.write(frame, (error) => {
+        if (error) this.#failTransport(error, "transport_error");
+      });
+    } catch (error) {
+      this.#failTransport(error, "transport_error");
+    }
     return response;
   }
 
@@ -675,15 +729,14 @@ export class AgentTabClient {
       try {
         for (const value of decoder.push(chunk)) this.#handleResponse(value);
       } catch (error) {
-        this.#socket.destroy();
-        this.#rejectPending(error instanceof Error ? error : new Error(String(error)));
+        this.#failTransport(error, "transport_error");
       }
     });
-    this.#socket.on("error", (error) => this.#rejectPending(error));
-    this.#socket.on("close", () => {
-      this.#closed = true;
-      this.#rejectPending(new Error("AgentTab connection closed"));
-    });
+    this.#socket.on("error", (error) => this.#failTransport(error, "transport_error"));
+    this.#socket.on("close", () => this.#failTransport(
+      new Error("AgentTab connection closed"),
+      "connection_closed",
+    ));
   }
 
   #handleResponse(value: unknown): void {
@@ -706,10 +759,30 @@ export class AgentTabClient {
     );
   }
 
-  #rejectPending(error: Error): void {
+  #failTransport(error: unknown, code: AgentTabTransportErrorCode): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#socket.destroy();
+    this.#rejectPending(error, code);
+  }
+
+  #transportError(
+    pending: PendingRequest,
+    cause: unknown,
+    code: AgentTabTransportErrorCode,
+  ): AgentTabTransportError {
+    return new AgentTabTransportError(pending.method, {
+      code,
+      ...(pending.idempotencyKey !== undefined ? { idempotencyKey: pending.idempotencyKey } : {}),
+      cause,
+    });
+  }
+
+  #rejectPending(cause: unknown, code?: AgentTabTransportErrorCode): void {
+    const error = cause instanceof Error ? cause : new Error(String(cause));
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(error);
+      pending.reject(code === undefined ? error : this.#transportError(pending, cause, code));
     }
     this.#pending.clear();
   }

@@ -670,30 +670,44 @@ export class StandardBrowserRuntime {
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30_000;
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
-    do {
-      await this.authorizeDebuggerUse(tabId);
-      if (revalidate) await revalidate();
-      if (requiresFullAutomationRoute) {
-        await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
-      }
-      const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs);
-      if (revalidate) await revalidate();
-      if (matched) {
-        return {
-          tab_id: tabId,
-          page_revision: await this.revisions.current(tabId),
-          condition: conditionKind,
-          matched: true,
-        };
-      }
-      const delay = Promise.withResolvers<void>();
-      setTimeout(delay.resolve, 100);
-      await delay.promise;
-    } while (Date.now() < deadline);
-    throw Object.assign(new Error(`Timed out waiting for ${String(condition.kind)}`), {
-      code: "wait_timeout",
-      outcome: "unknown",
-    });
+    let debuggerSession =
+      conditionKind === "network_idle" || conditionKind === "download"
+        ? await this.acquireDebuggerBusyLease(tabId)
+        : undefined;
+    try {
+      do {
+        await this.authorizeDebuggerUse(tabId);
+        if (revalidate) await revalidate();
+        if (requiresFullAutomationRoute) {
+          await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
+        }
+        if (
+          debuggerSession &&
+          (this.sessions.get(tabId) !== debuggerSession || !debuggerSession.attached)
+        ) {
+          debuggerSession = await this.acquireDebuggerBusyLease(tabId, debuggerSession);
+        }
+        const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs, debuggerSession);
+        if (revalidate) await revalidate();
+        if (matched) {
+          return {
+            tab_id: tabId,
+            page_revision: await this.revisions.current(tabId),
+            condition: conditionKind,
+            matched: true,
+          };
+        }
+        const delay = Promise.withResolvers<void>();
+        setTimeout(delay.resolve, 100);
+        await delay.promise;
+      } while (Date.now() < deadline);
+      throw Object.assign(new Error(`Timed out waiting for ${String(condition.kind)}`), {
+        code: "wait_timeout",
+        outcome: "unknown",
+      });
+    } finally {
+      if (debuggerSession) this.releaseDebuggerBusyLease(tabId, debuggerSession);
+    }
   }
 
   async developer(tabId: number, action: string, params: Record<string, unknown>): Promise<unknown> {
@@ -1116,6 +1130,7 @@ export class StandardBrowserRuntime {
     tabId: number,
     condition: Record<string, unknown>,
     waitStartedAtMs: number,
+    debuggerSession?: DebugSession,
   ): Promise<boolean> {
     const kind = condition.kind;
     if (kind === "load") return (await chrome.tabs.get(tabId)).status === "complete";
@@ -1132,9 +1147,8 @@ export class StandardBrowserRuntime {
       return result === true;
     }
     if (kind === "network_idle") {
-      await this.ensureAttached(tabId);
-      const session = this.sessions.get(tabId);
-      if (!session) return false;
+      const session = debuggerSession;
+      if (!session || this.sessions.get(tabId) !== session || !session.attached) return false;
       if (session.pageLoadInFlight) {
         if ((await chrome.tabs.get(tabId)).status === "loading") return false;
         session.pageLoadInFlight = false;
@@ -1143,9 +1157,8 @@ export class StandardBrowserRuntime {
       return session.inflight.size === 0 && Date.now() - session.lastNetworkActivity >= 500;
     }
     if (kind === "download") {
-      await this.ensureAttached(tabId);
-      const session = this.sessions.get(tabId);
-      if (!session) return false;
+      const session = debuggerSession;
+      if (!session || this.sessions.get(tabId) !== session || !session.attached) return false;
       for (const [guid, download] of session.downloads) {
         if (download.completedAt === undefined) continue;
         session.downloads.delete(guid);
@@ -1360,16 +1373,7 @@ export class StandardBrowserRuntime {
     }
   }
 
-  private scheduleIdleDetach(tabId: number, session: DebugSession): void {
-    if (session.idleTimer) clearTimeout(session.idleTimer);
-    session.idleTimer = setTimeout(() => {
-      void this.detach(tabId).catch(() => {
-        if (this.sessions.get(tabId) === session) this.scheduleIdleDetach(tabId, session);
-      });
-    }, DEBUGGER_IDLE_MS);
-  }
-
-  private async send(tabId: number, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async acquireDebuggerBusyLease(tabId: number, activeSession?: DebugSession): Promise<DebugSession> {
     await this.ensureAttached(tabId);
     const session = this.sessions.get(tabId);
     if (!session?.attached) {
@@ -1377,18 +1381,40 @@ export class StandardBrowserRuntime {
         code: "debugger_detached",
       });
     }
+    if (session === activeSession) return session;
+    if (activeSession) this.releaseDebuggerBusyLease(tabId, activeSession);
     if (session.idleTimer) clearTimeout(session.idleTimer);
     session.idleTimer = undefined;
     session.busyCount += 1;
+    return session;
+  }
+
+  private releaseDebuggerBusyLease(tabId: number, session: DebugSession): void {
+    session.busyCount -= 1;
+    if (this.sessions.get(tabId) === session && session.busyCount === 0) {
+      this.scheduleIdleDetach(tabId, session);
+    }
+  }
+
+  private scheduleIdleDetach(tabId: number, session: DebugSession): void {
+    if (session.busyCount > 0) return;
+    clearTimeout(session.idleTimer);
+    session.idleTimer = setTimeout(() => {
+      if (session.busyCount > 0) return;
+      void this.detach(tabId).catch(() => {
+        if (this.sessions.get(tabId) === session) this.scheduleIdleDetach(tabId, session);
+      });
+    }, DEBUGGER_IDLE_MS);
+  }
+
+  private async send(tabId: number, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const session = await this.acquireDebuggerBusyLease(tabId);
     try {
       await this.authorizeDebuggerUse(tabId);
       const result: unknown = await chrome.debugger.sendCommand({ tabId }, method, params);
       return isRecord(result) ? result : {};
     } finally {
-      session.busyCount -= 1;
-      if (this.sessions.get(tabId) === session && session.busyCount === 0) {
-        this.scheduleIdleDetach(tabId, session);
-      }
+      this.releaseDebuggerBusyLease(tabId, session);
     }
   }
 }

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import type { AgentTabClient } from "../../sdk-typescript/src/index";
+import { AgentTabTransportError, type AgentTabClient } from "../../sdk-typescript/src/index";
 import { makeExtension, type AgentApi } from "../src/index";
 
 const originalDeveloper = process.env.AGENTTAB_DEVELOPER;
@@ -103,6 +103,142 @@ test("registered tools call Core RPC without TCP or lease verbs", async () => {
     tabs: [],
     _agenttab: { outcome: "committed", task_id: "task-test-1234" },
   });
+});
+
+test("OMP reconnects after a closed client fails without replaying and reports the new task id", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const calls: Array<{ client: string; method: string }> = [];
+  const firstClient = {
+    connection: { task_id: "task-old" },
+    get closed() {
+      return true;
+    },
+    request: async (method: string) => {
+      calls.push({ client: "first", method });
+      throw new Error("transport closed");
+    },
+  } as unknown as AgentTabClient;
+  const secondClient = {
+    connection: { task_id: "task-new" },
+    get closed() {
+      return false;
+    },
+    request: async (method: string) => {
+      calls.push({ client: "second", method });
+      return {
+        ok: true,
+        outcome: "committed",
+        request_id: "request-new",
+        result: { tabs: ["tab-new"] },
+      };
+    },
+  } as unknown as AgentTabClient;
+  let connections = 0;
+  const api = {
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  };
+  makeExtension(async () => {
+    connections += 1;
+    return connections === 1 ? firstClient : secondClient;
+  })(api as unknown as AgentApi);
+  const tool = tools.find((candidate) => candidate.name === "browser_tabs");
+  const first = await executeTool(tool);
+  expect(first).toMatchObject({
+    content: [{ type: "text", text: "transport closed" }],
+    isError: true,
+  });
+  expect(calls).toEqual([{ client: "first", method: "browser_tabs" }]);
+  const second = await executeTool(tool);
+  expect(second.details).toEqual({
+    tabs: ["tab-new"],
+    _agenttab: { outcome: "committed", task_id: "task-new" },
+  });
+  expect(connections).toBe(2);
+  expect(calls).toEqual([
+    { client: "first", method: "browser_tabs" },
+    { client: "second", method: "browser_tabs" },
+  ]);
+});
+
+test("OMP reports mutation transport failures as unknown with the reconciliation key", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const client = {
+    connection: { task_id: "task-timeout" },
+    get closed() {
+      return false;
+    },
+    request: async () => {
+      throw new AgentTabTransportError("browser_open", {
+        code: "request_timeout",
+        idempotencyKey: "00000000-0000-7000-8000-000000000001",
+        cause: new Error("request timed out"),
+      });
+    },
+  } as unknown as AgentTabClient;
+  const api = {
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  };
+  makeExtension(async () => client)(api as unknown as AgentApi);
+  const result = await executeTool(tools.find((candidate) => candidate.name === "browser_open"));
+  expect(result).toMatchObject({
+    content: [{ type: "text", text: "request timed out" }],
+    details: {
+      code: "request_timeout",
+      outcome: "unknown",
+      method: "browser_open",
+      idempotency_key: "00000000-0000-7000-8000-000000000001",
+    },
+    isError: true,
+  });
+});
+
+test("OMP retains a live client after an RPC error", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const calls: string[] = [];
+  const client = {
+    connection: { task_id: "task-live" },
+    get closed() {
+      return false;
+    },
+    request: async (method: string) => {
+      calls.push(method);
+      if (calls.length === 1) {
+        return {
+          ok: false,
+          outcome: "denied",
+          request_id: "request-denied",
+          error: { code: "operation_denied", message: "application rejected" },
+        };
+      }
+      return {
+        ok: true,
+        outcome: "committed",
+        request_id: "request-live",
+        result: { tabs: ["tab-live"] },
+      };
+    },
+  } as unknown as AgentTabClient;
+  let connections = 0;
+  const api = {
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  };
+  makeExtension(async () => {
+    connections += 1;
+    return client;
+  })(api as unknown as AgentApi);
+  const tool = tools.find((candidate) => candidate.name === "browser_tabs");
+  const first = await executeTool(tool);
+  expect(first).toMatchObject({
+    details: { code: "operation_denied", outcome: "denied" },
+    isError: true,
+  });
+  const second = await executeTool(tool);
+  expect(second.structuredContent).toEqual({ tabs: ["tab-live"] });
+  expect(connections).toBe(1);
+  expect(calls).toEqual(["browser_tabs", "browser_tabs"]);
 });
 
 test("OMP tools expose compact and expanded custom renderers", () => {

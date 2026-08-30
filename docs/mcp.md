@@ -94,6 +94,8 @@ The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `reques
 
 Mutation methods carry a UUIDv7 idempotency key in Core RPC. The adapter generates one when a caller has not supplied a Core request. Reusing a completed key for identical work returns the durable response; reusing it with different input is a conflict. A mutation found only as started after recovery returns `unknown` and is not replayed.
 
+Raw TypeScript and Python SDK clients raise `AgentTabTransportError` for an ambiguous timeout, connection close, or transport failure. The error carries the method and, for mutations, the exact generated or caller-supplied idempotency key. A caller may reconnect and explicitly retry the same method and parameters with that key; the SDK never replays the request automatically. MCP and OMP adapters likewise return the failed invocation, discard a cached client only when its transport is closed, and reconnect on the next invocation.
+
 ### Your Turn handoff
 
 Call `browser_handoff` before the user enters credentials or completes another human-only step. AgentTab activates a global blackout, focuses the declared tab, opens its user-facing handoff state, and denies browser observation and capture for every task while the handoff is active. Automation resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the handoff is cleared.

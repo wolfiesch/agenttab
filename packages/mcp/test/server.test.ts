@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentTabClient } from "../../sdk-typescript/src/index";
+import { AgentTabTransportError, type AgentTabClient } from "../../sdk-typescript/src/index";
 import {
   DEVELOPER_TOOL,
   McpServer,
@@ -74,6 +74,137 @@ describe("AgentTab MCP surface", () => {
     const entries = [];
     for await (const entry of readBoundedLines(chunks(), 8)) entries.push(entry);
     expect(entries).toEqual([{ line: "12345678" }]);
+  });
+
+  test("evicts a closed client after a failed tool call and reconnects without replaying", async () => {
+    const calls: Array<{ client: string; method: string }> = [];
+    const firstClient = {
+      get closed() {
+        return true;
+      },
+      call: async (method: string) => {
+        calls.push({ client: "first", method });
+        throw new Error("transport closed");
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const secondClient = {
+      get closed() {
+        return false;
+      },
+      call: async (method: string) => {
+        calls.push({ client: "second", method });
+        return { tabs: ["tab-new"] };
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    let connections = 0;
+    const server = new McpServer({
+      clientFactory: async () => {
+        connections += 1;
+        return connections === 1 ? firstClient : secondClient;
+      },
+    });
+    const first = await server.handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "browser_tabs", arguments: {} },
+    }) as Record<string, unknown>;
+    expect(first).toMatchObject({
+      content: [{ type: "text", text: "transport closed" }],
+      isError: true,
+    });
+    expect(calls).toEqual([{ client: "first", method: "browser_tabs" }]);
+    const second = await server.handle({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "browser_tabs", arguments: {} },
+    }) as Record<string, unknown>;
+    expect(second.structuredContent).toEqual({ tabs: ["tab-new"] });
+    expect(connections).toBe(2);
+    expect(calls).toEqual([
+      { client: "first", method: "browser_tabs" },
+      { client: "second", method: "browser_tabs" },
+    ]);
+    server.close();
+  });
+
+  test("reports mutation transport failures as unknown with the reconciliation key", async () => {
+    const client = {
+      get closed() {
+        return false;
+      },
+      call: async () => {
+        throw new AgentTabTransportError("browser_open", {
+          code: "request_timeout",
+          idempotencyKey: "00000000-0000-7000-8000-000000000001",
+          cause: new Error("request timed out"),
+        });
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ clientFactory: async () => client });
+    const result = await server.handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "browser_open",
+        arguments: { mode: "create", url: "https://example.com" },
+      },
+    }) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      content: [{ type: "text", text: "request timed out" }],
+      structuredContent: {
+        code: "request_timeout",
+        outcome: "unknown",
+        method: "browser_open",
+        idempotency_key: "00000000-0000-7000-8000-000000000001",
+      },
+      isError: true,
+    });
+    server.close();
+  });
+
+  test("retains a live client after an application error", async () => {
+    const calls: string[] = [];
+    const client = {
+      get closed() {
+        return false;
+      },
+      call: async (method: string) => {
+        calls.push(method);
+        if (calls.length === 1) throw new Error("application rejected");
+        return { tabs: ["tab-live"] };
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    let connections = 0;
+    const server = new McpServer({
+      clientFactory: async () => {
+        connections += 1;
+        return client;
+      },
+    });
+    const first = await server.handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "browser_tabs", arguments: {} },
+    }) as Record<string, unknown>;
+    expect(first.isError).toBe(true);
+    const second = await server.handle({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "browser_tabs", arguments: {} },
+    }) as Record<string, unknown>;
+    expect(second.structuredContent).toEqual({ tabs: ["tab-live"] });
+    expect(connections).toBe(1);
+    expect(calls).toEqual(["browser_tabs", "browser_tabs"]);
+    server.close();
   });
 
   test("initialize and tools/call map directly to Core RPC", async () => {

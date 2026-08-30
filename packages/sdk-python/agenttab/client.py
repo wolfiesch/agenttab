@@ -13,7 +13,7 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping, Protocol
+from typing import Any, BinaryIO, Literal, Mapping, Protocol
 
 RPC_PROTOCOL = "agenttab.rpc"
 RPC_VERSION = 1
@@ -39,6 +39,27 @@ class AgentTabError(RuntimeError):
         self.outcome = str(response.get("outcome", "unknown"))
         self.recovery = details.get("recovery")
         self.details = details.get("details")
+
+
+TransportErrorCode = Literal[
+    "request_timeout",
+    "connection_closed",
+    "transport_error",
+]
+
+
+class AgentTabTransportError(RuntimeError):
+    def __init__(
+        self,
+        method: str,
+        code: TransportErrorCode,
+        idempotency_key: str | None = None,
+    ) -> None:
+        super().__init__(f"AgentTab transport failed during {method}: {code}")
+        self.outcome: Literal["unknown"] = "unknown"
+        self.method = method
+        self.code = code
+        self.idempotency_key = idempotency_key
 
 
 def uuid7(now_ms: int | None = None) -> uuid.UUID:
@@ -490,6 +511,79 @@ class AgentTabClient:
             stream.write(payload)
             stream.flush()
 
+    def _close_after_transport_failure(self) -> None:
+        self._closed = True
+        try:
+            self._stream.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _cancel_windows_io(worker: threading.Thread) -> None:
+        if os.name != "nt" or worker.native_id is None:
+            return
+        try:
+            import ctypes
+
+            thread_terminate = 0x0001
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenThread.argtypes = [
+                ctypes.c_ulong,
+                ctypes.c_bool,
+                ctypes.c_ulong,
+            ]
+            kernel32.OpenThread.restype = ctypes.c_void_p
+            kernel32.CancelSynchronousIo.argtypes = [ctypes.c_void_p]
+            kernel32.CancelSynchronousIo.restype = ctypes.c_bool
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_bool
+            handle = kernel32.OpenThread(thread_terminate, False, worker.native_id)
+            if handle:
+                try:
+                    kernel32.CancelSynchronousIo(handle)
+                finally:
+                    kernel32.CloseHandle(handle)
+        except (AttributeError, OSError):
+            pass
+
+    def _exchange(self, payload: bytes) -> JsonObject:
+        if isinstance(self._stream, socket.socket):
+            with self._lock:
+                self._write(self._stream, payload)
+                return read_frame(self._stream)
+
+        responses: list[JsonObject] = []
+        failures: list[Exception] = []
+        finished = threading.Event()
+
+        def exchange() -> None:
+            try:
+                with self._lock:
+                    self._write(self._stream, payload)
+                    responses.append(read_frame(self._stream))
+            except Exception as error:
+                failures.append(error)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=exchange, daemon=True)
+        worker.start()
+        if not finished.wait(self.request_timeout):
+            self._closed = True
+            self._cancel_windows_io(worker)
+            threading.Thread(
+                target=self._close_after_transport_failure,
+                daemon=True,
+            ).start()
+            raise TimeoutError(
+                f"AgentTab request timed out after {self.request_timeout} seconds"
+            )
+        if failures:
+            raise failures[0]
+        if not responses:
+            raise EOFError("AgentTab connection closed before a response arrived")
+        return responses[0]
+
     def confirm_resume_capability(self) -> None:
         candidate = self.pending_resume_capability
         connection_id = self.connection.get("connection_id")
@@ -534,6 +628,11 @@ class AgentTabClient:
             raise RuntimeError(
                 "Persist pending_resume_capability durably, then call confirm_resume_capability before RPC"
             )
+        mutation_idempotency_key: str | None = None
+        if method in MUTATIONS:
+            mutation_idempotency_key = (
+                idempotency_key if idempotency_key is not None else str(uuid7())
+            )
         request_id = str(uuid.uuid4())
         request: JsonObject = {
             "protocol": RPC_PROTOCOL,
@@ -542,11 +641,25 @@ class AgentTabClient:
             "method": method,
             "params": dict(params),
         }
-        if method in MUTATIONS:
-            request["idempotency_key"] = idempotency_key or str(uuid7())
-        with self._lock:
-            self._write(self._stream, encode_frame(request))
-            response = read_frame(self._stream)
+        if mutation_idempotency_key is not None:
+            request["idempotency_key"] = mutation_idempotency_key
+        payload = encode_frame(request)
+        try:
+            response = self._exchange(payload)
+        except (OSError, EOFError) as error:
+            if not self._closed:
+                self._close_after_transport_failure()
+            if isinstance(error, (TimeoutError, socket.timeout)):
+                code: TransportErrorCode = "request_timeout"
+            elif isinstance(error, (EOFError, ConnectionError)):
+                code = "connection_closed"
+            else:
+                code = "transport_error"
+            raise AgentTabTransportError(
+                method,
+                code,
+                mutation_idempotency_key,
+            ) from error
         if response.get("request_id") != request_id:
             raise RuntimeError("AgentTab response request_id did not match the request")
         task = response.get("task")

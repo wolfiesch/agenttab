@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import {
   AgentTabClient,
+  AgentTabTransportError,
   FrameDecoder,
   createUuidV7,
   createResumeCapabilityStore,
@@ -134,6 +135,136 @@ test("routes concurrent out-of-order responses by request id", async () => {
   expect(requests[0].idempotency_key).toMatch(/-7[0-9a-f]{3}-/);
   expect(requests[1]).not.toHaveProperty("idempotency_key");
   client.close();
+});
+
+test("exposes a generated key after a timeout so callers can retry without automatic replay", async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const endpoint = await listen((socket) => {
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da42",
+            resumed: false,
+            state: "ready",
+          }, 1024 * 1024));
+          continue;
+        }
+        requests.push(value);
+        if (requests.length === 2) {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            request_id: value.request_id,
+            ok: true,
+            outcome: "completed",
+            result: { retried: true },
+          }, 1024 * 1024));
+        }
+      }
+    });
+  });
+
+  const client = await AgentTabClient.connect({ endpoint });
+  let failure: unknown;
+  try {
+    await client.call("browser_open", { mode: "create", url: "https://example.com" }, { timeoutMs: 100 });
+  } catch (error) {
+    failure = error;
+  }
+
+  expect(failure).toBeInstanceOf(AgentTabTransportError);
+  const transportError = failure as AgentTabTransportError;
+  expect(transportError.code).toBe("request_timeout");
+  expect(transportError.method).toBe("browser_open");
+  expect(transportError.outcome).toBe("unknown");
+  expect(transportError.idempotencyKey).toMatch(/-7[0-9a-f]{3}-/);
+  expect(transportError.cause).toBeInstanceOf(Error);
+  expect(client.closed).toBe(false);
+  await expect(client.call(
+    "browser_open",
+    { mode: "create", url: "https://example.com" },
+    { idempotencyKey: transportError.idempotencyKey },
+  )).resolves.toEqual({ retried: true });
+  expect(requests).toHaveLength(2);
+  expect(requests[0].idempotency_key).toBe(transportError.idempotencyKey);
+  expect(requests[1].idempotency_key).toBe(transportError.idempotencyKey);
+  client.close();
+});
+
+test("exposes a caller-supplied key after connection close so callers can retry it", async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  let connections = 0;
+  const endpoint = await listen((socket) => {
+    const connection = connections++;
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da42",
+            resumed: false,
+            state: "ready",
+          }, 1024 * 1024));
+          continue;
+        }
+        requests.push(value);
+        if (connection === 0) {
+          socket.end();
+        } else {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            request_id: value.request_id,
+            ok: true,
+            outcome: "completed",
+            result: { retried: true },
+          }, 1024 * 1024));
+        }
+      }
+    });
+  });
+
+  const suppliedKey = "caller-supplied-idempotency-key";
+  const client = await AgentTabClient.connect({ endpoint });
+  let failure: unknown;
+  try {
+    await client.call(
+      "browser_open",
+      { mode: "create", url: "https://example.com" },
+      { idempotencyKey: suppliedKey },
+    );
+  } catch (error) {
+    failure = error;
+  }
+
+  expect(failure).toBeInstanceOf(AgentTabTransportError);
+  const transportError = failure as AgentTabTransportError;
+  expect(transportError.code).toBe("connection_closed");
+  expect(transportError.method).toBe("browser_open");
+  expect(transportError.outcome).toBe("unknown");
+  expect(transportError.idempotencyKey).toBe(suppliedKey);
+  expect(transportError.cause).toBeInstanceOf(Error);
+  expect(client.closed).toBe(true);
+  expect(connections).toBe(1);
+
+  const retry = await AgentTabClient.connect({ endpoint });
+  await expect(retry.call(
+    "browser_open",
+    { mode: "create", url: "https://example.com" },
+    { idempotencyKey: transportError.idempotencyKey },
+  )).resolves.toEqual({ retried: true });
+  expect(requests).toHaveLength(2);
+  expect(requests[0].idempotency_key).toBe(suppliedKey);
+  expect(requests[1].idempotency_key).toBe(suppliedKey);
+  retry.close();
 });
 
 test("does not create a new task when a stored resume capability is rejected", async () => {

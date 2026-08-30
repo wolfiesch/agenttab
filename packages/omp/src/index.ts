@@ -1,6 +1,7 @@
 import {
   AgentTabClient,
   AgentTabError,
+  AgentTabTransportError,
   STANDARD_ACTION_VALUE_MAX_CHARS,
   createResumeCapabilityStore,
   type MethodParams,
@@ -239,6 +240,18 @@ function failure(error: unknown): Record<string, unknown> {
       isError: true,
     };
   }
+  if (error instanceof AgentTabTransportError) {
+    return {
+      content: [{ type: "text", text: error.message }],
+      details: {
+        code: error.code,
+        outcome: error.outcome,
+        method: error.method,
+        ...(error.idempotencyKey ? { idempotency_key: error.idempotencyKey } : {}),
+      },
+      isError: true,
+    };
+  }
   return {
     content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
     isError: true,
@@ -291,10 +304,14 @@ export function makeExtension(clientFactory?: ClientFactory) {
         parameters: isOmp ? definition.schema(zod) : piSchema(definition.name),
         ...renderers,
         execute: async (_id: string, params: Record<string, unknown>) => {
+          let invocationClient: AgentTabClient | undefined;
           try {
-            client ??= await connectClient();
-            taskId ??= client.connection.task_id;
-            const response = await client.request(
+            if (client === undefined) {
+              client = await connectClient();
+              taskId = client.connection.task_id;
+            }
+            invocationClient = client;
+            const response = await invocationClient.request(
               definition.name,
               params as MethodParams[ToolMethod],
             );
@@ -302,6 +319,7 @@ export function makeExtension(clientFactory?: ClientFactory) {
             if (!response.ok) throw new AgentTabError(response);
             return success(response.result, { outcome: response.outcome, taskId });
           } catch (error) {
+            if (invocationClient?.closed && client === invocationClient) client = undefined;
             return failure(error);
           }
         },

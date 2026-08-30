@@ -142,6 +142,21 @@ async function waitForCondition(predicate: () => boolean): Promise<void> {
   throw new Error("condition did not settle within the bounded wait");
 }
 
+async function flushPromiseQueue(): Promise<void> {
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+}
+
+async function advanceTimers(milliseconds: number): Promise<void> {
+  for (let elapsed = 0; elapsed < milliseconds; elapsed += 50) {
+    vi.advanceTimersByTime(Math.min(50, milliseconds - elapsed));
+    await flushPromiseQueue();
+  }
+  if (milliseconds === 0) {
+    vi.advanceTimersByTime(0);
+    await flushPromiseQueue();
+  }
+}
+
 function emitDebuggerEvent(
   tabId: number,
   method: string,
@@ -1293,7 +1308,7 @@ describe("page revision monotonicity", () => {
         timeout_ms: 1,
       });
       await flushPromiseQueue();
-      await advanceTimers(100);
+      await advanceTimers(200);
       await expect(staleWait).rejects.toMatchObject({ code: "wait_timeout" });
 
       let settled = false;
@@ -1324,6 +1339,123 @@ describe("page revision monotonicity", () => {
         matched: true,
       });
       await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("holds an existing debugger session through a network-idle wait", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      await runtime.snapshot(61, { mode: "accessibility" });
+      emitDebuggerEvent(61, "Network.requestWillBeSent", { requestId: "still-loading" });
+
+      let settled = false;
+      const waiting = runtime.wait(61, {
+        condition: { kind: "network_idle" },
+        timeout_ms: 31_000,
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+      await flushPromiseQueue();
+
+      await advanceTimers(30_000);
+      expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(0);
+      expect(debuggerAttachedTabIds.has(61)).toBe(true);
+      expect(settled).toBe(false);
+
+      emitDebuggerEvent(61, "Network.loadingFinished", { requestId: "still-loading" });
+      await advanceTimers(600);
+      await expect(waiting).resolves.toMatchObject({
+        tab_id: 61,
+        condition: "network_idle",
+        matched: true,
+      });
+      await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("schedules idle detach after a newly attached network-idle wait completes", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      const waiting = runtime.wait(61, {
+        condition: { kind: "network_idle" },
+        timeout_ms: 1_000,
+      });
+      await flushPromiseQueue();
+      await advanceTimers(600);
+      await expect(waiting).resolves.toMatchObject({
+        tab_id: 61,
+        condition: "network_idle",
+        matched: true,
+      });
+      expect(debuggerAttachedTabIds.has(61)).toBe(true);
+
+      await advanceTimers(30_000);
+      expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(1);
+      expect(debuggerAttachedTabIds.has(61)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("schedules idle detach after network-idle timeout and revalidation failure", async () => {
+    vi.useFakeTimers();
+    try {
+      tabStore.set(61, {
+        id: 61,
+        windowId: 1,
+        groupId: -1,
+        url: "https://example.test/",
+        status: "loading",
+      });
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+
+      const timedOut = runtime.wait(61, {
+        condition: { kind: "network_idle" },
+        timeout_ms: 100,
+      });
+      await flushPromiseQueue();
+      await advanceTimers(200);
+      await expect(timedOut).rejects.toMatchObject({ code: "wait_timeout", outcome: "unknown" });
+      expect(debuggerAttachedTabIds.has(61)).toBe(true);
+
+      await advanceTimers(30_000);
+      expect(debuggerAttachedTabIds.has(61)).toBe(false);
+
+      const revalidationError = Object.assign(new Error("ownership changed"), { code: "ownership_revoked" });
+      await expect(runtime.wait(
+        62,
+        { condition: { kind: "network_idle" }, timeout_ms: 1_000 },
+        async () => {
+          throw revalidationError;
+        },
+      )).rejects.toBe(revalidationError);
+      expect(debuggerAttachedTabIds.has(62)).toBe(true);
+
+      await advanceTimers(30_000);
+      expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(2);
+      expect(debuggerAttachedTabIds.has(62)).toBe(false);
     } finally {
       vi.useRealTimers();
     }

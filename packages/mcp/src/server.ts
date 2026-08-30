@@ -2,6 +2,7 @@ import { stdin, stdout } from "node:process";
 import {
   AgentTabClient,
   AgentTabError,
+  AgentTabTransportError,
   createResumeCapabilityStore,
   type MethodParams,
   type RpcMethod,
@@ -193,6 +194,19 @@ function toolError(error: unknown): Record<string, unknown> {
       isError: true,
     };
   }
+  if (error instanceof AgentTabTransportError) {
+    const structuredContent = {
+      code: error.code,
+      outcome: error.outcome,
+      method: error.method,
+      ...(error.idempotencyKey ? { idempotency_key: error.idempotencyKey } : {}),
+    };
+    return {
+      content: [{ type: "text", text: error.message }],
+      structuredContent,
+      isError: true,
+    };
+  }
   return {
     content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
     isError: true,
@@ -260,14 +274,16 @@ export class McpServer {
     if (!isRecord(argumentsValue)) {
       throw Object.assign(new Error("tool arguments must be an object"), { jsonRpcCode: -32602 });
     }
+    let client: AgentTabClient | undefined;
     try {
-      this.#client ??= await this.#clientFactory();
-      const result = await this.#client.call(
+      client = this.#client ??= await this.#clientFactory();
+      const result = await client.call(
         params.name as RpcMethod,
         argumentsValue as MethodParams[RpcMethod],
       );
       return toolResult(result);
     } catch (error) {
+      if (client?.closed && this.#client === client) this.#client = undefined;
       return toolError(error);
     }
   }
