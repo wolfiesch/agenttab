@@ -385,7 +385,25 @@ pub enum BrowserSnapshotParams {
         selector: Option<String>,
         #[serde(default)]
         full_page: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<ScreenshotFormat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_width: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_height: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u32>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenshotFormat {
+    Png,
+    Jpeg,
+    Webp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,14 +596,55 @@ impl MethodParams {
                 if let Some(value) = max_bytes {
                     require(
                         method,
-                        (1..=1_048_576).contains(value),
-                        "max_bytes must be between 1 and 1048576",
+                        (1..=1_000_000).contains(value),
+                        "max_bytes must be between 1 and 1000000",
                     )?;
                 }
             }
-            Self::Snapshot(BrowserSnapshotParams::Screenshot { selector, .. }) => {
+            Self::Snapshot(BrowserSnapshotParams::Screenshot {
+                selector,
+                full_page,
+                format,
+                quality,
+                max_width,
+                max_height,
+                max_bytes,
+                ..
+            }) => {
                 if let Some(value) = selector {
                     require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
+                }
+                require(
+                    method,
+                    selector.is_none() || !*full_page,
+                    "screenshot cannot combine selector and full_page",
+                )?;
+                if let Some(value) = quality {
+                    require(method, *value <= 100, "quality must be between 0 and 100")?;
+                    require(
+                        method,
+                        matches!(
+                            format,
+                            Some(ScreenshotFormat::Jpeg | ScreenshotFormat::Webp)
+                        ),
+                        "quality requires format jpeg or webp",
+                    )?;
+                }
+                for (field, value) in [("max_width", max_width), ("max_height", max_height)] {
+                    if let Some(value) = value {
+                        require(
+                            method,
+                            (1..=16_384).contains(value),
+                            format!("{field} must be between 1 and 16384"),
+                        )?;
+                    }
+                }
+                if let Some(value) = max_bytes {
+                    require(
+                        method,
+                        (1..=750_000).contains(value),
+                        "max_bytes must be between 1 and 750000",
+                    )?;
                 }
             }
             Self::Act(params) => {
@@ -1863,6 +1922,49 @@ mod tests {
             assert!(matches!(
                 RpcRequest::parse(request(method, params, mutation)),
                 Err(ProtocolError::InvalidParamConstraint { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn screenshot_encoding_constraints_match_the_public_schema() {
+        let (_, valid) = RpcRequest::parse(request(
+            "browser_snapshot",
+            json!({
+                "mode": "screenshot",
+                "tab_id": 7,
+                "format": "webp",
+                "quality": 72,
+                "max_width": 1280,
+                "max_height": 720,
+                "max_bytes": 500000
+            }),
+            false,
+        ))
+        .unwrap();
+        assert!(matches!(
+            valid,
+            MethodParams::Snapshot(BrowserSnapshotParams::Screenshot {
+                format: Some(ScreenshotFormat::Webp),
+                quality: Some(72),
+                max_width: Some(1280),
+                max_height: Some(720),
+                max_bytes: Some(500000),
+                ..
+            })
+        ));
+
+        for params in [
+            json!({"mode": "screenshot", "tab_id": 7, "format": "png", "quality": 80}),
+            json!({"mode": "screenshot", "tab_id": 7, "max_bytes": 750001}),
+            json!({"mode": "screenshot", "tab_id": 7, "max_width": 16385}),
+            json!({"mode": "screenshot", "tab_id": 7, "selector": "main", "full_page": true}),
+            json!({"mode": "html", "tab_id": 7, "max_bytes": 1000001}),
+        ] {
+            assert!(matches!(
+                RpcRequest::parse(request("browser_snapshot", params, false)),
+                Err(ProtocolError::InvalidParamConstraint { .. })
+                    | Err(ProtocolError::InvalidParams { .. })
             ));
         }
     }

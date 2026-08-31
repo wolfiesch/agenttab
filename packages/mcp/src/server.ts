@@ -175,6 +175,23 @@ function respondError(id: JsonRpcRequest["id"], code: number, message: string, d
 }
 
 function toolResult(value: unknown): Record<string, unknown> {
+  if (
+    isRecord(value) &&
+    value.mode === "screenshot" &&
+    value.encoding === "base64" &&
+    typeof value.data === "string" &&
+    typeof value.media_type === "string" &&
+    /^image\/(png|jpeg|webp)$/.test(value.media_type)
+  ) {
+    const { data, encoding: _encoding, media_type: mediaType, ...metadata } = value;
+    return {
+      content: [
+        { type: "image", data, mimeType: mediaType },
+        { type: "text", text: JSON.stringify({ ...metadata, media_type: mediaType }, null, 2) },
+      ],
+      structuredContent: { ...metadata, media_type: mediaType },
+    };
+  }
   return {
     content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
     structuredContent: value,
@@ -326,4 +343,3 @@ export async function main(): Promise<void> {
   }
   server.close();
 }
-

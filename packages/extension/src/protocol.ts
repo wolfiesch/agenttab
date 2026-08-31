@@ -2,6 +2,9 @@ import { hasOnlyKeys, isBoundedString, isIntegerInRange, isRecord } from "./type
 
 export const NATIVE_PROTOCOL = "agenttab.native";
 export const PROTOCOL_VERSION = 1;
+export const SNAPSHOT_TEXT_MAX_BYTES = 1_000_000;
+export const SCREENSHOT_MAX_BYTES = 750_000;
+export const SCREENSHOT_MAX_DIMENSION = 16_384;
 
 export type NativeMethod =
   | "browser_open"
@@ -308,7 +311,23 @@ function assertAction(value: unknown): Record<string, unknown> {
 }
 
 function assertSnapshotParams(value: unknown): Record<string, unknown> {
-  const params = assertExactObject(value, ["tab_id", "mode"], ["root_ref", "max_depth", "max_nodes", "selector", "max_bytes", "full_page"], "browser_snapshot parameters");
+  const params = assertExactObject(
+    value,
+    ["tab_id", "mode"],
+    [
+      "root_ref",
+      "max_depth",
+      "max_nodes",
+      "selector",
+      "max_bytes",
+      "full_page",
+      "format",
+      "quality",
+      "max_width",
+      "max_height",
+    ],
+    "browser_snapshot parameters",
+  );
   assertTabId(params.tab_id);
   if (params.mode === "accessibility") {
     assertExactObject(params, ["tab_id", "mode"], ["root_ref", "max_depth", "max_nodes"], "accessibility snapshot parameters");
@@ -320,14 +339,43 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
   if (params.mode === "text" || params.mode === "html") {
     assertExactObject(params, ["tab_id", "mode"], ["selector", "max_bytes"], "text or html snapshot parameters");
     if (params.selector !== undefined) assertBoundedString(params.selector, "selector", 1, 65_536);
-    if (params.max_bytes !== undefined && !isIntegerInRange(params.max_bytes, 1, 1_048_576)) commandError("max_bytes must be between 1 and 1048576");
+    if (params.max_bytes !== undefined && !isIntegerInRange(params.max_bytes, 1, SNAPSHOT_TEXT_MAX_BYTES)) {
+      commandError(`max_bytes must be between 1 and ${SNAPSHOT_TEXT_MAX_BYTES}`);
+    }
     return params;
   }
   if (params.mode === "screenshot") {
-    assertExactObject(params, ["tab_id", "mode"], ["selector", "full_page"], "screenshot parameters");
+    assertExactObject(
+      params,
+      ["tab_id", "mode"],
+      ["selector", "full_page", "format", "quality", "max_width", "max_height", "max_bytes"],
+      "screenshot parameters",
+    );
     if (params.selector !== undefined) assertBoundedString(params.selector, "selector", 1, 65_536);
     if (params.full_page !== undefined && typeof params.full_page !== "boolean") commandError("full_page must be a boolean");
     if (params.selector !== undefined && params.full_page === true) commandError("screenshot cannot combine selector and full_page");
+    if (
+      params.format !== undefined &&
+      params.format !== "png" &&
+      params.format !== "jpeg" &&
+      params.format !== "webp"
+    ) {
+      commandError("format must be png, jpeg, or webp");
+    }
+    if (params.quality !== undefined) {
+      if (!isIntegerInRange(params.quality, 0, 100)) commandError("quality must be between 0 and 100");
+      if (params.format !== "jpeg" && params.format !== "webp") {
+        commandError("quality requires format jpeg or webp");
+      }
+    }
+    for (const field of ["max_width", "max_height"] as const) {
+      if (params[field] !== undefined && !isIntegerInRange(params[field], 1, SCREENSHOT_MAX_DIMENSION)) {
+        commandError(`${field} must be between 1 and ${SCREENSHOT_MAX_DIMENSION}`);
+      }
+    }
+    if (params.max_bytes !== undefined && !isIntegerInRange(params.max_bytes, 1, SCREENSHOT_MAX_BYTES)) {
+      commandError(`max_bytes must be between 1 and ${SCREENSHOT_MAX_BYTES}`);
+    }
     return params;
   }
   commandError("Unsupported snapshot mode");
