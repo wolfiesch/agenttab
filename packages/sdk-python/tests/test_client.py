@@ -75,6 +75,81 @@ class FramingTests(unittest.TestCase):
 
 @unittest.skipIf(not hasattr(socket, "AF_UNIX"), "requires Unix sockets")
 class ClientTests(unittest.TestCase):
+    def test_act_wait_observe_uses_semantic_settle_loop(self) -> None:
+        client = object.__new__(AgentTabClient)
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def request(method: str, params: object, **_options: object) -> dict[str, object]:
+            self.assertIsInstance(params, dict)
+            calls.append((method, dict(params)))  # type: ignore[arg-type]
+            return {
+                "ok": True,
+                "outcome": "completed",
+                "result": {"method": method},
+            }
+
+        def call(method: str, params: object, **_options: object) -> dict[str, object]:
+            self.assertIsInstance(params, dict)
+            calls.append((method, dict(params)))  # type: ignore[arg-type]
+            return {"method": method}
+
+        client.request = request  # type: ignore[method-assign]
+        client.call = call  # type: ignore[method-assign]
+        result = client.act_wait_observe({
+            "tab_id": 7,
+            "expected_page_revision": 3,
+            "actions": [{"kind": "click", "ref": "a3:button:Continue"}],
+        })
+
+        self.assertEqual(result, {
+            "outcome": "completed",
+            "action": {"method": "browser_act"},
+            "wait": {"method": "browser_wait"},
+            "observation": {"method": "browser_snapshot"},
+        })
+        self.assertEqual([method for method, _ in calls], [
+            "browser_act",
+            "browser_wait",
+            "browser_snapshot",
+        ])
+        self.assertEqual(calls[1][1], {
+            "tab_id": 7,
+            "condition": {"kind": "network_idle"},
+        })
+        self.assertEqual(calls[2][1], {"tab_id": 7, "mode": "accessibility"})
+
+    def test_act_wait_observe_stops_on_non_completed_success(self) -> None:
+        for outcome in ("commit_required", "needs_user"):
+            with self.subTest(outcome=outcome):
+                client = object.__new__(AgentTabClient)
+
+                def request(
+                    _method: str,
+                    _params: object,
+                    **_options: object,
+                ) -> dict[str, object]:
+                    return {
+                        "ok": True,
+                        "outcome": outcome,
+                        "result": {"stopped": outcome},
+                    }
+
+                def call(*_args: object, **_options: object) -> object:
+                    self.fail("wait or observation must not start")
+
+                client.request = request  # type: ignore[method-assign]
+                client.call = call  # type: ignore[method-assign]
+
+                result = client.act_wait_observe({
+                    "tab_id": 7,
+                    "expected_page_revision": 3,
+                    "actions": [{"kind": "click", "ref": "a3:button:Continue"}],
+                })
+                self.assertEqual(result, {
+                    "outcome": outcome,
+                    "action": {"stopped": outcome},
+                })
+
     def test_long_operation_transport_deadlines_follow_protocol_timeouts(self) -> None:
         self.assertEqual(
             resolve_transport_timeout(

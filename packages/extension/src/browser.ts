@@ -17,6 +17,28 @@ const DEBUGGER_IDLE_MS = 30_000;
 // the 1 MiB host-to-client frame. Screenshot base64 data is separately capped at
 // 1,000,000 characters (750,000 decoded bytes).
 const SNAPSHOT_RESULT_BUDGET_BYTES = 1_032_000;
+const WAIT_REVALIDATE_MS = 500;
+const NETWORK_IDLE_MS = 500;
+const DOM_OBSERVER_SCAN_INTERVAL_MS = 50;
+const SEMANTIC_REF_MAX_CHARS = 256;
+const SEMANTIC_ROLES = new Set([
+  "button",
+  "checkbox",
+  "combobox",
+  "link",
+  "listbox",
+  "menuitem",
+  "option",
+  "radio",
+  "searchbox",
+  "slider",
+  "spinbutton",
+  "switch",
+  "tab",
+  "textbox",
+  "treeitem",
+]);
+const LAZY_DEBUGGER_DOMAINS = new Set(["DOM", "Accessibility", "Runtime"]);
 const TAB_ONLY_ACTIONS: Readonly<Record<string, true>> = {
   navigate: true,
   go_back: true,
@@ -66,6 +88,8 @@ interface DebugSession {
   pageLoadInFlight: boolean;
   downloads: Map<string, TrackedDownload>;
   dialogGeneration: number;
+  enabledDomains: Set<string>;
+  domainEnableTail: Promise<void>;
   dialog?: JavaScriptDialog;
   pendingWindowOpen?: PendingWindowOpen;
 }
@@ -123,6 +147,12 @@ function base64ByteLength(value: string): number | null {
   return (value.length / 4) * 3 - padding;
 }
 
+interface SemanticTarget {
+  pageRevision: number;
+  role: string;
+  name: string;
+}
+
 type CloseTab = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 type AuthorizeDebuggerUse = (tabId: number) => Promise<void>;
@@ -151,6 +181,7 @@ export class StandardBrowserRuntime {
   private readonly sessions = new Map<number, DebugSession>();
   private readonly expectedDetaches = new Map<number, number>();
   private readonly debuggerCandidates = new Set<number>();
+  private readonly waitSignals = new Map<number, Set<() => void>>();
 
   constructor(
     private readonly revisions: RevisionTracker,
@@ -172,6 +203,7 @@ export class StandardBrowserRuntime {
       const session = this.sessions.get(source.tabId);
       if (session?.idleTimer) clearTimeout(session.idleTimer);
       this.sessions.delete(source.tabId);
+      this.signalWaiters(source.tabId);
       void this.invalidateStagedDialogs(source.tabId);
     });
     chrome.debugger.onEvent.addListener(
@@ -180,6 +212,7 @@ export class StandardBrowserRuntime {
         const session = this.sessions.get(source.tabId);
         if (!session) return;
         const params = isRecord(rawParams) ? rawParams : {};
+        let shouldSignalWaiters = false;
         if (method === "Network.requestWillBeSent" && typeof params.requestId === "string") {
           session.inflight.add(params.requestId);
           session.lastNetworkActivity = Date.now();
@@ -189,6 +222,10 @@ export class StandardBrowserRuntime {
         ) {
           session.inflight.delete(params.requestId);
           session.lastNetworkActivity = Date.now();
+          // A network-idle waiter cannot match while any request remains. Wake
+          // it only when the burst drains instead of revalidating on every
+          // resource completion.
+          shouldSignalWaiters = session.inflight.size === 0;
           // chrome.downloads has no initiator tab. Debugger events are scoped by source.tabId,
           // so a matching Page GUID is the only completion proof accepted here.
         } else if (method === "Page.downloadWillBegin" && typeof params.guid === "string") {
@@ -197,6 +234,7 @@ export class StandardBrowserRuntime {
           const download = session.downloads.get(params.guid);
           if (params.state === "completed" && download) {
             download.completedAt = Date.now();
+            shouldSignalWaiters = true;
           } else if (params.state === "canceled") {
             session.downloads.delete(params.guid);
           }
@@ -227,8 +265,18 @@ export class StandardBrowserRuntime {
           session.dialog = undefined;
           void this.invalidateStagedDialogs(source.tabId);
         }
+        if (shouldSignalWaiters) this.signalWaiters(source.tabId);
       },
     );
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      if (
+        changeInfo.status === "loading" ||
+        changeInfo.status === "complete" ||
+        typeof changeInfo.url === "string"
+      ) {
+        this.signalWaiters(tabId);
+      }
+    });
     this.revisions.onChange((tabId) => this.invalidateStagedDialogs(tabId));
   }
 
@@ -372,7 +420,7 @@ export class StandardBrowserRuntime {
     );
     const result = typeof params.root_ref === "string"
       ? await this.send(tabId, "Accessibility.getPartialAXTree", {
-        backendNodeId: this.backendNodeId(pageRevision, params.root_ref),
+        backendNodeId: await this.resolveBackendNodeId(tabId, pageRevision, params.root_ref),
         fetchRelatives: true,
       })
       : await this.send(tabId, "Accessibility.getFullAXTree", { depth: maxDepth });
@@ -389,16 +437,39 @@ export class StandardBrowserRuntime {
       });
     }
     const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
-    const encoded = nodes.slice(0, maxNodes).map((node) => ({
-      ...(node.backendDOMNodeId
-        ? { ref: `r${pageRevision}-${node.backendDOMNodeId}` }
-        : {}),
-      role: typeof node.role?.value === "string" ? node.role.value : "unknown",
-      name: typeof node.name?.value === "string" ? node.name.value : "",
-      ...(node.value?.value !== undefined ? { value: node.value.value } : {}),
-      ...(node.description?.value !== undefined ? { description: node.description.value } : {}),
-      ...(node.ignored ? { ignored: true } : {}),
-    }));
+    const semanticCounts = new Map<string, number>();
+    for (const node of nodes) {
+      const role = this.axText(node.role?.value);
+      const name = this.axText(node.name?.value);
+      if (!node.ignored && node.backendDOMNodeId && SEMANTIC_ROLES.has(role) && name.length > 0) {
+        const key = this.semanticKey(role, name);
+        semanticCounts.set(key, (semanticCounts.get(key) ?? 0) + 1);
+      }
+    }
+    const encoded = nodes.slice(0, maxNodes).map((node) => {
+      const role = this.axText(node.role?.value) || "unknown";
+      const name = this.axText(node.name?.value);
+      const nodeRef = node.backendDOMNodeId
+        ? `r${pageRevision}-${node.backendDOMNodeId}`
+        : undefined;
+      const semanticRef =
+        !node.ignored &&
+        nodeRef !== undefined &&
+        SEMANTIC_ROLES.has(role) &&
+        name.length > 0 &&
+        semanticCounts.get(this.semanticKey(role, name)) === 1
+          ? this.encodeSemanticRef(pageRevision, role, name)
+          : undefined;
+      return {
+        ...(nodeRef !== undefined ? { ref: nodeRef } : {}),
+        ...(semanticRef !== undefined ? { semantic_ref: semanticRef } : {}),
+        role,
+        name,
+        ...(node.value?.value !== undefined ? { value: node.value.value } : {}),
+        ...(node.description?.value !== undefined ? { description: node.description.value } : {}),
+        ...(node.ignored ? { ignored: true } : {}),
+      };
+    });
     return assertDeliverableSnapshot({
       tab_id: tabId,
       page_revision: pageRevision,
@@ -446,7 +517,13 @@ export class StandardBrowserRuntime {
         });
       }
       await this.revisions.assertExpected(tabId, pageRevision);
-      const stagedConsequence = await this.consequence(tabId, pageRevision, action);
+      const resolvedTargets = new Map<string, number>();
+      const stagedConsequence = await this.consequence(
+        tabId,
+        pageRevision,
+        action,
+        resolvedTargets,
+      );
       if (stagedConsequence) {
         const staged: StagedCommit = {
           native_token: randomToken(),
@@ -492,7 +569,12 @@ export class StandardBrowserRuntime {
           },
         };
       }
-      completedActions.push(await this.performAction(tabId, pageRevision, action));
+      completedActions.push(await this.performAction(
+        tabId,
+        pageRevision,
+        action,
+        resolvedTargets,
+      ));
     }
     return {
       result: {
@@ -659,8 +741,15 @@ export class StandardBrowserRuntime {
         code: "staged_commit_mismatch",
       });
     }
+    const resolvedTargets = new Map<string, number>();
     const currentTarget = typeof action.ref === "string"
-      ? await this.targetDescriptor(staged.tab_id, staged.page_revision, action.ref, action)
+      ? await this.targetDescriptor(
+        staged.tab_id,
+        staged.page_revision,
+        action.ref,
+        action,
+        resolvedTargets,
+      )
       : { kind: action.kind };
     if (
       await this.stageFingerprint(taskId, staged.tab_id, staged.page_revision, action, currentTarget) !==
@@ -678,7 +767,12 @@ export class StandardBrowserRuntime {
     });
     const result = action.kind === "dialog" && action.decision === "accept"
       ? await this.acceptStagedDialog(staged.tab_id, action, staged.dialog)
-      : await this.performAction(staged.tab_id, staged.page_revision, action);
+      : await this.performAction(
+        staged.tab_id,
+        staged.page_revision,
+        action,
+        resolvedTargets,
+      );
     return {
       tab_id: staged.tab_id,
       page_revision: await this.revisions.current(staged.tab_id),
@@ -749,9 +843,34 @@ export class StandardBrowserRuntime {
             matched: true,
           };
         }
-        const delay = Promise.withResolvers<void>();
-        setTimeout(delay.resolve, 100);
-        await delay.promise;
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) break;
+        if (conditionKind === "text" || conditionKind === "selector") {
+          const observerStartedAt = Date.now();
+          const observerSliceMs = Math.min(remainingMs, WAIT_REVALIDATE_MS);
+          const observed = await this.waitForDomCondition(
+            tabId,
+            condition,
+            observerSliceMs,
+          );
+          if (observed) continue;
+          const unusedSliceMs = observerSliceMs - (Date.now() - observerStartedAt);
+          const observerRemainingMs = deadline - Date.now();
+          if (unusedSliceMs > 0 && observerRemainingMs > 0) {
+            await this.waitForTabSignal(
+              tabId,
+              Math.min(unusedSliceMs, observerRemainingMs),
+            );
+          }
+          continue;
+        }
+        await this.waitForTabSignal(
+          tabId,
+          Math.min(
+            remainingMs,
+            this.nextWaitDelay(conditionKind, debuggerSession, waitStartedAtMs),
+          ),
+        );
       } while (Date.now() < deadline);
       throw Object.assign(new Error(`Timed out waiting for ${String(condition.kind)}`), {
         code: "wait_timeout",
@@ -771,7 +890,14 @@ export class StandardBrowserRuntime {
       });
     }
     await this.requireFullAutomationRoute(tabId, `run ${action}`);
-    return this.send(tabId, action, params);
+    const result = await this.send(tabId, action, params);
+    if (action.endsWith(".disable")) {
+      // Developer mode can invalidate the Standard runtime's domain cache.
+      // Recycle the attachment so the next Standard call re-establishes a
+      // known Page, Network, and lazy-domain baseline.
+      await this.detach(tabId);
+    }
+    return result;
   }
 
   private async scriptSnapshot(
@@ -955,6 +1081,7 @@ export class StandardBrowserRuntime {
     tabId: number,
     pageRevision: number,
     action: Record<string, unknown>,
+    resolvedTargets: Map<string, number>,
   ): Promise<StagedConsequence | null> {
     if (action.kind === "close") {
       return {
@@ -967,7 +1094,7 @@ export class StandardBrowserRuntime {
       return {
         effect: `Upload ${count} ${count === 1 ? "file" : "files"} to the page`,
         target: typeof action.ref === "string"
-          ? await this.targetDescriptor(tabId, pageRevision, action.ref)
+          ? await this.targetDescriptor(tabId, pageRevision, action.ref, undefined, resolvedTargets)
           : { kind: action.kind },
       };
     }
@@ -986,7 +1113,13 @@ export class StandardBrowserRuntime {
     ) {
       return null;
     }
-    const target = await this.targetDescriptor(tabId, pageRevision, action.ref, action);
+    const target = await this.targetDescriptor(
+      tabId,
+      pageRevision,
+      action.ref,
+      action,
+      resolvedTargets,
+    );
     const label = [
       target.role,
       target.text,
@@ -1090,13 +1223,19 @@ export class StandardBrowserRuntime {
     pageRevision: number,
     ref: unknown,
     action?: Record<string, unknown>,
+    resolvedTargets?: Map<string, number>,
   ): Promise<Record<string, unknown>> {
     const requestedValue = action?.kind === "select"
       ? String(action.value ?? "")
       : action?.kind === "fill" || action?.kind === "type"
         ? String(action.text ?? "")
         : null;
-    const backendNodeId = this.backendNodeId(pageRevision, ref);
+    const backendNodeId = await this.resolveBackendNodeId(
+      tabId,
+      pageRevision,
+      ref,
+      resolvedTargets,
+    );
     const resolved = await this.send(tabId, "DOM.resolveNode", { backendNodeId });
     if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
       throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
@@ -1124,6 +1263,7 @@ export class StandardBrowserRuntime {
     tabId: number,
     pageRevision: number,
     action: Record<string, unknown>,
+    resolvedTargets: Map<string, number> = new Map(),
   ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const kind = action.kind;
@@ -1170,7 +1310,12 @@ export class StandardBrowserRuntime {
       });
       return { kind, completed: true };
     }
-    const backendNodeId = this.backendNodeId(pageRevision, action.ref);
+    const backendNodeId = await this.resolveBackendNodeId(
+      tabId,
+      pageRevision,
+      action.ref,
+      resolvedTargets,
+    );
     if (kind === "click") {
       const [activeTab, existingTabs] = await Promise.all([
         chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab),
@@ -1241,7 +1386,12 @@ export class StandardBrowserRuntime {
         [{ value: Number(action.delta_x ?? 0) }, { value: Number(action.delta_y ?? 0) }],
       );
     } else if (kind === "drag") {
-      const targetBackendNodeId = this.backendNodeId(pageRevision, action.target_ref);
+      const targetBackendNodeId = await this.resolveBackendNodeId(
+        tabId,
+        pageRevision,
+        action.target_ref,
+        resolvedTargets,
+      );
       const [source, target] = await Promise.all([
         this.nodeCenter(tabId, backendNodeId),
         this.nodeCenter(tabId, targetBackendNodeId),
@@ -1307,7 +1457,8 @@ export class StandardBrowserRuntime {
         session.pageLoadInFlight = false;
         session.lastNetworkActivity = Date.now();
       }
-      return session.inflight.size === 0 && Date.now() - session.lastNetworkActivity >= 500;
+      const quietSince = Math.max(session.lastNetworkActivity, waitStartedAtMs);
+      return session.inflight.size === 0 && Date.now() - quietSince >= NETWORK_IDLE_MS;
     }
     if (kind === "download") {
       const session = debuggerSession;
@@ -1323,14 +1474,261 @@ export class StandardBrowserRuntime {
       code: "invalid_request",
     });
   }
-  private backendNodeId(pageRevision: number, ref: unknown): number {
+
+  private async waitForDomCondition(
+    tabId: number,
+    condition: Record<string, unknown>,
+    timeoutMs: number,
+  ): Promise<boolean> {
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: async (kind: string, value: string, timeout: number, scanInterval: number) =>
+          new Promise<boolean>((resolve) => {
+            const matches = () =>
+              kind === "text"
+                ? (document.documentElement.textContent ?? "").includes(value)
+                : document.querySelector(value) !== null;
+            if (matches()) {
+              resolve(true);
+              return;
+            }
+            let settled = false;
+            let scanTimer: ReturnType<typeof setTimeout> | undefined;
+            const finish = (matched: boolean) => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              if (scanTimer !== undefined) clearTimeout(scanTimer);
+              observer.disconnect();
+              removeEventListener("pagehide", pageHidden);
+              resolve(matched);
+            };
+            const observer = new MutationObserver(() => {
+              // A dynamic page may deliver mutations at animation-frame rate.
+              // Coalesce them so a wait never rescans the whole DOM at that rate.
+              if (settled || scanTimer !== undefined) return;
+              scanTimer = setTimeout(() => {
+                scanTimer = undefined;
+                if (matches()) finish(true);
+              }, scanInterval);
+            });
+            const pageHidden = () => finish(false);
+            const timer = setTimeout(() => finish(false), timeout);
+            observer.observe(document.documentElement, {
+              // Attribute changes can affect a CSS selector, but cannot change
+              // the textContent tested by a text wait.
+              attributes: kind === "selector",
+              childList: true,
+              characterData: kind === "text",
+              subtree: true,
+            });
+            addEventListener("pagehide", pageHidden, { once: true });
+            // Close the check/observe race without falling back to a poll.
+            if (matches()) finish(true);
+          }),
+        args: [
+          String(condition.kind),
+          String(condition.value ?? ""),
+          timeoutMs,
+          DOM_OBSERVER_SCAN_INTERVAL_MS,
+        ],
+      });
+      return result === true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/execution context was destroyed|frame was removed|cannot access contents of url/i.test(message)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private nextWaitDelay(
+    conditionKind: string,
+    session?: DebugSession,
+    waitStartedAtMs = 0,
+  ): number {
+    if (
+      conditionKind === "network_idle" &&
+      session &&
+      !session.pageLoadInFlight &&
+      session.inflight.size === 0
+    ) {
+      return Math.max(
+        1,
+        Math.min(
+          WAIT_REVALIDATE_MS,
+          NETWORK_IDLE_MS - (Date.now() - Math.max(session.lastNetworkActivity, waitStartedAtMs)),
+        ),
+      );
+    }
+    return WAIT_REVALIDATE_MS;
+  }
+
+  private waitForTabSignal(tabId: number, timeoutMs: number): Promise<void> {
+    if (timeoutMs <= 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const waiters = this.waitSignals.get(tabId) ?? new Set<() => void>();
+      this.waitSignals.set(tabId, waiters);
+      let timer: ReturnType<typeof setTimeout>;
+      const wake = () => {
+        clearTimeout(timer);
+        waiters.delete(wake);
+        if (waiters.size === 0) this.waitSignals.delete(tabId);
+        resolve();
+      };
+      waiters.add(wake);
+      timer = setTimeout(wake, timeoutMs);
+    });
+  }
+
+  private signalWaiters(tabId: number): void {
+    const waiters = this.waitSignals.get(tabId);
+    if (!waiters) return;
+    for (const wake of [...waiters]) wake();
+  }
+
+  private axText(value: unknown): string {
+    return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  }
+
+  private semanticKey(role: string, name: string): string {
+    return `${role}\u0000${name}`;
+  }
+
+  private encodeSemanticRef(pageRevision: number, role: string, name: string): string | undefined {
+    const ref = `a${pageRevision}:${encodeURIComponent(role)}:${encodeURIComponent(name)}`;
+    return ref.length <= SEMANTIC_REF_MAX_CHARS ? ref : undefined;
+  }
+
+  private decodeSemanticRef(ref: unknown): SemanticTarget | null {
+    const match = /^a(\d+):([^:]+):(.*)$/.exec(String(ref ?? ""));
+    if (!match) return null;
+    try {
+      const role = decodeURIComponent(match[2]);
+      const name = decodeURIComponent(match[3]);
+      if (!SEMANTIC_ROLES.has(role) || name.length === 0) return null;
+      return { pageRevision: Number(match[1]), role, name };
+    } catch {
+      return null;
+    }
+  }
+
+  private async resolveBackendNodeId(
+    tabId: number,
+    pageRevision: number,
+    ref: unknown,
+    resolvedTargets?: Map<string, number>,
+  ): Promise<number> {
+    const cacheKey = String(ref ?? "");
+    const cached = resolvedTargets?.get(cacheKey);
+    if (cached !== undefined) return cached;
     const match = /^r(\d+)-(\d+)$/.exec(String(ref ?? ""));
-    if (!match || Number(match[1]) !== pageRevision) {
+    if (match) {
+      if (Number(match[1]) !== pageRevision) {
+        throw Object.assign(new Error("Snapshot ref belongs to a stale page revision"), {
+          code: "stale_ref",
+        });
+      }
+      const backendNodeId = Number(match[2]);
+      resolvedTargets?.set(cacheKey, backendNodeId);
+      return backendNodeId;
+    }
+    const semantic = this.decodeSemanticRef(ref);
+    if (!semantic || semantic.pageRevision !== pageRevision) {
       throw Object.assign(new Error("Snapshot ref belongs to a stale page revision"), {
         code: "stale_ref",
       });
     }
-    return Number(match[2]);
+    const before = await this.pageIdentity(tabId);
+    const beforeRevision = await this.revisions.observeDocument(
+      tabId,
+      before.documentId,
+      before.loaderId,
+    );
+    if (beforeRevision !== pageRevision) {
+      throw Object.assign(new Error("Semantic ref belongs to a stale page document"), {
+        code: "stale_ref",
+        currentPageRevision: beforeRevision,
+        recovery: "Take a fresh accessibility snapshot and retry.",
+      });
+    }
+    const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
+    if (!isRecord(document.root) || typeof document.root.nodeId !== "number") {
+      throw Object.assign(new Error("Could not inspect the semantic target document"), {
+        code: "target_not_found",
+        recovery: "Take a fresh accessibility snapshot and retry.",
+      });
+    }
+    const result = await this.send(tabId, "Accessibility.queryAXTree", {
+      nodeId: document.root.nodeId,
+      accessibleName: semantic.name,
+      role: semantic.role,
+    });
+    const after = await this.pageIdentity(tabId);
+    const afterRevision = await this.revisions.observeDocument(
+      tabId,
+      after.documentId,
+      after.loaderId,
+    );
+    if (
+      before.documentId !== after.documentId ||
+      before.loaderId !== after.loaderId ||
+      afterRevision !== pageRevision
+    ) {
+      throw Object.assign(new Error("Page changed while resolving the semantic ref"), {
+        code: "stale_ref",
+        currentPageRevision: afterRevision,
+        recovery: "Take a fresh accessibility snapshot and retry.",
+      });
+    }
+    const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
+    const matches = nodes.filter((node) =>
+      !node.ignored &&
+      typeof node.backendDOMNodeId === "number" &&
+      this.axText(node.role?.value) === semantic.role &&
+      this.axText(node.name?.value) === semantic.name,
+    );
+    if (matches.length === 1) {
+      const backendNodeId = matches[0].backendDOMNodeId as number;
+      resolvedTargets?.set(cacheKey, backendNodeId);
+      return backendNodeId;
+    }
+    const candidates = matches.slice(0, 8).map((node) => ({
+      ref: `r${pageRevision}-${String(node.backendDOMNodeId)}`,
+      role: this.axText(node.role?.value),
+      name: this.axText(node.name?.value),
+      ...(node.description?.value !== undefined
+        ? { description: String(node.description.value).slice(0, 160) }
+        : {}),
+    }));
+    if (matches.length === 0) {
+      throw Object.assign(
+        new Error(`Semantic target no longer exists: ${semantic.role} “${semantic.name}”`),
+        {
+          code: "target_not_found",
+          recovery: "Take a fresh accessibility snapshot and retry with its semantic_ref or ref.",
+          details: { role: semantic.role, name: semantic.name, match_count: 0 },
+        },
+      );
+    }
+    throw Object.assign(
+      new Error(
+        `Semantic target is ambiguous: ${matches.length} ${semantic.role} elements are named “${semantic.name}”`,
+      ),
+      {
+        code: "ambiguous_target",
+        recovery: "Use one of details.candidates.ref from a fresh accessibility snapshot.",
+        details: {
+          role: semantic.role,
+          name: semantic.name,
+          match_count: matches.length,
+          candidates,
+          candidates_truncated: matches.length > candidates.length,
+        },
+      },
+    );
   }
 
   private async callOnNode(
@@ -1472,6 +1870,8 @@ export class StandardBrowserRuntime {
         pageLoadInFlight: false,
         downloads: new Map(),
         dialogGeneration: 0,
+        enabledDomains: new Set(),
+        domainEnableTail: Promise.resolve(),
       };
       this.sessions.set(tabId, session);
     }
@@ -1492,20 +1892,11 @@ export class StandardBrowserRuntime {
       await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
       session.attached = true;
       try {
-        for (const method of [
-          "Page.enable",
-          "DOM.enable",
-          "Accessibility.enable",
-          "Runtime.enable",
-          "Network.enable",
-        ]) {
-          await this.authorizeDebuggerUse(tabId);
-          await chrome.debugger.sendCommand({ tabId }, method, {});
-          if (method === "Network.enable") {
-            session.pageLoadInFlight = (await chrome.tabs.get(tabId)).status === "loading";
-            session.lastNetworkActivity = Date.now();
-          }
-        }
+        // Page and Network events must be observed for the lifetime of an
+        // attachment so dialogs, popups, downloads, and in-flight requests are
+        // not missed. Command-only domains are enabled on first use below.
+        await this.enableDebuggerDomain(tabId, session, "Page");
+        await this.enableDebuggerDomain(tabId, session, "Network");
       } catch (error) {
         try {
           await this.detachTrackedSession(tabId, session);
@@ -1560,9 +1951,61 @@ export class StandardBrowserRuntime {
     }, DEBUGGER_IDLE_MS);
   }
 
+  private async enableDebuggerDomain(
+    tabId: number,
+    session: DebugSession,
+    domain: string,
+  ): Promise<void> {
+    if (session.enabledDomains.has(domain)) return;
+    const enabling = session.domainEnableTail.then(async () => {
+      if (session.enabledDomains.has(domain)) return;
+      if (this.sessions.get(tabId) !== session || !session.attached) {
+        throw Object.assign(new Error("Debugger detached before its domain could be enabled"), {
+          code: "debugger_detached",
+        });
+      }
+      await this.authorizeDebuggerUse(tabId);
+      await chrome.debugger.sendCommand({ tabId }, `${domain}.enable`, {});
+      session.enabledDomains.add(domain);
+      if (domain === "Network") {
+        session.pageLoadInFlight = (await chrome.tabs.get(tabId)).status === "loading";
+        session.lastNetworkActivity = Date.now();
+      }
+    });
+    session.domainEnableTail = enabling.then(
+      () => undefined,
+      () => undefined,
+    );
+    await enabling;
+  }
+
+  private async enableCommandDomain(
+    tabId: number,
+    session: DebugSession,
+    method: string,
+  ): Promise<void> {
+    const separator = method.indexOf(".");
+    const domain = separator > 0 ? method.slice(0, separator) : "";
+    if (!LAZY_DEBUGGER_DOMAINS.has(domain)) return;
+    try {
+      await this.enableDebuggerDomain(tabId, session, domain);
+    } catch (error) {
+      try {
+        await this.detachTrackedSession(tabId, session);
+      } catch (detachError) {
+        throw new AggregateError(
+          [error, detachError],
+          "Debugger initialization and cleanup both failed",
+        );
+      }
+      throw error;
+    }
+  }
+
   private async send(tabId: number, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     const session = await this.acquireDebuggerBusyLease(tabId);
     try {
+      await this.enableCommandDomain(tabId, session, method);
       await this.authorizeDebuggerUse(tabId);
       const result: unknown = await chrome.debugger.sendCommand({ tabId }, method, params);
       return isRecord(result) ? result : {};

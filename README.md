@@ -23,7 +23,7 @@ The command has no path, token, or shell-specific argument and is suitable for P
 ## A task-owned workflow
 
 1. An agent calls `browser_open` with `mode: "create"`. AgentTab creates a background tab for that task and returns its task, tab, window, page-revision, and automation-route identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
-2. On a normal web origin, the agent calls `browser_snapshot`, works from revisioned accessibility references, then calls `browser_act` with the expected page revision. It cannot act on unrelated tabs.
+2. On a normal web origin, the agent calls `browser_snapshot`, prefers a unique accessibility `semantic_ref`, then calls `browser_act` with the expected page revision. AgentTab resolves the semantic target against the live accessibility tree, waits on browser/page events rather than requiring arbitrary sleeps, and rejects ambiguous targets with bounded candidates. It cannot act on unrelated tabs.
 3. If a site requires human-only input, the agent calls `browser_handoff`. AgentTab focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
 4. If AgentTab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token.
 5. The task can list only its own tabs with `browser_tabs`. A separate client gets a separate task unless it proves its durable resume capability.
@@ -111,6 +111,7 @@ Generated extension assets live only in `packages/extension/dist/`; they are not
 - [Setup and local paths](docs/setup.md)
 - [Command reference](docs/commands.md)
 - [MCP adapter and Core RPC](docs/mcp.md)
+- [Semantic automation and deterministic waits](docs/semantic-automation.md)
 - [Security and trust boundary](docs/security.md)
 - [Multi-agent behavior](docs/multi-agent.md)
 - [Runtime architecture decision](docs/adr/0001-agenttab-runtime.md)

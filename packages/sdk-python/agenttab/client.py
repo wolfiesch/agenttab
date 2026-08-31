@@ -59,6 +59,22 @@ def resolve_transport_timeout(
     return max(request_timeout, operation_timeout + LONG_OPERATION_TRANSPORT_GRACE)
 
 
+def _inferred_post_action_wait(
+    actions: object,
+) -> JsonObject | None:
+    if not isinstance(actions, list) or not actions:
+        return None
+    last = actions[-1]
+    if not isinstance(last, Mapping):
+        return None
+    kind = last.get("kind")
+    if kind in {"navigate", "go_back", "go_forward", "reload"}:
+        return {"kind": "load"}
+    if kind in {"click", "select", "drag", "dialog", "upload_file"}:
+        return {"kind": "network_idle"}
+    return None
+
+
 class AgentTabError(RuntimeError):
     def __init__(self, response: Mapping[str, Any]) -> None:
         error = response.get("error")
@@ -984,6 +1000,59 @@ class AgentTabClient:
         if not response.get("ok"):
             raise AgentTabError(response)
         return response.get("result")
+
+    def act_wait_observe(
+        self,
+        act: Mapping[str, Any],
+        *,
+        wait: Mapping[str, Any] | Literal[False] | None = None,
+        wait_timeout_ms: int | None = None,
+        observe: Mapping[str, Any] | Literal[False] | None = None,
+    ) -> JsonObject:
+        """Act, await a deterministic postcondition, then return a fresh observation."""
+        action_response = self.request("browser_act", act)
+        if not action_response.get("ok"):
+            raise AgentTabError(action_response)
+        outcome = str(action_response.get("outcome", "unknown"))
+        result: JsonObject = {
+            "outcome": outcome,
+            "action": action_response.get("result"),
+        }
+        if outcome != "completed":
+            return result
+
+        actions = act.get("actions")
+        last = actions[-1] if isinstance(actions, list) and actions else None
+        if isinstance(last, Mapping) and last.get("kind") == "close":
+            return result
+
+        if wait is False:
+            condition = None
+        elif isinstance(wait, Mapping):
+            condition = dict(wait)
+        else:
+            condition = _inferred_post_action_wait(actions)
+        if condition is not None:
+            wait_params: JsonObject = {
+                "tab_id": act["tab_id"],
+                "condition": condition,
+            }
+            if wait_timeout_ms is not None:
+                wait_params["timeout_ms"] = wait_timeout_ms
+            result["wait"] = self.call("browser_wait", wait_params)
+
+        if observe is False:
+            observation = None
+        elif isinstance(observe, Mapping):
+            observation = dict(observe)
+        else:
+            observation = {"mode": "accessibility"}
+        if observation is not None:
+            result["observation"] = self.call(
+                "browser_snapshot",
+                {"tab_id": act["tab_id"], **observation},
+            )
+        return result
 
     def close(self) -> None:
         if self._closed:

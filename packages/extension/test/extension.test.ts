@@ -72,6 +72,12 @@ let nextTabId: number;
 let nextGroupId: number;
 let scriptResult: unknown;
 let scriptingCallCount: number;
+let scriptingExecuteOverride:
+  | ((options: {
+    func?: (...args: unknown[]) => unknown;
+    args?: unknown[];
+  }) => unknown | Promise<unknown>)
+  | null;
 let alarmCreates: Array<{ name: string; when: number }>;
 let alarmClears: string[];
 let alarmListeners: Array<(alarm: { name: string }) => void>;
@@ -318,6 +324,7 @@ function installChromeMock(): void {
   nextGroupId = 50;
   scriptResult = true;
   scriptingCallCount = 0;
+  scriptingExecuteOverride = null;
   alarmCreates = [];
   alarmClears = [];
   alarmListeners = [];
@@ -558,9 +565,16 @@ function installChromeMock(): void {
         async reload() { },
       },
       scripting: {
-        async executeScript() {
+        async executeScript(options: {
+          func?: (...args: unknown[]) => unknown;
+          args?: unknown[];
+        }) {
           scriptingCallCount += 1;
-          return [{ result: scriptResult }];
+          return [{
+            result: scriptingExecuteOverride
+              ? await scriptingExecuteOverride(options)
+              : scriptResult,
+          }];
         },
       },
       windows: {
@@ -1059,6 +1073,43 @@ describe("mutation scheduler", () => {
     expect(order).toEqual(["writer-start", "other-tab-read", "writer-end", "same-tab-read"]);
   });
 
+  test("a global observation waits for prior writes without becoming a later write barrier", async () => {
+    const scheduler = new MutationScheduler();
+    const writerGate = Promise.withResolvers<void>();
+    const writerStarted = Promise.withResolvers<void>();
+    const observationGate = Promise.withResolvers<void>();
+    const observationStarted = Promise.withResolvers<void>();
+    const order: string[] = [];
+    const writer = scheduler.enqueueTab(TASK_A, 41, async () => {
+      order.push("writer-start");
+      writerStarted.resolve();
+      await writerGate.promise;
+      order.push("writer-end");
+    });
+    const observation = scheduler.readAfterAllWrites(async () => {
+      order.push("observation-start");
+      observationStarted.resolve();
+      await observationGate.promise;
+      order.push("observation-end");
+    });
+    const laterWriter = scheduler.enqueueTab(TASK_B, 42, async () => {
+      order.push("later-writer");
+    });
+
+    await writerStarted.promise;
+    await laterWriter;
+    expect(order).toEqual(["writer-start", "later-writer"]);
+
+    writerGate.resolve();
+    await writer;
+    await observationStarted.promise;
+    expect(order).toEqual(["writer-start", "later-writer", "writer-end", "observation-start"]);
+
+    observationGate.resolve();
+    await observation;
+    expect(order.at(-1)).toBe("observation-end");
+  });
+
   test("prunes idle tab generations and invalidation reasons", async () => {
     const scheduler = new MutationScheduler();
     const internal = scheduler as unknown as {
@@ -1337,6 +1388,192 @@ describe("page revision monotonicity", () => {
     await runtime.detach(61);
   });
 
+  test("publishes stable semantic refs only for unique actionable accessibility targets", async () => {
+    debuggerCommandOverride = (method) => {
+      if (method !== "Accessibility.getFullAXTree") return undefined;
+      return {
+        nodes: [
+          { backendDOMNodeId: 22, role: { value: "button" }, name: { value: "Continue" } },
+          { backendDOMNodeId: 23, role: { value: "link" }, name: { value: "Documentation" } },
+          { backendDOMNodeId: 24, role: { value: "button" }, name: { value: "Delete" } },
+          { backendDOMNodeId: 25, role: { value: "button" }, name: { value: "Delete" } },
+          { backendDOMNodeId: 26, role: { value: "paragraph" }, name: { value: "Introduction" } },
+        ],
+      };
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const snapshot = await runtime.snapshot(61, { mode: "accessibility" });
+    const nodes = snapshot.nodes as Array<Record<string, unknown>>;
+
+    expect(nodes[0]).toMatchObject({
+      ref: "r1-22",
+      semantic_ref: "a1:button:Continue",
+      role: "button",
+      name: "Continue",
+    });
+    expect(nodes[1]).toMatchObject({
+      ref: "r1-23",
+      semantic_ref: "a1:link:Documentation",
+    });
+    expect(nodes[2].semantic_ref).toBeUndefined();
+    expect(nodes[3].semantic_ref).toBeUndefined();
+    expect(nodes[4].semantic_ref).toBeUndefined();
+    await runtime.detach(61);
+  });
+
+  test("resolves a semantic ref after an SPA replaces the underlying DOM node", async () => {
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.queryAXTree") {
+        return {
+          nodes: [
+            { backendDOMNodeId: 77, role: { value: "button" }, name: { value: "Continue" } },
+          ],
+        };
+      }
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return { result: { value: { tag: "BUTTON", text: "Continue" } } };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const pageRevision = await revisions.ensure(61);
+
+    await expect(runtime.act(
+      TASK_A,
+      61,
+      pageRevision,
+      [{ kind: "click", ref: `a${pageRevision}:button:Continue` }],
+    )).resolves.toMatchObject({
+      result: { actions: [{ kind: "click", completed: true }] },
+    });
+    expect(debuggerCommands.filter(
+      ({ method, params }) => method === "DOM.resolveNode" && params.backendNodeId === 77,
+    )).not.toHaveLength(0);
+    expect(debuggerCommands.filter(({ method }) => method === "Accessibility.queryAXTree"))
+      .toEqual([{
+        method: "Accessibility.queryAXTree",
+        params: { nodeId: 1, accessibleName: "Continue", role: "button" },
+      }]);
+    await runtime.detach(61);
+  });
+
+  test("rejects a semantic ref when its document changes during live resolution", async () => {
+    let documentReads = 0;
+    let frameTreeReads = 0;
+    debuggerCommandOverride = (method) => {
+      if (method === "DOM.getDocument") {
+        documentReads += 1;
+        const backendNodeId = documentReads === 1 ? 1 : 2;
+        return { root: { nodeId: backendNodeId, backendNodeId } };
+      }
+      if (method === "Page.getFrameTree") {
+        frameTreeReads += 1;
+        return {
+          frameTree: {
+            frame: { loaderId: frameTreeReads === 1 ? "loader-a" : "loader-b" },
+          },
+        };
+      }
+      if (method === "Accessibility.queryAXTree") {
+        return {
+          nodes: [
+            { backendDOMNodeId: 77, role: { value: "button" }, name: { value: "Continue" } },
+          ],
+        };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const pageRevision = await revisions.observeDocument(61, "backend:1", "loader-a");
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    await expect(runtime.act(
+      TASK_A,
+      61,
+      pageRevision,
+      [{ kind: "click", ref: `a${pageRevision}:button:Continue` }],
+    )).rejects.toMatchObject({
+      code: "stale_ref",
+      currentPageRevision: pageRevision + 1,
+    });
+    expect(debuggerCommands.some(({ method }) =>
+      method === "DOM.resolveNode" || method === "Runtime.callFunctionOn",
+    )).toBe(false);
+    await runtime.detach(61);
+  });
+
+  test("returns actionable candidates when a semantic target becomes ambiguous", async () => {
+    debuggerCommandOverride = (method) => {
+      if (method !== "Accessibility.queryAXTree") return undefined;
+      return {
+        nodes: [
+          { backendDOMNodeId: 40, role: { value: "button" }, name: { value: "Continue" } },
+          { backendDOMNodeId: 41, role: { value: "button" }, name: { value: "Continue" } },
+        ],
+      };
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const pageRevision = await revisions.ensure(61);
+
+    await expect(runtime.act(
+      TASK_A,
+      61,
+      pageRevision,
+      [{ kind: "click", ref: `a${pageRevision}:button:Continue` }],
+    )).rejects.toMatchObject({
+      code: "ambiguous_target",
+      details: {
+        role: "button",
+        name: "Continue",
+        match_count: 2,
+        candidates: [
+          { ref: `r${pageRevision}-40` },
+          { ref: `r${pageRevision}-41` },
+        ],
+      },
+    });
+    debuggerCommandOverride = (method) => method === "Accessibility.queryAXTree"
+      ? { nodes: [] }
+      : undefined;
+    await expect(runtime.act(
+      TASK_A,
+      61,
+      pageRevision,
+      [{ kind: "click", ref: `a${pageRevision}:button:Continue` }],
+    )).rejects.toMatchObject({
+      code: "target_not_found",
+      recovery: expect.stringContaining("fresh accessibility snapshot"),
+      details: { role: "button", name: "Continue", match_count: 0 },
+    });
+    await runtime.detach(61);
+  });
+
   test("retries a content match when navigation replaces the probed document", async () => {
     tabStore.set(61, {
       id: 61,
@@ -1364,9 +1601,218 @@ describe("page revision monotonicity", () => {
       timeout_ms: 500,
     });
 
-    expect(scriptingCallCount).toBe(2);
+    expect(scriptingCallCount).toBe(3);
     expect(result).toMatchObject({ matched: true, page_revision: 2 });
     await runtime.detach(61);
+  });
+
+  test("wakes a load wait from the Chrome tab event without waiting for its heartbeat", async () => {
+    vi.useFakeTimers();
+    try {
+      tabStore.set(61, {
+        id: 61,
+        windowId: 1,
+        groupId: -1,
+        url: "https://example.test/next",
+        status: "loading",
+      });
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      let settled = false;
+      const waiting = runtime.wait(61, {
+        condition: { kind: "load" },
+        timeout_ms: 1_000,
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+      await flushPromiseQueue();
+      expect(settled).toBe(false);
+
+      const tab = tabStore.get(61);
+      if (!tab) throw new Error("missing tab");
+      tab.status = "complete";
+      for (const listener of tabUpdatedListeners) listener(61, { status: "complete" });
+      for (let turn = 0; turn < 50; turn += 1) await Promise.resolve();
+
+      expect(settled).toBe(true);
+      await expect(waiting).resolves.toMatchObject({ condition: "load", matched: true });
+      await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("ignores unrelated tab-update storms while still waking for URL changes", async () => {
+    vi.useFakeTimers();
+    try {
+      tabStore.set(61, {
+        id: 61,
+        windowId: 1,
+        groupId: -1,
+        url: "https://example.test/before",
+        status: "complete",
+      });
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      let revalidations = 0;
+      const waiting = runtime.wait(
+        61,
+        {
+          condition: { kind: "url", value: "https://example.test/next" },
+          timeout_ms: 1_000,
+        },
+        async () => {
+          revalidations += 1;
+        },
+      );
+      for (let turn = 0; turn < 50 && revalidations < 2; turn += 1) {
+        await Promise.resolve();
+      }
+      const beforeStorm = revalidations;
+
+      for (let index = 0; index < 100; index += 1) {
+        for (const listener of tabUpdatedListeners) {
+          listener(61, { title: `Loading ${index}` });
+        }
+      }
+      await flushPromiseQueue();
+      expect(revalidations).toBe(beforeStorm);
+
+      const tab = tabStore.get(61);
+      if (!tab) throw new Error("missing tab");
+      tab.url = "https://example.test/next";
+      for (const listener of tabUpdatedListeners) listener(61, { url: tab.url });
+      for (let turn = 0; turn < 50 && revalidations === beforeStorm; turn += 1) {
+        await Promise.resolve();
+      }
+
+      expect(revalidations).toBeGreaterThan(beforeStorm);
+      await expect(waiting).resolves.toMatchObject({ condition: "url", matched: true });
+      await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("bounds quiet DOM waits to two mutation-observer slices per second", async () => {
+    vi.useFakeTimers();
+    try {
+      scriptResult = false;
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      const waiting = runtime.wait(61, {
+        condition: { kind: "selector", value: "#never" },
+        timeout_ms: 1_000,
+      });
+      await flushPromiseQueue();
+      await advanceTimers(1_100);
+
+      await expect(waiting).rejects.toMatchObject({ code: "wait_timeout" });
+      expect(scriptingCallCount).toBeLessThanOrEqual(5);
+      await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("coalesces mutation bursts and observes only condition-relevant DOM changes", async () => {
+    vi.useFakeTimers();
+    const priorGlobals = new Map<string, { present: boolean; value: unknown }>();
+    for (const key of ["document", "MutationObserver", "addEventListener", "removeEventListener"]) {
+      priorGlobals.set(key, {
+        present: key in globalThis,
+        value: Reflect.get(globalThis, key),
+      });
+    }
+    try {
+      for (const kind of ["text", "selector"] as const) {
+        let ready = false;
+        let scans = 0;
+        let mutationCallback: (() => void) | undefined;
+        let observerOptions: MutationObserverInit | undefined;
+        const documentElement = {
+          get textContent(): string {
+            scans += 1;
+            return ready ? "ready" : "pending";
+          },
+        };
+        Reflect.set(globalThis, "document", {
+          documentElement,
+          querySelector: () => {
+            scans += 1;
+            return ready ? documentElement : null;
+          },
+        });
+        Reflect.set(globalThis, "MutationObserver", class {
+          constructor(callback: () => void) {
+            mutationCallback = callback;
+          }
+
+          observe(_target: unknown, options: MutationObserverInit): void {
+            observerOptions = options;
+          }
+
+          disconnect(): void { }
+        });
+        Reflect.set(globalThis, "addEventListener", () => undefined);
+        Reflect.set(globalThis, "removeEventListener", () => undefined);
+
+        scriptingExecuteOverride = async (options) => {
+          if (options.args?.length !== 4 || !options.func) return ready;
+          const observerResult = Promise.resolve(options.func(...options.args));
+          expect(mutationCallback).toBeDefined();
+          for (let index = 0; index < 100; index += 1) mutationCallback?.();
+          expect(scans).toBe(2);
+
+          ready = true;
+          vi.advanceTimersByTime(49);
+          await flushPromiseQueue();
+          expect(scans).toBe(2);
+          vi.advanceTimersByTime(1);
+          await flushPromiseQueue();
+          expect(scans).toBe(3);
+          return observerResult;
+        };
+
+        const runtime = new StandardBrowserRuntime(
+          new RevisionTracker(),
+          async () => undefined,
+          () => undefined,
+          async () => undefined,
+        );
+        await expect(runtime.wait(61, {
+          condition: { kind, value: kind === "text" ? "ready" : "#ready" },
+          timeout_ms: 1_000,
+        })).resolves.toMatchObject({ condition: kind, matched: true });
+        expect(observerOptions).toMatchObject({
+          attributes: kind === "selector",
+          characterData: kind === "text",
+          childList: true,
+          subtree: true,
+        });
+        await runtime.detach(61);
+      }
+    } finally {
+      scriptingExecuteOverride = null;
+      for (const [key, prior] of priorGlobals) {
+        if (prior.present) Reflect.set(globalThis, key, prior.value);
+        else Reflect.deleteProperty(globalThis, key);
+      }
+      vi.useRealTimers();
+    }
   });
 
   test("serializes concurrent attachment and keeps a failed detach recoverable", async () => {
@@ -1381,6 +1827,10 @@ describe("page revision monotonicity", () => {
       runtime.snapshot(62, { mode: "accessibility" }),
     ]);
     expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+    for (const domain of ["Page", "Network", "DOM", "Accessibility"]) {
+      expect(debuggerCalls.filter((call) => call === `${domain}.enable`)).toHaveLength(1);
+    }
+    expect(debuggerCalls).not.toContain("Runtime.enable");
 
     debuggerDetachFailures = 1;
     await expect(runtime.detach(62)).rejects.toThrow("debugger detach failed");
@@ -1447,7 +1897,7 @@ describe("page revision monotonicity", () => {
         await Promise.resolve();
       }
       expect(debuggerCalls).toContain("Network.enable");
-      await advanceTimers(0);
+      await advanceTimers(1);
       emitDebuggerEvent(61, "Network.loadingFinished", { requestId: "racing-enable" });
 
       await advanceTimers(550);
@@ -1461,7 +1911,7 @@ describe("page revision monotonicity", () => {
 
       await advanceTimers(450);
       expect(settled).toBe(false);
-      await advanceTimers(100);
+      await advanceTimers(500);
       await expect(waiting).resolves.toMatchObject({
         tab_id: 61,
         condition: "network_idle",
@@ -1584,6 +2034,85 @@ describe("page revision monotonicity", () => {
     expect(debuggerAttachedTabIds.has(66)).toBe(false);
     expect(runtime.debuggerTabIds()).toEqual([]);
     expect(forgotten).toEqual([66]);
+  });
+
+  test("enables command-only debugger domains once, on first use", async () => {
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+    );
+
+    await runtime.snapshot(67, { mode: "text" });
+    expect(debuggerCommands.filter(({ method }) => method.endsWith(".enable")).map(({ method }) => method)).toEqual([
+      "Page.enable",
+      "Network.enable",
+      "DOM.enable",
+    ]);
+
+    await runtime.snapshot(67, { mode: "accessibility" });
+    await runtime.snapshot(67, { mode: "accessibility" });
+    expect(debuggerCommands.filter(({ method }) => method.endsWith(".enable")).map(({ method }) => method)).toEqual([
+      "Page.enable",
+      "Network.enable",
+      "DOM.enable",
+      "Accessibility.enable",
+    ]);
+
+    await runtime.developer(67, "Runtime.evaluate", { expression: "document.title" });
+    expect(debuggerCommands.filter(({ method }) => method.endsWith(".enable")).map(({ method }) => method)).toEqual([
+      "Page.enable",
+      "Network.enable",
+      "DOM.enable",
+      "Accessibility.enable",
+      "Runtime.enable",
+    ]);
+    await runtime.detach(67);
+  });
+
+  test("recycles the debugger session after a Developer domain disable", async () => {
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+    );
+
+    await runtime.snapshot(67, { mode: "accessibility" });
+    await runtime.developer(67, "Accessibility.disable", {});
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(1);
+
+    await runtime.snapshot(67, { mode: "accessibility" });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
+    expect(debuggerCalls.filter((call) => call === "Accessibility.enable")).toHaveLength(2);
+    await runtime.detach(67);
+  });
+
+  test("detaches and recovers when a lazy domain fails to enable", async () => {
+    let failDomEnable = true;
+    debuggerCommandOverride = (method) => {
+      if (method === "DOM.enable" && failDomEnable) {
+        failDomEnable = false;
+        throw new Error("DOM domain unavailable");
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+    );
+
+    await expect(runtime.snapshot(68, { mode: "text" })).rejects.toThrow("DOM domain unavailable");
+    expect(debuggerAttachedTabIds.has(68)).toBe(false);
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(1);
+
+    await expect(runtime.snapshot(68, { mode: "text" })).resolves.toMatchObject({
+      tab_id: 68,
+      mode: "text",
+    });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
+    expect(debuggerCalls.filter((call) => call === "DOM.enable")).toHaveLength(2);
+    await runtime.detach(68);
   });
 
   test("authorizes every debugger initialization command", async () => {
@@ -1874,6 +2403,95 @@ describe("page revision monotonicity", () => {
       await advanceTimers(600);
       await expect(waiting).resolves.toMatchObject({
         tab_id: 61,
+        condition: "network_idle",
+        matched: true,
+      });
+      await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("anchors network idle to a new wait on an already quiet debugger session", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      await runtime.snapshot(61, { mode: "accessibility" });
+      await advanceTimers(5_000);
+
+      let settled = false;
+      const waiting = runtime.wait(61, {
+        condition: { kind: "network_idle" },
+        timeout_ms: 2_000,
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+      await flushPromiseQueue();
+
+      await advanceTimers(100);
+      expect(settled).toBe(false);
+      emitDebuggerEvent(61, "Network.requestWillBeSent", { requestId: "post-action" });
+      await advanceTimers(100);
+      emitDebuggerEvent(61, "Network.loadingFinished", { requestId: "post-action" });
+
+      await advanceTimers(450);
+      expect(settled).toBe(false);
+      await advanceTimers(100);
+      await expect(waiting).resolves.toMatchObject({
+        tab_id: 61,
+        condition: "network_idle",
+        matched: true,
+      });
+      await runtime.detach(61);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("bounds network-event wakeups until the active request burst drains", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = new StandardBrowserRuntime(
+        new RevisionTracker(),
+        async () => undefined,
+        () => undefined,
+        async () => undefined,
+      );
+      await runtime.snapshot(61, { mode: "accessibility" });
+      let revalidations = 0;
+      const waiting = runtime.wait(
+        61,
+        { condition: { kind: "network_idle" }, timeout_ms: 2_000 },
+        async () => {
+          revalidations += 1;
+        },
+      );
+      await flushPromiseQueue();
+      for (let turn = 0; turn < 50 && revalidations < 2; turn += 1) {
+        await Promise.resolve();
+      }
+      const beforeBurst = revalidations;
+
+      for (let index = 0; index < 100; index += 1) {
+        emitDebuggerEvent(61, "Network.requestWillBeSent", { requestId: `burst-${index}` });
+      }
+      for (let index = 0; index < 99; index += 1) {
+        emitDebuggerEvent(61, "Network.loadingFinished", { requestId: `burst-${index}` });
+      }
+      await flushPromiseQueue();
+      expect(revalidations).toBe(beforeBurst);
+
+      emitDebuggerEvent(61, "Network.loadingFinished", { requestId: "burst-99" });
+      await flushPromiseQueue();
+      expect(revalidations).toBeGreaterThan(beforeBurst);
+      await advanceTimers(600);
+      await expect(waiting).resolves.toMatchObject({
         condition: "network_idle",
         matched: true,
       });
@@ -4407,6 +5025,38 @@ describe("extension entrypoint admission boundaries", () => {
         ({ method, params }) => method === "Runtime.evaluate" && params.expression === "document.title",
       ),
     ).toBe(true);
+
+    debuggerCommandOverride = (method) => method === "Accessibility.queryAXTree"
+      ? {
+        nodes: [
+          { backendDOMNodeId: 40, role: { value: "button" }, name: { value: "Continue" } },
+          { backendDOMNodeId: 41, role: { value: "button" }, name: { value: "Continue" } },
+        ],
+      }
+      : undefined;
+    const ambiguousTarget = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6401",
+      TASK_A,
+      "browser_act",
+      {
+        tab_id: 100,
+        expected_page_revision: 1,
+        actions: [{ kind: "click", ref: "a1:button:Continue" }],
+      },
+    );
+    expect(ambiguousTarget).toMatchObject({
+      outcome: "not_started",
+      error: {
+        code: "ambiguous_target",
+        details: {
+          role: "button",
+          name: "Continue",
+          match_count: 2,
+          candidates: [{ ref: "r1-40" }, { ref: "r1-41" }],
+        },
+      },
+    });
+    debuggerCommandOverride = null;
 
 
     const staged = await sendNativeCommand(

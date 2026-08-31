@@ -44,6 +44,8 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   permissions_required: true,
   stale_revision: true,
   stale_ref: true,
+  target_not_found: true,
+  ambiguous_target: true,
   paused: true,
   developer_mode_required: true,
   invalid_staged_token: true,
@@ -334,6 +336,15 @@ function errorRecovery(error: unknown): string | undefined {
   return isRecord(error) && typeof error.recovery === "string" ? error.recovery : undefined;
 }
 
+function errorDetails(error: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(error)) return undefined;
+  const details = isRecord(error.details) ? { ...error.details } : {};
+  if (typeof error.currentPageRevision === "number") {
+    details.current_page_revision = error.currentPageRevision;
+  }
+  return Object.keys(details).length > 0 ? details : undefined;
+}
+
 function errorOutcome(error: unknown, mutating: boolean, code: string): Outcome {
   if (isRecord(error) && typeof error.outcome === "string") {
     const outcome = error.outcome;
@@ -390,7 +401,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       return completed(command.request_id, await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params)));
     }
     if (command.method === "browser_tabs") {
-      const result = await scheduler.enqueueGlobal(() => ownership.inventory());
+      const result = await scheduler.readAfterAllWrites(() => ownership.inventory());
       return completed(command.request_id, {
         tabs: result
           .filter((tab) => tab.task_id === command.task_id)
@@ -487,9 +498,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       normalized instanceof Error ? normalized.message : String(normalized),
       errorOutcome(normalized, mutating, code),
       errorRecovery(normalized),
-      isRecord(normalized) && typeof normalized.currentPageRevision === "number"
-        ? { current_page_revision: normalized.currentPageRevision }
-        : undefined,
+      errorDetails(normalized),
     );
   }
 }

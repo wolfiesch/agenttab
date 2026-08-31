@@ -158,7 +158,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_snapshot",
       label: "Browser Snapshot",
-      description: "Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab.",
+      description: "Read an accessibility snapshot with stable semantic refs, bounded text or HTML, or a screenshot from a task-owned tab.",
       approval: "read",
       schema: (z) => z.union([
         z.object({
@@ -190,7 +190,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_act",
       label: "Browser Act",
-      description: "Run an ordered batch of typed actions against one task-owned tab and page revision.",
+      description: "Run typed actions against one task-owned tab and page revision; prefer a snapshot semantic_ref when available.",
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);
@@ -231,7 +231,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_wait",
       label: "Browser Wait",
-      description: "Wait for one schema-defined load, URL, text, selector, network-idle, or download condition.",
+      description: "Wait event-first for one load, URL, text, selector, network-idle, or download condition instead of sleeping.",
       approval: "read",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
