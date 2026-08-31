@@ -144,6 +144,7 @@ impl StdioNative {
             lifecycle,
             handoff,
             event_sink: RwLock::new(None),
+            extension_version: RwLock::new(None),
             disconnected: AtomicBool::new(true),
             generation: AtomicU64::new(0),
         })
