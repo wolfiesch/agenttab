@@ -3155,7 +3155,7 @@ describe("consequential action staging", () => {
     await runtime.detach(7);
     expect(events).toEqual([]);
   });
-  test("stages consequential selected and entered values before dispatch while allowing harmless values immediately", async () => {
+  test("classifies page-owned target semantics without treating caller-entered values as consequences", async () => {
     debuggerCommandOverride = (method, params) => {
       if (
         method !== "Runtime.callFunctionOn" ||
@@ -3173,25 +3173,39 @@ describe("consequential action staging", () => {
         ? (firstArgument as Record<string, string>).value
         : null;
       const expectedValue = objectId.endsWith("-22")
-        ? "account-ending-1234"
+        ? "Remove filter"
         : objectId.endsWith("-23")
-          ? "Authorize"
+          ? "Post title"
           : objectId.endsWith("-24")
-            ? "Pay"
-            : "keep-draft";
+            ? "please send the report"
+            : objectId.endsWith("-25")
+              ? "account-ending-1234"
+              : null;
       expect(requestedValue).toBe(expectedValue);
       return {
         result: {
           value: {
-            tag: objectId.endsWith("-22") ? "SELECT" : "INPUT",
-            role: objectId.endsWith("-22") ? "combobox" : "textbox",
-            text: "Action",
-            aria_label: "Action",
-            name: "action",
-            associated_labels: ["Action"],
-            accessible_labels: ["Action"],
+            tag: objectId.endsWith("-22") || objectId.endsWith("-25")
+              ? "SELECT"
+              : objectId.endsWith("-26")
+                ? "BUTTON"
+                : "INPUT",
+            role: objectId.endsWith("-22") || objectId.endsWith("-25")
+              ? "combobox"
+              : objectId.endsWith("-26")
+                ? "button"
+                : "textbox",
+            text: objectId.endsWith("-26") ? "Submit order" : "Editor control",
+            aria_label: objectId.endsWith("-26") ? "Submit order" : "Editor control",
+            name: "editor-control",
+            associated_labels: ["Editor control"],
+            accessible_labels: ["Editor control"],
             requested_value: requestedValue,
-            requested_option_label: objectId.endsWith("-22") ? "Delete" : null,
+            requested_option_label: objectId.endsWith("-25")
+              ? "Delete account"
+              : objectId.endsWith("-22")
+                ? "Keep current filter"
+                : null,
             form_action: "https://example.test/profile",
             form_method: "get",
           },
@@ -3202,53 +3216,68 @@ describe("consequential action staging", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(8);
 
-    for (const [action, keyword] of [
-      [{ kind: "select", ref: `r${pageRevision}-22`, value: "account-ending-1234" }, "Delete"],
-      [{ kind: "fill", ref: `r${pageRevision}-23`, text: "Authorize" }, "Authorize"],
-      [{ kind: "type", ref: `r${pageRevision}-24`, text: "Pay" }, "Pay"],
+    for (const action of [
+      { kind: "select", ref: `r${pageRevision}-22`, value: "Remove filter" },
+      { kind: "fill", ref: `r${pageRevision}-23`, text: "Post title" },
+      { kind: "type", ref: `r${pageRevision}-24`, text: "please send the report" },
     ] as const) {
-      const prepared = await runtime.act(TASK_A, 8, pageRevision, [action]);
-      expect(prepared).toMatchObject({
+      const completed = await runtime.act(TASK_A, 8, pageRevision, [action]);
+      expect(completed).toMatchObject({
         result: {
           tab_id: 8,
           page_revision: pageRevision,
-          actions: [],
-          staged_index: 0,
-        },
-        staged: {
-          task_id: TASK_A,
-          tab_id: 8,
-          page_revision: pageRevision,
-          effect: expect.stringContaining(keyword),
-          preview: { kind: action.kind },
+          actions: [{ kind: action.kind, completed: true }],
         },
       });
+      expect(completed.staged).toBeUndefined();
     }
-    const valueDispatches = debuggerCommands.filter(
-      ({ method, params }) =>
-        method === "Runtime.callFunctionOn" &&
-        /this\.value=|dispatchEvent/.test(String(params.functionDeclaration)),
-    );
-    expect(valueDispatches).toHaveLength(0);
 
-    const harmless = await runtime.act(TASK_A, 8, pageRevision, [
-      { kind: "select", ref: `r${pageRevision}-25`, value: "keep-draft" },
-    ]);
-    expect(harmless).toMatchObject({
-      result: {
-        tab_id: 8,
-        page_revision: pageRevision,
-        actions: [{ kind: "select", completed: true }],
-      },
-    });
-    expect(harmless.staged).toBeUndefined();
     expect(
       debuggerCommands.filter(
         ({ method, params }) =>
           method === "Runtime.callFunctionOn" &&
           /this\.value=|dispatchEvent/.test(String(params.functionDeclaration)),
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(3);
+
+    const destructiveSelection = await runtime.act(TASK_A, 8, pageRevision, [
+      { kind: "select", ref: `r${pageRevision}-25`, value: "account-ending-1234" },
+    ]);
+    expect(destructiveSelection).toMatchObject({
+      result: {
+        tab_id: 8,
+        page_revision: pageRevision,
+        actions: [],
+        staged_index: 0,
+      },
+      staged: {
+        effect: expect.stringContaining("Delete account"),
+        preview: { kind: "select" },
+      },
+    });
+
+    const submitOrder = await runtime.act(TASK_A, 8, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-26` },
+    ]);
+    expect(submitOrder).toMatchObject({
+      result: {
+        tab_id: 8,
+        page_revision: pageRevision,
+        actions: [],
+        staged_index: 0,
+      },
+      staged: {
+        effect: expect.stringContaining("Submit order"),
+        preview: { kind: "click" },
+      },
+    });
+
+    const consequentialDispatches = debuggerCommands.filter(
+      ({ method, params }) =>
+        method === "Runtime.callFunctionOn" &&
+        /this\.value=|dispatchEvent/.test(String(params.functionDeclaration)),
+    );
+    expect(consequentialDispatches).toHaveLength(3);
   });
   test("retains an approved popup review until Commit and clears an abandoned review", async () => {
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
