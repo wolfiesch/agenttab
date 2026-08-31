@@ -568,16 +568,27 @@ async function reconcileOwnership(): Promise<void> {
 }
 
 chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) => {
+  if (!Number.isInteger(tab.id) || !Number.isInteger(tab.openerTabId)) return;
   runAfterStart(() => ownership.adoptOwnedChild(tab));
 });
 chrome.tabs.onRemoved.addListener((removedTabId: number) => {
   runAfterStart(async () => {
+    const owner = await ownership.taskIdForTab(removedTabId);
+    if (!owner && !browser.tracksTab(removedTabId)) return;
     await handoff.cancelForTab(removedTabId);
     await browser.detach(removedTabId);
     await ownership.revoke(removedTabId, "tab_removed");
   });
 });
 chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
+  if (
+    changeInfo.status !== "loading" &&
+    changeInfo.status !== "complete" &&
+    typeof changeInfo.url !== "string" &&
+    !("groupId" in changeInfo)
+  ) {
+    return;
+  }
   runAfterStart(async () => {
     const owner = await ownership.taskIdForTab(updatedTabId);
     if (!owner) return;
@@ -597,9 +608,21 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
     }
   });
 });
-chrome.tabs.onAttached.addListener(() => runAfterStart(reconcileOwnership));
-chrome.tabs.onDetached.addListener(() => runAfterStart(reconcileOwnership));
-chrome.tabGroups.onRemoved.addListener(() => runAfterStart(reconcileOwnership));
+const reconcileOwnedTab = (tabId: number): void => {
+  runAfterStart(async () => {
+    if (!(await ownership.taskIdForTab(tabId)) && !browser.tracksTab(tabId)) return;
+    await reconcileOwnership();
+  });
+};
+chrome.tabs.onAttached.addListener(reconcileOwnedTab);
+chrome.tabs.onDetached.addListener(reconcileOwnedTab);
+chrome.tabGroups.onRemoved.addListener((group: { id?: number }) => {
+  if (!Number.isInteger(group.id)) return;
+  runAfterStart(async () => {
+    if (!(await ownership.hasOwnedGroup(group.id as number))) return;
+    await reconcileOwnership();
+  });
+});
 chrome.runtime.onStartup.addListener(() => runAfterStart());
 chrome.runtime.onInstalled.addListener(() => runAfterStart());
 chrome.permissions.onRemoved.addListener((permissions) => {

@@ -372,12 +372,19 @@ export function mutateState<T>(
 ): Promise<T> {
   const operation = mutationQueue.then(async () => {
     const state = await initializeState();
+    // initializeState returns a clone, so the cached value remains a stable
+    // baseline while the mutator works without another whole-state clone.
+    const before = initializedState;
     const result = await mutator(state);
-    await chrome.storage.local.set({ [STATE_KEY]: state });
-    const verified = parseState((await chrome.storage.local.get(STATE_KEY))[STATE_KEY]);
+    if (before && jsonEquivalent(before, state)) return result;
+    // Keep the cache isolated from objects retained by the mutator/caller,
+    // matching Chrome storage's structured-clone boundary without a readback.
+    const persisted = structuredClone(state);
+    const verified = parseState(persisted);
     if (!verified || !jsonEquivalent(verified, state)) {
-      throw new Error("AgentTab state persistence read-back failed");
+      throw new Error("AgentTab state mutation produced malformed state");
     }
+    await chrome.storage.local.set({ [STATE_KEY]: state });
     initializedState = verified;
     return result;
   });

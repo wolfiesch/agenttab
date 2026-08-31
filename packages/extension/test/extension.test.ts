@@ -108,6 +108,11 @@ type TabUpdatedListener = (
   tabId: number,
   changeInfo: Record<string, unknown>,
 ) => void;
+type TabCreatedListener = (tab: { id?: number; openerTabId?: number }) => void;
+type TabRemovedListener = (tabId: number) => void;
+type TabAttachedListener = (tabId: number) => void;
+type TabDetachedListener = (tabId: number) => void;
+type TabGroupRemovedListener = (group: { id?: number }) => void;
 type AlarmListener = (alarm: { name: string }) => void;
 
 const EXTENSION_ID = "agenttab-test-extension";
@@ -119,10 +124,19 @@ let permissionRequestResult: boolean;
 let popupMessageListeners: PopupMessageListener[];
 let permissionRemovedListeners: PermissionRemovedListener[];
 let permissionAddedListeners: PermissionAddedListener[];
+let tabCreatedListeners: TabCreatedListener[];
+let tabRemovedListeners: TabRemovedListener[];
 let tabUpdatedListeners: TabUpdatedListener[];
+let tabAttachedListeners: TabAttachedListener[];
+let tabDetachedListeners: TabDetachedListener[];
+let tabGroupRemovedListeners: TabGroupRemovedListener[];
 let debuggerEventListeners: Array<(...args: unknown[]) => void>;
 let debuggerDetachListeners: Array<(...args: unknown[]) => void>;
 let popupRuntimeHandler: (message: Record<string, unknown>) => unknown | Promise<unknown>;
+let storageGetCount: number;
+let storageSetCount: number;
+let storageRemoveCount: number;
+let tabQueryCount: number;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -328,11 +342,20 @@ function installChromeMock(): void {
   permissionRequestResult = true;
   popupMessageListeners = [];
   permissionAddedListeners = [];
+  tabCreatedListeners = [];
+  tabRemovedListeners = [];
   tabUpdatedListeners = [];
+  tabAttachedListeners = [];
+  tabDetachedListeners = [];
+  tabGroupRemovedListeners = [];
   permissionRemovedListeners = [];
   debuggerEventListeners = [];
   debuggerDetachListeners = [];
   popupRuntimeHandler = () => popupUiState();
+  storageGetCount = 0;
+  storageSetCount = 0;
+  storageRemoveCount = 0;
+  tabQueryCount = 0;
   const listeners = {
     detach: debuggerDetachListeners,
     event: debuggerEventListeners,
@@ -347,17 +370,20 @@ function installChromeMock(): void {
       storage: {
         local: {
           async get(keys: string | string[] | null) {
+            storageGetCount += 1;
             if (keys === null) return clone(persisted);
             const selected = Array.isArray(keys) ? keys : [keys];
             return Object.fromEntries(selected.filter((key) => key in persisted).map((key) => [key, clone(persisted[key])]));
           },
           async set(values: Record<string, unknown>) {
+            storageSetCount += 1;
             Object.assign(
               persisted,
               normalizeStoredObjectKeys ? recursivelySortObjectKeys(values) : clone(values),
             );
           },
           async remove(keys: string | string[]) {
+            storageRemoveCount += 1;
             for (const key of Array.isArray(keys) ? keys : [keys]) delete persisted[key];
           },
         },
@@ -423,15 +449,31 @@ function installChromeMock(): void {
         },
       },
       tabs: {
-        onCreated: { addListener() { } },
-        onRemoved: { addListener() { } },
+        onCreated: {
+          addListener(listener: TabCreatedListener) {
+            tabCreatedListeners.push(listener);
+          },
+        },
+        onRemoved: {
+          addListener(listener: TabRemovedListener) {
+            tabRemovedListeners.push(listener);
+          },
+        },
         onUpdated: {
           addListener(listener: TabUpdatedListener) {
             tabUpdatedListeners.push(listener);
           },
         },
-        onAttached: { addListener() { } },
-        onDetached: { addListener() { } },
+        onAttached: {
+          addListener(listener: TabAttachedListener) {
+            tabAttachedListeners.push(listener);
+          },
+        },
+        onDetached: {
+          addListener(listener: TabDetachedListener) {
+            tabDetachedListeners.push(listener);
+          },
+        },
         SPLIT_VIEW_ID_NONE: -1,
         async get(tabId: number) {
           return clone({
@@ -444,6 +486,7 @@ function installChromeMock(): void {
           });
         },
         async query(query: Record<string, unknown>) {
+          tabQueryCount += 1;
           let tabs = [...tabStore.values()];
           if (typeof query.windowId === "number") tabs = tabs.filter((tab) => tab.windowId === query.windowId);
           if (query.active === true) tabs = tabs.filter((tab) => tab.active);
@@ -552,7 +595,11 @@ function installChromeMock(): void {
       },
       tabGroups: {
         async update() { },
-        onRemoved: { addListener() { } },
+        onRemoved: {
+          addListener(listener: TabGroupRemovedListener) {
+            tabGroupRemovedListeners.push(listener);
+          },
+        },
       },
       downloads: { async search() { return clone(completedDownloads); } },
       alarms: {
@@ -1012,6 +1059,42 @@ describe("mutation scheduler", () => {
     expect(order).toEqual(["writer-start", "other-tab-read", "writer-end", "same-tab-read"]);
   });
 
+  test("prunes idle tab generations and invalidation reasons", async () => {
+    const scheduler = new MutationScheduler();
+    const internal = scheduler as unknown as {
+      generations: Map<number, number>;
+      generationReasons: Map<number, { code: string; message: string }>;
+    };
+
+    scheduler.invalidateTab(404);
+    expect(internal.generations.size).toBe(0);
+    expect(internal.generationReasons.size).toBe(0);
+
+    const activeGate = Promise.withResolvers<void>();
+    const activeStarted = Promise.withResolvers<void>();
+    const active = scheduler.enqueueTab(TASK_A, 41, async () => {
+      activeStarted.resolve();
+      await activeGate.promise;
+    });
+    const stale = scheduler.enqueueTab(TASK_A, 41, async () => "must not run");
+    const staleOutcome = stale.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await activeStarted.promise;
+
+    scheduler.invalidateTab(41);
+    expect(internal.generations.get(41)).toBe(1);
+    expect(internal.generationReasons.get(41)?.code).toBe("stale_revision");
+
+    activeGate.resolve();
+    await active;
+    expect(await staleOutcome).toMatchObject({ code: "stale_revision" });
+    await flushPromiseQueue();
+    expect(internal.generations.size).toBe(0);
+    expect(internal.generationReasons.size).toBe(0);
+  });
+
   test("navigation rejects an admitted mutation before it starts", async () => {
     const scheduler = new MutationScheduler();
     const firstGate = Promise.withResolvers<void>();
@@ -1141,9 +1224,32 @@ describe("durable extension state", () => {
     expect(persisted[STATE_KEY]).toBeDefined();
     expect(persisted[LEGACY_TASKS_KEY]).toBeUndefined();
     expect(persisted[LEGACY_PREFERENCES_KEY]).toBeUndefined();
+    expect(storageSetCount).toBe(1);
+    expect(storageGetCount).toBe(3);
+    expect(storageRemoveCount).toBe(1);
   });
 
-  test("accepts Chrome storage read-back with normalized object-key order", async () => {
+  test("skips no-op persistence and avoids hot-path write verification reads", async () => {
+    await readState();
+    const initialGets = storageGetCount;
+    const initialSets = storageSetCount;
+
+    await mutateState(() => undefined);
+    expect(storageGetCount).toBe(initialGets);
+    expect(storageSetCount).toBe(initialSets);
+
+    await mutateState((state) => {
+      state.showAgentPointer = false;
+    });
+    expect(storageGetCount).toBe(initialGets);
+    expect(storageSetCount).toBe(initialSets + 1);
+
+    resetStateForTest();
+    expect((await readState()).showAgentPointer).toBe(false);
+    expect(storageGetCount).toBe(initialGets + 1);
+  });
+
+  test("accepts normalized persisted object-key order after restart", async () => {
     normalizeStoredObjectKeys = true;
     await mutateState((state) => {
       state.tasks[TASK_A] = {
@@ -1157,12 +1263,21 @@ describe("durable extension state", () => {
         updatedAt: 2,
       };
     });
+    resetStateForTest();
 
     expect((await readState()).tasks[TASK_A]).toMatchObject({
       name: "Key-order-safe task",
       groupId: 9,
       tabIds: [41],
     });
+  });
+
+  test("still rejects malformed persisted state during startup", async () => {
+    await readState();
+    persisted[STATE_KEY] = { schemaVersion: 1, paused: "not-a-boolean" };
+    resetStateForTest();
+
+    await expect(readState()).rejects.toThrow("Persisted AgentTab state is malformed");
   });
 });
 
@@ -1191,6 +1306,23 @@ describe("page revision monotonicity", () => {
       code: "stale_revision",
       currentPageRevision: original + 1,
     });
+  });
+
+  test("does not persist unchanged revision observations", async () => {
+    const revisions = new RevisionTracker();
+    expect(await revisions.observeDocument(7, "document-a", "loader-a")).toBe(1);
+    const initialGets = storageGetCount;
+    const initialSets = storageSetCount;
+
+    expect(await revisions.ensure(7)).toBe(1);
+    expect(await revisions.observeDocument(7, "document-a", "loader-a")).toBe(1);
+    expect(await revisions.observeDocument(7, "document-a", "loader-a")).toBe(1);
+    expect(storageGetCount).toBe(initialGets);
+    expect(storageSetCount).toBe(initialSets);
+
+    expect(await revisions.markNavigation(7)).toBe(2);
+    expect(storageGetCount).toBe(initialGets);
+    expect(storageSetCount).toBe(initialSets + 1);
   });
 
   test("keeps a snapshot revision stable until Chrome reports a new document", async () => {
@@ -2536,6 +2668,23 @@ describe("ownership and task isolation", () => {
       page_revision: 1,
       task_id: TASK_A,
     }]);
+  });
+
+  test("does not persist a matching ownership reconciliation", async () => {
+    await seedTask(TASK_A, [31], 7);
+    const revisions = new RevisionTracker();
+    await revisions.ensure(31);
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      revisions,
+      () => undefined,
+    );
+    const initialGets = storageGetCount;
+    const initialSets = storageSetCount;
+
+    expect(await ownership.reconcile()).toEqual([]);
+    expect(storageGetCount).toBe(initialGets);
+    expect(storageSetCount).toBe(initialSets);
   });
 
   test("reconciliation revokes a moved tab and its queued mutation", async () => {
@@ -3997,6 +4146,22 @@ describe("extension entrypoint admission boundaries", () => {
       state: "ready",
     });
     await waitForCondition(() => alarmClears.includes(RECONNECT_ALARM));
+
+    const writesBeforeUnrelatedEvents = storageSetCount;
+    const queriesBeforeUnrelatedEvents = tabQueryCount;
+    for (const listener of tabCreatedListeners) {
+      listener({ id: 900 });
+      listener({ id: 901, openerTabId: 902 });
+    }
+    for (const listener of tabRemovedListeners) listener(900);
+    for (const listener of tabUpdatedListeners) listener(900, { favIconUrl: "https://example.test/icon.png" });
+    for (const listener of tabAttachedListeners) listener(900);
+    for (const listener of tabDetachedListeners) listener(900);
+    for (const listener of tabGroupRemovedListeners) listener({ id: 900 });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await flushPromiseQueue();
+    expect(storageSetCount).toBe(writesBeforeUnrelatedEvents);
+    expect(tabQueryCount).toBe(queriesBeforeUnrelatedEvents);
 
     const popupListener = popupMessageListeners.at(-1);
     if (!popupListener) throw new Error("popup message listener is unavailable");

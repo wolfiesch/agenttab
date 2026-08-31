@@ -134,19 +134,17 @@ export class MutationScheduler {
   }
 
   revokeTab(tabId: number): void {
-    this.generationReasons.set(tabId, {
+    this.invalidateQueuedTab(tabId, {
       code: "ownership_revoked",
       message: "Tab ownership changed before this mutation was dispatched",
     });
-    this.generations.set(tabId, (this.generations.get(tabId) ?? 0) + 1);
   }
 
   invalidateTab(tabId: number): void {
-    this.generationReasons.set(tabId, {
+    this.invalidateQueuedTab(tabId, {
       code: "stale_revision",
       message: "Page navigation invalidated this queued mutation",
     });
-    this.generations.set(tabId, (this.generations.get(tabId) ?? 0) + 1);
   }
 
   revokePermissions(): void {
@@ -204,11 +202,28 @@ export class MutationScheduler {
     this.tabTails.set(tabId, tail);
     if (taskId !== undefined) this.taskTails.set(taskId, tail);
     void tail.then(() => {
-      if (this.tabTails.get(tabId) === tail) this.tabTails.delete(tabId);
+      if (this.tabTails.get(tabId) === tail) {
+        this.tabTails.delete(tabId);
+        this.generations.delete(tabId);
+        this.generationReasons.delete(tabId);
+      }
       if (taskId !== undefined && this.taskTails.get(taskId) === tail) {
         this.taskTails.delete(taskId);
       }
     });
+  }
+
+  private invalidateQueuedTab(
+    tabId: number,
+    reason: { code: string; message: string },
+  ): void {
+    if (!this.tabTails.has(tabId)) {
+      this.generations.delete(tabId);
+      this.generationReasons.delete(tabId);
+      return;
+    }
+    this.generationReasons.set(tabId, reason);
+    this.generations.set(tabId, (this.generations.get(tabId) ?? 0) + 1);
   }
 
   private track<T>(operation: Promise<T>): void {
