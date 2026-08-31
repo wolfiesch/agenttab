@@ -1,0 +1,24 @@
+{
+  "name": "@getagenttab/gpt-control-driver",
+  "version": "2.0.0-rc.1",
+  "description": "AgentTab browser driver for GPT-Control",
+  "type": "module",
+  "bin": {
+    "agenttab-gpt-control-driver": "dist/driver.mjs"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "bun run scripts/build.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "node-html-parser": "^7.0.1",
+    "@types/bun": "^1.2.23",
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.3"
+  }
+}

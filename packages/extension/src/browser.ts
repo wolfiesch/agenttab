@@ -670,7 +670,9 @@ export class StandardBrowserRuntime {
     }
     const currentTarget = typeof action.ref === "string"
       ? await this.targetDescriptor(staged.tab_id, staged.page_revision, action.ref, action)
-      : { kind: action.kind };
+      : action.kind === "upload_file" && typeof action.selector === "string"
+        ? await this.targetDescriptorBySelector(staged.tab_id, action.selector)
+        : { kind: action.kind };
     if (
       await this.stageFingerprint(taskId, staged.tab_id, staged.page_revision, action, currentTarget) !==
       staged.fingerprint
@@ -790,6 +792,7 @@ export class StandardBrowserRuntime {
   ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const selector = typeof params.selector === "string" ? params.selector : null;
+    const selectorMatch = params.match === "last" ? "last" : "first";
     const requestedMaxBytes = typeof params.max_bytes === "number"
       ? Math.min(params.max_bytes, SNAPSHOT_TEXT_MAX_BYTES)
       : 256_000;
@@ -797,12 +800,19 @@ export class StandardBrowserRuntime {
     const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (snapshotMode: "text" | "html", targetSelector: string | null) => {
-        const target = targetSelector ? document.querySelector(targetSelector) : document.documentElement;
+      func: (
+        snapshotMode: "text" | "html",
+        targetSelector: string | null,
+        targetMatch: "first" | "last",
+      ) => {
+        const matches = targetSelector ? document.querySelectorAll(targetSelector) : [];
+        const target = targetSelector
+          ? targetMatch === "last" ? matches[matches.length - 1] : matches[0]
+          : document.documentElement;
         if (!target) throw new Error(`Selector did not match: ${targetSelector}`);
         return snapshotMode === "text" ? target.textContent ?? "" : target.outerHTML;
       },
-      args: [mode, selector],
+      args: [mode, selector, selectorMatch],
     });
     const after = await this.pageIdentity(tabId);
     const currentPageRevision = await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
@@ -977,7 +987,7 @@ export class StandardBrowserRuntime {
         effect: `Upload ${count} ${count === 1 ? "file" : "files"} to the page`,
         target: typeof action.ref === "string"
           ? await this.targetDescriptor(tabId, pageRevision, action.ref)
-          : { kind: action.kind },
+          : await this.targetDescriptorBySelector(tabId, String(action.selector ?? "")),
       };
     }
     if (action.kind === "dialog" && action.decision === "accept") {
@@ -1100,12 +1110,33 @@ export class StandardBrowserRuntime {
     ref: unknown,
     action?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    return this.targetDescriptorForBackendNode(
+      tabId,
+      this.backendNodeId(pageRevision, ref),
+      action,
+    );
+  }
+
+  private async targetDescriptorBySelector(
+    tabId: number,
+    selector: string,
+  ): Promise<Record<string, unknown>> {
+    return this.targetDescriptorForBackendNode(
+      tabId,
+      await this.backendNodeIdFromSelector(tabId, selector),
+    );
+  }
+
+  private async targetDescriptorForBackendNode(
+    tabId: number,
+    backendNodeId: number,
+    action?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const requestedValue = action?.kind === "select"
       ? String(action.value ?? "")
       : action?.kind === "fill" || action?.kind === "type"
         ? String(action.text ?? "")
         : null;
-    const backendNodeId = this.backendNodeId(pageRevision, ref);
     const resolved = await this.send(tabId, "DOM.resolveNode", { backendNodeId });
     if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
       throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
@@ -1179,7 +1210,9 @@ export class StandardBrowserRuntime {
       });
       return { kind, completed: true };
     }
-    const backendNodeId = this.backendNodeId(pageRevision, action.ref);
+    const backendNodeId = kind === "upload_file" && typeof action.selector === "string"
+      ? await this.backendNodeIdFromSelector(tabId, action.selector)
+      : this.backendNodeId(pageRevision, action.ref);
     if (kind === "click") {
       const [activeTab, existingTabs] = await Promise.all([
         chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab),
@@ -1340,6 +1373,34 @@ export class StandardBrowserRuntime {
       });
     }
     return Number(match[2]);
+  }
+
+  private async backendNodeIdFromSelector(tabId: number, selector: string): Promise<number> {
+    const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
+    if (!isRecord(document.root) || typeof document.root.nodeId !== "number") {
+      throw Object.assign(new Error("Could not inspect the upload document"), {
+        code: "action_failed",
+      });
+    }
+    const selected = await this.send(tabId, "DOM.querySelector", {
+      nodeId: document.root.nodeId,
+      selector,
+    });
+    if (typeof selected.nodeId !== "number" || selected.nodeId === 0) {
+      throw Object.assign(new Error(`Selector did not match: ${selector}`), {
+        code: "selector_not_found",
+      });
+    }
+    const described = await this.send(tabId, "DOM.describeNode", {
+      nodeId: selected.nodeId,
+      depth: 0,
+    });
+    if (!isRecord(described.node) || typeof described.node.backendNodeId !== "number") {
+      throw Object.assign(new Error("Selected upload target could not be resolved"), {
+        code: "action_failed",
+      });
+    }
+    return described.node.backendNodeId;
   }
 
   private async callOnNode(

@@ -4,6 +4,7 @@
   "title": "browser_act parameters",
   "$defs": {
     "ref": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "selector": { "type": "string", "minLength": 1, "maxLength": 2048 },
     "url": { "type": "string", "maxLength": 2048, "pattern": "^(https?://|about:)[^\\s]+$" },
     "action": {
       "oneOf": [
@@ -113,10 +114,11 @@
     },
     "upload_file": {
       "type": "object",
-      "required": ["kind", "ref", "files"],
+      "required": ["kind", "files"],
       "properties": {
         "kind": { "const": "upload_file" },
         "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" },
         "files": {
           "type": "array",
           "minItems": 1,
@@ -124,6 +126,10 @@
           "items": { "type": "string", "minLength": 1, "maxLength": 512 }
         }
       },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
       "additionalProperties": false
     }
   },

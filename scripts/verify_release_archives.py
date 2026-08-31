@@ -179,6 +179,7 @@ def smoke_packages(directory: Path, root: Path, tag: str, temporary_root: Path) 
         directory / f"agenttab-sdk-{version}.tgz",
         directory / f"agenttab-mcp-{version}.tgz",
         directory / f"agenttab-omp-{version}.tgz",
+        directory / f"agenttab-gpt-control-driver-{version}.tgz",
         directory / f"agenttab-{version}.tgz",
     ]
     run(
@@ -190,6 +191,7 @@ def smoke_packages(directory: Path, root: Path, tag: str, temporary_root: Path) 
     for relative in (
         "node_modules/agenttab-mcp/dist/server.mjs",
         "node_modules/@getagenttab/omp/dist/index.mjs",
+        "node_modules/@getagenttab/gpt-control-driver/dist/driver.mjs",
         "node_modules/agenttab/dist/cli.mjs",
     ):
         run([node, "--check", relative], cwd=npm_root, env=env)

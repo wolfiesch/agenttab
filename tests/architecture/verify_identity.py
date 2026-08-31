@@ -42,6 +42,7 @@ def verify(*, release: bool) -> None:
         "typescript": "@getagenttab/sdk",
         "python": "agenttab",
         "omp": "@getagenttab/omp",
+        "gptControlDriver": "@getagenttab/gpt-control-driver",
     }
     development = identity["developmentExtension"]
     assert chrome_id(development["publicKey"]) == development["id"]
@@ -57,6 +58,10 @@ def verify(*, release: bool) -> None:
         ROOT / "packages" / "installer" / "package.json": (identity["packages"]["cli"], version),
         ROOT / "packages" / "mcp" / "package.json": (identity["packages"]["mcp"], version),
         ROOT / "packages" / "omp" / "package.json": (identity["packages"]["omp"], version),
+        ROOT / "packages" / "gpt-control-driver" / "package.json": (
+            identity["packages"]["gptControlDriver"],
+            version,
+        ),
         ROOT / "packages" / "sdk-typescript" / "package.json": (identity["packages"]["typescript"], version),
     }
     for path, expected in package_expectations.items():

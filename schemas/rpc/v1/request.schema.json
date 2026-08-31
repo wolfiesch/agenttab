@@ -22,7 +22,8 @@
         "browser_handoff",
         "browser_commit",
         "browser_developer",
-        "agenttab.status"
+        "agenttab.status",
+        "agenttab.close"
       ]
     },
     "params": { "type": "object" }
@@ -68,7 +69,10 @@
       "then": { "properties": { "params": { "$ref": "browser-commit.schema.json" } } }
     },
     {
-      "if": { "properties": { "method": { "const": "agenttab.status" } }, "required": ["method"] },
+      "if": {
+        "properties": { "method": { "enum": ["agenttab.status", "agenttab.close"] } },
+        "required": ["method"]
+      },
       "then": { "properties": { "params": { "$ref": "status.schema.json" } } }
     },
     {

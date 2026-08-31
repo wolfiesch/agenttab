@@ -20,6 +20,7 @@ PACKAGE_MANIFESTS = {
     "packages/sdk-typescript/package.json": "@getagenttab/sdk",
     "packages/mcp/package.json": "agenttab-mcp",
     "packages/omp/package.json": "@getagenttab/omp",
+    "packages/gpt-control-driver/package.json": "@getagenttab/gpt-control-driver",
     "packages/installer/package.json": "agenttab",
 }
 EXTENSION_MANIFESTS = (
@@ -115,6 +116,7 @@ def verify(root: Path, tag: str) -> dict[str, str]:
         "typescript": "@getagenttab/sdk",
         "python": "agenttab",
         "omp": "@getagenttab/omp",
+        "gptControlDriver": "@getagenttab/gpt-control-driver",
     }.items():
         expect(errors, packages.get(key), expected, f"config/identity.json:packages.{key}")
 

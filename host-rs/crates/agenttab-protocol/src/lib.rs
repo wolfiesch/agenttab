@@ -177,6 +177,8 @@ pub enum RpcMethod {
     BrowserCommit,
     #[serde(rename = "agenttab.status")]
     AgenttabStatus,
+    #[serde(rename = "agenttab.close")]
+    AgenttabClose,
     BrowserDeveloper,
 }
 
@@ -285,6 +287,7 @@ pub enum MethodParams {
     Handoff(BrowserHandoffParams),
     Commit(BrowserCommitParams),
     Status(BrowserTabsParams),
+    Close(BrowserTabsParams),
     Developer(BrowserDeveloperParams),
 }
 
@@ -299,6 +302,7 @@ impl MethodParams {
             RpcMethod::BrowserHandoff => Self::Handoff(decode_params(method, value)?),
             RpcMethod::BrowserCommit => Self::Commit(decode_params(method, value)?),
             RpcMethod::AgenttabStatus => Self::Status(decode_params(method, value)?),
+            RpcMethod::AgenttabClose => Self::Close(decode_params(method, value)?),
             RpcMethod::BrowserDeveloper => Self::Developer(decode_params(method, value)?),
         };
         params.validate(method)?;
@@ -315,6 +319,7 @@ impl MethodParams {
             Self::Handoff(value) => serde_json::to_value(value),
             Self::Commit(value) => serde_json::to_value(value),
             Self::Status(value) => serde_json::to_value(value),
+            Self::Close(value) => serde_json::to_value(value),
             Self::Developer(value) => serde_json::to_value(value),
         }
         .expect("typed protocol parameters serialize")
@@ -370,6 +375,8 @@ pub enum BrowserSnapshotParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#match: Option<SnapshotSelectorMatch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u32>,
     },
     Html {
@@ -378,6 +385,8 @@ pub enum BrowserSnapshotParams {
         selector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#match: Option<SnapshotSelectorMatch>,
     },
     Screenshot {
         tab_id: u64,
@@ -396,6 +405,13 @@ pub enum BrowserSnapshotParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u32>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSelectorMatch {
+    First,
+    Last,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,7 +472,10 @@ pub enum BrowserAction {
         decision: DialogDecision,
     },
     UploadFile {
-        r#ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
         files: Vec<String>,
     },
 }
@@ -582,17 +601,24 @@ impl MethodParams {
             }
             Self::Snapshot(BrowserSnapshotParams::Text {
                 selector,
+                r#match,
                 max_bytes,
                 ..
             })
             | Self::Snapshot(BrowserSnapshotParams::Html {
                 selector,
+                r#match,
                 max_bytes,
                 ..
             }) => {
                 if let Some(value) = selector {
                     require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
                 }
+                require(
+                    method,
+                    r#match.is_none() || selector.is_some(),
+                    "match requires selector",
+                )?;
                 if let Some(value) = max_bytes {
                     require(
                         method,
@@ -717,7 +743,10 @@ impl MethodParams {
                 require_len(method, &params.action, 1, 128, "action")?;
                 validate_developer_params(method, &params.params)?;
             }
-            Self::Open(BrowserOpenParams::AdoptActive) | Self::Tabs(_) | Self::Status(_) => {}
+            Self::Open(BrowserOpenParams::AdoptActive)
+            | Self::Tabs(_)
+            | Self::Status(_)
+            | Self::Close(_) => {}
         }
         Ok(())
     }
@@ -761,8 +790,24 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             )
         }
         BrowserAction::Dialog { .. } => Ok(()),
-        BrowserAction::UploadFile { r#ref, files } => {
-            require_ref(method, r#ref)?;
+        BrowserAction::UploadFile {
+            r#ref,
+            selector,
+            files,
+        } => {
+            match (r#ref, selector) {
+                (Some(value), None) => require_ref(method, value)?,
+                (None, Some(value)) => {
+                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?
+                }
+                _ => {
+                    return require(
+                        method,
+                        false,
+                        "upload_file requires exactly one of ref or selector",
+                    )
+                }
+            }
             require(
                 method,
                 (1..=MAX_UPLOAD_FILES).contains(&files.len()),
@@ -1967,6 +2012,87 @@ mod tests {
                     | Err(ProtocolError::InvalidParams { .. })
             ));
         }
+    }
+
+    #[test]
+    fn selector_addressing_and_task_close_match_the_public_schema() {
+        let (_, snapshot) = RpcRequest::parse(request(
+            "browser_snapshot",
+            json!({
+                "mode": "html",
+                "tab_id": 7,
+                "selector": "[data-message-author-role=\"assistant\"]",
+                "match": "last"
+            }),
+            false,
+        ))
+        .unwrap();
+        assert!(matches!(
+            snapshot,
+            MethodParams::Snapshot(BrowserSnapshotParams::Html {
+                r#match: Some(SnapshotSelectorMatch::Last),
+                ..
+            })
+        ));
+        assert!(matches!(
+            RpcRequest::parse(request(
+                "browser_snapshot",
+                json!({"mode": "html", "tab_id": 7, "match": "last"}),
+                false,
+            )),
+            Err(ProtocolError::InvalidParamConstraint { .. })
+        ));
+
+        let (_, upload) = RpcRequest::parse(request(
+            "browser_act",
+            json!({
+                "tab_id": 7,
+                "expected_page_revision": 1,
+                "actions": [{
+                    "kind": "upload_file",
+                    "selector": "input[type=\"file\"]",
+                    "files": ["/tmp/a.png"]
+                }]
+            }),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(
+            upload,
+            MethodParams::Act(BrowserActParams { actions, .. })
+                if matches!(
+                    actions.as_slice(),
+                    [BrowserAction::UploadFile {
+                        r#ref: None,
+                        selector: Some(selector),
+                        ..
+                    }] if selector == "input[type=\"file\"]"
+                )
+        ));
+
+        for action in [
+            json!({"kind": "upload_file", "files": ["/tmp/a.png"]}),
+            json!({
+                "kind": "upload_file",
+                "ref": "r1-2",
+                "selector": "input[type=\"file\"]",
+                "files": ["/tmp/a.png"]
+            }),
+        ] {
+            assert!(RpcRequest::parse(request(
+                "browser_act",
+                json!({
+                    "tab_id": 7,
+                    "expected_page_revision": 1,
+                    "actions": [action]
+                }),
+                true,
+            ))
+            .is_err());
+        }
+
+        let (_, close) = RpcRequest::parse(request("agenttab.close", json!({}), false)).unwrap();
+        assert!(matches!(close, MethodParams::Close(_)));
     }
 
     #[test]

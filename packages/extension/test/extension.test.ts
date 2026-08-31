@@ -917,6 +917,61 @@ describe("native protocol", () => {
     })).toThrow("max_bytes must be between 1 and 1000000");
   });
 
+  test("accepts last-match snapshots and selector-addressed uploads", () => {
+    const envelope = {
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "command",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621d",
+      task_id: TASK_A,
+      connection_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621f",
+    };
+    expect(parseCommand({
+      ...envelope,
+      method: "browser_snapshot",
+      params: {
+        tab_id: 42,
+        mode: "html",
+        selector: '[data-message-author-role="assistant"]',
+        match: "last",
+      },
+    }).params).toMatchObject({ match: "last" });
+    expect(parseCommand({
+      ...envelope,
+      method: "agenttab.close",
+      params: {},
+    }).method).toBe("agenttab.close");
+    const upload = {
+      ...envelope,
+      method: "browser_act",
+      params: {
+        tab_id: 42,
+        expected_page_revision: 1,
+        actions: [{ kind: "upload_file", selector: 'input[type="file"]', files: ["/tmp/a.png"] }],
+      },
+    };
+    expect(parseCommand(upload).params).toEqual(upload.params);
+    expect(() => parseCommand({
+      ...upload,
+      params: {
+        ...upload.params,
+        actions: [{
+          kind: "upload_file",
+          ref: "r1-2",
+          selector: 'input[type="file"]',
+          files: ["/tmp/a.png"],
+        }],
+      },
+    })).toThrow("exactly one of ref or selector");
+    expect(() => parseCommand({
+      ...upload,
+      params: {
+        ...upload.params,
+        actions: [{ kind: "upload_file", files: ["/tmp/a.png"] }],
+      },
+    })).toThrow("exactly one of ref or selector");
+  });
+
   test("rejects removed focus and prompt-input action capabilities", () => {
     const command = {
       protocol: "agenttab.native",
@@ -1335,6 +1390,48 @@ describe("page revision monotonicity", () => {
     expect(second.page_revision).toBe(1);
     expect((await readState()).revisions["61"]).toMatchObject({ floor: 1, current: 1 });
     await runtime.detach(61);
+  });
+
+  test("re-resolves selector-addressed uploads before Commit", async () => {
+    tabStore.set(65, {
+      id: 65,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    debuggerCommandOverride = (method) => {
+      if (method === "DOM.querySelector") return { nodeId: 77 };
+      if (method === "DOM.describeNode") return { node: { backendNodeId: 88 } };
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const execution = await runtime.act(TASK_A, 65, 1, [{
+      kind: "upload_file",
+      selector: 'input[type="file"]',
+      files: ["/tmp/a.png"],
+    }]);
+    expect(execution.staged).toBeDefined();
+    const result = await runtime.commit(TASK_A, {
+      native_token: execution.staged?.native_token,
+    });
+
+    expect(result).toMatchObject({
+      actions: [{
+        kind: "upload_file",
+        completed: true,
+      }],
+    });
+    expect(
+      debuggerCommands.find((command) => command.method === "DOM.setFileInputFiles")?.params,
+    ).toEqual({ files: ["/tmp/a.png"], backendNodeId: 88 });
+    await runtime.detach(65);
   });
 
   test("retries a content match when navigation replaces the probed document", async () => {

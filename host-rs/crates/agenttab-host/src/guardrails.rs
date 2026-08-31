@@ -551,7 +551,8 @@ mod tests {
             tab_id: 1,
             expected_page_revision: 2,
             actions: vec![BrowserAction::UploadFile {
-                r#ref: "e1".into(),
+                r#ref: Some("e1".into()),
+                selector: None,
                 files: vec![std::env::current_exe().unwrap().display().to_string()],
             }],
         });
@@ -665,7 +666,8 @@ mod tests {
             tab_id: 7,
             expected_page_revision: 1,
             actions: vec![BrowserAction::UploadFile {
-                r#ref: "e1".into(),
+                r#ref: Some("e1".into()),
+                selector: None,
                 files: vec![link.display().to_string()],
             }],
         });
@@ -691,7 +693,8 @@ mod tests {
             tab_id: 7,
             expected_page_revision: 1,
             actions: vec![BrowserAction::UploadFile {
-                r#ref: "e1".into(),
+                r#ref: Some("e1".into()),
+                selector: None,
                 files: vec![hardlink.display().to_string()],
             }],
         });

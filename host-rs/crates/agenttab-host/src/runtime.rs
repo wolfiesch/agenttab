@@ -509,6 +509,48 @@ impl Runtime {
                 false,
             );
         }
+        if request.method == RpcMethod::AgenttabClose {
+            let task_id = connection.task_id().ok().flatten();
+            let response = match task_id {
+                Some(task_id) => self
+                    .native
+                    .close_task(task_id, CLOSE_TASK_TIMEOUT)
+                    .map_err(|error| JournalError::NativeTaskCleanup(error.to_string()))
+                    .and_then(|()| self.journal.close_task(task_id))
+                    .map(|()| {
+                        connection.cancel();
+                        self.native.cancel_connection(connection.connection_id);
+                        RpcResponse::success(
+                            request.request_id.clone(),
+                            Outcome::Completed,
+                            json!({ "closed": true }),
+                        )
+                    })
+                    .unwrap_or_else(|error| {
+                        RpcResponse::failure(
+                            request.request_id.clone(),
+                            Outcome::Unknown,
+                            journal_rpc_error(error),
+                        )
+                    }),
+                None => RpcResponse::success(
+                    request.request_id.clone(),
+                    Outcome::Completed,
+                    json!({ "closed": false }),
+                ),
+            };
+            return self.audited_value(
+                connection,
+                task_id,
+                &request,
+                &params_value,
+                response,
+                started_at_ms,
+                started,
+                false,
+                false,
+            );
+        }
         if connection.is_cancelled() {
             let response = cancelled_response(request.request_id.clone());
             return self.audited_value(
@@ -1344,6 +1386,7 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Tabs(_)
         | MethodParams::Commit(_)
         | MethodParams::Status(_)
+        | MethodParams::Close(_)
         | MethodParams::Developer(_) => None,
     }
 }
@@ -2043,6 +2086,62 @@ mod tests {
         assert!(matches!(error, JournalError::NativeTaskCleanup(_)));
         assert_eq!(native.closed_tasks.lock().len(), 1);
         assert!(runtime.journal.resume_task(&capability).unwrap().is_some());
+    }
+
+    #[test]
+    fn agenttab_close_closes_the_task_and_cancels_the_connection() {
+        let native = FakeNative::normal();
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let opened = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "tabs",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+        let capability = opened["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let task_id = opened["task"]["task_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap();
+        confirm_new_capability(&runtime, &connection, capability.clone());
+
+        let closed = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "close",
+                "method": "agenttab.close",
+                "params": {}
+            }),
+        );
+
+        assert_eq!(closed["outcome"], "completed");
+        assert_eq!(closed["result"]["closed"], true);
+        assert_eq!(*native.closed_tasks.lock(), vec![task_id]);
+        assert!(connection.is_cancelled());
+        assert!(runtime.journal.resume_task(&capability).unwrap().is_none());
+
+        let rejected = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "tabs-after-close",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+        assert_eq!(rejected["outcome"], "not_started");
+        assert_eq!(rejected["error"]["code"], "connection_cancelled");
     }
 
     fn confirm_new_capability(

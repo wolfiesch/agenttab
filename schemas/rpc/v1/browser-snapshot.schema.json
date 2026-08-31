@@ -22,8 +22,10 @@
         "tab_id": { "type": "integer", "minimum": 0 },
         "mode": { "enum": ["text", "html"] },
         "selector": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "match": { "enum": ["first", "last"], "default": "first" },
         "max_bytes": { "type": "integer", "minimum": 1, "maximum": 1000000 }
       },
+      "dependentRequired": { "match": ["selector"] },
       "additionalProperties": false
     },
     {
