@@ -15,11 +15,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agenttab import (
     AgentTabClient,
+    AgentTabCompatibilityError,
     AgentTabError,
     AgentTabTransportError,
     DEFAULT_BROWSER_HANDOFF_TIMEOUT,
     DEFAULT_BROWSER_WAIT_TIMEOUT,
     LONG_OPERATION_TRANSPORT_GRACE,
+    RPC_FEATURES,
     encode_frame,
     read_frame,
     resolve_transport_timeout,
@@ -175,6 +177,8 @@ class ClientTests(unittest.TestCase):
                 try:
                     hello = read_frame(connection)
                     self.assertEqual(hello["kind"], "connect")
+                    self.assertEqual(hello["supported_versions"], [1])
+                    self.assertEqual(hello["supported_features"], list(RPC_FEATURES))
                     connection.sendall(encode_frame({
                         "protocol": "agenttab.rpc",
                         "version": 1,
@@ -206,6 +210,130 @@ class ClientTests(unittest.TestCase):
             worker.join(timeout=2)
             server.close()
             self.assertRegex(str(captured[0]["idempotency_key"]), r"-7[0-9a-f]{3}-")
+
+    def test_compatibility_error_preserves_recovery_details(self) -> None:
+        error = AgentTabCompatibilityError({
+            "message": "AgentTab Core does not support protocol version 2",
+            "requested_protocol": "agenttab.rpc",
+            "requested_version": 2,
+            "supported_versions": [1],
+            "recovery": "Update AgentTab.",
+        })
+        self.assertEqual(error.requested_protocol, "agenttab.rpc")
+        self.assertEqual(error.requested_version, 2)
+        self.assertEqual(error.supported_versions, (1,))
+        self.assertEqual(error.recovery, "Update AgentTab.")
+
+    def test_pre_ack_rejection_retries_with_exact_legacy_v1_connect(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(endpoint)
+            server.listen(2)
+            captured: list[dict[str, object]] = []
+
+            def serve() -> None:
+                for attempt in range(2):
+                    connection, _ = server.accept()
+                    try:
+                        captured.append(read_frame(connection))
+                        if attempt == 0:
+                            continue
+                        connection.sendall(encode_frame({
+                            "protocol": "agenttab.rpc",
+                            "version": 1,
+                            "kind": "connected",
+                            "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                            "resumed": False,
+                            "state": "ready",
+                        }))
+                    finally:
+                        connection.close()
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            client = AgentTabClient.connect(
+                endpoint=endpoint,
+                conversation_id="conversation-for-both-attempts",
+            )
+            client.close()
+            worker.join(timeout=2)
+            server.close()
+
+            self.assertEqual(len(captured), 2)
+            self.assertEqual(captured[0]["supported_versions"], [1])
+            self.assertEqual(captured[0]["supported_features"], list(RPC_FEATURES))
+            self.assertEqual(captured[1], {
+                "protocol": "agenttab.rpc",
+                "version": 1,
+                "kind": "connect",
+                "conversation_id": "conversation-for-both-attempts",
+            })
+
+    def test_legacy_v1_connect_rejection_is_not_retried_again(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(endpoint)
+            server.listen(2)
+            captured: list[dict[str, object]] = []
+
+            def serve() -> None:
+                for _attempt in range(2):
+                    connection, _ = server.accept()
+                    try:
+                        captured.append(read_frame(connection))
+                    finally:
+                        connection.close()
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            with self.assertRaises((EOFError, ConnectionResetError)):
+                AgentTabClient.connect(endpoint=endpoint)
+            worker.join(timeout=2)
+            server.close()
+
+            self.assertEqual(len(captured), 2)
+            self.assertIn("supported_versions", captured[0])
+            self.assertNotIn("supported_versions", captured[1])
+            self.assertNotIn("supported_features", captured[1])
+
+    def test_explicit_incompatibility_never_falls_back_to_legacy_v1(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(endpoint)
+            server.listen(2)
+            captured: list[dict[str, object]] = []
+
+            def serve() -> None:
+                connection, _ = server.accept()
+                try:
+                    captured.append(read_frame(connection))
+                    connection.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "kind": "incompatible",
+                        "requested_protocol": "agenttab.rpc",
+                        "requested_version": 2,
+                        "supported_versions": [1],
+                        "message": "AgentTab Core does not support protocol version 2",
+                        "recovery": "Update AgentTab.",
+                    }))
+                finally:
+                    connection.close()
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            with self.assertRaises(AgentTabCompatibilityError):
+                AgentTabClient.connect(endpoint=endpoint)
+            worker.join(timeout=2)
+            server.settimeout(0.05)
+            with self.assertRaises(socket.timeout):
+                server.accept()
+            server.close()
+
+            self.assertEqual(len(captured), 1)
 
     def test_file_transport_enforces_request_deadline(self) -> None:
         class BlockingStream(io.RawIOBase):
@@ -327,18 +455,50 @@ class ClientTests(unittest.TestCase):
         with patch("agenttab.client.os.name", "nt"), patch(
             "agenttab.client._open_windows_named_pipe",
             return_value=stream,
-        ):
+        ) as open_pipe:
             with self.assertRaises(TimeoutError):
-                AgentTabClient._negotiate_connection(
-                    r"\\.\pipe\agenttab-test",
-                    conversation_id=None,
-                    resume_capability=None,
+                AgentTabClient.connect(
+                    endpoint=r"\\.\pipe\agenttab-test",
                     connect_timeout=0.05,
                     request_timeout=1.0,
                 )
+        self.assertEqual(open_pipe.call_count, 1)
         self.assertTrue(stream.closed)
         self.assertEqual(len(stream.timeouts), 1)
         self.assertLessEqual(stream.timeouts[0] or 0, 0.05)
+
+    def test_partial_connection_response_never_triggers_legacy_fallback(self) -> None:
+        class TruncatedWindowsPipe:
+            _agenttab_windows_pipe = True
+
+            def __init__(self) -> None:
+                self.response = io.BytesIO(b"\x01")
+                self.closed = False
+
+            def read(self, size: int, _timeout: float | None = None) -> bytes:
+                return self.response.read(size)
+
+            def write(self, payload: bytes, _timeout: float | None = None) -> int:
+                return len(payload)
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        stream = TruncatedWindowsPipe()
+        with patch("agenttab.client.os.name", "nt"), patch(
+            "agenttab.client._open_windows_named_pipe",
+            return_value=stream,
+        ) as open_pipe:
+            with self.assertRaises(EOFError):
+                AgentTabClient.connect(
+                    endpoint=r"\\.\pipe\agenttab-test",
+                    connect_timeout=0.05,
+                )
+        self.assertEqual(open_pipe.call_count, 1)
+        self.assertTrue(stream.closed)
 
     def test_generated_mutation_key_survives_timeout_and_reuses(self) -> None:
         with tempfile.TemporaryDirectory() as root:

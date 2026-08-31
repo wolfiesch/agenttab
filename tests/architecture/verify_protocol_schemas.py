@@ -208,7 +208,22 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
     )
 
     connection_validator.validate(
-        {"protocol": "agenttab.rpc", "version": 1, "kind": "connect"}
+        {
+            "protocol": "agenttab.rpc",
+            "version": 2,
+            "kind": "connect",
+            "supported_versions": [1, 2],
+            "supported_features": ["task_resume_v1"],
+        }
+    )
+    connection_validator.validate(
+        {
+            "protocol": "agenttab.rpc",
+            "version": 1,
+            "kind": "connect",
+            "supported_versions": [1],
+            "supported_features": ["task_resume_v1"],
+        }
     )
     connected = {
         "protocol": "agenttab.rpc",
@@ -217,6 +232,7 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         "connection_id": "018f47a0-7b10-7abc-8def-0123456789ab",
         "resumed": False,
         "state": "ready",
+        "features": ["task_resume_v1"],
     }
     connection_validator.validate(connected)
     missing_state = dict(connected)
@@ -235,7 +251,29 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
             resume_capability="r" * 32,
         )
     )
-    return len(requests) + 10
+    connection_validator.validate(
+        {
+            "protocol": "agenttab.rpc",
+            "version": 1,
+            "kind": "incompatible",
+            "requested_protocol": "agenttab.rpc",
+            "requested_version": 2,
+            "supported_versions": [1],
+            "message": "AgentTab Core does not support protocol version 2",
+            "recovery": "Update AgentTab.",
+        }
+    )
+    expect_invalid(
+        connection_validator,
+        {
+            "protocol": "agenttab.rpc",
+            "version": 1,
+            "kind": "connect",
+            "supported_versions": [1, 1],
+        },
+        "duplicate supported versions",
+    )
+    return len(requests) + 16
 
 
 def verify_native_messages(schemas: dict[Path, dict], registry: Registry) -> int:
@@ -256,7 +294,43 @@ def verify_native_messages(schemas: dict[Path, dict], registry: Registry) -> int
     missing_task = dict(close_task)
     missing_task.pop("task_id")
     expect_invalid(native_validator, missing_task, "close_task task binding")
-    return 3
+    native_validator.validate(
+        {
+            "protocol": "agenttab.native",
+            "version": 2,
+            "kind": "hello",
+            "extension_version": "2.0.0",
+            "inventory": [],
+            "paused": False,
+            "handoff": {"active": False},
+            "staged_commits": [],
+            "supported_versions": [1, 2],
+            "supported_features": ["event_ack_v1"],
+        }
+    )
+    native_validator.validate(
+        {
+            "protocol": "agenttab.native",
+            "version": 1,
+            "kind": "ready",
+            "host_version": "2.0.0",
+            "state": "ready",
+            "features": ["event_ack_v1"],
+        }
+    )
+    native_validator.validate(
+        {
+            "protocol": "agenttab.native",
+            "version": 1,
+            "kind": "incompatible",
+            "requested_protocol": "agenttab.native",
+            "requested_version": 2,
+            "supported_versions": [1],
+            "message": "Native protocol version 2 is unsupported",
+            "recovery": "Update AgentTab.",
+        }
+    )
+    return 6
 
 
 def main() -> int:

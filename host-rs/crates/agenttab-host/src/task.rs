@@ -32,6 +32,7 @@ impl ConnectionContext {
         journal: &Arc<Journal>,
         runtime_state: RuntimeState,
     ) -> Result<(Arc<Self>, ConnectionAck), JournalError> {
+        let features = init.negotiated_features();
         let resumed_lease = match init.resume_capability.as_deref() {
             Some(capability) => journal.resume_task(capability)?,
             None => None,
@@ -48,6 +49,7 @@ impl ConnectionContext {
                 .as_ref()
                 .map(|lease| lease.resume_capability.clone()),
             state: runtime_state,
+            features,
         };
         let context = Arc::new(Self {
             connection_id: ack.connection_id,
@@ -184,6 +186,8 @@ mod tests {
             kind: ConnectKind::Connect,
             conversation_id: Some("conversation".into()),
             resume_capability: capability,
+            supported_versions: None,
+            supported_features: None,
         }
     }
 

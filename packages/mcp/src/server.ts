@@ -4,6 +4,8 @@ import {
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
+  MUTATING_RPC_METHODS,
+  RPC_TOOL_METADATA,
   createUuidV7,
   createResumeCapabilityStore,
   type MethodParams,
@@ -27,13 +29,7 @@ export const MCP_MAX_LINE_BYTES = 1024 * 1024 + 64 * 1024;
 export const MCP_INLINE_RESULT_MAX_BYTES = 8 * 1024;
 const IDEMPOTENCY_KEY_CACHE_MAX_ENTRIES = 4_096;
 
-const MUTATIONS = new Set<RpcMethod>([
-  "browser_open",
-  "browser_act",
-  "browser_handoff",
-  "browser_commit",
-  "browser_developer",
-]);
+const MUTATIONS = new Set<RpcMethod>(MUTATING_RPC_METHODS);
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 class InvocationIdempotencyKeys {
@@ -151,44 +147,44 @@ const schema = (value: Record<string, unknown>): Record<string, unknown> => {
 export const STANDARD_TOOLS: readonly Tool[] = [
   {
     name: "browser_open",
-    description: "Create a task tab, create an unfocused task-owned window, or explicitly adopt the active tab.",
+    description: RPC_TOOL_METADATA.browser_open.description,
     inputSchema: schema(openSchema),
   },
   {
     name: "browser_snapshot",
-    description: "Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab.",
+    description: RPC_TOOL_METADATA.browser_snapshot.description,
     inputSchema: schema(snapshotSchema),
   },
   {
     name: "browser_act",
-    description: "Run an ordered batch of typed actions against one task-owned tab and page revision.",
+    description: RPC_TOOL_METADATA.browser_act.description,
     inputSchema: schema(actSchema),
   },
   {
     name: "browser_wait",
-    description: "Wait for one schema-defined load, URL, text, selector, network-idle, or download condition.",
+    description: RPC_TOOL_METADATA.browser_wait.description,
     inputSchema: schema(waitSchema),
   },
   {
     name: "browser_tabs",
-    description: "List only tabs owned by this task connection.",
+    description: RPC_TOOL_METADATA.browser_tabs.description,
     inputSchema: schema(tabsSchema),
   },
   {
     name: "browser_handoff",
-    description: "Pause all agent actions and give the user control for credentials, MFA, CAPTCHA, or other human-only input.",
+    description: RPC_TOOL_METADATA.browser_handoff.description,
     inputSchema: schema(handoffSchema),
   },
   {
     name: "browser_commit",
-    description: "Execute one previously staged consequential action after semantic review.",
+    description: RPC_TOOL_METADATA.browser_commit.description,
     inputSchema: schema(commitSchema),
   },
 ] as const;
 
 export const DEVELOPER_TOOL: Tool = {
   name: "browser_developer",
-  description: "Run an explicitly enabled developer-mode action outside the Standard tool surface.",
+  description: RPC_TOOL_METADATA.browser_developer.description,
   inputSchema: schema(developerSchema),
 };
 

@@ -5,11 +5,31 @@ import { chmod, lstat, mkdir, open, readFile, rename, rm } from "node:fs/promise
 import { homedir, platform } from "node:os";
 import { createConnection, type Socket } from "node:net";
 import { join } from "node:path";
+import {
+  CLIENT_TO_HOST_MAX_BYTES,
+  HOST_TO_CLIENT_MAX_BYTES,
+  MUTATING_RPC_METHODS,
+  RPC_FEATURES,
+  RPC_PROTOCOL,
+  RPC_SUPPORTED_VERSIONS,
+  RPC_VERSION,
+  type GeneratedMutationMethod,
+  type GeneratedOutcome,
+  type GeneratedRpcMethod,
+} from "./generated/protocol";
 
-export const RPC_PROTOCOL = "agenttab.rpc" as const;
-export const RPC_VERSION = 1 as const;
-export const CLIENT_TO_HOST_MAX_BYTES = 1024 * 1024;
-export const HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024;
+export {
+  CLIENT_TO_HOST_MAX_BYTES,
+  HOST_TO_CLIENT_MAX_BYTES,
+  MUTATING_RPC_METHODS,
+  OUTCOMES,
+  RPC_FEATURES,
+  RPC_METHODS,
+  RPC_PROTOCOL,
+  RPC_SUPPORTED_VERSIONS,
+  RPC_TOOL_METADATA,
+  RPC_VERSION,
+} from "./generated/protocol";
 
 export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -102,13 +122,8 @@ export interface MethodParams {
   "agenttab.status": Record<string, never>;
 }
 
-export type RpcMethod = keyof MethodParams;
-export type MutationMethod =
-  | "browser_open"
-  | "browser_act"
-  | "browser_handoff"
-  | "browser_commit"
-  | "browser_developer";
+export type RpcMethod = GeneratedRpcMethod;
+export type MutationMethod = GeneratedMutationMethod;
 
 export interface ConnectionAck {
   protocol: typeof RPC_PROTOCOL;
@@ -119,9 +134,37 @@ export interface ConnectionAck {
   task_id?: string;
   resume_capability?: string;
   state?: "starting" | "reconciling" | "ready" | "paused" | "terminal";
+  features?: string[];
 }
 
-export type Outcome = "completed" | "not_started" | "unknown" | "needs_user" | "commit_required";
+export interface ProtocolIncompatible {
+  protocol: typeof RPC_PROTOCOL;
+  version: number;
+  kind: "incompatible";
+  requested_protocol: string;
+  requested_version: number;
+  supported_versions: number[];
+  message: string;
+  recovery: string;
+}
+
+export class AgentTabCompatibilityError extends Error {
+  readonly requestedProtocol: string;
+  readonly requestedVersion: number;
+  readonly supportedVersions: readonly number[];
+  readonly recovery: string;
+
+  constructor(message: ProtocolIncompatible) {
+    super(message.message);
+    this.name = "AgentTabCompatibilityError";
+    this.requestedProtocol = message.requested_protocol;
+    this.requestedVersion = message.requested_version;
+    this.supportedVersions = message.supported_versions;
+    this.recovery = message.recovery;
+  }
+}
+
+export type Outcome = GeneratedOutcome;
 
 export interface RpcResponse<T = unknown> {
   protocol: typeof RPC_PROTOCOL;
@@ -381,13 +424,7 @@ export interface ClientOptions {
   capabilityStore?: ResumeCapabilityStore;
 }
 
-const MUTATIONS = new Set<RpcMethod>([
-  "browser_open",
-  "browser_act",
-  "browser_handoff",
-  "browser_commit",
-  "browser_developer",
-]);
+const MUTATIONS = new Set<RpcMethod>(MUTATING_RPC_METHODS);
 
 function longOperationTimeoutMs(
   method: RpcMethod,
@@ -517,38 +554,64 @@ interface NegotiatedConnection {
   connected: ConnectionAck;
 }
 
+class RetryLegacyV1Handshake extends Error {
+  constructor() {
+    super("AgentTab rejected capability negotiation before acknowledging the connection");
+    this.name = "RetryLegacyV1Handshake";
+  }
+}
+
 async function negotiateConnection(
   endpoint: string,
   timeoutMs: number,
   conversationId: string | undefined,
   resumeCapability: string | undefined,
+  advertiseCapabilities: boolean,
 ): Promise<NegotiatedConnection> {
   const socket = createConnection(endpoint);
   const decoder = new FrameDecoder();
   const connected = await new Promise<ConnectionAck>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      socket.destroy();
-      reject(new Error(`Timed out after ${timeoutMs} ms connecting to AgentTab at ${endpoint}`));
-    }, timeoutMs);
-    const closed = () => fail(new Error("AgentTab closed during connection negotiation"));
-    const fail = (error: Error) => {
+    let handshakeSent = false;
+    let receivedData = false;
+    let settled = false;
+    const cleanup = () => {
       clearTimeout(timer);
-      socket.off("error", fail);
-      socket.off("close", closed);
+      socket.off("error", rejectedBeforeAck);
+      socket.off("close", closedBeforeAck);
+      socket.removeAllListeners("data");
+    };
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      socket.destroy();
       reject(error);
     };
+    const retryOrFail = (error: Error) => {
+      fail(
+        advertiseCapabilities && handshakeSent && !receivedData
+          ? new RetryLegacyV1Handshake()
+          : error,
+      );
+    };
+    const rejectedBeforeAck = (error: Error) => retryOrFail(error);
+    const closedBeforeAck = () => retryOrFail(new Error("AgentTab closed during connection negotiation"));
+    const timer = setTimeout(() => {
+      fail(new Error(`Timed out after ${timeoutMs} ms connecting to AgentTab at ${endpoint}`));
+    }, timeoutMs);
     const accept = (value: ConnectionAck) => {
-      clearTimeout(timer);
-      socket.off("error", fail);
-      socket.off("close", closed);
-      socket.removeAllListeners("data");
+      if (settled) return;
+      settled = true;
+      cleanup();
       resolve(value);
     };
-    socket.once("error", fail);
-    socket.once("close", closed);
+    socket.once("error", rejectedBeforeAck);
+    socket.once("close", closedBeforeAck);
     socket.on("data", (chunk) => {
+      receivedData = true;
       try {
         for (const value of decoder.push(chunk)) {
+          if (isProtocolIncompatible(value)) throw new AgentTabCompatibilityError(value);
           if (!isConnectionAck(value)) throw new Error("AgentTab sent a response before connection negotiation completed");
           accept(value);
           return;
@@ -559,13 +622,25 @@ async function negotiateConnection(
       }
     });
     socket.once("connect", () => {
-      socket.write(encodeFrame({
-        protocol: RPC_PROTOCOL,
-        version: RPC_VERSION,
-        kind: "connect",
-        ...(conversationId ? { conversation_id: conversationId } : {}),
-        ...(resumeCapability ? { resume_capability: resumeCapability } : {}),
-      }));
+      try {
+        const frame = encodeFrame({
+          protocol: RPC_PROTOCOL,
+          version: RPC_VERSION,
+          kind: "connect",
+          ...(advertiseCapabilities
+            ? {
+              supported_versions: RPC_SUPPORTED_VERSIONS,
+              supported_features: RPC_FEATURES,
+            }
+            : {}),
+          ...(conversationId ? { conversation_id: conversationId } : {}),
+          ...(resumeCapability ? { resume_capability: resumeCapability } : {}),
+        });
+        handshakeSent = true;
+        socket.write(frame);
+      } catch (error) {
+        retryOrFail(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   });
   return { socket, decoder, connected };
@@ -658,8 +733,28 @@ export class AgentTabClient {
       .filter((value, index, values) => values.indexOf(value) === index);
     let attemptedCapability: string | undefined;
     let negotiated: NegotiatedConnection | undefined;
+    let advertiseCapabilities = true;
     for (const capability of candidates.length === 0 ? [undefined] : candidates) {
-      const attempt = await negotiateConnection(endpoint, timeoutMs, options.conversationId, capability);
+      let attempt: NegotiatedConnection;
+      try {
+        attempt = await negotiateConnection(
+          endpoint,
+          timeoutMs,
+          options.conversationId,
+          capability,
+          advertiseCapabilities,
+        );
+      } catch (error) {
+        if (!(error instanceof RetryLegacyV1Handshake)) throw error;
+        advertiseCapabilities = false;
+        attempt = await negotiateConnection(
+          endpoint,
+          timeoutMs,
+          options.conversationId,
+          capability,
+          false,
+        );
+      }
       if (capability && !attempt.connected.resumed) {
         attempt.socket.destroy();
         if (capability !== activeCapability) continue;
@@ -940,12 +1035,31 @@ function isConnectionAck(value: unknown): value is ConnectionAck {
   return (
     isRecord(value) &&
     value.protocol === RPC_PROTOCOL &&
-    value.version === RPC_VERSION &&
+    typeof value.version === "number" &&
+    Number.isInteger(value.version) &&
+    value.version > 0 &&
     value.kind === "connected" &&
     typeof value.connection_id === "string" &&
     typeof value.resumed === "boolean" &&
+    (value.features === undefined ||
+      (Array.isArray(value.features) && value.features.every((feature) => typeof feature === "string"))) &&
     (!value.resumed ||
       (typeof value.task_id === "string" && typeof value.resume_capability === "string"))
+  );
+}
+
+function isProtocolIncompatible(value: unknown): value is ProtocolIncompatible {
+  return (
+    isRecord(value) &&
+    value.protocol === RPC_PROTOCOL &&
+    value.version === RPC_VERSION &&
+    value.kind === "incompatible" &&
+    typeof value.requested_protocol === "string" &&
+    typeof value.requested_version === "number" &&
+    Array.isArray(value.supported_versions) &&
+    value.supported_versions.every((version) => Number.isInteger(version) && version > 0) &&
+    typeof value.message === "string" &&
+    typeof value.recovery === "string"
   );
 }
 

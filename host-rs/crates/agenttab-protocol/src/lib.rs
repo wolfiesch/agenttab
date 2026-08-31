@@ -4,13 +4,8 @@ use std::io::{self, Read, Write};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const RPC_PROTOCOL: &str = "agenttab.rpc";
-pub const NATIVE_PROTOCOL: &str = "agenttab.native";
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const CLIENT_TO_HOST_MAX_BYTES: usize = 1024 * 1024;
-pub const HOST_TO_CLIENT_MAX_BYTES: usize = 1024 * 1024;
-pub const HOST_TO_EXTENSION_MAX_BYTES: usize = 1024 * 1024;
-pub const EXTENSION_TO_HOST_MAX_BYTES: usize = 64 * 1024 * 1024;
+mod generated;
+pub use generated::*;
 
 const MAX_URL_CHARS: usize = 2_048;
 const MAX_SELECTOR_CHARS: usize = 2_048;
@@ -29,59 +24,6 @@ const MAX_DEVELOPER_PARAMS: usize = 16;
 const MAX_DEVELOPER_PARAM_KEY_CHARS: usize = 64;
 const MAX_DEVELOPER_VALUE_CHARS: usize = 512;
 const MAX_DEVELOPER_ARRAY_ITEMS: usize = 16;
-
-pub const RPC_SCHEMA_ASSETS: &[(&str, &str)] = &[
-    (
-        "request",
-        include_str!("../../../../schemas/rpc/v1/request.schema.json"),
-    ),
-    (
-        "response",
-        include_str!("../../../../schemas/rpc/v1/response.schema.json"),
-    ),
-    (
-        "connection",
-        include_str!("../../../../schemas/rpc/v1/connection.schema.json"),
-    ),
-    (
-        "status",
-        include_str!("../../../../schemas/rpc/v1/status.schema.json"),
-    ),
-    (
-        "browser_open",
-        include_str!("../../../../schemas/rpc/v1/browser-open.schema.json"),
-    ),
-    (
-        "browser_snapshot",
-        include_str!("../../../../schemas/rpc/v1/browser-snapshot.schema.json"),
-    ),
-    (
-        "browser_act",
-        include_str!("../../../../schemas/rpc/v1/browser-act.schema.json"),
-    ),
-    (
-        "browser_wait",
-        include_str!("../../../../schemas/rpc/v1/browser-wait.schema.json"),
-    ),
-    (
-        "browser_tabs",
-        include_str!("../../../../schemas/rpc/v1/browser-tabs.schema.json"),
-    ),
-    (
-        "browser_handoff",
-        include_str!("../../../../schemas/rpc/v1/browser-handoff.schema.json"),
-    ),
-    (
-        "browser_commit",
-        include_str!("../../../../schemas/rpc/v1/browser-commit.schema.json"),
-    ),
-    (
-        "browser_developer",
-        include_str!("../../../../schemas/rpc/v1/browser-developer.schema.json"),
-    ),
-];
-
-pub const NATIVE_SCHEMA: &str = include_str!("../../../../schemas/native/v1/message.schema.json");
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -217,7 +159,7 @@ impl RpcRequest {
         validate_serialized_request_limit(&value)?;
         let explicit_null_idempotency = value.get("idempotency_key").is_some_and(Value::is_null);
         let request: Self = serde_json::from_value(value)?;
-        if request.protocol != RPC_PROTOCOL || request.version != PROTOCOL_VERSION {
+        if request.protocol != RPC_PROTOCOL || request.version != RPC_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: request.protocol.clone(),
                 version: request.version,
@@ -941,7 +883,7 @@ impl RpcResponse {
     pub fn success(request_id: impl Into<String>, outcome: Outcome, result: Value) -> Self {
         Self {
             protocol: RPC_PROTOCOL.into(),
-            version: PROTOCOL_VERSION,
+            version: RPC_VERSION,
             request_id: request_id.into(),
             ok: true,
             outcome,
@@ -954,7 +896,7 @@ impl RpcResponse {
     pub fn failure(request_id: impl Into<String>, outcome: Outcome, error: RpcError) -> Self {
         Self {
             protocol: RPC_PROTOCOL.into(),
-            version: PROTOCOL_VERSION,
+            version: RPC_VERSION,
             request_id: request_id.into(),
             outcome,
             ok: false,
@@ -984,17 +926,54 @@ pub struct ConnectionInit {
     pub conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_versions: Option<Vec<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_features: Option<Vec<String>>,
 }
 
 impl ConnectionInit {
     pub fn parse(value: Value) -> Result<Self, ProtocolError> {
         validate_serialized_request_limit(&value)?;
         let message: Self = serde_json::from_value(value)?;
-        if message.protocol != RPC_PROTOCOL || message.version != PROTOCOL_VERSION {
+        if message.protocol != RPC_PROTOCOL {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: message.protocol.clone(),
                 version: message.version,
             });
+        }
+        let supported_versions = message
+            .supported_versions
+            .as_deref()
+            .unwrap_or(std::slice::from_ref(&message.version));
+        if supported_versions.is_empty()
+            || supported_versions.len() > 16
+            || supported_versions.contains(&0)
+            || !supported_versions.contains(&message.version)
+            || has_duplicates(supported_versions)
+        {
+            return Err(ProtocolError::InvalidConnection(
+                "supported_versions must contain 1 to 16 unique positive versions including version"
+                    .into(),
+            ));
+        }
+        if !supported_versions.contains(&RPC_VERSION) {
+            return Err(ProtocolError::UnsupportedProtocol {
+                protocol: message.protocol.clone(),
+                version: message.version,
+            });
+        }
+        if message.supported_features.as_ref().is_some_and(|features| {
+            features.len() > 64
+                || features
+                    .iter()
+                    .any(|feature| feature.is_empty() || feature.chars().count() > 128)
+                || has_duplicates(features)
+        }) {
+            return Err(ProtocolError::InvalidConnection(
+                "supported_features must contain at most 64 unique names of 1 to 128 characters"
+                    .into(),
+            ));
         }
         if message
             .conversation_id
@@ -1014,6 +993,25 @@ impl ConnectionInit {
         }
         Ok(message)
     }
+
+    pub fn negotiated_features(&self) -> Option<Vec<String>> {
+        self.supported_features.as_ref().map(|supported| {
+            RPC_FEATURES
+                .iter()
+                .filter(|feature| {
+                    supported
+                        .iter()
+                        .any(|candidate| candidate.as_str() == **feature)
+                })
+                .map(|feature| (*feature).into())
+                .collect()
+        })
+    }
+}
+
+fn has_duplicates<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    values.iter().any(|value| !seen.insert(value))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1030,7 +1028,7 @@ impl ResumeCapabilityConfirm {
     pub fn parse(value: Value) -> Result<Self, ProtocolError> {
         validate_serialized_request_limit(&value)?;
         let message: Self = serde_json::from_value(value)?;
-        if message.protocol != RPC_PROTOCOL || message.version != PROTOCOL_VERSION {
+        if message.protocol != RPC_PROTOCOL || message.version != RPC_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: message.protocol.clone(),
                 version: message.version,
@@ -1081,12 +1079,31 @@ pub struct ConnectionAck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_capability: Option<String>,
     pub state: RuntimeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
 }
 
 impl ConnectionAck {
     pub fn value(&self) -> Value {
         serde_json::to_value(self).expect("connection acknowledgement serializes")
     }
+}
+
+pub fn connection_incompatible(requested_protocol: &str, requested_version: u64) -> Value {
+    let requested_protocol: String = requested_protocol.chars().take(128).collect();
+    let message = format!(
+        "AgentTab Core does not support {requested_protocol:?} protocol version {requested_version}"
+    );
+    serde_json::json!({
+        "protocol": RPC_PROTOCOL,
+        "version": RPC_VERSION,
+        "kind": "incompatible",
+        "requested_protocol": requested_protocol,
+        "requested_version": requested_version,
+        "supported_versions": RPC_SUPPORTED_VERSIONS,
+        "message": message,
+        "recovery": "Update the AgentTab client and host to releases with an overlapping protocol major.",
+    })
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1179,15 +1196,52 @@ pub struct NativeHello {
     pub paused: bool,
     pub handoff: NativeHandoff,
     pub staged_commits: Vec<NativeStagedCommit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_versions: Option<Vec<u16>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_features: Option<Vec<String>>,
 }
 impl NativeHello {
     pub fn parse(value: Value) -> Result<Self, ProtocolError> {
         let hello: Self = serde_json::from_value(value)?;
-        if hello.protocol != NATIVE_PROTOCOL || hello.version != PROTOCOL_VERSION {
+        if hello.protocol != NATIVE_PROTOCOL {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: hello.protocol.clone(),
                 version: hello.version,
             });
+        }
+        let supported_versions = hello
+            .supported_versions
+            .as_deref()
+            .unwrap_or(std::slice::from_ref(&hello.version));
+        if supported_versions.is_empty()
+            || supported_versions.len() > 16
+            || supported_versions.contains(&0)
+            || !supported_versions.contains(&hello.version)
+            || has_duplicates(supported_versions)
+        {
+            return Err(ProtocolError::InvalidNativeMessage(
+                "supported_versions must contain 1 to 16 unique positive versions including version"
+                    .into(),
+            ));
+        }
+        if !supported_versions.contains(&NATIVE_VERSION) {
+            return Err(ProtocolError::UnsupportedProtocol {
+                protocol: hello.protocol.clone(),
+                version: hello.version,
+            });
+        }
+        if hello.supported_features.as_ref().is_some_and(|features| {
+            features.len() > 64
+                || features
+                    .iter()
+                    .any(|feature| feature.is_empty() || feature.chars().count() > 128)
+                || has_duplicates(features)
+        }) {
+            return Err(ProtocolError::InvalidNativeMessage(
+                "supported_features must contain at most 64 unique names of 1 to 128 characters"
+                    .into(),
+            ));
         }
         if hello.extension_version.is_empty() {
             return Err(ProtocolError::InvalidNativeMessage(
@@ -1200,6 +1254,20 @@ impl NativeHello {
             staged.validate()?;
         }
         Ok(hello)
+    }
+
+    pub fn negotiated_features(&self) -> Option<Vec<String>> {
+        self.supported_features.as_ref().map(|supported| {
+            NATIVE_FEATURES
+                .iter()
+                .filter(|feature| {
+                    supported
+                        .iter()
+                        .any(|candidate| candidate.as_str() == **feature)
+                })
+                .map(|feature| (*feature).into())
+                .collect()
+        })
     }
 }
 
@@ -1222,7 +1290,7 @@ pub struct NativeDisconnectRecovery {
 impl NativeDisconnectRecovery {
     pub fn parse(value: Value) -> Result<Self, ProtocolError> {
         let recovery: Self = serde_json::from_value(value)?;
-        if recovery.protocol != NATIVE_PROTOCOL || recovery.version != PROTOCOL_VERSION {
+        if recovery.protocol != NATIVE_PROTOCOL || recovery.version != NATIVE_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: recovery.protocol.clone(),
                 version: recovery.version,
@@ -1261,7 +1329,7 @@ pub struct NativeCloseTask {
 impl NativeCloseTask {
     pub fn parse(value: Value) -> Result<Self, ProtocolError> {
         let command: Self = serde_json::from_value(value)?;
-        if command.protocol != NATIVE_PROTOCOL || command.version != PROTOCOL_VERSION {
+        if command.protocol != NATIVE_PROTOCOL || command.version != NATIVE_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: command.protocol.clone(),
                 version: command.version,
@@ -1303,7 +1371,7 @@ impl NativeResponse {
             ));
         }
         let response: Self = serde_json::from_value(value)?;
-        if response.protocol != NATIVE_PROTOCOL || response.version != PROTOCOL_VERSION {
+        if response.protocol != NATIVE_PROTOCOL || response.version != NATIVE_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: response.protocol.clone(),
                 version: response.version,
@@ -1456,7 +1524,7 @@ pub struct NativeDisconnectEvent {
 impl NativeEvent {
     pub fn parse(value: Value) -> Result<(Self, NativeEventPayload), ProtocolError> {
         let event: Self = serde_json::from_value(value)?;
-        if event.protocol != NATIVE_PROTOCOL || event.version != PROTOCOL_VERSION {
+        if event.protocol != NATIVE_PROTOCOL || event.version != NATIVE_VERSION {
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: event.protocol.clone(),
                 version: event.version,
@@ -1605,7 +1673,7 @@ pub fn native_command(
 ) -> Value {
     let mut command = serde_json::json!({
         "protocol": NATIVE_PROTOCOL,
-        "version": PROTOCOL_VERSION,
+        "version": NATIVE_VERSION,
         "kind": "command",
         "request_id": request_id,
         "connection_id": connection_id,
@@ -1621,7 +1689,7 @@ pub fn native_command(
 pub fn native_close_task(request_id: Uuid, task_id: Uuid) -> Value {
     serde_json::json!({
         "protocol": NATIVE_PROTOCOL,
-        "version": PROTOCOL_VERSION,
+        "version": NATIVE_VERSION,
         "kind": "close_task",
         "request_id": request_id,
         "task_id": task_id,
@@ -1631,7 +1699,7 @@ pub fn native_close_task(request_id: Uuid, task_id: Uuid) -> Value {
 pub fn native_event_ack(event: NativeEventName, event_id: &str) -> Value {
     serde_json::json!({
         "protocol": NATIVE_PROTOCOL,
-        "version": PROTOCOL_VERSION,
+        "version": NATIVE_VERSION,
         "kind": "event_ack",
         "event": event,
         "event_id": event_id,
@@ -1665,13 +1733,34 @@ pub fn native_event_ack_result(
     value
 }
 
-pub fn native_ready(state: RuntimeState) -> Value {
-    serde_json::json!({
+pub fn native_ready(state: RuntimeState, features: Option<Vec<String>>) -> Value {
+    let mut message = serde_json::json!({
         "protocol": NATIVE_PROTOCOL,
-        "version": PROTOCOL_VERSION,
+        "version": NATIVE_VERSION,
         "kind": "ready",
         "host_version": env!("CARGO_PKG_VERSION"),
         "state": state,
+    });
+    if let Some(features) = features {
+        message["features"] = serde_json::json!(features);
+    }
+    message
+}
+
+pub fn native_incompatible(requested_protocol: &str, requested_version: u64) -> Value {
+    let requested_protocol: String = requested_protocol.chars().take(128).collect();
+    let message = format!(
+        "AgentTab host does not support {requested_protocol:?} native protocol version {requested_version}"
+    );
+    serde_json::json!({
+        "protocol": NATIVE_PROTOCOL,
+        "version": NATIVE_VERSION,
+        "kind": "incompatible",
+        "requested_protocol": requested_protocol,
+        "requested_version": requested_version,
+        "supported_versions": NATIVE_SUPPORTED_VERSIONS,
+        "message": message,
+        "recovery": "Update the AgentTab extension and host to releases with an overlapping native protocol major.",
     })
 }
 
@@ -1716,6 +1805,75 @@ mod tests {
         ] {
             assert!(names.contains(&required));
         }
+    }
+
+    #[test]
+    fn generated_catalog_matches_runtime_enums() {
+        let methods = [
+            RpcMethod::BrowserOpen,
+            RpcMethod::BrowserSnapshot,
+            RpcMethod::BrowserAct,
+            RpcMethod::BrowserWait,
+            RpcMethod::BrowserTabs,
+            RpcMethod::BrowserHandoff,
+            RpcMethod::BrowserCommit,
+            RpcMethod::BrowserDeveloper,
+            RpcMethod::AgenttabStatus,
+        ];
+        assert_eq!(
+            methods.map(|method| method.to_string()).to_vec(),
+            RPC_METHOD_NAMES
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            methods
+                .into_iter()
+                .filter(|method| method.is_mutation())
+                .map(|method| method.to_string())
+                .collect::<Vec<_>>(),
+            MUTATING_RPC_METHOD_NAMES
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect::<Vec<_>>()
+        );
+        let outcomes = [
+            Outcome::Completed,
+            Outcome::NotStarted,
+            Outcome::Unknown,
+            Outcome::NeedsUser,
+            Outcome::CommitRequired,
+        ]
+        .map(|outcome| serde_json::to_value(outcome).unwrap());
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|outcome| outcome.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            OUTCOME_NAMES.to_vec()
+        );
+        let native_events = [
+            NativeEventName::Inventory,
+            NativeEventName::OwnershipRevoked,
+            NativeEventName::TabRemoved,
+            NativeEventName::GroupMembershipChanged,
+            NativeEventName::PauseChanged,
+            NativeEventName::HandoffChanged,
+            NativeEventName::CommitExpired,
+            NativeEventName::CommitAbandoned,
+            NativeEventName::PopupCommitApproved,
+            NativeEventName::PopupCommitAbandoned,
+            NativeEventName::ExtensionDisconnected,
+        ]
+        .map(|event| serde_json::to_value(event).unwrap());
+        assert_eq!(
+            native_events
+                .iter()
+                .map(|event| event.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            NATIVE_EVENT_NAMES.to_vec()
+        );
     }
 
     #[test]
@@ -1971,6 +2129,31 @@ mod tests {
 
     #[test]
     fn connection_runtime_constraints_match_schema() {
+        let negotiated = ConnectionInit::parse(json!({
+            "protocol": RPC_PROTOCOL,
+            "version": 2,
+            "kind": "connect",
+            "supported_versions": [1, 2],
+            "supported_features": ["task_resume_v1", "future_feature"]
+        }))
+        .unwrap();
+        assert_eq!(
+            negotiated.negotiated_features().unwrap(),
+            vec!["task_resume_v1"]
+        );
+        assert!(matches!(
+            ConnectionInit::parse(json!({
+                "protocol": RPC_PROTOCOL,
+                "version": 2,
+                "kind": "connect",
+                "supported_versions": [2]
+            })),
+            Err(ProtocolError::UnsupportedProtocol { .. })
+        ));
+        let incompatible = connection_incompatible(RPC_PROTOCOL, 2);
+        assert_eq!(incompatible["kind"], "incompatible");
+        assert_eq!(incompatible["supported_versions"], json!([1]));
+
         assert!(matches!(
             ConnectionInit::parse(json!({
                 "protocol": RPC_PROTOCOL,
@@ -2027,6 +2210,42 @@ mod tests {
             connection_id: confirmation.connection_id,
         };
         assert_eq!(confirmed.value()["kind"], "resume_confirmed");
+    }
+
+    #[test]
+    fn native_hello_negotiates_features_and_versions() {
+        let hello = NativeHello::parse(json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": 2,
+            "kind": "hello",
+            "extension_version": "2.0.0",
+            "inventory": [],
+            "paused": false,
+            "handoff": {"active": false},
+            "staged_commits": [],
+            "supported_versions": [1, 2],
+            "supported_features": ["event_ack_v1", "future_feature"]
+        }))
+        .unwrap();
+        assert_eq!(hello.negotiated_features().unwrap(), vec!["event_ack_v1"]);
+        assert!(matches!(
+            NativeHello::parse(json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": 2,
+                "kind": "hello",
+                "extension_version": "2.0.0",
+                "inventory": [],
+                "paused": false,
+                "handoff": {"active": false},
+                "staged_commits": [],
+                "supported_versions": [2]
+            })),
+            Err(ProtocolError::UnsupportedProtocol { .. })
+        ));
+        assert_eq!(
+            native_ready(RuntimeState::Ready, Some(vec!["event_ack_v1".into()]))["features"],
+            json!(["event_ack_v1"])
+        );
     }
 
     #[test]

@@ -1,11 +1,12 @@
 use crate::handoff::HandoffState;
 use crate::lifecycle::Lifecycle;
 use agenttab_protocol::{
-    native_close_task, native_command, native_event_ack, native_event_ack_result, native_ready,
-    read_frame, write_frame, NativeDisconnectEvent, NativeDisconnectRecovery, NativeEvent,
-    NativeEventName, NativeEventPayload, NativeHandoff, NativeHello, NativeOriginPolicy,
-    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ProtocolError, RpcError, RuntimeState,
-    EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, PROTOCOL_VERSION,
+    native_close_task, native_command, native_event_ack, native_event_ack_result,
+    native_incompatible, native_ready, read_frame, write_frame, NativeDisconnectEvent,
+    NativeDisconnectRecovery, NativeEvent, NativeEventName, NativeEventPayload, NativeHandoff,
+    NativeHello, NativeOriginPolicy, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
+    ProtocolError, RpcError, RuntimeState, EXTENSION_TO_HOST_MAX_BYTES,
+    HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, NATIVE_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
@@ -166,19 +167,35 @@ impl StdioNative {
             .get("protocol")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let version = value
+        let requested_version = value
             .get("version")
             .and_then(Value::as_u64)
-            .unwrap_or_default() as u16;
-        if protocol != NATIVE_PROTOCOL || version != PROTOCOL_VERSION {
+            .unwrap_or_default();
+        let kind = value.get("kind").and_then(Value::as_str).map(str::to_owned);
+        let supports_host_version = value
+            .get("supported_versions")
+            .and_then(Value::as_array)
+            .is_some_and(|versions| {
+                versions
+                    .iter()
+                    .any(|version| version.as_u64() == Some(u64::from(NATIVE_VERSION)))
+            });
+        if protocol != NATIVE_PROTOCOL
+            || (requested_version != u64::from(NATIVE_VERSION)
+                && !(kind.as_deref() == Some("hello") && supports_host_version))
+        {
+            if kind.as_deref() == Some("hello") {
+                self.write_value(&native_incompatible(protocol, requested_version))?;
+            }
             return Err(ProtocolError::UnsupportedProtocol {
                 protocol: protocol.into(),
-                version,
+                version: u16::try_from(requested_version).unwrap_or_default(),
             });
         }
-        match value.get("kind").and_then(Value::as_str) {
+        match kind.as_deref() {
             Some("hello") => {
                 let hello = NativeHello::parse(value)?;
+                let features = hello.negotiated_features();
                 self.lifecycle.begin_reconciliation();
                 if let Some(sink) = self.event_sink.read().clone() {
                     sink.reconcile(&hello.inventory, &hello.staged_commits, &hello.handoff)
@@ -192,7 +209,7 @@ impl StdioNative {
                 } else {
                     RuntimeState::Ready
                 };
-                self.write_value(&native_ready(state))?;
+                self.write_value(&native_ready(state, features))?;
             }
             Some("response") => {
                 let response = NativeResponse::parse(value)?;
@@ -543,13 +560,15 @@ mod tests {
         let native = StdioNative::new(output.clone(), lifecycle.clone(), handoff.clone());
         let hello = json!({
             "protocol": NATIVE_PROTOCOL,
-            "version": PROTOCOL_VERSION,
+            "version": NATIVE_VERSION,
             "kind": "hello",
             "extension_version": "0.2.0",
             "inventory": [],
             "paused": false,
             "handoff": {"active": false},
-            "staged_commits": []
+            "staged_commits": [],
+            "supported_versions": [1],
+            "supported_features": ["event_ack_v1", "future_feature"]
         });
         let mut input = Vec::new();
         write_frame(&mut input, &hello, EXTENSION_TO_HOST_MAX_BYTES).unwrap();
@@ -560,6 +579,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ready["kind"], "ready");
+        assert_eq!(ready["features"], json!(["event_ack_v1"]));
+    }
+
+    #[test]
+    fn incompatible_native_hello_receives_recovery_before_failure() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        let handoff = Arc::new(HandoffState::default());
+        let output = SharedWriter::default();
+        let native = StdioNative::new(output.clone(), lifecycle, handoff);
+        let result = native.handle_inbound(json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": 2,
+            "kind": "hello",
+            "extension_version": "3.0.0",
+            "inventory": [],
+            "paused": false,
+            "handoff": {"active": false},
+            "staged_commits": [],
+            "supported_versions": [2],
+            "supported_features": []
+        }));
+        assert!(matches!(
+            result,
+            Err(ProtocolError::UnsupportedProtocol { .. })
+        ));
+        let bytes = output.bytes.lock().clone();
+        let incompatible = read_frame(&mut bytes.as_slice(), HOST_TO_EXTENSION_MAX_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(incompatible["kind"], "incompatible");
+        assert_eq!(incompatible["requested_version"], 2);
+        assert_eq!(incompatible["supported_versions"], json!([1]));
     }
     #[test]
     fn handoff_clear_is_acknowledged_only_after_sink_applies_it() {
@@ -576,7 +627,7 @@ mod tests {
         native
             .handle_inbound(json!({
                 "protocol": NATIVE_PROTOCOL,
-                "version": PROTOCOL_VERSION,
+                "version": NATIVE_VERSION,
                 "kind": "event",
                 "event": "handoff_changed",
                 "event_id": "handoff-clear-0001",
@@ -596,7 +647,7 @@ mod tests {
                 .unwrap(),
             json!({
                 "protocol": NATIVE_PROTOCOL,
-                "version": PROTOCOL_VERSION,
+                "version": NATIVE_VERSION,
                 "kind": "event_ack",
                 "event": "handoff_changed",
                 "event_id": "handoff-clear-0001",
@@ -618,7 +669,7 @@ mod tests {
         native
             .handle_inbound(json!({
                 "protocol": NATIVE_PROTOCOL,
-                "version": PROTOCOL_VERSION,
+                "version": NATIVE_VERSION,
                 "kind": "event",
                 "event": "popup_commit_approved",
                 "event_id": event_id,
@@ -650,7 +701,7 @@ mod tests {
         native
             .handle_inbound(json!({
                 "protocol": NATIVE_PROTOCOL,
-                "version": PROTOCOL_VERSION,
+                "version": NATIVE_VERSION,
                 "kind": "response",
                 "request_id": request_id,
                 "outcome": "completed",

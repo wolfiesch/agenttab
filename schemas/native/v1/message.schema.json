@@ -8,7 +8,7 @@
       "required": ["protocol", "version", "kind"],
       "properties": {
         "protocol": { "const": "agenttab.native" },
-        "version": { "const": 1 },
+        "version": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "kind": { "type": "string" }
       }
     },
@@ -136,7 +136,20 @@
             "inventory": { "type": "array", "items": { "$ref": "#/$defs/tab" } },
             "paused": { "type": "boolean" },
             "handoff": { "$ref": "#/$defs/handoff" },
-            "staged_commits": { "type": "array", "items": { "$ref": "#/$defs/staged" } }
+            "staged_commits": { "type": "array", "items": { "$ref": "#/$defs/staged" } },
+            "supported_versions": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true
+            },
+            "supported_features": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "maxItems": 64,
+              "uniqueItems": true
+            }
           },
           "additionalProperties": false
         }
@@ -149,9 +162,15 @@
           "type": "object",
           "required": ["kind", "host_version", "state"],
           "properties": {
-            "protocol": {}, "version": {}, "kind": { "const": "ready" },
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "ready" },
             "host_version": { "type": "string", "minLength": 1 },
-            "state": { "enum": ["ready", "paused"] }
+            "state": { "enum": ["ready", "paused"] },
+            "features": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "maxItems": 64,
+              "uniqueItems": true
+            }
           },
           "additionalProperties": false
         }
@@ -164,7 +183,7 @@
           "type": "object",
           "required": ["kind", "request_id", "connection_id", "task_id", "method", "params"],
           "properties": {
-            "protocol": {}, "version": {}, "kind": { "const": "command" },
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "command" },
             "request_id": { "type": "string", "format": "uuid" },
             "connection_id": { "type": "string", "format": "uuid" },
             "task_id": { "type": "string", "format": "uuid" },
@@ -183,7 +202,7 @@
           "type": "object",
           "required": ["kind", "request_id", "task_id"],
           "properties": {
-            "protocol": {}, "version": {}, "kind": { "const": "close_task" },
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "close_task" },
             "request_id": { "type": "string", "format": "uuid" },
             "task_id": { "type": "string", "format": "uuid" }
           },
@@ -198,7 +217,7 @@
           "type": "object",
           "required": ["kind", "request_id", "outcome"],
           "properties": {
-            "protocol": {}, "version": {}, "kind": { "const": "response" },
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "response" },
             "request_id": { "type": "string", "format": "uuid" },
             "outcome": { "enum": ["completed", "not_started", "unknown", "needs_user", "commit_required"] },
             "result": {},
@@ -240,7 +259,7 @@
         {
           "required": ["kind", "event", "event_id"],
           "properties": {
-            "protocol": {}, "version": {}, "kind": { "const": "event_ack" },
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "event_ack" },
             "event": { "enum": ["handoff_changed", "popup_commit_approved", "popup_commit_abandoned"] },
             "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
             "outcome": { "enum": ["completed", "not_started", "unknown"] },
@@ -286,7 +305,7 @@
           "type": "object",
           "required": ["kind", "event", "payload"],
           "properties": {
-            "protocol": {}, "version": {}, "kind": { "const": "event" },
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "event" },
             "event": {
               "enum": [
                 "inventory",
@@ -376,9 +395,39 @@
           "type": "object",
           "required": ["kind", "reason", "pending_outcome"],
           "properties": {
-            "protocol": {}, "version": {}, "kind": { "const": "disconnect_recovery" },
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "disconnect_recovery" },
             "reason": { "type": "string", "minLength": 1 },
             "pending_outcome": { "const": "unknown" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "requested_protocol",
+            "requested_version",
+            "supported_versions",
+            "message",
+            "recovery"
+          ],
+          "properties": {
+            "protocol": {}, "version": { "const": 1 }, "kind": { "const": "incompatible" },
+            "requested_protocol": { "type": "string", "maxLength": 128 },
+            "requested_version": { "type": "integer", "minimum": 0 },
+            "supported_versions": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "message": { "type": "string", "minLength": 1 },
+            "recovery": { "type": "string", "minLength": 1 }
           },
           "additionalProperties": false
         }

@@ -1,7 +1,7 @@
 use crate::runtime::{request_lock_scope, RequestLockScope, Runtime};
 use agenttab_protocol::{
-    ConnectionInit, Outcome, ResumeCapabilityConfirm, RpcError, RpcMethod, RpcResponse,
-    CLIENT_TO_HOST_MAX_BYTES, HOST_TO_CLIENT_MAX_BYTES,
+    connection_incompatible, ConnectionInit, Outcome, ProtocolError, ResumeCapabilityConfirm,
+    RpcError, RpcMethod, RpcResponse, CLIENT_TO_HOST_MAX_BYTES, HOST_TO_CLIENT_MAX_BYTES,
 };
 #[cfg(all(test, unix))]
 use agenttab_protocol::{PROTOCOL_VERSION, RPC_PROTOCOL};
@@ -540,8 +540,27 @@ where
     let Some(init_value) = read_frame_async(&mut stream, CLIENT_TO_HOST_MAX_BYTES).await? else {
         return Ok(());
     };
-    let init = ConnectionInit::parse(init_value)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let init = match ConnectionInit::parse(init_value.clone()) {
+        Ok(init) => init,
+        Err(ProtocolError::UnsupportedProtocol { .. }) => {
+            let requested_protocol = init_value
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
+            let requested_version = init_value
+                .get("version")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            write_frame_async(
+                &mut stream,
+                &connection_incompatible(requested_protocol, requested_version),
+                HOST_TO_CLIENT_MAX_BYTES,
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+    };
     let resume_capability_supplied = init.resume_capability.is_some();
     let (connection, ack) = runtime
         .connect(init)
@@ -1002,6 +1021,8 @@ mod tests {
             kind: agenttab_protocol::ConnectKind::Connect,
             conversation_id: None,
             resume_capability,
+            supported_versions: None,
+            supported_features: None,
         }
     }
 
@@ -1038,6 +1059,37 @@ mod tests {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn incompatible_connection_receives_a_recovery_frame_before_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, paths) = test_runtime(&temp);
+        let (mut client, server) = start_test_connection(runtime).await;
+        write_frame_async(
+            &mut client,
+            &serde_json::json!({
+                "protocol": RPC_PROTOCOL,
+                "version": 2,
+                "kind": "connect",
+                "supported_versions": [2],
+                "supported_features": []
+            }),
+            CLIENT_TO_HOST_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+
+        let response = read_frame_async(&mut client, HOST_TO_CLIENT_MAX_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["kind"], "incompatible");
+        assert_eq!(response["requested_version"], 2);
+        assert_eq!(response["supported_versions"], serde_json::json!([1]));
+        assert!(response["recovery"].as_str().unwrap().contains("Update"));
+        assert_eq!(task_count(&paths), 0);
+        assert!(server.await.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -1376,6 +1428,8 @@ mod tests {
                 kind: agenttab_protocol::ConnectKind::Connect,
                 conversation_id: None,
                 resume_capability: None,
+                supported_versions: None,
+                supported_features: None,
             })
             .unwrap(),
             CLIENT_TO_HOST_MAX_BYTES,

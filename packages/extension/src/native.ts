@@ -33,6 +33,14 @@ interface ReadyReconciliation {
   promise: Promise<void>;
 }
 
+interface NativeHandshakeAttempt {
+  port: NativePort;
+  advertisedCapabilities: boolean;
+  helloSent: boolean;
+  receivedMessage: boolean;
+  locallyClosed: boolean;
+}
+
 interface NativePort {
   postMessage(message: unknown): void;
   disconnect(): void;
@@ -75,6 +83,10 @@ export class NativeBridge {
   private reconnectFallbackAtMs: number | null = null;
   private readonly pendingEventAcks = new Map<string, PendingEventAck>();
   private readyReconciliation: ReadyReconciliation | null = null;
+  private protocolIncompatible = false;
+  // Do not alternate handshake shapes inside the existing reconnect loop.
+  private useLegacyV1Handshake = false;
+  private handshakeAttempt: NativeHandshakeAttempt | null = null;
   constructor(
     private readonly scheduler: MutationScheduler,
     private readonly ownership: OwnershipLedger,
@@ -86,7 +98,7 @@ export class NativeBridge {
   ) { }
 
   async connect(): Promise<void> {
-    if (this.port) return;
+    if (this.protocolIncompatible || this.port) return;
     this.clearReconnectTimer();
     let port: NativePort;
     try {
@@ -98,16 +110,24 @@ export class NativeBridge {
     this.port = port;
     this.ready = false;
     this.readyReconciliation = null;
+    const handshakeAttempt: NativeHandshakeAttempt = {
+      port,
+      advertisedCapabilities: !this.useLegacyV1Handshake,
+      helloSent: false,
+      receivedMessage: false,
+      locallyClosed: false,
+    };
+    this.handshakeAttempt = handshakeAttempt;
     this.ensureReconnectAlarm(RECONNECT_ALARM_FLOOR_MS);
     port.onMessage.addListener((message: unknown) => {
       void this.onMessage(port, message).catch(() => {
-        if (this.port === port) port.disconnect();
+        if (this.port === port) this.disconnectLocally(port);
       });
     });
     port.onDisconnect.addListener(() => void this.onDisconnect(port));
     try {
       const state = await readState();
-      port.postMessage(nativeHello(
+      const hello = nativeHello(
         chrome.runtime.getManifest().version,
         nativeInventory(await this.ownership.inventory()),
         state.paused,
@@ -127,7 +147,10 @@ export class NativeBridge {
           approved: _approved,
           ...staged
         }) => staged),
-      ));
+        handshakeAttempt.advertisedCapabilities,
+      );
+      handshakeAttempt.helloSent = true;
+      port.postMessage(hello);
     } catch {
       this.onDisconnect(port);
     }
@@ -222,13 +245,14 @@ export class NativeBridge {
     this.clearReconnectTimer();
     if (this.port) {
       if (this.ready) return;
-      this.port.disconnect();
+      this.disconnectLocally(this.port);
       return;
     }
     await this.connect();
   }
   private async onMessage(port: NativePort, message: unknown): Promise<void> {
     if (this.port !== port) return;
+    if (this.handshakeAttempt?.port === port) this.handshakeAttempt.receivedMessage = true;
     let parsed: NativeInboundMessage;
     try {
       parsed = parseInboundNativeMessage(message);
@@ -243,7 +267,7 @@ export class NativeBridge {
         port.postMessage(failed(message.request_id, "invalid_request", error instanceof Error ? error.message : String(error)));
         return;
       }
-      if (this.port === port) port.disconnect();
+      if (this.port === port) this.disconnectLocally(port);
       return;
     }
     if (parsed.kind === "event_ack") {
@@ -257,9 +281,18 @@ export class NativeBridge {
       }
       return;
     }
+    if (parsed.kind === "incompatible") {
+      this.protocolIncompatible = true;
+      this.clearReconnectTimer();
+      this.reconnectFallbackAtMs = null;
+      await chrome.alarms.clear(RECONNECT_ALARM);
+      console.error(`${parsed.message} ${parsed.recovery}`);
+      this.disconnectLocally(port);
+      return;
+    }
     if (parsed.kind === "ready") {
       if (this.readyReconciliation?.port === port) {
-        port.disconnect();
+        this.disconnectLocally(port);
         return;
       }
       const promise = this.reconcileReady(port, parsed);
@@ -278,7 +311,7 @@ export class NativeBridge {
       if (this.port !== port) return;
     }
     if (!this.ready) {
-      if (this.port === port) port.disconnect();
+      if (this.port === port) this.disconnectLocally(port);
       return;
     }
     let response: NativeResponse;
@@ -308,10 +341,11 @@ export class NativeBridge {
       await this.discardStages(parsed.discard_staged_tokens ?? []);
       if (this.port !== port) return;
     } catch {
-      if (this.port === port) port.disconnect();
+      if (this.port === port) this.disconnectLocally(port);
       return;
     }
     this.ready = true;
+    this.handshakeAttempt = null;
     this.reconnectAttempt = 0;
     this.clearReconnectTimer();
     this.reconnectFallbackAtMs = null;
@@ -335,9 +369,17 @@ export class NativeBridge {
 
   private onDisconnect(port: NativePort): void {
     if (this.port !== port) return;
+    const attempt = this.handshakeAttempt?.port === port ? this.handshakeAttempt : null;
+    const retryLegacyHandshake =
+      !this.protocolIncompatible &&
+      attempt?.advertisedCapabilities === true &&
+      attempt.helloSent &&
+      !attempt.receivedMessage &&
+      !attempt.locallyClosed;
     this.port = null;
     this.ready = false;
     this.readyReconciliation = null;
+    this.handshakeAttempt = null;
     for (const [eventId, pending] of this.pendingEventAcks) {
       clearTimeout(pending.timeout);
       pending.reject(Object.assign(new Error("AgentTab host disconnected before acknowledging the staged action"), {
@@ -346,12 +388,22 @@ export class NativeBridge {
       this.pendingEventAcks.delete(eventId);
     }
     this.scheduler.disconnect();
+    if (retryLegacyHandshake) {
+      this.useLegacyV1Handshake = true;
+      void this.connect();
+      return;
+    }
     void this.discardStages([]);
     this.scheduleReconnect();
   }
 
+  private disconnectLocally(port: NativePort): void {
+    if (this.handshakeAttempt?.port === port) this.handshakeAttempt.locallyClosed = true;
+    port.disconnect();
+  }
+
   private scheduleReconnect(): void {
-    if (this.port || this.cancelReconnectTimer) return;
+    if (this.protocolIncompatible || this.port || this.cancelReconnectTimer) return;
     const delay = Math.min(1000 * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS);
     this.reconnectAttempt += 1;
     this.ensureReconnectAlarm(delay);
