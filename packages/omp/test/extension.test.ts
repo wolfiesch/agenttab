@@ -18,18 +18,29 @@ afterEach(() => {
 });
 
 const literalValues: unknown[] = [];
-const schema: Record<string, unknown> = new Proxy({}, {
-  get: () => (..._args: unknown[]) => schema,
-});
+const enumValues: unknown[] = [];
+
+function stubSchema(kind: string): Record<string, unknown> {
+  let schema: Record<string, unknown>;
+  schema = new Proxy({ kind }, {
+    get: (target, property) => property in target
+      ? Reflect.get(target, property)
+      : (..._args: unknown[]) => schema,
+  });
+  return schema;
+}
+
 const zod: Record<string, unknown> = new Proxy({}, {
   get: (_target, property) => (...args: unknown[]) => {
     if (property === "literal") literalValues.push(args[0]);
-    return schema;
+    if (property === "enum" && Array.isArray(args[0])) enumValues.push(...args[0]);
+    return stubSchema(String(property));
   },
 });
 
 function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
   literalValues.length = 0;
+  enumValues.length = 0;
   if (developer) process.env.AGENTTAB_DEVELOPER = "1";
   else delete process.env.AGENTTAB_DEVELOPER;
   const tools: Array<Record<string, unknown>> = [];
@@ -53,7 +64,7 @@ function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
   // The fluent Proxy implements the exact schema calls under test; the production runtime injects concrete Zod.
   const compatibleApi = api as unknown as AgentApi;
   makeExtension(async () => client)(compatibleApi);
-  return { tools, calls, literalValues: [...literalValues] };
+  return { tools, calls, literalValues: [...literalValues], enumValues: [...enumValues] };
 }
 
 async function executeTool(
@@ -89,10 +100,13 @@ test("Standard OMP actions expose no direct focus transition", () => {
   expect(registered.literalValues).not.toContain("focus");
 });
 
-test("Standard browser_open exposes background-only task window creation", () => {
+test("Standard read and open tools expose provider-compatible object schemas", () => {
   const registered = register(false);
-  expect(registered.literalValues).toContain("new_window");
-  expect(registered.literalValues).toContain(true);
+  const open = registered.tools.find((tool) => tool.name === "browser_open");
+  const snapshot = registered.tools.find((tool) => tool.name === "browser_snapshot");
+  expect(open?.parameters).toMatchObject({ kind: "object" });
+  expect(snapshot?.parameters).toMatchObject({ kind: "object" });
+  expect(registered.enumValues).toContain("new_window");
 });
 
 test("developer mode adds only browser_developer", () => {
