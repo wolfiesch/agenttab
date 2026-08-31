@@ -27,7 +27,11 @@ export class MutationScheduler {
   private readonly pending = new Set<Promise<unknown>>();
 
   setInitialPaused(paused: boolean): void {
-    if (!paused) return;
+    if (!paused) {
+      this.lifecycleAccepting = true;
+      this.accepting = this.permissionsAvailable;
+      return;
+    }
     this.accepting = false;
     this.lifecycleAccepting = false;
     this.admissionEpoch += 1;

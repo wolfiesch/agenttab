@@ -7,6 +7,7 @@ import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from
 import { RevisionTracker } from "../src/revisions";
 import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
 import { MutationScheduler } from "../src/scheduler";
+import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
 
@@ -1104,6 +1105,21 @@ describe("mutation scheduler", () => {
       code: "paused",
       message: "AgentTab connection is unavailable",
     });
+  });
+
+  test("reapplying an unpaused initial state recovers a partial startup attempt", () => {
+    const scheduler = new MutationScheduler();
+    scheduler.setInitialPaused(true);
+    expect(scheduler.isAccepting()).toBe(false);
+
+    scheduler.setInitialPaused(false);
+    expect(scheduler.isAccepting()).toBe(true);
+
+    scheduler.revokePermissions();
+    scheduler.setInitialPaused(false);
+    expect(scheduler.isAccepting()).toBe(false);
+    scheduler.restorePermissions();
+    expect(scheduler.isAccepting()).toBe(true);
   });
 });
 
@@ -2986,8 +3002,131 @@ describe("native bridge transport", () => {
     port.disconnect();
     expect(scheduler.isAccepting()).toBe(false);
     expect(alarmCreates.at(-1)).toMatchObject({ name: RECONNECT_ALARM });
-    expect(alarmCreates.at(-1)?.when).toBeGreaterThanOrEqual(disconnectedAt + 1_000);
-    expect(alarmCreates.at(-1)?.when).toBeLessThanOrEqual(Date.now() + 1_000);
+    expect(alarmCreates.at(-1)?.when).toBeGreaterThanOrEqual(disconnectedAt + 30_000);
+    expect(alarmCreates.at(-1)?.when).toBeLessThanOrEqual(Date.now() + 30_000);
+
+    const reconnectPort = new MockNativePort();
+    nativePort = reconnectPort;
+    await bridge.reconnectFromAlarm(RECONNECT_ALARM);
+    reconnectPort.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+    await waitForCondition(() => scheduler.isAccepting());
+  });
+
+  test("uses an in-worker timer for fast reconnects with a 30-second alarm fallback", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const scheduled: Array<{ callback: () => void; delayMs: number; cancelled: boolean }> = [];
+    const disconnectedAt = 123_000;
+    const bridge = new NativeBridge(
+      scheduler,
+      ownership,
+      async () => {
+        throw new Error("command handler must not run");
+      },
+      undefined,
+      undefined,
+      undefined,
+      {
+        now: () => disconnectedAt,
+        schedule: (callback, delayMs) => {
+          const timer = { callback, delayMs, cancelled: false };
+          scheduled.push(timer);
+          return () => {
+            timer.cancelled = true;
+          };
+        },
+      },
+    );
+
+    await bridge.connect();
+
+    expect(alarmCreates).toEqual([{
+      name: RECONNECT_ALARM,
+      when: disconnectedAt + 30_000,
+    }]);
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.delayMs).toBe(1_000);
+
+    scheduled[0]?.callback();
+    await waitForCondition(() => scheduled.length === 2);
+    expect(scheduled[1]?.delayMs).toBe(2_000);
+    expect(alarmCreates).toHaveLength(1);
+
+    const recoveredPort = new MockNativePort();
+    nativePort = recoveredPort;
+
+    scheduled[1]?.callback();
+    await waitForCondition(() => recoveredPort.posted.length > 0);
+    expect(recoveredPort.posted[0]).toMatchObject({ kind: "hello" });
+    expect(alarmCreates).toHaveLength(1);
+
+    recoveredPort.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+    await waitForCondition(() => alarmClears.includes(RECONNECT_ALARM));
+  });
+
+  test("recycles a connected native port that never completes its ready handshake", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const hangingPort = new MockNativePort();
+    nativePort = hangingPort;
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    const now = 456_000;
+    const bridge = new NativeBridge(
+      scheduler,
+      ownership,
+      async () => {
+        throw new Error("command handler must not run");
+      },
+      undefined,
+      undefined,
+      undefined,
+      {
+        now: () => now,
+        schedule: (callback, delayMs) => {
+          scheduled.push({ callback, delayMs });
+          return () => undefined;
+        },
+      },
+    );
+
+    await bridge.connect();
+    expect(hangingPort.posted[0]).toMatchObject({ kind: "hello" });
+    expect(alarmCreates).toEqual([{
+      name: RECONNECT_ALARM,
+      when: now + 30_000,
+    }]);
+
+    await bridge.reconnectFromAlarm(RECONNECT_ALARM);
+
+    expect(hangingPort.disconnectCount).toBe(1);
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]?.delayMs).toBe(1_000);
+    expect(alarmCreates).toHaveLength(2);
+
+    const recoveredPort = new MockNativePort();
+    nativePort = recoveredPort;
+    scheduled[0]?.callback();
+    await waitForCondition(() => recoveredPort.posted.length > 0);
+    recoveredPort.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+    await waitForCondition(() => scheduler.isAccepting());
   });
 
   test("serializes commands behind ready reconciliation", async () => {
@@ -3087,6 +3226,49 @@ describe("native bridge transport", () => {
       payload: { inventory: [{ tab_id: 44, url: "" }] },
     });
     expect(port.disconnectCount).toBe(0);
+  });
+
+  test("serializes inventory snapshots so a slow older snapshot cannot publish last", async () => {
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const events: Array<Record<string, unknown>> = [];
+    const ownership = new OwnershipLedger(scheduler, revisions, (event, payload) => {
+      if (event === "inventory") events.push(payload);
+    });
+    const firstStarted = Promise.withResolvers<void>();
+    const releaseFirst = Promise.withResolvers<void>();
+    let inventoryCalls = 0;
+    ownership.inventory = async () => {
+      inventoryCalls += 1;
+      const revision = inventoryCalls;
+      if (revision === 1) {
+        firstStarted.resolve();
+        await releaseFirst.promise;
+      }
+      return [{
+        tab_id: 44,
+        window_id: 1,
+        group_id: 12,
+        url: "https://example.test/",
+        page_revision: revision,
+        task_id: TASK_A,
+      }];
+    };
+
+    const firstPublication = ownership.publishInventory();
+    await firstStarted.promise;
+    const secondPublication = ownership.publishInventory();
+    await flushPromiseQueue();
+    expect(inventoryCalls).toBe(1);
+
+    releaseFirst.resolve();
+    await Promise.all([firstPublication, secondPublication]);
+
+    expect(inventoryCalls).toBe(2);
+    expect(events.map((payload) => {
+      const inventory = payload.inventory as Array<Record<string, unknown>>;
+      return inventory[0]?.page_revision;
+    })).toEqual([1, 2]);
   });
 
 
@@ -3233,6 +3415,79 @@ describe("native bridge transport", () => {
 
     await waitForCondition(() => port.disconnectCount === 1);
     expect(scheduler.isAccepting()).toBe(false);
+  });
+});
+
+describe("startup lifecycle", () => {
+  test("shares concurrent initialization and retries after a rejected attempt", async () => {
+    let attempts = 0;
+    const startup = new IdempotentStartup(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("transient startup failure");
+    });
+
+    const first = startup.start();
+    const concurrent = startup.start();
+    expect(first).toBe(concurrent);
+    expect(startup.phase).toBe("starting");
+    await expect(first).rejects.toThrow("transient startup failure");
+    expect(startup.phase).toBe("idle");
+
+    await expect(startup.start()).resolves.toBeUndefined();
+    expect(startup.phase).toBe("ready");
+    await expect(startup.start()).resolves.toBeUndefined();
+    expect(attempts).toBe(2);
+  });
+
+  test("replays queued Chrome event work after a later event retries startup", async () => {
+    let attempts = 0;
+    const startupErrors: unknown[] = [];
+    const completed = Promise.withResolvers<void>();
+    const operations: string[] = [];
+    const startup = new IdempotentStartup(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("storage temporarily unavailable");
+    });
+    const queue = new StartupOperationQueue(
+      startup,
+      (error) => startupErrors.push(error),
+    );
+
+    queue.enqueue(() => {
+      operations.push("tab-created");
+    });
+    await waitForCondition(() => startupErrors.length === 1);
+    expect(operations).toEqual([]);
+
+    queue.enqueue(() => {
+      operations.push("tab-updated");
+      completed.resolve();
+    });
+    await completed.promise;
+
+    expect(attempts).toBe(2);
+    expect(operations).toEqual(["tab-created", "tab-updated"]);
+  });
+
+  test("drains retained Chrome event work when a direct caller retries startup", async () => {
+    let attempts = 0;
+    const startupFailed = Promise.withResolvers<void>();
+    const operationCompleted = Promise.withResolvers<void>();
+    const startup = new IdempotentStartup(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("storage temporarily unavailable");
+    });
+    const queue = new StartupOperationQueue(
+      startup,
+      () => startupFailed.resolve(),
+    );
+
+    queue.enqueue(() => operationCompleted.resolve());
+    await startupFailed.promise;
+    await startup.start();
+    await operationCompleted.promise;
+
+    expect(attempts).toBe(2);
   });
 });
 

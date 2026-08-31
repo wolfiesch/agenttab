@@ -37,6 +37,7 @@ function groupTitle(task: TaskRecord, developerMode: boolean): string {
 
 export class OwnershipLedger {
   private transitionTail: Promise<unknown> = Promise.resolve();
+  private inventoryTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly scheduler: MutationScheduler,
@@ -587,7 +588,11 @@ export class OwnershipLedger {
   }
 
   private async emitInventory(): Promise<void> {
-    this.emit("inventory", { inventory: await this.inventory() });
+    const publication = this.inventoryTail.then(async () => {
+      this.emit("inventory", { inventory: await this.inventory() });
+    });
+    this.inventoryTail = publication.catch(() => undefined);
+    await publication;
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {

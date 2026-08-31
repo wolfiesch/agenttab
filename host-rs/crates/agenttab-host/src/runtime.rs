@@ -2,8 +2,8 @@ use crate::audit::{canonicalize, now_ms, AuditEntry, AuditLog};
 use crate::guardrails::{GuardrailLoadError, Guardrails};
 use crate::handoff::HandoffState;
 use crate::journal::{
-    BeginDecision, Journal, JournalError, StagedCommitApproval, StagedCommitConsumption,
-    StagedReplayResolution,
+    BeginDecision, InventoryReconciliation, Journal, JournalError, StagedCommitApproval,
+    StagedCommitConsumption, StagedReplayResolution,
 };
 use crate::lifecycle::Lifecycle;
 use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTransport};
@@ -59,10 +59,13 @@ impl NativeEventSink for JournalNativeEventSink {
         staged_commits: &[NativeStagedCommit],
         handoff: &NativeHandoff,
     ) -> Result<(), String> {
-        replace_inventory_urls(&self.tab_urls, inventory);
-        self.journal
+        let inventory_reconciliation = self
+            .journal
             .reconcile_inventory(inventory)
             .map_err(|error| error.to_string())?;
+        if inventory_reconciliation == InventoryReconciliation::Applied {
+            replace_inventory_urls(&self.tab_urls, inventory);
+        }
         let removed_uploads = self
             .journal
             .reconcile_staged_commits(staged_commits)
@@ -111,11 +114,16 @@ impl NativeEventSink for JournalNativeEventSink {
                 ))
             }
             NativeEventPayload::Inventory(event) => {
-                replace_inventory_urls(&self.tab_urls, &event.inventory);
-                self.journal
+                let reconciliation = self
+                    .journal
                     .reconcile_inventory(&event.inventory)
                     .map_err(|error| error.to_string())?;
-                Ok(NativeEventResult::completed(json!({})))
+                if reconciliation == InventoryReconciliation::Applied {
+                    replace_inventory_urls(&self.tab_urls, &event.inventory);
+                }
+                Ok(NativeEventResult::completed(json!({
+                    "ignored_stale": reconciliation == InventoryReconciliation::IgnoredStale,
+                })))
             }
             NativeEventPayload::TaskTabs(event) => {
                 self.journal
@@ -1599,8 +1607,9 @@ fn enforce_response_limit(response: RpcResponse) -> RpcResponse {
 mod tests {
     use super::*;
     use agenttab_protocol::{
-        ConnectKind, NativeOriginPolicy, NativeResponse, NativeResponseKind, NativeStagedCommit,
-        NativeTab, ResumeCapabilityConfirm, ResumeCapabilityConfirmKind, RPC_PROTOCOL,
+        ConnectKind, NativeInventoryEvent, NativeOriginPolicy, NativeResponse, NativeResponseKind,
+        NativeStagedCommit, NativeTab, ResumeCapabilityConfirm, ResumeCapabilityConfirmKind,
+        RPC_PROTOCOL,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -2079,6 +2088,48 @@ mod tests {
             .write()
             .insert(3, "https://allowed.test/".into());
         task_id
+    }
+
+    #[test]
+    fn stale_inventory_event_is_ignored_without_regressing_runtime_state() {
+        let native = FakeNative::normal();
+        let (_temp, runtime, connection) = connected_runtime(native);
+        let task_id = own_tab(&runtime, &connection, 10);
+        let sink = JournalNativeEventSink {
+            journal: runtime.journal.clone(),
+            tab_urls: runtime.tab_urls.clone(),
+            runtime: Mutex::new(Arc::downgrade(&runtime)),
+        };
+
+        let result = sink
+            .handle(
+                &NativeEventPayload::Inventory(NativeInventoryEvent {
+                    inventory: vec![NativeTab {
+                        tab_id: 3,
+                        window_id: 1,
+                        group_id: Some(9),
+                        url: "https://stale.test/".into(),
+                        page_revision: 9,
+                        task_id: Some(task_id),
+                    }],
+                }),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.outcome, Outcome::Completed);
+        assert_eq!(result.result, Some(json!({ "ignored_stale": true })));
+        assert_eq!(
+            runtime.tab_urls.read().get(&3).map(String::as_str),
+            Some("https://allowed.test/")
+        );
+        assert_eq!(
+            runtime
+                .journal
+                .verify_task_tab(task_id, 3, Some(10))
+                .unwrap(),
+            10
+        );
     }
 
     #[test]
