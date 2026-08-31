@@ -17,12 +17,16 @@ interface ReviewView {
   tabId: number;
   effect: string;
   expiresAtMs: number;
+  policyEffect: string | null;
+  origin: string | null;
 }
 
 interface UiState {
   automationEnabled: boolean;
   paused: boolean;
   developerMode: boolean;
+  policyProfile: "autopilot" | "review_selected" | "strict";
+  policyAllowanceCount: number;
   pointer: boolean | null;
   handoffPrompt: string | null;
   tasks: TaskView[];
@@ -72,11 +76,6 @@ const developerChip = element("developer-chip", HTMLSpanElement);
 const automationDetail = element("automation-detail", HTMLElement);
 const pauseButton = element("pause", HTMLButtonElement);
 const runtimeError = element("runtime-error", HTMLParagraphElement);
-const permissionPanel = element("permission", HTMLElement);
-const enableButton = element("enable", HTMLButtonElement);
-const permissionError = element("permission-error", HTMLParagraphElement);
-const automationSetting = element("automation-setting", HTMLDivElement);
-const disableButton = element("disable", HTMLButtonElement);
 const developerPanel = element("developer", HTMLElement);
 const developerOff = element("developer-off", HTMLButtonElement);
 const handoffPanel = element("handoff", HTMLElement);
@@ -89,6 +88,11 @@ const taskList = element("tasks", HTMLUListElement);
 const taskError = element("task-error", HTMLParagraphElement);
 const pointerToggle = element("pointer", HTMLInputElement);
 const pointerDetail = element("pointer-detail", HTMLElement);
+const policyProfile = element("policy-profile", HTMLSelectElement);
+const policyDetail = element("policy-detail", HTMLElement);
+const allowanceSetting = element("allowance-setting", HTMLDivElement);
+const allowanceDetail = element("allowance-detail", HTMLElement);
+const clearAllowances = element("clear-allowances", HTMLButtonElement);
 const settingsError = element("settings-error", HTMLParagraphElement);
 const reviews = element("reviews", HTMLElement);
 const reviewList = element("review-list", HTMLUListElement);
@@ -165,6 +169,8 @@ function parseReview(value: Record<string, unknown>): ReviewView | null {
     tabId: value.tab_id,
     effect: value.effect,
     expiresAtMs: value.expires_at_ms,
+    policyEffect: typeof value.policy_effect === "string" ? value.policy_effect : null,
+    origin: typeof value.origin === "string" ? value.origin : null,
   };
 }
 
@@ -178,6 +184,12 @@ async function load(): Promise<UiState> {
     automationEnabled: response.automation_enabled === true,
     paused: response.paused === true,
     developerMode: response.developer_mode === true,
+    policyProfile: response.policy_profile === "review_selected" || response.policy_profile === "strict"
+      ? response.policy_profile
+      : "autopilot",
+    policyAllowanceCount: typeof response.policy_allowance_count === "number"
+      ? response.policy_allowance_count
+      : 0,
     pointer: typeof response.show_agent_pointer === "boolean" ? response.show_agent_pointer : null,
     handoffPrompt: handoff === null ? null : prompt,
     tasks: Array.isArray(response.tasks)
@@ -204,7 +216,7 @@ function lifecycle(state: UiState): Lifecycle {
 function admissionDetail(phase: Lifecycle, paused: boolean): string {
   if (phase === "your-turn") return "Held until you finish or cancel the step above.";
   if (paused) return "Queued agent work is refused. Work already dispatched still finishes.";
-  if (phase === "disabled") return "Agents can open task tabs, but page reads and actions stay blocked.";
+  if (phase === "disabled") return "Required browser access is unavailable. Reload or reinstall AgentTab.";
   return "Agents can open task tabs and act inside them.";
 }
 
@@ -311,12 +323,32 @@ function renderReview(review: ReviewView): HTMLLIElement {
   const approve = document.createElement("button");
   approve.type = "button";
   approve.textContent = "Approve stage";
+  const scope = document.createElement("select");
+  scope.className = "review-scope";
+  const scopes = review.policyEffect === null
+    ? [["once", "Once"]]
+    : [
+      ["once", "Once"],
+      ["task", "Remember for task"],
+      ...(review.origin === null ? [] : [["domain", "Remember for site"]]),
+      ["effect", "Remember on all sites"],
+    ];
+  for (const [value, label] of scopes) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    scope.append(option);
+  }
   approve.addEventListener("click", () => {
     void guard(reviewError, async () => {
-      await send({ kind: "approve_popup_commit", review_handle: review.reviewHandle });
+      await send({
+        kind: "approve_popup_commit",
+        review_handle: review.reviewHandle,
+        remember_scope: scope.value || "once",
+      });
     });
   });
-  actions.append(abandon, approve);
+  actions.append(scope, abandon, approve);
   row.append(effect, expiry, actions);
   return row;
 }
@@ -326,10 +358,6 @@ function render(state: UiState): void {
   document.body.dataset.state = phase;
   status.textContent = STATUS_TEXT[phase];
 
-  permissionPanel.hidden = state.automationEnabled;
-  if (state.automationEnabled) hide(permissionError);
-  automationSetting.hidden = !state.automationEnabled;
-
   automationDetail.textContent = admissionDetail(phase, state.paused);
   pauseButton.textContent = state.paused ? "Resume agents" : "Pause agents";
   pauseButton.dataset.mode = state.paused ? "resume" : "pause";
@@ -337,6 +365,15 @@ function render(state: UiState): void {
 
   developerChip.hidden = !state.developerMode;
   developerPanel.hidden = !state.developerMode;
+
+  policyProfile.value = state.policyProfile;
+  policyDetail.textContent = state.policyProfile === "autopilot"
+    ? "Runs actions without Commit prompts. Secrets still require Your Turn."
+    : state.policyProfile === "review_selected"
+      ? "Reviews recognized external effects; owned-tab close runs directly."
+      : "Reviews recognized effects and owned-tab close.";
+  allowanceSetting.hidden = state.policyAllowanceCount === 0;
+  allowanceDetail.textContent = `${state.policyAllowanceCount} remembered ${state.policyAllowanceCount === 1 ? "decision" : "decisions"}`;
 
   handoffPanel.hidden = state.handoffPrompt === null;
   if (state.handoffPrompt !== null) {
@@ -414,36 +451,27 @@ function reload(): void {
     .catch(fatal);
 }
 
-async function changeOptionalScriptingPermission(method: "request" | "remove"): Promise<boolean> {
-  return chrome.permissions[method]({ permissions: ["scripting"] });
-}
-
-enableButton.addEventListener("click", () => {
-  void guard(permissionError, async () => {
-    const granted = await changeOptionalScriptingPermission("request");
-    if (!granted) {
-      throw new Error("Chrome denied optional scripting access. AgentTab stays installed but page automation remains disabled.");
-    }
-  });
-});
-
-disableButton.addEventListener("click", () => {
-  void guard(settingsError, async () => {
-    const removed = await changeOptionalScriptingPermission("remove");
-    const scripting = await chrome.permissions.contains({ permissions: ["scripting"] });
-    if (!removed || scripting) {
-      throw new Error(
-        "Chrome kept optional scripting access. The install-time debugger grant stays installed; disable AgentTab from chrome://extensions to remove it.",
-      );
-    }
-  });
-});
-
 pauseButton.addEventListener("click", () => {
   const mode = pauseButton.dataset.mode;
   void guard(runtimeError, async () => {
     if (mode !== "pause" && mode !== "resume") throw new Error("Pause is unavailable right now.");
     await send({ kind: mode });
+  });
+});
+
+policyProfile.addEventListener("change", () => {
+  const profile = policyProfile.value;
+  void guard(settingsError, async () => {
+    if (profile !== "autopilot" && profile !== "review_selected" && profile !== "strict") {
+      throw new Error("Unknown AgentTab action policy");
+    }
+    await send({ kind: "set_policy_profile", profile });
+  });
+});
+
+clearAllowances.addEventListener("click", () => {
+  void guard(settingsError, async () => {
+    await send({ kind: "clear_policy_allowances" });
   });
 });
 

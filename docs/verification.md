@@ -22,22 +22,22 @@ cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
 cargo build --release --locked --manifest-path host-rs/Cargo.toml -p agenttab-host
 ```
 
-The workspace checks TypeScript adapters, extension code, installer, OMP adapter, and package builds. The architecture gates cover manifest identity, required and optional permission behavior, RPC schemas, forbidden legacy surface, and Rust IPC framing. They do not operate a real signed-in browser.
+The workspace checks TypeScript adapters, extension code, installer, OMP adapter, and package builds. The architecture gates cover manifest identity and permission behavior, RPC schemas, forbidden legacy surface, and Rust IPC framing. They do not operate a real signed-in browser.
 
 ## Live browser evidence
 
 Use a disposable Chrome profile and a disposable test account. Reload the unpacked extension through Chrome's extension UI, then observe the actual surface after every UI action. Exercise:
 
-1. required `debugger` availability plus optional `scripting` grant and revocation from the popup;
+1. required `debugger` and `scripting` availability, with Pause and Resume leaving both grants unchanged;
 2. host handshake and reconciliation to ready;
 3. create and adopt-active task tabs, child popup inheritance, visible grouping, and ownership revocation after an ungroup or move;
 4. accessibility, text, HTML, and screenshot snapshots; stale revision/ref rejection; wait conditions; and debugger detach/restart;
 5. ready, working, needs-you, resumed, and finished popup states;
 6. Pause, restart while paused, reconciliation, and Resume;
 7. global blackout during `browser_handoff`, including host and extension restart during the handoff;
-8. recognizable consequential controls staged without side effect, a changed target rejected, one unchanged Commit execution, and harmless controls executed without review.
+8. Autopilot direct execution on controlled fixtures; Review selected and Strict staging recognizable controls without side effect; remembered task/site/effect approval; changed-target rejection; and one unchanged Commit execution.
 
-Never Commit a real send, purchase, delete, permission grant, or upload against a live account merely to prove the barrier. Use controlled fixtures and stop at the staged preview for live authenticated checks.
+Never exercise a real send, purchase, delete, permission grant, or upload against a live account merely to prove policy behavior. Use controlled fixtures; select a review profile and stop at the staged preview for live authenticated checks.
 
 ## Platform evidence
 

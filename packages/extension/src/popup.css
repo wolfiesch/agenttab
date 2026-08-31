@@ -165,11 +165,21 @@ button:disabled { opacity: .45; cursor: default; }
 button:disabled:hover { background: var(--violet-fill); }
 button.quiet:disabled:hover { background: var(--surface-lift); }
 
-body[data-busy] button, body[data-busy] input { pointer-events: none; opacity: .55; }
+body[data-busy] button, body[data-busy] input, body[data-busy] select { pointer-events: none; opacity: .55; }
 
 .actions { display: flex; justify-content: flex-end; gap: var(--step-1); margin-top: var(--step-3); }
 
 input[type="checkbox"] { flex: none; width: 17px; height: 17px; margin: 0; accent-color: var(--violet); }
+
+select {
+  min-width: 104px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  background: var(--surface-lift);
+  color: var(--text);
+  font: inherit;
+}
 
 :focus-visible { outline: 2px solid var(--violet-bright); outline-offset: 2px; }
 
@@ -196,7 +206,8 @@ input[type="checkbox"] { flex: none; width: 17px; height: 17px; margin: 0; accen
   border-top: 1px solid var(--line-soft);
 }
 .review:first-child { padding-top: 0; border-top: 0; }
-.review-actions { display: flex; justify-content: flex-end; gap: var(--step-1); }
+.review-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--step-1); }
+.review-scope { flex: 1; min-width: 0; }
 
 /* tasks */
 .tasks {

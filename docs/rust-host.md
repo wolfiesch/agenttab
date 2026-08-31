@@ -49,9 +49,9 @@ Mutation idempotency is keyed by task and UUIDv7 key with a canonical method/par
 
 ## Guardrails and effects
 
-The host validates optional origin policy before dispatch and revalidates the known current origin for later actions. Uploads must be regular files under configured allowed roots and size limits; they are copied into private staging before the extension receives them.
+The host validates optional origin policy before dispatch and revalidates the known current origin for later actions. Uploads must be regular files under configured allowed roots and size limits; `agenttab policy allow-upload PATH` adds one canonical root idempotently. Authorized files are copied into private staging before the extension receives them.
 
-The extension classifies recognizable consequential actions and the host durably binds the resulting Commit stage to its task, tab, revision, effect, fingerprint, expiry, one-use token, and popup review handle. Popup approval marks that host record approved without dispatch. Only a later public `browser_commit` with the private token can consume the approved record and execute it. The host does not infer that a staged label makes the underlying page effect safe.
+The extension applies its action policy locally and leaves native protocol v1 unchanged. Under a review profile, the extension returns the existing Commit stage shape, which the host durably binds to its task, tab, revision, effect, fingerprint, expiry, one-use token, and popup review handle. Popup approval marks that host record approved without dispatch. Only a later public `browser_commit` with the private token can consume the approved record and execute it. The host does not mirror the selected profile or infer that a staged label makes the underlying page effect safe. See [Action policy](action-policy.md).
 
 ## Build and test scope
 

@@ -38,7 +38,7 @@ Every existing-page mutation includes `expected_page_revision`. The host and ext
 
 ## Pause and recovery
 
-Pause is a barrier, not an optimistic UI toggle. It stops new admissions, lets already-dispatched work settle, rejects waiting work as not started, and persists the paused state. On restart, the extension restores paused state before reconciliation. Resume reconciles ownership before reopening admission.
+Pause is a barrier, not an optimistic UI toggle. It stops new admissions, lets already-dispatched work settle, rejects waiting work as not started, and persists the paused state. It does not request or revoke Chrome permissions. On restart, the extension restores paused state before reconciliation. Resume reconciles ownership before reopening admission.
 
 A host that has not completed its native handshake and reconciliation remains unavailable for browser work. The connection status can report its lifecycle, but callers must retry only after it becomes ready or the user resumes it.
 
@@ -50,6 +50,6 @@ Automation resumes only after the declared completion condition or explicit comp
 
 ## Consequential work across agents
 
-Each recognizable consequential Standard action stages its own Commit. A staged token is bound to one task and tab, expires after five minutes, revalidates the page revision and target fingerprint, and executes once. A batch stops at its first staged action; another agent cannot use that stage to run later batch items.
+Under Review selected or Strict, each recognizable consequential Standard action stages its own Commit. Strict also stages owned-tab close; Autopilot inserts no semantic Commit stage. Fresh installs start in Autopilot, while existing pre-policy state migrates to Strict. A staged token is bound to one task and tab, expires after five minutes, revalidates the page revision and target fingerprint, and executes once. A batch stops at its first staged action; another agent cannot use that stage to run later batch items. Remembered approvals remain bound to an effect category and a task, site, or all-sites scope.
 
 There are no agent-facing global lease tools. Coordinating intent is still the responsibility of the agents and the user. Use distinct tasks for independent work, observe task counts in the extension, and have the human review staged effects before Commit.

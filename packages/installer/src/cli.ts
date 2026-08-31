@@ -3,9 +3,11 @@ import { AgentTabClient } from "../../sdk-typescript/src/index";
 import { main as mcpMain } from "../../mcp/src/server";
 import packageJson from "../package.json" with { type: "json" };
 import { install, InstallError } from "./install";
+import { allowUploadRoot } from "./policy";
 import { runProxy } from "./proxy";
 
 interface ParsedArgs {
+  positional: string[];
   flags: Map<string, string | true>;
 }
 
@@ -26,6 +28,7 @@ const COMMAND_FLAGS: Record<string, Readonly<Record<string, FlagKind>>> = {
   },
   status: {},
   doctor: { layer: "string" },
+  policy: { "state-dir": "string" },
   mcp: {},
   proxy: { port: "string", "token-file": "string" },
 };
@@ -33,11 +36,16 @@ const COMMAND_FLAGS: Record<string, Readonly<Record<string, FlagKind>>> = {
 function parseArgs(command: string, args: string[]): ParsedArgs {
   const allowed = COMMAND_FLAGS[command];
   if (!allowed) throw new Error(`Unknown command: ${command}`);
+  const positional: string[] = [];
   const flags = new Map<string, string | true>();
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index];
     if (!value.startsWith("--")) {
-      throw new Error(`Unexpected argument for agenttab ${command}: ${value}`);
+      if (command !== "policy") {
+        throw new Error(`Unexpected argument for agenttab ${command}: ${value}`);
+      }
+      positional.push(value);
+      continue;
     }
     const equals = value.indexOf("=");
     const name = value.slice(2, equals >= 0 ? equals : undefined);
@@ -57,7 +65,7 @@ function parseArgs(command: string, args: string[]): ParsedArgs {
     flags.set(name, next);
     if (inlineValue === undefined) index += 1;
   }
-  return { flags };
+  return { positional, flags };
 }
 
 function stringFlag(args: ParsedArgs, name: string): string | undefined {
@@ -77,6 +85,7 @@ const USAGE = [
   "  agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]",
   "  agenttab status",
   "  agenttab doctor [--layer ipc|extension]",
+  "  agenttab policy allow-upload PATH [--state-dir PATH]",
   "  agenttab mcp",
   "  agenttab proxy --token-file PATH [--port 9224]",
 ].join("\n");
@@ -135,6 +144,21 @@ async function run(): Promise<void> {
       }, null, 2));
       process.exitCode = 1;
     }
+    return;
+  }
+  if (command === "policy") {
+    const action = parsed.positional[0];
+    const path = parsed.positional[1];
+    if (
+      action !== "allow-upload" ||
+      !path ||
+      parsed.positional.length !== 2
+    ) {
+      throw new Error("Usage: agenttab policy allow-upload PATH [--state-dir PATH]");
+    }
+    console.log(JSON.stringify(await allowUploadRoot(path, {
+      stateDir: stringFlag(parsed, "state-dir"),
+    }), null, 2));
     return;
   }
   if (command === "proxy") {

@@ -85,8 +85,7 @@ if (channel === "development") {
   }
   delete manifest.key;
 }
-const required = ["nativeMessaging", "debugger", "tabs", "tabGroups", "storage", "alarms"];
-const optional = ["scripting"];
+const required = ["nativeMessaging", "debugger", "tabs", "tabGroups", "storage", "alarms", "scripting"];
 const forbiddenKeys = ["content_scripts", "web_accessible_resources", "externally_connectable", "side_panel", "commands"];
 for (const key of forbiddenKeys) {
   if (key in manifest) throw new Error(`Forbidden manifest surface: ${key}`);
@@ -94,7 +93,7 @@ for (const key of forbiddenKeys) {
 if (JSON.stringify(manifest.permissions) !== JSON.stringify(required)) {
   throw new Error(`Required permission drift: ${JSON.stringify(manifest.permissions)}`);
 }
-if (JSON.stringify(manifest.optional_permissions) !== JSON.stringify(optional)) {
+if ("optional_permissions" in manifest) {
   throw new Error(`Optional permission drift: ${JSON.stringify(manifest.optional_permissions)}`);
 }
 if (JSON.stringify(manifest.host_permissions) !== JSON.stringify(["<all_urls>"])) {

@@ -418,6 +418,11 @@ export class OwnershipLedger {
       for (const [token, staged] of Object.entries(state.stagedCommits)) {
         if (staged.task_id === taskId) delete state.stagedCommits[token];
       }
+      for (const [key, allowance] of Object.entries(state.policyAllowances)) {
+        if (allowance.scope === "task" && allowance.taskId === taskId) {
+          delete state.policyAllowances[key];
+        }
+      }
       return ownedTabIds;
     });
     for (const tabId of tabIds) await this.revisions.remove(tabId);

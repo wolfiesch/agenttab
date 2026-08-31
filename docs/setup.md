@@ -8,7 +8,7 @@ This guide distinguishes the contributor source path from the future signed RC a
 
 - Chrome must be version 127 or later for the current extension manifest.
 - AgentTab runs in the existing signed-in Chrome profile. It is task-scoped browser control, not a separate profile, cookie jar, or identity boundary.
-- Keep page content untrusted. Use **Your Turn** for passwords, passkeys, 2FA, CAPTCHA, payment secrets, and other human-only input. Review a staged **Commit** before performing it.
+- Keep page content untrusted. Use **Your Turn** for passwords, passkeys, 2FA, CAPTCHA, payment secrets, and other human-only input. **Autopilot** does not insert Commit prompts; choose Review selected or Strict when recognizable effects should be staged. Fresh installs start in Autopilot, while existing pre-policy state migrates to Strict.
 - A future installation needs an AgentTab extension and the `dev.agenttab.host` native host. Standard mode does not require a TCP listener, a bearer token, or a Python process.
 
 The product boundary and residual Commit risk are described in the [runtime ADR](adr/0001-agenttab-runtime.md) and [Security](security.md).
@@ -58,10 +58,12 @@ The installer deliberately stages the extension but does not silently install or
 2. Enable **Developer mode**.
 3. Choose **Load unpacked** and select the installer-reported AgentTab extension directory. For a source build, that is `packages/extension/dist/`.
 4. Confirm that **AgentTab** is enabled.
-5. Open the AgentTab popup and choose **Enable AgentTab automation**. Chrome requests the optional `scripting` permission. The required `debugger` permission is already present from extension installation; both capabilities are required for Standard browser automation.
+5. Open the AgentTab popup and confirm the action policy. Fresh state starts in unattended **Autopilot**; upgraded pre-policy state starts in Strict to preserve former Commit behavior. Review selected and Strict add Commit review.
 6. Run `agenttab doctor --layer extension` after the extension is enabled. Use `agenttab doctor --layer ipc` to check the local host path.
 
-The manifest keeps `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, and `alarms` as required permissions because Chrome rejects `debugger` in `optional_permissions`. `scripting` is optional and is requested only from the user-facing popup. Removing it disables automation and detaches active task debugger sessions until it is enabled again.
+The manifest keeps `nativeMessaging`, `debugger`, `scripting`, `tabs`, `tabGroups`, `storage`, and `alarms` as required permissions. This keeps setup to Chrome's install confirmation and prevents unattended work from stopping on a later scripting prompt. **Pause agents** is a persisted logical scheduler toggle and never requests or revokes a Chrome permission.
+
+To permit file uploads from a working directory, run `agenttab policy allow-upload PATH` once and restart the AgentTab host. The command is idempotent and updates the same `policy.json` read by the host. See [Action policy](action-policy.md) for profile and remembered-approval behavior.
 
 ## Native identity, registration, and local paths
 

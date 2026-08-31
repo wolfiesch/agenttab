@@ -9,6 +9,29 @@ export type TaskState = "working" | "needs_user" | "completed";
 
 export type TaskColor = "purple" | "cyan" | "green" | "yellow" | "orange" | "red" | "pink" | "blue";
 
+export const POLICY_PROFILES = ["autopilot", "review_selected", "strict"] as const;
+export type PolicyProfile = (typeof POLICY_PROFILES)[number];
+
+export const POLICY_EFFECTS = [
+  "external_communication",
+  "financial",
+  "destructive",
+  "authorization",
+  "upload",
+  "dialog_accept",
+  "owned_tab_close",
+] as const;
+export type PolicyEffect = (typeof POLICY_EFFECTS)[number];
+export type PolicyAllowanceScope = "task" | "domain" | "effect";
+
+export interface PolicyAllowance {
+  scope: PolicyAllowanceScope;
+  effect: PolicyEffect;
+  taskId?: string;
+  origin?: string;
+  createdAt: number;
+}
+
 export interface TaskRecord {
   taskId: string;
   name: string;
@@ -54,6 +77,8 @@ export interface ExtensionState {
   paused: boolean;
   developerMode: boolean;
   showAgentPointer: boolean;
+  policyProfile: PolicyProfile;
+  policyAllowances: Record<string, PolicyAllowance>;
   tasks: Record<string, TaskRecord>;
   revisions: Record<string, RevisionRecord>;
   handoff: HandoffRecord;
@@ -71,6 +96,8 @@ function defaultState(): ExtensionState {
     paused: false,
     developerMode: false,
     showAgentPointer: true,
+    policyProfile: "autopilot",
+    policyAllowances: {},
     tasks: {},
     revisions: {},
     handoff: { active: false },
@@ -92,6 +119,17 @@ function objectValue(value: unknown): Record<string, unknown> | null {
 
 function finiteInteger(value: unknown, minimum = 0): value is number {
   return Number.isInteger(value) && Number(value) >= minimum;
+}
+
+export function policyAllowanceKey(
+  scope: PolicyAllowanceScope,
+  effect: PolicyEffect,
+  taskId?: string,
+  origin?: string,
+): string {
+  if (scope === "task") return `task:${taskId ?? ""}:${effect}`;
+  if (scope === "domain") return `domain:${origin ?? ""}:${effect}`;
+  return `effect:${effect}`;
 }
 
 function jsonEquivalent(left: unknown, right: unknown): boolean {
@@ -131,6 +169,17 @@ function parseState(value: unknown): ExtensionState | null {
   const revisionsValue = objectValue(raw.revisions);
   const handoffValue = objectValue(raw.handoff);
   const commitsValue = objectValue(raw.stagedCommits);
+  // A persisted v1 state without either policy field predates selectable
+  // profiles. Preserve that installation's former Commit behavior on upgrade.
+  const missingPolicyState = raw.policyProfile === undefined || raw.policyAllowances === undefined;
+  if (
+    raw.policyProfile !== undefined &&
+    !POLICY_PROFILES.includes(raw.policyProfile as PolicyProfile)
+  ) return null;
+  const policyProfile = missingPolicyState ? "strict" : raw.policyProfile;
+  const policyAllowancesValue = missingPolicyState
+    ? {}
+    : objectValue(raw.policyAllowances);
   const cleanupValue = raw.automationCleanup === undefined
     ? {
       pending: false,
@@ -139,7 +188,16 @@ function parseState(value: unknown): ExtensionState | null {
       epoch: 0,
     }
     : objectValue(raw.automationCleanup);
-  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue || !cleanupValue) return null;
+  if (
+    !tasksValue ||
+    !revisionsValue ||
+    !handoffValue ||
+    !commitsValue ||
+    !cleanupValue ||
+    !POLICY_PROFILES.includes(policyProfile as PolicyProfile) ||
+    !policyAllowancesValue ||
+    Object.keys(policyAllowancesValue).length > 256
+  ) return null;
   if (
     typeof cleanupValue.pending !== "boolean" ||
     !Array.isArray(cleanupValue.tabIds) ||
@@ -249,11 +307,38 @@ function parseState(value: unknown): ExtensionState | null {
     stagedCommits[token] = commit as unknown as StagedCommit;
   }
 
+  const policyAllowances: Record<string, PolicyAllowance> = {};
+  for (const [key, candidate] of Object.entries(policyAllowancesValue)) {
+    const allowance = objectValue(candidate);
+    if (
+      !allowance ||
+      !["task", "domain", "effect"].includes(String(allowance.scope)) ||
+      !POLICY_EFFECTS.includes(allowance.effect as PolicyEffect) ||
+      !finiteInteger(allowance.createdAt) ||
+      (allowance.taskId !== undefined && typeof allowance.taskId !== "string") ||
+      (allowance.origin !== undefined && typeof allowance.origin !== "string")
+    ) {
+      return null;
+    }
+    const scope = allowance.scope as PolicyAllowanceScope;
+    const effect = allowance.effect as PolicyEffect;
+    if (
+      (scope === "task" && (typeof allowance.taskId !== "string" || allowance.taskId.length === 0)) ||
+      (scope === "domain" && (typeof allowance.origin !== "string" || allowance.origin.length === 0)) ||
+      key !== policyAllowanceKey(scope, effect, allowance.taskId as string | undefined, allowance.origin as string | undefined)
+    ) {
+      return null;
+    }
+    policyAllowances[key] = allowance as unknown as PolicyAllowance;
+  }
+
   return {
     schemaVersion: SCHEMA_VERSION,
     paused: raw.paused,
     developerMode: raw.developerMode,
     showAgentPointer: raw.showAgentPointer,
+    policyProfile: policyProfile as PolicyProfile,
+    policyAllowances,
     tasks,
     revisions,
     handoff: handoffValue as unknown as HandoffRecord,
@@ -325,8 +410,17 @@ async function loadInitialState(): Promise<ExtensionState> {
     LEGACY_PREFERENCES_KEY,
   ]);
   if (Object.hasOwn(stored, STATE_KEY)) {
-    const existing = parseState(stored[STATE_KEY]);
+    const storedState = stored[STATE_KEY];
+    const existing = parseState(storedState);
     if (!existing) throw new Error("Persisted AgentTab state is malformed");
+    const rawState = objectValue(storedState);
+    if (rawState?.policyProfile === undefined || rawState.policyAllowances === undefined) {
+      await chrome.storage.local.set({ [STATE_KEY]: existing });
+      const verified = parseState((await chrome.storage.local.get(STATE_KEY))[STATE_KEY]);
+      if (!verified || !jsonEquivalent(verified, existing)) {
+        throw new Error("AgentTab action policy migration read-back failed");
+      }
+    }
     initializedState = existing;
     await removeLegacyState(
       [LEGACY_TASKS_KEY, LEGACY_PREFERENCES_KEY].filter((key) => Object.hasOwn(stored, key)),
@@ -335,6 +429,12 @@ async function loadInitialState(): Promise<ExtensionState> {
   }
 
   const next = defaultState();
+  if (
+    Object.hasOwn(stored, LEGACY_TASKS_KEY) ||
+    Object.hasOwn(stored, LEGACY_PREFERENCES_KEY)
+  ) {
+    next.policyProfile = "strict";
+  }
   next.tasks = legacyTasks(stored[LEGACY_TASKS_KEY]);
   const preferences = objectValue(stored[LEGACY_PREFERENCES_KEY]);
   if (preferences && typeof preferences.showAgentPointer === "boolean") {

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +34,7 @@ describe("installer CLI arguments", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Usage:");
     expect(result.stdout).toContain("agenttab install");
+    expect(result.stdout).toContain("agenttab policy allow-upload");
     expect(result.stderr).toBe("");
   });
 
@@ -73,5 +74,52 @@ describe("installer CLI arguments", () => {
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toContain(message);
     }
+  });
+
+  test("adds an upload root through the strict command parser", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttab-cli-test-"));
+    temporaryRoots.push(root);
+    const stateDir = join(root, "state");
+    const uploadRoot = join(root, "workspace");
+    await mkdir(uploadRoot);
+
+    const result = await runCli([
+      "policy",
+      "allow-upload",
+      uploadRoot,
+      "--state-dir",
+      stateDir,
+    ]);
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      allowedRoot: uploadRoot,
+      added: true,
+      restartRequired: true,
+    });
+    expect(result.stderr).toBe("");
+    expect(existsSync(join(stateDir, "policy.json"))).toBe(true);
+  });
+
+  test("rejects malformed upload-policy invocations before writing state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttab-cli-test-"));
+    temporaryRoots.push(root);
+    const stateDir = join(root, "state");
+    const uploadRoot = join(root, "workspace");
+    await mkdir(uploadRoot);
+
+    const cases = [
+      ["policy", "allow-upload", uploadRoot, "extra", "--state-dir", stateDir],
+      ["policy", "unknown", uploadRoot, "--state-dir", stateDir],
+    ];
+    for (const args of cases) {
+      const result = await runCli(args);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("Usage: agenttab policy allow-upload PATH");
+    }
+    const unknownFlag = await runCli(["policy", "allow-upload", uploadRoot, "--unknown"]);
+    expect(unknownFlag.exitCode).toBe(1);
+    expect(unknownFlag.stderr).toContain("Unknown option for agenttab policy: --unknown");
+    expect(existsSync(stateDir)).toBe(false);
   });
 });

@@ -34,7 +34,7 @@ Standard MCP access exposes exactly seven tools: `browser_open`, `browser_snapsh
 
 **Your Turn** is for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. During a handoff, AgentTab applies an observation blackout: standard capture and observation requests for every task return `needs_user`. The runtime clears the blackout only after the declared completion condition or explicit Done and its recovery checks. AgentTab does not capture human keystrokes.
 
-**Commit** is a best-effort review barrier for recognizable sends, publishes, purchases, deletes, uploads, authorizations, and permission grants. Before acting, AgentTab prepares, classifies, and revalidates the target. A recognizable consequential action is staged with a preview, then requires approval in a human popup and the requesting agent's one-use token. The record expires after a short interval, cannot be replayed, and is invalidated if the page or target changes. Harmless actions proceed without Commit review. Commit reduces recognizable risk; it cannot prove that a page has no hidden external effect.
+**Commit** is a policy-controlled, best-effort review barrier for recognizable sends, publishes, purchases, deletes, uploads, authorizations, and permission grants. Fresh state starts in unattended Autopilot and inserts no semantic Commit prompt; existing pre-policy state migrates to Strict. Review selected stages recognizable external effects, and Strict also stages owned-tab close. A staged record requires popup approval and the requesting agent's one-use token, expires after a short interval, and is invalidated if the page or target changes. Commit reduces recognizable risk; it cannot prove that a page has no hidden external effect.
 
 ### Trust boundary
 
@@ -54,7 +54,7 @@ This section is draft review copy for the v2 contract. It must be reconciled aga
 | `tabGroups` | Required permission | Shows task-owned tabs as a visible workspace with working, needs-you, or finished status. Group membership is display-only and never authorizes an operation. Removing or moving a tab out of its task group revokes its ownership. |
 | `storage` | Required permission | Persists the minimum extension state needed to recover task status, pause state, handoff blackout state, revision floors, and user interface preferences across MV3 service-worker restarts. It is not an analytics store and is not used to collect browsing history. |
 | `alarms` | Required permission | Schedules bounded MV3 lifecycle work such as reconnect, expiry, and recovery checks after service-worker suspension. It is not used for tracking, advertising, or remote scheduling. |
-| `scripting` | Optional permission | Requested only after the user explicitly clicks **Enable AgentTab automation** in the AgentTab popup. It is not a required install-time permission, denial leaves the extension visibly disabled, and it does not add a Standard raw-script API. |
+| `scripting` | Required permission | Supports the task-scoped text, HTML, selector, wait, scroll, and pointer paths. Keeping it installed avoids a runtime prompt that can strand unattended work. Pause is a logical scheduler control; Standard mode still exposes no arbitrary script API. |
 | `<all_urls>` | Required host permission | Required so the `chrome.scripting` text, HTML, selector, wait, and scroll paths can run on the task-owned page the user directs AgentTab to use, regardless of its site. It does not let an agent claim tabs or expose raw cookies, browser storage, arbitrary JavaScript, CDP, or network APIs in Standard mode. |
 
 ## Reviewer setup notes
@@ -66,7 +66,7 @@ These notes are for a controlled reviewer package only. They are not public inst
 3. Reconcile the package identity and native-host allowed origins with `config/identity.json` before review. Do not infer an identity from this document or treat it as store publication evidence.
 4. Demonstrate a local MCP client opening a task workspace, taking an accessibility snapshot, performing a harmless action, waiting for a defined condition, and listing only that task's tabs.
 5. Demonstrate Your Turn with a harmless test page. Verify that observations from every task return `needs_user` during the handoff and that the agent resumes only after Done or the declared completion condition.
-6. Demonstrate Commit with a controlled test control labelled as a send, upload, delete, authorization, or permission action. Verify that no side effect occurs before the human popup approves the staged action with the requesting agent's one-use token. Do not use a real message, purchase, upload, deletion, or authorization.
+6. Select Review selected or Strict, then demonstrate Commit with a controlled test control labelled as a send, upload, delete, authorization, or permission action. Verify that no side effect occurs before the human popup approves the staged action with the requesting agent's one-use token. Do not use a real message, purchase, upload, deletion, or authorization.
 7. Demonstrate Pause and Resume, including that queued work does not start after Pause and that task status remains visible after recovery.
 8. Verify that Standard discovery exposes exactly the seven Standard tools and that the Developer-only tool is absent until the reviewer explicitly enables Developer mode.
 

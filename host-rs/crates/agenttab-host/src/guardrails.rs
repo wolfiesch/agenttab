@@ -418,7 +418,9 @@ impl Guardrails {
                 "upload_file_not_allowed",
                 "Upload file is outside AgentTab policy dlp_allowed_roots",
             )
-            .with_recovery("Add a narrow user-owned directory to dlp_allowed_roots."));
+            .with_recovery(
+                "Run agenttab policy allow-upload PATH once, then restart the AgentTab host.",
+            ));
         }
         let mut options = OpenOptions::new();
         options.read(true);

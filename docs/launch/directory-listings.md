@@ -20,7 +20,7 @@ Give an agent a task workspace in your signed-in Chrome profile, not broad contr
 
 ## Short description
 
-AgentTab is a local browser runtime for AI agents. It gives each agent task-owned tabs, uses Your Turn for human-only input, stages recognizable consequential actions with Commit, and connects local MCP clients through per-user operating-system-native IPC.
+AgentTab is a local browser runtime for AI agents. It gives each agent task-owned tabs, uses Your Turn for human-only input, starts fresh state in unattended Autopilot while preserving Strict on pre-policy upgrades, offers Commit review profiles, and connects local MCP clients through per-user operating-system-native IPC.
 
 ## Long description
 
@@ -35,7 +35,7 @@ AgentTab declares the `<all_urls>` host permission so its defined `chrome.script
 
 **Your Turn** is the human handoff state for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. During handoff, AgentTab applies an observation blackout across every task, so standard observations return `needs_user`; it does not capture human keystrokes.
 
-**Commit** is a best-effort review barrier for recognizable send, publish, purchase, delete, upload, authorization, and permission-grant controls. It stages a recognizable action with a preview, requires a human popup approval and the requesting agent's one-use token, and revalidates the page and target before execution. It is not a guarantee that every page-triggered external effect is recognizable.
+**Commit** is a policy-controlled, best-effort review barrier for recognizable send, publish, purchase, delete, upload, authorization, and permission-grant controls. Autopilot executes directly; Review selected and Strict can stage a recognizable action with a preview, human popup approval, and the requesting agent's one-use token. It is not a guarantee that every page-triggered external effect is recognizable.
 
 Task ownership coordinates work but does not isolate the signed-in Chrome profile. An agent acting in an owned tab can use the same web session available to the person at the keyboard. Users should connect only trusted local agents and software. Hostile page content and misleading controls remain risks, including prompt injection and effects that Commit cannot classify correctly.
 
