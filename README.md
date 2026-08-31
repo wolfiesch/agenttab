@@ -1,4 +1,4 @@
-# Agent Tab
+# AgentTab
 
 **Any agent. Your browser. Your rules.**
 
@@ -6,11 +6,11 @@
 
 > Give an agent a tab, not the keys to your browser.
 
-Agent Tab lets an agent work in your existing signed-in Chrome profile without giving it unrestricted control of the profile. Each connection receives a task-owned browser workspace. The agent can create tabs, inspect and act in those tabs, wait for page state, and ask for help. Passwords, passkeys, 2FA, CAPTCHA, payment secrets, and other human-only input belong to **Your Turn**. Recognizable consequential actions are staged for **Commit** instead of being performed immediately.
+AgentTab lets an agent work in your existing signed-in Chrome profile without giving it unrestricted control of the profile. Each connection receives a task-owned browser workspace. The agent can create tabs, inspect and act in those tabs, wait for page state, and ask for help. Passwords, passkeys, 2FA, CAPTCHA, payment secrets, and other human-only input belong to **Your Turn**. Recognizable consequential actions are staged for **Commit** instead of being performed immediately.
 
 ## Release status
 
-Agent Tab v2 is **unreleased**. The local source version is `2.0.0-rc.1`; it is not a public npm package, Chrome Web Store item, hosted site, or published release artifact. **Chrome Bridge v1.0.1 remains the available stable legacy path** until the v2 launch cutover.
+AgentTab v2 is **unreleased**. The local source version is `2.0.0-rc.1`; it is not a public npm package, publicly installable Chrome Web Store release, hosted site, or published release artifact. The assigned Web Store item ID is frozen in `config/identity.json`, but its publication state is not verified here. **Chrome Bridge v1.0.1 remains the available stable legacy path** until the v2 launch cutover.
 
 Do not expect `npx agenttab install` to work today. Stable v2 remains blocked on signing, package-registry, Chrome Web Store, controlled-domain, and platform release gates. The command below is the intended public install flow only after those dependencies are live:
 
@@ -22,22 +22,22 @@ The command has no path, token, or shell-specific argument and is suitable for P
 
 ## A task-owned workflow
 
-1. An agent calls `browser_open` with `mode: "create"`. Agent Tab creates a background tab for that task and returns its task, tab, window, page-revision, and automation-route identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
+1. An agent calls `browser_open` with `mode: "create"`. AgentTab creates a background tab for that task and returns its task, tab, window, page-revision, and automation-route identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
 2. On a normal web origin, the agent calls `browser_snapshot`, works from revisioned accessibility references, then calls `browser_act` with the expected page revision. It cannot act on unrelated tabs.
-3. If a site requires human-only input, the agent calls `browser_handoff`. Agent Tab focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
-4. If Agent Tab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token.
+3. If a site requires human-only input, the agent calls `browser_handoff`. AgentTab focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
+4. If AgentTab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token.
 5. The task can list only its own tabs with `browser_tabs`. A separate client gets a separate task unless it proves its durable resume capability.
 
-Chrome does not expose page scripting or debugger access on browser-restricted origins such as `chrome://`, `chrome-extension://`, `devtools://`, and the Chrome Web Store. Agent Tab reports these task tabs with `automation_route: "tab_only"`. Explicit navigation, reload, close, load or URL waits, and human-only `browser_handoff` remain available. History movement is also available when managed origin constraints are absent; with constraints, Agent Tab rejects it because Chrome does not expose the destination for authorization before navigation. Download waits require the `full` route because exact task-tab attribution comes from tab-scoped debugger events, not browser-global download state. Page snapshots, element actions, page-content waits, and raw Developer-mode CDP fail immediately with `browser_restricted_origin` and `outcome: "not_started"` before Agent Tab attempts the blocked route. Use a focus-safe OS accessibility driver bound to the exact browser window when native UI work is required.
+Chrome does not expose page scripting or debugger access on browser-restricted origins such as `chrome://`, `chrome-extension://`, `devtools://`, and the Chrome Web Store. AgentTab reports these task tabs with `automation_route: "tab_only"`. Explicit navigation, reload, close, load or URL waits, and human-only `browser_handoff` remain available. History movement is also available when managed origin constraints are absent; with constraints, AgentTab rejects it because Chrome does not expose the destination for authorization before navigation. Download waits require the `full` route because exact task-tab attribution comes from tab-scoped debugger events, not browser-global download state. Page snapshots, element actions, page-content waits, and raw Developer-mode CDP fail immediately with `browser_restricted_origin` and `outcome: "not_started"` before AgentTab attempts the blocked route. Use a focus-safe OS accessibility driver bound to the exact browser window when native UI work is required.
 
 Commit is a two-party, best-effort semantic barrier, not proof that a page has no external effect. The popup records the human approval, while only the agent's later `browser_commit` can execute the staged action. Page content is untrusted data and a page can attach an effect to an innocently labelled control. Inspect the page and staged action before approving or committing.
 
 ## Trust contract
 
-- **Task ownership is an execution and coordination boundary, not profile isolation.** Agent Tab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or a generic browser-global mutation API. Its one window-level operation creates an unfocused normal window for the first tab of an otherwise empty task.
+- **Task ownership is an execution and coordination boundary, not profile isolation.** AgentTab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or a generic browser-global mutation API. Its one window-level operation creates an unfocused normal window for the first tab of an otherwise empty task.
 - **Your Turn is the only routine focus transition.** Routine task work stays in task-owned tabs. During handoff, all agent observation and capture are denied so human credentials are not captured.
 - **Commit requires human approval and agent intent.** A staged action is bound to its task, tab, page revision, element fingerprint, effect, and short expiry. Popup approval records consent but does not execute it. The agent must then call `browser_commit`; a changed page, expired stage, used token, or unapproved stage cannot execute.
-- **Local by default.** Policy, task state, audit records, and IPC stay on the machine. Agent Tab has no telemetry. See [Telemetry](docs/telemetry.md) and [Security](docs/security.md).
+- **Local by default.** Policy, task state, audit records, and IPC stay on the machine. AgentTab has no telemetry. See [Telemetry](docs/telemetry.md) and [Security](docs/security.md).
 
 ## Tool surface
 
@@ -53,7 +53,7 @@ Standard mode exposes exactly seven MCP tools:
 | `browser_handoff` | Give the user control for human-only input. |
 | `browser_commit` | Execute one staged consequential action. |
 
-Developer mode adds one tool, `browser_developer`. It is absent from Standard discovery. It requires both the persistent Developer mode control in the Agent Tab popup and `AGENTTAB_DEVELOPER=1` in the adapter environment. Treat it as an explicit expansion of the normal boundary.
+Developer mode adds one tool, `browser_developer`. It is absent from Standard discovery. It requires both the persistent Developer mode control in the AgentTab popup and `AGENTTAB_DEVELOPER=1` in the adapter environment. Treat it as an explicit expansion of the normal boundary.
 
 The exact schemas, return semantics, and stdio configuration are in [MCP](docs/mcp.md). The source contract is in [Core RPC schemas](schemas/rpc/v1) and the [runtime ADR](docs/adr/0001-agenttab-runtime.md).
 
@@ -75,9 +75,9 @@ The installer writes this as an absolute local command in supported client confi
 flowchart LR
     A[Agent or MCP client] --> B[Task-scoped Core RPC]
     B --> C[User-owned local IPC]
-    C --> D[One Rust Agent Tab host]
+    C --> D[One Rust AgentTab host]
     D --> E[Chrome Native Messaging]
-    E --> F[Agent Tab extension]
+    E --> F[AgentTab extension]
     F --> G[Task-owned tabs in signed-in Chrome]
     G -. Your Turn .-> H[Human]
 ```

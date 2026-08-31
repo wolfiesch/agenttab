@@ -64,7 +64,7 @@ jobs:
           bun run workspace:build
           bun run extension:build
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=packages/sdk-python python3 -m unittest discover -s packages/sdk-python/tests -v
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_prepare_ci_cache.py
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_prepare_ci_cache.py scripts/test_background_reliability.py
           PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_package_host_archive scripts.test_package_artifact_manifest scripts.test_verify_release_asset_set
           PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile scripts/background_reliability.py scripts/package_extension_store.py tests/architecture/verify_identity.py tests/architecture/verify_permissions.py tests/architecture/verify_protocol_schemas.py tests/architecture/verify_forbidden_surface.py
           node --check packages/extension/dist/background.js
