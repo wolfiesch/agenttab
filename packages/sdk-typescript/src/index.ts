@@ -71,6 +71,37 @@ export interface BrowserWaitParams {
   timeout_ms?: number;
 }
 
+export type BrowserObservation =
+  | { mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number }
+  | { mode: "text" | "html"; selector?: string; max_bytes?: number }
+  | {
+    mode: "screenshot";
+    selector?: string;
+    full_page?: boolean;
+    format?: "png" | "jpeg" | "webp";
+    quality?: number;
+    max_width?: number;
+    max_height?: number;
+    max_bytes?: number;
+  };
+
+export interface ActWaitObserveOptions {
+  act: BrowserActParams;
+  /** Omit for an action-aware default, or pass false to observe immediately. */
+  wait?: BrowserWaitCondition | false;
+  waitTimeoutMs?: number;
+  /** Defaults to a fresh accessibility snapshot; pass false to skip observation. */
+  observe?: BrowserObservation | false;
+}
+
+export interface ActWaitObserveResult {
+  /** Core outcome from browser_act. Wait and observation run only when this is completed. */
+  outcome: Outcome;
+  action: unknown;
+  wait?: unknown;
+  observation?: unknown;
+}
+
 export interface BrowserHandoffParams {
   tab_id: number;
   expected_page_revision: number;
@@ -100,6 +131,29 @@ export interface MethodParams {
   browser_commit: BrowserCommitParams;
   browser_developer: BrowserDeveloperParams;
   "agenttab.status": Record<string, never>;
+}
+
+function inferredPostActionWait(actions: readonly BrowserAction[]): BrowserWaitCondition | undefined {
+  const last = actions.at(-1);
+  if (!last || last.kind === "close") return undefined;
+  if (
+    last.kind === "navigate" ||
+    last.kind === "go_back" ||
+    last.kind === "go_forward" ||
+    last.kind === "reload"
+  ) {
+    return { kind: "load" };
+  }
+  if (
+    last.kind === "click" ||
+    last.kind === "select" ||
+    last.kind === "drag" ||
+    last.kind === "dialog" ||
+    last.kind === "upload_file"
+  ) {
+    return { kind: "network_idle" };
+  }
+  return undefined;
 }
 
 export type RpcMethod = keyof MethodParams;
@@ -796,6 +850,48 @@ export class AgentTabClient {
     const response = await this.request<M, T>(method, params, options);
     if (!response.ok) throw new AgentTabError(response);
     return response.result as T;
+  }
+
+  /**
+   * Run the common semantic automation loop without caller-authored sleeps:
+   * act, wait for a deterministic postcondition, then return a fresh observation.
+   */
+  async actWaitObserve(options: ActWaitObserveOptions): Promise<ActWaitObserveResult> {
+    const actionResponse = await this.request("browser_act", options.act);
+    if (!actionResponse.ok) throw new AgentTabError(actionResponse);
+    const actionResult: ActWaitObserveResult = {
+      outcome: actionResponse.outcome,
+      action: actionResponse.result,
+    };
+    if (actionResponse.outcome !== "completed") return actionResult;
+
+    const lastAction = options.act.actions.at(-1);
+    if (lastAction?.kind === "close") return actionResult;
+
+    const condition = options.wait === false
+      ? undefined
+      : options.wait ?? inferredPostActionWait(options.act.actions);
+    const waited = condition === undefined
+      ? undefined
+      : await this.call("browser_wait", {
+        tab_id: options.act.tab_id,
+        condition,
+        ...(options.waitTimeoutMs === undefined ? {} : { timeout_ms: options.waitTimeoutMs }),
+      });
+    const observationSpec = options.observe === false
+      ? undefined
+      : options.observe ?? { mode: "accessibility" as const };
+    const observation = observationSpec === undefined
+      ? undefined
+      : await this.call("browser_snapshot", {
+        tab_id: options.act.tab_id,
+        ...observationSpec,
+      } as BrowserSnapshotParams);
+    return {
+      ...actionResult,
+      ...(waited === undefined ? {} : { wait: waited }),
+      ...(observation === undefined ? {} : { observation }),
+    };
   }
 
   close(): void {

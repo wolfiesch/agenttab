@@ -102,25 +102,10 @@ export class MutationScheduler {
     return result;
   }
 
-  readAfterWrites<T>(tabId: number | undefined, work: Work<T>): Promise<T> {
+  readAfterWrites<T>(tabId: number, work: Work<T>): Promise<T> {
     if (!this.accepting) return Promise.reject(this.notStarted());
     const admissionEpoch = this.admissionEpoch;
     const priorGlobal = this.globalTail;
-    if (tabId === undefined) {
-      const result = priorGlobal.then(async () => {
-        if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
-          throw this.notStarted("AgentTab paused before this observation was dispatched");
-        }
-        return work();
-      });
-      this.globalTail = result.then(
-        () => undefined,
-        () => undefined,
-      );
-      this.track(result);
-      return result;
-    }
-
     const priorTab = this.tabTails.get(tabId) ?? Promise.resolve();
     const result = priorGlobal.then(() => priorTab).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
@@ -129,6 +114,23 @@ export class MutationScheduler {
       return work();
     });
     this.rememberTabTail(undefined, tabId, result);
+    this.track(result);
+    return result;
+  }
+
+  readAfterAllWrites<T>(work: Work<T>): Promise<T> {
+    if (!this.accepting) return Promise.reject(this.notStarted());
+    const admissionEpoch = this.admissionEpoch;
+    const priorGlobal = this.globalTail;
+    const priorTabs = [...this.tabTails.values()];
+    const result = priorGlobal.then(() => Promise.all(priorTabs)).then(async () => {
+      if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
+        throw this.notStarted("AgentTab paused before this observation was dispatched");
+      }
+      return work();
+    });
+    // Observations wait for writes admitted before them, but do not become a
+    // global write barrier for independent work admitted afterward.
     this.track(result);
     return result;
   }

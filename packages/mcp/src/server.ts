@@ -156,17 +156,17 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_snapshot",
-    description: "Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab.",
+    description: "Read an accessibility snapshot with stable semantic refs, bounded text or HTML, or a screenshot from a task-owned tab.",
     inputSchema: schema(snapshotSchema),
   },
   {
     name: "browser_act",
-    description: "Run an ordered batch of typed actions against one task-owned tab and page revision.",
+    description: "Run typed actions against one task-owned tab and page revision; prefer a snapshot semantic_ref when available.",
     inputSchema: schema(actSchema),
   },
   {
     name: "browser_wait",
-    description: "Wait for one schema-defined load, URL, text, selector, network-idle, or download condition.",
+    description: "Wait event-first for one load, URL, text, selector, network-idle, or download condition instead of sleeping.",
     inputSchema: schema(waitSchema),
   },
   {

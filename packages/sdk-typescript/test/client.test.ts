@@ -157,6 +157,77 @@ describe("Core RPC transport deadlines", () => {
   });
 });
 
+test("actWaitObserve replaces post-action sleeps with wait and fresh observation", async () => {
+  const requests: Array<{ method: string; params: unknown }> = [];
+  const client = Object.create(AgentTabClient.prototype) as AgentTabClient;
+  client.request = (async (method: string, params: unknown) => {
+    requests.push({ method, params });
+    return {
+      protocol: "agenttab.rpc",
+      version: 1,
+      request_id: "act-request",
+      ok: true,
+      outcome: "completed",
+      result: { method },
+    };
+  }) as AgentTabClient["request"];
+  client.call = (async (method: string, params: unknown) => {
+    requests.push({ method, params });
+    return { method };
+  }) as AgentTabClient["call"];
+
+  await expect(client.actWaitObserve({
+    act: {
+      tab_id: 7,
+      expected_page_revision: 3,
+      actions: [{ kind: "click", ref: "a3:button:Continue" }],
+    },
+  })).resolves.toEqual({
+    outcome: "completed",
+    action: { method: "browser_act" },
+    wait: { method: "browser_wait" },
+    observation: { method: "browser_snapshot" },
+  });
+  expect(requests.map(({ method }) => method)).toEqual([
+    "browser_act",
+    "browser_wait",
+    "browser_snapshot",
+  ]);
+  expect(requests[1].params).toEqual({
+    tab_id: 7,
+    condition: { kind: "network_idle" },
+  });
+  expect(requests[2].params).toEqual({ tab_id: 7, mode: "accessibility" });
+});
+
+test("actWaitObserve stops on non-completed successful action outcomes", async () => {
+  for (const outcome of ["commit_required", "needs_user"] as const) {
+    const client = Object.create(AgentTabClient.prototype) as AgentTabClient;
+    client.request = (async () => ({
+      protocol: "agenttab.rpc",
+      version: 1,
+      request_id: `${outcome}-request`,
+      ok: true,
+      outcome,
+      result: { stopped: outcome },
+    })) as AgentTabClient["request"];
+    client.call = (async () => {
+      throw new Error("wait or observation must not start");
+    }) as AgentTabClient["call"];
+
+    await expect(client.actWaitObserve({
+      act: {
+        tab_id: 7,
+        expected_page_revision: 3,
+        actions: [{ kind: "click", ref: "a3:button:Continue" }],
+      },
+    })).resolves.toEqual({
+      outcome,
+      action: { stopped: outcome },
+    });
+  }
+});
+
 if (false) {
   // @ts-expect-error Standard browser actions never expose an agent-controlled focus transition.
   const forbiddenFocusAction: BrowserAction = { kind: "focus" };
