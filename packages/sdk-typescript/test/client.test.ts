@@ -7,6 +7,7 @@ import {
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
+  DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS,
   DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS,
   DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
   FrameDecoder,
@@ -111,6 +112,10 @@ describe("Core RPC transport deadlines", () => {
         completion: { kind: "manual_done" },
       },
     )).toBe(DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs(
+      "browser_credentials",
+      { action: "prepare", tab_id: 1, expected_page_revision: 1 },
+    )).toBe(DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
     expect(resolveTransportTimeoutMs("browser_tabs", {}, 45_000)).toBe(45_000);
     expect(resolveTransportTimeoutMs(
       "browser_wait",

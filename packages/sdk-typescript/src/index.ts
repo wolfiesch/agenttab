@@ -15,6 +15,7 @@ export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_WAIT_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;
+export const DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS = 120_000;
 // Core gives long-running extension operations five seconds to return after their
 // declared timeout. Keep a second, bounded five-second margin for the response to
 // cross the native and Core transports before the client classifies it as unknown.
@@ -432,6 +433,8 @@ function longOperationTimeoutMs(
     defaultTimeoutMs = DEFAULT_BROWSER_WAIT_TIMEOUT_MS;
   } else if (method === "browser_handoff") {
     defaultTimeoutMs = DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS;
+  } else if (method === "browser_credentials") {
+    defaultTimeoutMs = DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS;
   } else {
     return undefined;
   }

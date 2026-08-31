@@ -17,6 +17,7 @@ from agenttab import (
     AgentTabClient,
     AgentTabError,
     AgentTabTransportError,
+    DEFAULT_BROWSER_CREDENTIALS_TIMEOUT,
     DEFAULT_BROWSER_HANDOFF_TIMEOUT,
     DEFAULT_BROWSER_WAIT_TIMEOUT,
     LONG_OPERATION_TRANSPORT_GRACE,
@@ -105,6 +106,13 @@ class ClientTests(unittest.TestCase):
                 },
             ),
             DEFAULT_BROWSER_HANDOFF_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
+        )
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_credentials",
+                {"action": "prepare", "tab_id": 1, "expected_page_revision": 1},
+            ),
+            DEFAULT_BROWSER_CREDENTIALS_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
         )
         self.assertEqual(resolve_transport_timeout("browser_tabs", {}, 45), 45)
         self.assertEqual(

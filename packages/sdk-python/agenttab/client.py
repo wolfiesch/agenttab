@@ -22,6 +22,7 @@ HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT = 30.0
 DEFAULT_BROWSER_WAIT_TIMEOUT = 30.0
 DEFAULT_BROWSER_HANDOFF_TIMEOUT = 300.0
+DEFAULT_BROWSER_CREDENTIALS_TIMEOUT = 120.0
 # Core reserves five seconds after a long operation's declared timeout. Keep a
 # second, bounded five-second margin for its response to cross the transports.
 LONG_OPERATION_TRANSPORT_GRACE = 10.0
@@ -46,6 +47,8 @@ def resolve_transport_timeout(
         default_timeout = DEFAULT_BROWSER_WAIT_TIMEOUT
     elif method == "browser_handoff":
         default_timeout = DEFAULT_BROWSER_HANDOFF_TIMEOUT
+    elif method == "browser_credentials":
+        default_timeout = DEFAULT_BROWSER_CREDENTIALS_TIMEOUT
     else:
         return request_timeout
     requested_timeout_ms = params.get("timeout_ms")
