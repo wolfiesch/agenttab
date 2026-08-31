@@ -15,6 +15,7 @@ import {
   STANDARD_TOOLS,
   listedTools,
   readBoundedLines,
+  serveMcp,
 } from "../src/server";
 
 describe("AgentTab MCP surface", () => {
@@ -162,7 +163,13 @@ describe("AgentTab MCP surface", () => {
         method: "tools/call",
         params: { name: "browser_open", arguments: { mode: "create" } },
       }) as Record<string, unknown>;
-      expect(first.structuredContent).toEqual({ tab_id: 1 });
+      expect(first.structuredContent).toEqual({
+        tab_id: 1,
+        _agenttab: {
+          outcome: "completed",
+          task_id: "018f22b2-4126-7c1a-8c31-3f45a783da44",
+        },
+      });
       expect(confirmed).toBe(true);
 
       const second = await server.handle({
@@ -171,7 +178,13 @@ describe("AgentTab MCP surface", () => {
         method: "tools/call",
         params: { name: "browser_tabs", arguments: {} },
       }) as Record<string, unknown>;
-      expect(second.structuredContent).toEqual({ tabs: [] });
+      expect(second.structuredContent).toEqual({
+        tabs: [],
+        _agenttab: {
+          outcome: "completed",
+          task_id: "018f22b2-4126-7c1a-8c31-3f45a783da44",
+        },
+      });
       expect(methods).toEqual(["browser_open", "browser_tabs"]);
     } finally {
       server?.close();
@@ -189,22 +202,29 @@ describe("AgentTab MCP surface", () => {
   test("evicts a closed client after a failed tool call and reconnects without replaying", async () => {
     const calls: Array<{ client: string; method: string }> = [];
     const firstClient = {
+      connection: { task_id: "task-old" },
       get closed() {
         return true;
       },
-      call: async (method: string) => {
+      request: async (method: string) => {
         calls.push({ client: "first", method });
         throw new Error("transport closed");
       },
       close: () => undefined,
     } as unknown as AgentTabClient;
     const secondClient = {
+      connection: { task_id: "task-new" },
       get closed() {
         return false;
       },
-      call: async (method: string) => {
+      request: async (method: string) => {
         calls.push({ client: "second", method });
-        return { tabs: ["tab-new"] };
+        return {
+          ok: true,
+          outcome: "completed",
+          request_id: "request-new",
+          result: { tabs: ["tab-new"] },
+        };
       },
       close: () => undefined,
     } as unknown as AgentTabClient;
@@ -232,7 +252,10 @@ describe("AgentTab MCP surface", () => {
       method: "tools/call",
       params: { name: "browser_tabs", arguments: {} },
     }) as Record<string, unknown>;
-    expect(second.structuredContent).toEqual({ tabs: ["tab-new"] });
+    expect(second.structuredContent).toEqual({
+      tabs: ["tab-new"],
+      _agenttab: { outcome: "completed", task_id: "task-new" },
+    });
     expect(connections).toBe(2);
     expect(calls).toEqual([
       { client: "first", method: "browser_tabs" },
@@ -243,10 +266,11 @@ describe("AgentTab MCP surface", () => {
 
   test("reports mutation transport failures as unknown with the reconciliation key", async () => {
     const client = {
+      connection: { task_id: "task-timeout" },
       get closed() {
         return false;
       },
-      call: async () => {
+      request: async () => {
         throw new AgentTabTransportError("browser_open", {
           code: "request_timeout",
           idempotencyKey: "00000000-0000-7000-8000-000000000001",
@@ -281,13 +305,19 @@ describe("AgentTab MCP surface", () => {
   test("retains a live client after an application error", async () => {
     const calls: string[] = [];
     const client = {
+      connection: { task_id: "task-live" },
       get closed() {
         return false;
       },
-      call: async (method: string) => {
+      request: async (method: string) => {
         calls.push(method);
         if (calls.length === 1) throw new Error("application rejected");
-        return { tabs: ["tab-live"] };
+        return {
+          ok: true,
+          outcome: "completed",
+          request_id: "request-live",
+          result: { tabs: ["tab-live"] },
+        };
       },
       close: () => undefined,
     } as unknown as AgentTabClient;
@@ -311,7 +341,10 @@ describe("AgentTab MCP surface", () => {
       method: "tools/call",
       params: { name: "browser_tabs", arguments: {} },
     }) as Record<string, unknown>;
-    expect(second.structuredContent).toEqual({ tabs: ["tab-live"] });
+    expect(second.structuredContent).toEqual({
+      tabs: ["tab-live"],
+      _agenttab: { outcome: "completed", task_id: "task-live" },
+    });
     expect(connections).toBe(1);
     expect(calls).toEqual(["browser_tabs", "browser_tabs"]);
     server.close();
@@ -320,9 +353,15 @@ describe("AgentTab MCP surface", () => {
   test("initialize and tools/call map directly to Core RPC", async () => {
     const calls: unknown[] = [];
     const client = {
-      call: async (method: string, params: unknown) => {
+      connection: { task_id: "task-direct" },
+      request: async (method: string, params: unknown) => {
         calls.push({ method, params });
-        return { tabs: [] };
+        return {
+          ok: true,
+          outcome: "completed",
+          request_id: "request-direct",
+          result: { tabs: [] },
+        };
       },
       close: () => undefined,
     } as unknown as AgentTabClient;
@@ -343,7 +382,10 @@ describe("AgentTab MCP surface", () => {
     expect(calls).toEqual([{ method: "browser_tabs", params: {} }]);
     expect(result).toEqual({
       content: [{ type: "text", text: "{\n  \"tabs\": []\n}" }],
-      structuredContent: { tabs: [] },
+      structuredContent: {
+        tabs: [],
+        _agenttab: { outcome: "completed", task_id: "task-direct" },
+      },
     });
     server.close();
   });
@@ -351,9 +393,15 @@ describe("AgentTab MCP surface", () => {
   test("MCP forwards long-operation timeouts for SDK deadline selection", async () => {
     const calls: unknown[] = [];
     const client = {
-      call: async (method: string, params: unknown) => {
+      connection: { task_id: "task-timeout-forwarding" },
+      request: async (method: string, params: unknown) => {
         calls.push({ method, params });
-        return { matched: true };
+        return {
+          ok: true,
+          outcome: "completed",
+          request_id: `request-${method}`,
+          result: { matched: true },
+        };
       },
       close: () => undefined,
     } as unknown as AgentTabClient;
@@ -409,58 +457,211 @@ describe("AgentTab MCP surface", () => {
     server.close();
   });
 
-  test("returns screenshots as native MCP image content without duplicating base64", async () => {
-    const screenshotData = "c2NyZWVuc2hvdA==";
+  test("reuses the JSON-RPC invocation idempotency key for mutation retries", async () => {
+    const keys: unknown[] = [];
     const client = {
-      call: async () => ({
-        tab_id: 7,
-        page_revision: 3,
-        mode: "screenshot",
-        data: screenshotData,
-        encoding: "base64",
-        media_type: "image/webp",
-        format: "webp",
-        byte_length: 10,
+      connection: { task_id: "task-idempotent" },
+      get closed() {
+        return false;
+      },
+      request: async (_method: string, _params: unknown, options: { idempotencyKey?: string }) => {
+        keys.push(options.idempotencyKey);
+        return {
+          ok: true,
+          outcome: "completed",
+          request_id: "request-idempotent",
+          result: { tab_id: 1 },
+        };
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ clientFactory: async () => client });
+    const call = (id: string | number, url?: string) => server.handle({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: "browser_open", arguments: { mode: "create", ...(url ? { url } : {}) } },
+    });
+    await call(11);
+    await call(11);
+    await call(12);
+    await call(11, "https://example.com");
+    expect(keys[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(keys[1]).toBe(keys[0]);
+    expect(keys[2]).not.toBe(keys[0]);
+    expect(keys[3]).not.toBe(keys[0]);
+    server.close();
+  });
+
+  test("summarizes large text content without duplicating the structured payload", async () => {
+    const text = "x".repeat(12_000);
+    const client = {
+      connection: { task_id: "task-large" },
+      get closed() {
+        return false;
+      },
+      request: async () => ({
+        ok: true,
+        outcome: "completed",
+        request_id: "request-large",
+        result: { mode: "text", text, page_revision: 3 },
       }),
       close: () => undefined,
     } as unknown as AgentTabClient;
     const server = new McpServer({ clientFactory: async () => client });
+    const result = await server.handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "browser_snapshot", arguments: { tab_id: 1, mode: "text" } },
+    }) as Record<string, any>;
+    expect(result.content).toEqual([{
+      type: "text",
+      text: expect.stringMatching(/^AgentTab completed; full structured result attached \([0-9]+ bytes\)\.$/),
+    }]);
+    expect(result.structuredContent).toEqual({
+      mode: "text",
+      text,
+      page_revision: 3,
+      _agenttab: { outcome: "completed", task_id: "task-large" },
+    });
+    server.close();
+  });
 
+  test("returns screenshots once as MCP image content", async () => {
+    const client = {
+      connection: { task_id: "task-image" },
+      get closed() {
+        return false;
+      },
+      request: async () => ({
+        ok: true,
+        outcome: "completed",
+        request_id: "request-image",
+        result: {
+          mode: "screenshot",
+          encoding: "base64",
+          data: "aW1hZ2U=",
+          media_type: "image/webp",
+          format: "webp",
+          byte_length: 5,
+          page_revision: 8,
+        },
+      }),
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ clientFactory: async () => client });
     const result = await server.handle({
       jsonrpc: "2.0",
       id: 1,
       method: "tools/call",
       params: {
         name: "browser_snapshot",
-        arguments: { tab_id: 7, mode: "screenshot", format: "webp" },
+        arguments: { tab_id: 1, mode: "screenshot", format: "webp" },
       },
     }) as Record<string, unknown>;
-
     expect(result).toEqual({
-      content: [
-        { type: "image", data: screenshotData, mimeType: "image/webp" },
-        {
-          type: "text",
-          text: JSON.stringify({
-            tab_id: 7,
-            page_revision: 3,
-            mode: "screenshot",
-            format: "webp",
-            byte_length: 10,
-            media_type: "image/webp",
-          }, null, 2),
-        },
-      ],
+      content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/webp" }],
       structuredContent: {
-        tab_id: 7,
-        page_revision: 3,
         mode: "screenshot",
-        format: "webp",
-        byte_length: 10,
         media_type: "image/webp",
+        format: "webp",
+        byte_length: 5,
+        page_revision: 8,
+        _agenttab: { outcome: "completed", task_id: "task-image" },
       },
     });
-    expect(JSON.stringify(result).split(screenshotData)).toHaveLength(2);
+    expect(JSON.stringify(result.structuredContent)).not.toContain("aW1hZ2U=");
+    server.close();
+  });
+
+  test("dispatches requests concurrently while serializing JSON-RPC output", async () => {
+    let releaseWait!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      releaseWait = resolve;
+    });
+    const client = {
+      connection: { task_id: "task-concurrent" },
+      get closed() {
+        return false;
+      },
+      request: async () => {
+        await wait;
+        return {
+          ok: true,
+          outcome: "completed",
+          request_id: "request-wait",
+          result: { matched: true },
+        };
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ clientFactory: async () => client });
+    async function* input(): AsyncGenerator<string> {
+      yield `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "browser_wait",
+          arguments: { tab_id: 1, condition: { kind: "load" } },
+        },
+      })}\n${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" })}\n`;
+    }
+    const responses: Array<Record<string, unknown>> = [];
+    let activeWriters = 0;
+    let maxActiveWriters = 0;
+    let resolvePing!: () => void;
+    const pingWritten = new Promise<void>((resolve) => {
+      resolvePing = resolve;
+    });
+    const running = serveMcp(server, input(), async (line) => {
+      activeWriters += 1;
+      maxActiveWriters = Math.max(maxActiveWriters, activeWriters);
+      await Promise.resolve();
+      const response = JSON.parse(line) as Record<string, unknown>;
+      responses.push(response);
+      if (response.id === 2) resolvePing();
+      activeWriters -= 1;
+    });
+    await pingWritten;
+    expect(responses.map((response) => response.id)).toEqual([2]);
+    releaseWait();
+    await running;
+    expect(responses.map((response) => response.id)).toEqual([2, 1]);
+    expect(maxActiveWriters).toBe(1);
+    server.close();
+  });
+
+  test("shares one in-flight Core connection across concurrent first calls", async () => {
+    let connections = 0;
+    const client = {
+      connection: { task_id: "task-shared-connect" },
+      get closed() {
+        return false;
+      },
+      request: async () => ({
+        ok: true,
+        outcome: "completed",
+        request_id: "request-shared-connect",
+        result: { tabs: [] },
+      }),
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({
+      clientFactory: async () => {
+        connections += 1;
+        await Promise.resolve();
+        return client;
+      },
+    });
+    await Promise.all([1, 2].map((id) => server.handle({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: "browser_tabs", arguments: {} },
+    })));
+    expect(connections).toBe(1);
     server.close();
   });
 });

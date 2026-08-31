@@ -311,10 +311,20 @@ function summarizeResult(
           : "Task tab opened";
     case "browser_snapshot": {
       const mode = fieldString(args, "mode");
-      if (mode === "accessibility") return countSummary(observationItems(details), "node");
+      if (mode === "accessibility") {
+        const compactCount = fieldNumber(result, "nodes_count");
+        return compactCount === undefined
+          ? countSummary(observationItems(details), "node")
+          : countLabel(compactCount, "node");
+      }
       if (mode === "screenshot") return "Screenshot captured";
-      const text = fieldString(result, mode === "html" ? "html" : "text");
-      return text === undefined ? `${humanize(mode ?? "page")} snapshot ready` : `${text.length.toLocaleString()} characters read`;
+      const text = fieldString(result, "content") ?? fieldString(result, mode === "html" ? "html" : "text");
+      const compactCharacters = fieldNumber(result, "content_characters") ??
+        fieldNumber(result, `${mode ?? "content"}_characters`);
+      const characters = text?.length ?? compactCharacters;
+      return characters === undefined
+        ? `${humanize(mode ?? "page")} snapshot ready`
+        : `${characters.toLocaleString()} characters read`;
     }
     case "browser_act": {
       const actions = Array.isArray(args.actions) ? args.actions.length : 0;
@@ -323,7 +333,9 @@ function summarizeResult(
     case "browser_wait":
       return "Wait condition observed";
     case "browser_tabs":
-      return countSummary(Array.isArray(result.tabs) ? result.tabs : [], "task tab");
+      return typeof result.tabs_count === "number"
+        ? countLabel(result.tabs_count, "task tab")
+        : countSummary(Array.isArray(result.tabs) ? result.tabs : [], "task tab");
     case "browser_handoff":
       return status === "awaiting_user" ? "Waiting for user" : "User handoff completed";
     case "browser_commit":
@@ -604,7 +616,11 @@ function targetMeta(condition: Record<string, unknown>): string | undefined {
 
 
 function countSummary(values: unknown[], noun: string): string {
-  return `${values.length} ${noun}${values.length === 1 ? "" : "s"}`;
+  return countLabel(values.length, noun);
+}
+
+function countLabel(count: number, noun: string): string {
+  return `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 function toRecord(value: unknown): Record<string, unknown> {

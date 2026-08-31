@@ -52,7 +52,7 @@ For OMP and Pi, the release's public package coordinate is `@getagenttab/omp`. T
 
 An MCP server process opens one AgentTab Core connection when it first calls a tool. The host lazily creates the task on the first browser operation. That connection owns the task and may list or mutate only that task's tabs.
 
-Set `AGENTTAB_CONVERSATION_ID` only when the MCP client can provide one stable, private conversation scope. With it, the adapter stores a resume capability in an owner-only local state file under the AgentTab state directory. On reconnect it offers the stored capability, the host returns a replacement capability, the adapter durably records it, confirms it on that connection, and then activates the replacement. A failed durable confirmation closes the connection instead of treating the task as resumed.
+OMP and Pi automatically use the harness session ID as their stable private conversation scope. `AGENTTAB_CONVERSATION_ID` may override it, and remains useful for an MCP client that can provide a stable scope across stdio process restarts. The adapter creates one owner-only resume-capability store for that scope and reuses it across transport reconnects. On reconnect it offers the stored capability, the host returns a replacement capability, the adapter durably records it, confirms it on that connection, and then activates the replacement. A failed durable confirmation closes the connection instead of treating the task as resumed.
 
 `AGENTTAB_CONVERSATION_ID` is non-authoritative metadata. The opaque resume capability is the authorization proof and must never be copied into a client config, prompt, log, or shared state. Without a valid capability, a new connection receives a new task; the previous task is not silently shared. The host can rotate a capability with task responses, and the adapter persists the replacement before resolving that response to the caller.
 
@@ -82,7 +82,7 @@ Every existing-page mutation carries its expected page revision. If navigation o
 
 ### Results and errors
 
-The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `request_id`, `ok`, and an `outcome`. A successful MCP tool call returns both readable MCP text content and `structuredContent`. Screenshots instead return native MCP image content plus metadata; their base64 bytes are not repeated in text or structured content. A Core error is returned as an MCP tool error with `isError: true`; when available, its structured content contains `code`, `outcome`, `recovery`, and `details`.
+The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `request_id`, `ok`, and an `outcome`. A successful MCP tool call preserves `outcome` and task identity under `structuredContent._agenttab`. Small results also have readable text content; large results use a bounded text summary instead of duplicating the full structured payload. Screenshots are returned once as native MCP image content using the negotiated PNG, JPEG, or WebP media type; their base64 bytes are omitted from text and structured content. A Core error is returned as an MCP tool error with `isError: true`; when available, its structured content contains `code`, `outcome`, `recovery`, `details`, and task identity.
 
 | Outcome | Meaning |
 |---|---|
@@ -92,7 +92,9 @@ The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `reques
 | `needs_user` | The operation requires human involvement. Follow the returned recovery or handoff state. |
 | `commit_required` | A recognizable consequential action was staged instead of executed. |
 
-Mutation methods carry a UUIDv7 idempotency key in Core RPC. The adapter generates one when a caller has not supplied a Core request. Reusing a completed key for identical work returns the durable response; reusing it with different input is a conflict. A mutation found only as started after recovery returns `unknown` and is not replayed.
+Mutation methods carry a UUIDv7 idempotency key in Core RPC. MCP, OMP, and Pi bind one key to each harness invocation ID so a retry of that invocation retains its reconciliation identity. Reusing a completed key for identical work returns the durable response; reusing it with different input is a conflict. A mutation found only as started after recovery returns `unknown` and is not replayed.
+
+The stdio MCP reader dispatches requests concurrently, while its writer serializes complete JSON-RPC lines. A long `browser_wait` or `browser_handoff` therefore does not block `ping`, discovery, or an independent tool call at the adapter layer.
 
 Raw TypeScript and Python SDK clients raise `AgentTabTransportError` for an ambiguous timeout, connection close, or transport failure. The error carries the method and, for mutations, the exact generated or caller-supplied idempotency key. A caller may reconnect and explicitly retry the same method and parameters with that key; the SDK never replays the request automatically. MCP and OMP adapters likewise return the failed invocation, discard a cached client only when its transport is closed, and reconnect on the next invocation.
 

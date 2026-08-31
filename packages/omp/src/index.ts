@@ -7,8 +7,10 @@ import {
   SCREENSHOT_MAX_DIMENSION,
   SNAPSHOT_TEXT_MAX_BYTES,
   STANDARD_ACTION_VALUE_MAX_CHARS,
+  createUuidV7,
   createResumeCapabilityStore,
   type MethodParams,
+  type MutationMethod,
 } from "../../sdk-typescript/src/index";
 import { piSchema } from "./pi-schema";
 import {
@@ -49,8 +51,81 @@ export interface AgentApi {
   registerTool(tool: Record<string, unknown>): void;
 }
 
+interface ToolExecutionContext {
+  sessionManager?: {
+    getSessionId?(): string;
+  };
+}
 
-type ClientFactory = () => Promise<AgentTabClient>;
+type ClientFactory = (context?: ToolExecutionContext) => Promise<AgentTabClient>;
+
+const MUTATIONS = new Set<ToolMethod>([
+  "browser_open",
+  "browser_act",
+  "browser_handoff",
+  "browser_commit",
+  "browser_developer",
+]);
+const INLINE_RESULT_MAX_BYTES = 8 * 1024;
+const IDEMPOTENCY_KEY_CACHE_MAX_ENTRIES = 4_096;
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+class InvocationIdempotencyKeys {
+  readonly #keys = new Map<string, string>();
+
+  for(invocationId: string): string {
+    if (UUID_V7.test(invocationId)) return invocationId.toLowerCase();
+    const current = this.#keys.get(invocationId);
+    if (current !== undefined) return current;
+    const created = createUuidV7();
+    if (this.#keys.size >= IDEMPOTENCY_KEY_CACHE_MAX_ENTRIES) {
+      const oldest = this.#keys.keys().next().value;
+      if (oldest !== undefined) this.#keys.delete(oldest);
+    }
+    this.#keys.set(invocationId, created);
+    return created;
+  }
+}
+
+function isMutation(method: ToolMethod): method is MutationMethod {
+  return MUTATIONS.has(method);
+}
+
+function contextConversationId(context: ToolExecutionContext | undefined): string | undefined {
+  try {
+    const sessionId = context?.sessionManager?.getSessionId?.();
+    return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function compactLargeValue(value: unknown, resultBytes: number): Record<string, unknown> {
+  if (typeof value === "string") {
+    return { value_characters: value.length, value_bytes: resultBytes, result_bytes: resultBytes };
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { value, result_bytes: resultBytes };
+  }
+  const compact: Record<string, unknown> = {};
+  for (const [key, field] of Object.entries(value as Record<string, unknown>)) {
+    const encoded = JSON.stringify(field) ?? "null";
+    const fieldBytes = Buffer.byteLength(encoded, "utf8");
+    if (fieldBytes <= 2 * 1024) {
+      compact[key] = field;
+    } else if (typeof field === "string") {
+      compact[`${key}_characters`] = field.length;
+      compact[`${key}_bytes`] = fieldBytes;
+    } else if (Array.isArray(field)) {
+      compact[`${key}_count`] = field.length;
+      compact[`${key}_bytes`] = fieldBytes;
+    } else {
+      compact[`${key}_bytes`] = fieldBytes;
+    }
+  }
+  compact.result_bytes = resultBytes;
+  return compact;
+}
 
 const DEFINITIONS: ReadonlyArray<{
   name: ToolMethod;
@@ -214,29 +289,48 @@ function success(
   value: unknown,
   presentation: { outcome: string; taskId?: string },
 ): Record<string, unknown> {
-  const details = value !== null && typeof value === "object" && !Array.isArray(value)
+  const record = value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+  const screenshot = record?.mode === "screenshot" &&
+    record.encoding === "base64" &&
+    typeof record.data === "string" &&
+    typeof record.media_type === "string" &&
+    /^image\/(png|jpeg|webp)$/.test(record.media_type);
+  const text = screenshot
+    ? undefined
+    : typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const resultBytes = text === undefined ? 0 : Buffer.byteLength(text, "utf8");
+  const presentedValue = screenshot
+    ? Object.fromEntries(Object.entries(record).filter(([key]) => key !== "data" && key !== "encoding"))
+    : resultBytes > INLINE_RESULT_MAX_BYTES ? compactLargeValue(value, resultBytes) : value;
+  const details = presentedValue !== null && typeof presentedValue === "object" && !Array.isArray(presentedValue)
     ? {
-      ...(value as Record<string, unknown>),
+      ...(presentedValue as Record<string, unknown>),
       _agenttab: {
         outcome: presentation.outcome,
         ...(presentation.taskId ? { task_id: presentation.taskId } : {}),
       },
     }
     : {
-      value,
+      value: presentedValue,
       _agenttab: {
         outcome: presentation.outcome,
         ...(presentation.taskId ? { task_id: presentation.taskId } : {}),
       },
     };
   return {
-    content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
+    content: screenshot
+      ? [{ type: "image", data: record.data, mimeType: record.media_type }]
+      : [{ type: "text", text }],
     details,
-    structuredContent: value,
+    ...(!screenshot && resultBytes <= INLINE_RESULT_MAX_BYTES
+      ? { structuredContent: details }
+      : {}),
   };
 }
 
-function failure(error: unknown): Record<string, unknown> {
+function failure(error: unknown, taskId?: string): Record<string, unknown> {
   if (error instanceof AgentTabError) {
     return {
       content: [{ type: "text", text: error.message }],
@@ -245,6 +339,7 @@ function failure(error: unknown): Record<string, unknown> {
         outcome: error.outcome,
         ...(error.recovery ? { recovery: error.recovery } : {}),
         ...(error.details ? { details: error.details } : {}),
+        ...(taskId ? { _agenttab: { outcome: error.outcome, task_id: taskId } } : {}),
       },
       isError: true,
     };
@@ -257,6 +352,7 @@ function failure(error: unknown): Record<string, unknown> {
         outcome: error.outcome,
         method: error.method,
         ...(error.idempotencyKey ? { idempotency_key: error.idempotencyKey } : {}),
+        ...(taskId ? { _agenttab: { outcome: error.outcome, task_id: taskId } } : {}),
       },
       isError: true,
     };
@@ -272,17 +368,40 @@ export function makeExtension(clientFactory?: ClientFactory) {
     const zod = pi.zod;
     const isOmp = zod !== undefined;
     if (isOmp) pi.setLabel?.("AgentTab");
-    const connectClient = clientFactory ?? (() => {
-      const conversationId = process.env.AGENTTAB_CONVERSATION_ID;
+    let defaultConnection: {
+      conversationId?: string;
+      capabilityStore: ReturnType<typeof createResumeCapabilityStore>;
+    } | undefined;
+    const connectClient = clientFactory ?? ((context?: ToolExecutionContext) => {
+      if (defaultConnection === undefined) {
+        const conversationId = process.env.AGENTTAB_CONVERSATION_ID ?? contextConversationId(context);
+        defaultConnection = {
+          ...(conversationId ? { conversationId } : {}),
+          capabilityStore: createResumeCapabilityStore(isOmp ? "omp" : "pi", {
+            scope: conversationId ?? `session-${randomUUID()}`,
+          }),
+        };
+      }
       return AgentTabClient.connect({
-        conversationId,
-        capabilityStore: createResumeCapabilityStore(isOmp ? "omp" : "pi", {
-          scope: conversationId ?? `session-${randomUUID()}`,
-        }),
+        conversationId: defaultConnection.conversationId,
+        capabilityStore: defaultConnection.capabilityStore,
       });
     });
     let client: AgentTabClient | undefined;
+    let connecting: Promise<AgentTabClient> | undefined;
     let taskId: string | undefined;
+    const invocationKeys = new InvocationIdempotencyKeys();
+    const getClient = async (context?: ToolExecutionContext): Promise<AgentTabClient> => {
+      if (client !== undefined && !client.closed) return client;
+      const pending = connecting ??= connectClient(context);
+      try {
+        client = await pending;
+        taskId = client.connection.task_id ?? taskId;
+        return client;
+      } finally {
+        if (connecting === pending) connecting = undefined;
+      }
+    };
     const register = (definition: (typeof DEFINITIONS)[number] | typeof DEVELOPER) => {
       const renderers = isOmp
         ? {
@@ -312,24 +431,29 @@ export function makeExtension(clientFactory?: ClientFactory) {
         } : {}),
         parameters: isOmp ? definition.schema(zod) : piSchema(definition.name),
         ...renderers,
-        execute: async (_id: string, params: Record<string, unknown>) => {
+        execute: async (
+          invocationId: string,
+          params: Record<string, unknown>,
+          _signal?: AbortSignal,
+          _onUpdate?: unknown,
+          context?: ToolExecutionContext,
+        ) => {
           let invocationClient: AgentTabClient | undefined;
           try {
-            if (client === undefined) {
-              client = await connectClient();
-              taskId = client.connection.task_id;
-            }
-            invocationClient = client;
+            invocationClient = await getClient(context);
             const response = await invocationClient.request(
               definition.name,
               params as MethodParams[ToolMethod],
+              isMutation(definition.name)
+                ? { idempotencyKey: invocationKeys.for(invocationId) }
+                : {},
             );
             taskId = response.task?.task_id ?? taskId;
             if (!response.ok) throw new AgentTabError(response);
             return success(response.result, { outcome: response.outcome, taskId });
           } catch (error) {
             if (invocationClient?.closed && client === invocationClient) client = undefined;
-            return failure(error);
+            return failure(error, taskId);
           }
         },
       });
