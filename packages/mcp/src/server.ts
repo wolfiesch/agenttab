@@ -16,6 +16,7 @@ import actSchema from "../../../schemas/rpc/v1/browser-act.schema.json" with { t
 import waitSchema from "../../../schemas/rpc/v1/browser-wait.schema.json" with { type: "json" };
 import tabsSchema from "../../../schemas/rpc/v1/browser-tabs.schema.json" with { type: "json" };
 import handoffSchema from "../../../schemas/rpc/v1/browser-handoff.schema.json" with { type: "json" };
+import credentialsSchema from "../../../schemas/rpc/v1/browser-credentials.schema.json" with { type: "json" };
 import commitSchema from "../../../schemas/rpc/v1/browser-commit.schema.json" with { type: "json" };
 import developerSchema from "../../../schemas/rpc/v1/browser-developer.schema.json" with { type: "json" };
 import packageJson from "../package.json" with { type: "json" };
@@ -178,6 +179,11 @@ export const STANDARD_TOOLS: readonly Tool[] = [
     name: "browser_handoff",
     description: "Pause all agent actions and give the user control for credentials, MFA, CAPTCHA, or other human-only input.",
     inputSchema: schema(handoffSchema),
+  },
+  {
+    name: "browser_credentials",
+    description: "Use an origin-matching 1Password Login without exposing values; more than three matches require the user.",
+    inputSchema: schema(credentialsSchema),
   },
   {
     name: "browser_commit",

@@ -175,6 +175,7 @@ pub enum RpcMethod {
     BrowserTabs,
     BrowserHandoff,
     BrowserCommit,
+    BrowserCredentials,
     #[serde(rename = "agenttab.status")]
     AgenttabStatus,
     #[serde(rename = "agenttab.close")]
@@ -190,6 +191,7 @@ impl RpcMethod {
                 | Self::BrowserAct
                 | Self::BrowserHandoff
                 | Self::BrowserCommit
+                | Self::BrowserCredentials
                 | Self::BrowserDeveloper
         )
     }
@@ -285,6 +287,7 @@ pub enum MethodParams {
     Wait(BrowserWaitParams),
     Tabs(BrowserTabsParams),
     Handoff(BrowserHandoffParams),
+    Credentials(BrowserCredentialsParams),
     Commit(BrowserCommitParams),
     Status(BrowserTabsParams),
     Close(BrowserTabsParams),
@@ -300,6 +303,7 @@ impl MethodParams {
             RpcMethod::BrowserWait => Self::Wait(decode_params(method, value)?),
             RpcMethod::BrowserTabs => Self::Tabs(decode_params(method, value)?),
             RpcMethod::BrowserHandoff => Self::Handoff(decode_params(method, value)?),
+            RpcMethod::BrowserCredentials => Self::Credentials(decode_params(method, value)?),
             RpcMethod::BrowserCommit => Self::Commit(decode_params(method, value)?),
             RpcMethod::AgenttabStatus => Self::Status(decode_params(method, value)?),
             RpcMethod::AgenttabClose => Self::Close(decode_params(method, value)?),
@@ -317,6 +321,7 @@ impl MethodParams {
             Self::Wait(value) => serde_json::to_value(value),
             Self::Tabs(value) => serde_json::to_value(value),
             Self::Handoff(value) => serde_json::to_value(value),
+            Self::Credentials(value) => serde_json::to_value(value),
             Self::Commit(value) => serde_json::to_value(value),
             Self::Status(value) => serde_json::to_value(value),
             Self::Close(value) => serde_json::to_value(value),
@@ -540,6 +545,37 @@ pub enum HandoffCompletion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserCredentialsParams {
+    Prepare {
+        tab_id: u64,
+        expected_page_revision: u64,
+    },
+    Fill {
+        tab_id: u64,
+        expected_page_revision: u64,
+        credential_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        otp_ref: Option<String>,
+    },
+    Next {
+        tab_id: u64,
+        expected_page_revision: u64,
+        credential_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        otp_ref: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserCommitParams {
     pub staged_token: String,
@@ -728,6 +764,45 @@ impl MethodParams {
                         )?;
                     }
                     HandoffCompletion::Navigation | HandoffCompletion::ManualDone => {}
+                }
+            }
+            Self::Credentials(BrowserCredentialsParams::Prepare { .. }) => {}
+            Self::Credentials(
+                BrowserCredentialsParams::Fill {
+                    credential_token,
+                    username_ref,
+                    password_ref,
+                    otp_ref,
+                    ..
+                }
+                | BrowserCredentialsParams::Next {
+                    credential_token,
+                    username_ref,
+                    password_ref,
+                    otp_ref,
+                    ..
+                },
+            ) => {
+                require_len(
+                    method,
+                    credential_token,
+                    32,
+                    MAX_STAGED_TOKEN_CHARS,
+                    "credential_token",
+                )?;
+                require(
+                    method,
+                    username_ref.is_some() || password_ref.is_some() || otp_ref.is_some(),
+                    "at least one credential field ref is required",
+                )?;
+                for (name, value) in [
+                    ("username_ref", username_ref),
+                    ("password_ref", password_ref),
+                    ("otp_ref", otp_ref),
+                ] {
+                    if let Some(value) = value {
+                        require_len(method, value, 1, MAX_REF_CHARS, name)?;
+                    }
                 }
             }
             Self::Commit(params) => {

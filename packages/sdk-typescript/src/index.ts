@@ -81,6 +81,22 @@ export interface BrowserHandoffParams {
   timeout_ms?: number;
 }
 
+export type BrowserCredentialsParams =
+  | {
+    action: "prepare";
+    tab_id: number;
+    expected_page_revision: number;
+  }
+  | {
+    action: "fill" | "next";
+    tab_id: number;
+    expected_page_revision: number;
+    credential_token: string;
+    username_ref?: string;
+    password_ref?: string;
+    otp_ref?: string;
+  };
+
 export interface BrowserCommitParams {
   staged_token: string;
 }
@@ -97,6 +113,7 @@ export interface MethodParams {
   browser_wait: BrowserWaitParams;
   browser_tabs: Record<string, never>;
   browser_handoff: BrowserHandoffParams;
+  browser_credentials: BrowserCredentialsParams;
   browser_commit: BrowserCommitParams;
   browser_developer: BrowserDeveloperParams;
   "agenttab.status": Record<string, never>;
@@ -108,6 +125,7 @@ export type MutationMethod =
   | "browser_open"
   | "browser_act"
   | "browser_handoff"
+  | "browser_credentials"
   | "browser_commit"
   | "browser_developer";
 
@@ -400,6 +418,7 @@ const MUTATIONS = new Set<RpcMethod>([
   "browser_open",
   "browser_act",
   "browser_handoff",
+  "browser_credentials",
   "browser_commit",
   "browser_developer",
 ]);

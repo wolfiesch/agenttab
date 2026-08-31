@@ -82,7 +82,7 @@ async function executeTool(
   return value as Record<string, unknown>;
 }
 
-test("Standard OMP mode registers exactly seven Core RPC tools", () => {
+test("Standard OMP mode registers exactly eight Core RPC tools", () => {
   expect(register(false).tools.map((tool) => tool.name)).toEqual([
     "browser_open",
     "browser_snapshot",
@@ -90,6 +90,7 @@ test("Standard OMP mode registers exactly seven Core RPC tools", () => {
     "browser_wait",
     "browser_tabs",
     "browser_handoff",
+    "browser_credentials",
     "browser_commit",
   ]);
 });
@@ -117,6 +118,7 @@ test("developer mode adds only browser_developer", () => {
     "browser_wait",
     "browser_tabs",
     "browser_handoff",
+    "browser_credentials",
     "browser_commit",
     "browser_developer",
   ]);
@@ -682,6 +684,7 @@ test("Pi mode registers the same tools with TypeBox schemas and Pi metadata", ()
     "browser_wait",
     "browser_tabs",
     "browser_handoff",
+    "browser_credentials",
     "browser_commit",
   ]);
   for (const tool of tools) {

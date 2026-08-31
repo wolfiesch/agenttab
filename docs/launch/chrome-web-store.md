@@ -28,11 +28,11 @@ An agent starts with a task workspace, not general access to every tab. AgentTab
 
 The runtime consists of one minimal MV3 extension, a local Rust host, and per-user operating-system-native IPC. The extension uses Chrome Native Messaging to reach the local host. Client adapters, including MCP, connect to the host through a user-owned Unix socket on macOS and Linux or a current-user named pipe on Windows. AgentTab has no cloud relay, remote browser session, telemetry service, or routine network control plane.
 
-Standard MCP access exposes exactly seven tools: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, and `browser_commit`. `browser_developer` is available only after a persistent, explicit Developer mode opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
+Standard MCP access exposes exactly eight tools: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, `browser_commit`, and `browser_credentials`. The credential tool is inert unless managed policy explicitly enables the local 1Password broker, and it never returns a credential value. `browser_developer` is available only after a persistent, explicit Developer mode opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
 
 ### Human controls
 
-**Your Turn** is for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. During a handoff, AgentTab applies an observation blackout: standard capture and observation requests for every task return `needs_user`. The runtime clears the blackout only after the declared completion condition or explicit Done and its recovery checks. AgentTab does not capture human keystrokes.
+The optional local 1Password broker can fill one of at most three origin-matching Login items directly into a selected field without revealing the value to the agent. **Your Turn** remains the path for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, or a broker result that needs the user. During a handoff, AgentTab applies an observation blackout: standard capture and observation requests for every task return `needs_user`. The runtime clears the blackout only after the declared completion condition or explicit Done and its recovery checks. AgentTab does not capture human keystrokes.
 
 **Commit** is a best-effort review barrier for recognizable sends, publishes, purchases, deletes, uploads, authorizations, and permission grants. Before acting, AgentTab prepares, classifies, and revalidates the target. A recognizable consequential action is staged with a preview, then requires approval in a human popup and the requesting agent's one-use token. The record expires after a short interval, cannot be replayed, and is invalidated if the page or target changes. Harmless actions proceed without Commit review. Commit reduces recognizable risk; it cannot prove that a page has no hidden external effect.
 
@@ -68,7 +68,7 @@ These notes are for a controlled reviewer package only. They are not public inst
 5. Demonstrate Your Turn with a harmless test page. Verify that observations from every task return `needs_user` during the handoff and that the agent resumes only after Done or the declared completion condition.
 6. Demonstrate Commit with a controlled test control labelled as a send, upload, delete, authorization, or permission action. Verify that no side effect occurs before the human popup approves the staged action with the requesting agent's one-use token. Do not use a real message, purchase, upload, deletion, or authorization.
 7. Demonstrate Pause and Resume, including that queued work does not start after Pause and that task status remains visible after recovery.
-8. Verify that Standard discovery exposes exactly the seven Standard tools and that the Developer-only tool is absent until the reviewer explicitly enables Developer mode.
+8. Verify that Standard discovery exposes exactly the eight Standard tools, that `browser_credentials` returns a disabled-policy result before any provider call, and that the Developer-only tool is absent until the reviewer explicitly enables Developer mode.
 
 ## Privacy declaration draft
 

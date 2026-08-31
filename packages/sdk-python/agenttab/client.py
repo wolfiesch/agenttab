@@ -29,6 +29,7 @@ MUTATIONS = {
     "browser_open",
     "browser_act",
     "browser_handoff",
+    "browser_credentials",
     "browser_commit",
     "browser_developer",
 }

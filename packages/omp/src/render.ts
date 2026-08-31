@@ -228,6 +228,17 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
         meta: humanize(fieldString(completion, "kind") ?? "manual completion"),
       };
     }
+    case "browser_credentials": {
+      const action = fieldString(args, "action") ?? "prepare";
+      return {
+        title: action === "prepare"
+          ? "Prepare 1Password credentials"
+          : action === "next"
+            ? "Try next 1Password login"
+            : "Fill 1Password login",
+        meta: action === "prepare" ? "origin-bound" : "values stay hidden",
+      };
+    }
     case "browser_commit":
       return { title: "Commit staged action", meta: "approved one-use token" };
     case "browser_developer":
@@ -338,6 +349,15 @@ function summarizeResult(
         : countSummary(Array.isArray(result.tabs) ? result.tabs : [], "task tab");
     case "browser_handoff":
       return status === "awaiting_user" ? "Waiting for user" : "User handoff completed";
+    case "browser_credentials": {
+      const credentialStatus = fieldString(result, "status");
+      if (credentialStatus === "ready") {
+        const count = fieldNumber(result, "candidate_count") ?? 0;
+        return `${count} matching login${count === 1 ? "" : "s"} ready`;
+      }
+      if (credentialStatus === "filled") return "Credentials filled";
+      return credentialStatus ? humanize(credentialStatus) : "Credential action completed";
+    }
     case "browser_commit":
       return "Staged action executed";
     case "browser_developer":
@@ -354,7 +374,12 @@ function resultStatus(
   const outcome = fieldString(toRecord(details._agenttab), "outcome") ?? fieldString(details, "outcome");
   if (outcome === "unknown") return "uncertain";
   if (method === "browser_handoff" && outcome === "needs_user") return "awaiting_user";
-  if (options.isPartial === true) return method === "browser_handoff" ? "awaiting_user" : "running";
+  if (method === "browser_credentials" && outcome === "needs_user") return "awaiting_user";
+  if (options.isPartial === true) {
+    return method === "browser_handoff" || method === "browser_credentials"
+      ? "awaiting_user"
+      : "running";
+  }
   if (result.isError === true) return "blocked";
   if (typeof details.staged_token === "string" || details.awaiting_human_approval === true) {
     return "awaiting_approval";

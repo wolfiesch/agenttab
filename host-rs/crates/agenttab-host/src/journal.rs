@@ -241,9 +241,7 @@ impl Journal {
                  FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
              );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_staged_commits_native_token
-                 ON staged_commits(native_token);
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_staged_commits_review_handle
-                 ON staged_commits(review_handle_hash);",
+                 ON staged_commits(native_token);",
         )?;
         ensure_column(
             &connection,
@@ -1459,6 +1457,44 @@ mod tests {
             page_revision,
             task_id: Some(task_id),
         }
+    }
+
+    #[test]
+    fn opens_legacy_staged_commit_schema_before_creating_new_indexes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE staged_commits (
+                     token_hash BLOB PRIMARY KEY,
+                     task_id TEXT NOT NULL,
+                     native_token TEXT NOT NULL,
+                     tab_id INTEGER NOT NULL,
+                     page_revision INTEGER NOT NULL,
+                     effect TEXT NOT NULL,
+                     fingerprint TEXT NOT NULL,
+                     expires_at_ms INTEGER NOT NULL,
+                     used INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1))
+                 );",
+            )
+            .unwrap();
+
+        let journal = Journal::open(&path).unwrap();
+        let task = journal.create_task(None).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(task.task_id, 1)])
+            .unwrap();
+        let staged = NativeStagedCommit {
+            native_token: "legacy-schema-native-token".into(),
+            task_id: task.task_id,
+            tab_id: 7,
+            page_revision: 1,
+            effect: "legacy schema migration".into(),
+            fingerprint: "a".repeat(64),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        journal.store_staged_commit(&staged, &[]).unwrap();
     }
 
     #[test]

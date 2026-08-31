@@ -104,6 +104,22 @@ const schemas: Record<ToolMethod, unknown> = {
     ]),
     timeout_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 900_000 })),
   }),
+  browser_credentials: Type.Union([
+    object({
+      action: Type.Literal("prepare"),
+      tab_id: Type.Integer({ minimum: 0 }),
+      expected_page_revision: Type.Integer({ minimum: 0 }),
+    }),
+    object({
+      action: stringEnum(["fill", "next"]),
+      tab_id: Type.Integer({ minimum: 0 }),
+      expected_page_revision: Type.Integer({ minimum: 0 }),
+      credential_token: Type.String({ minLength: 32, maxLength: 256 }),
+      username_ref: Type.Optional(ref()),
+      password_ref: Type.Optional(ref()),
+      otp_ref: Type.Optional(ref()),
+    }),
+  ]),
   browser_commit: object({ staged_token: Type.String({ minLength: 32, maxLength: 256 }) }),
   browser_developer: object({
     action: Type.String({ minLength: 1, maxLength: 128 }),

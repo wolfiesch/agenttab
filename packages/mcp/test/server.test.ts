@@ -19,7 +19,7 @@ import {
 } from "../src/server";
 
 describe("AgentTab MCP surface", () => {
-  test("Standard mode exposes exactly seven Core RPC tools", () => {
+  test("Standard mode exposes exactly eight Core RPC tools", () => {
     expect(STANDARD_TOOLS.map((tool) => tool.name)).toEqual([
       "browser_open",
       "browser_snapshot",
@@ -27,9 +27,10 @@ describe("AgentTab MCP surface", () => {
       "browser_wait",
       "browser_tabs",
       "browser_handoff",
+      "browser_credentials",
       "browser_commit",
     ]);
-    expect(listedTools(false)).toHaveLength(7);
+    expect(listedTools(false)).toHaveLength(8);
     expect(listedTools(false).some((tool) => tool.name === DEVELOPER_TOOL.name)).toBe(false);
   });
 
@@ -46,6 +47,11 @@ describe("AgentTab MCP surface", () => {
     expect(schema).toContain('"max_width"');
     expect(schema).toContain('"maximum":750000');
     expect(schema).toContain('"maximum":1000000');
+  });
+
+  test("browser_credentials fills only and cannot bypass Browser Act submission review", () => {
+    const credentialTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_credentials")!;
+    expect(JSON.stringify(credentialTool.inputSchema)).not.toContain("submit_ref");
   });
 
   test("browser_act advertises no press action", () => {

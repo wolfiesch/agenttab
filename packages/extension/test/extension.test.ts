@@ -1661,6 +1661,32 @@ describe("page revision monotonicity", () => {
     expect(forgotten).toEqual([65]);
   });
 
+  test("reattaches once when Chrome reports a stale debugger session", async () => {
+    let detachedFailure = true;
+    debuggerCommandOverride = (method) => {
+      if (method === "DOM.getDocument" && detachedFailure) {
+        detachedFailure = false;
+        debuggerAttachedTabIds.delete(65);
+        throw new Error("Debugger is not attached to the tab with id: 65");
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    await expect(runtime.snapshot(65, { mode: "accessibility" })).resolves.toMatchObject({
+      tab_id: 65,
+      mode: "accessibility",
+    });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
+
+    await runtime.detach(65);
+  });
+
   test("detaches a restored debugger candidate during ownership revocation", async () => {
     debuggerAttachedTabIds.add(66);
     const forgotten: number[] = [];

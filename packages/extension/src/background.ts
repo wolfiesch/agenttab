@@ -361,7 +361,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     }
   }
   const params = command.params;
-  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer";
+  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer" || command.method === "browser_credentials_fill";
   try {
     if (command.method === "commit_review_bind") {
       return completed(command.request_id, await browser.bindReview(command.task_id, params));
@@ -438,6 +438,19 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await ownership.assertOwned(command.task_id, targetTabId);
         await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.developer(targetTabId, action, cdpParams);
+      });
+      return completed(command.request_id, result);
+    }
+    if (command.method === "browser_credentials_fill") {
+      const targetTabId = tabId(params);
+      const result = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
+        await ownership.assertOwned(command.task_id, targetTabId);
+        await assertCurrentOrigin(targetTabId, command.origin_policy);
+        return browser.fillCredentials(
+          targetTabId,
+          params.expected_page_revision,
+          params.fields,
+        );
       });
       return completed(command.request_id, result);
     }

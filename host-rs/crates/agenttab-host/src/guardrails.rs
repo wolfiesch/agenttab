@@ -27,8 +27,33 @@ pub enum GuardrailLoadError {
         pattern: String,
         source: regex::Error,
     },
+    #[error("invalid 1Password policy: {0}")]
+    InvalidOnePasswordPolicy(String),
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OnePasswordPolicy {
+    pub enabled: bool,
+    pub account: Option<String>,
+    pub executable: Option<PathBuf>,
+    pub max_candidates: usize,
+    pub max_attempts: usize,
+    pub auth_timeout_ms: u64,
+}
+
+impl Default for OnePasswordPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            account: None,
+            executable: None,
+            max_candidates: 3,
+            max_attempts: 3,
+            auth_timeout_ms: 45_000,
+        }
+    }
+}
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Policy {
@@ -39,6 +64,7 @@ struct Policy {
     dlp_allowed_roots: Vec<PathBuf>,
     dlp_max_file_bytes: u64,
     redact_patterns: Vec<String>,
+    one_password: OnePasswordPolicy,
 }
 
 impl Default for Policy {
@@ -50,6 +76,7 @@ impl Default for Policy {
             allowed_origins: Vec::new(),
             dlp_allowed_roots: Vec::new(),
             dlp_max_file_bytes: DEFAULT_DLP_MAX_FILE_BYTES,
+            one_password: OnePasswordPolicy::default(),
             redact_patterns: Vec::new(),
         }
     }
@@ -82,6 +109,39 @@ impl Guardrails {
     }
 
     fn from_policy(policy: Policy) -> Result<Self, GuardrailLoadError> {
+        let credentials = &policy.one_password;
+        if !(1..=3).contains(&credentials.max_candidates) {
+            return Err(GuardrailLoadError::InvalidOnePasswordPolicy(
+                "max_candidates must be between 1 and 3".into(),
+            ));
+        }
+        if !(1..=credentials.max_candidates).contains(&credentials.max_attempts) {
+            return Err(GuardrailLoadError::InvalidOnePasswordPolicy(format!(
+                "max_attempts must be between 1 and {}",
+                credentials.max_candidates
+            )));
+        }
+        if !(5_000..=120_000).contains(&credentials.auth_timeout_ms) {
+            return Err(GuardrailLoadError::InvalidOnePasswordPolicy(
+                "auth_timeout_ms must be between 5000 and 120000".into(),
+            ));
+        }
+        if credentials.account.as_ref().is_some_and(|account| {
+            account.is_empty() || account.len() > 256 || account.contains('\0')
+        }) {
+            return Err(GuardrailLoadError::InvalidOnePasswordPolicy(
+                "account must contain between 1 and 256 non-NUL bytes".into(),
+            ));
+        }
+        if credentials
+            .executable
+            .as_ref()
+            .is_some_and(|executable| !executable.is_absolute())
+        {
+            return Err(GuardrailLoadError::InvalidOnePasswordPolicy(
+                "executable must be an absolute path".into(),
+            ));
+        }
         let mut patterns = vec![
             r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}\b".to_string(),
             r"\b\d{3}-\d{2}-\d{4}\b".to_string(),
@@ -107,6 +167,10 @@ impl Guardrails {
         self.policy.audit_enabled
     }
 
+    pub fn one_password_policy(&self) -> &OnePasswordPolicy {
+        &self.policy.one_password
+    }
+
     pub fn authorize(&self, method: RpcMethod, params: &MethodParams) -> Result<(), RpcError> {
         if method == RpcMethod::BrowserDeveloper && !self.policy.developer_enabled {
             return Err(RpcError::new(
@@ -114,6 +178,13 @@ impl Guardrails {
                 "browser_developer is disabled by AgentTab policy",
             )
             .with_recovery("Enable Developer mode in AgentTab's managed local policy."));
+        }
+        if method == RpcMethod::BrowserCredentials && !self.policy.one_password.enabled {
+            return Err(RpcError::new(
+                "credential_provider_disabled",
+                "1Password credential filling is disabled by AgentTab policy",
+            )
+            .with_recovery("Enable one_password in AgentTab's managed local policy."));
         }
 
         match params {

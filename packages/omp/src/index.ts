@@ -245,6 +245,28 @@ const DEFINITIONS: ReadonlyArray<{
       }).strict(),
     },
     {
+      name: "browser_credentials",
+      label: "Browser Credentials",
+      description: "Use a URL-matching 1Password Login without exposing its values. Prepare first; more than three matches require the user. Fill only, then submit through Browser Act.",
+      approval: "write",
+      schema: (z) => z.union([
+        z.object({
+          action: z.literal("prepare"),
+          tab_id: z.number().int().min(0),
+          expected_page_revision: z.number().int().min(0),
+        }).strict(),
+        z.object({
+          action: z.enum(["fill", "next"]),
+          tab_id: z.number().int().min(0),
+          expected_page_revision: z.number().int().min(0),
+          credential_token: z.string().min(32).max(256),
+          username_ref: z.string().min(1).max(256).optional(),
+          password_ref: z.string().min(1).max(256).optional(),
+          otp_ref: z.string().min(1).max(256).optional(),
+        }).strict(),
+      ]),
+    },
+    {
       name: "browser_commit",
       label: "Browser Commit",
       description: "Execute one previously staged consequential action after semantic review.",

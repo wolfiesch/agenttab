@@ -172,16 +172,8 @@ export class StandardBrowserRuntime {
   ) {
     chrome.debugger.onDetach.addListener((source: { tabId?: number }) => {
       if (source.tabId === undefined) return;
-      const expected = this.expectedDetaches.get(source.tabId) ?? 0;
-      if (expected > 0) {
-        if (expected === 1) this.expectedDetaches.delete(source.tabId);
-        else this.expectedDetaches.set(source.tabId, expected - 1);
-        return;
-      }
-      const session = this.sessions.get(source.tabId);
-      if (session?.idleTimer) clearTimeout(session.idleTimer);
-      this.sessions.delete(source.tabId);
-      void this.invalidateStagedDialogs(source.tabId);
+      if (this.consumeExpectedDetach(source.tabId)) return;
+      this.invalidateDetachedSession(source.tabId);
     });
     chrome.debugger.onEvent.addListener(
       (source, method: string, rawParams?: object) => {
@@ -345,10 +337,18 @@ export class StandardBrowserRuntime {
     this.debuggerCandidates.delete(tabId);
   }
 
-  private consumeExpectedDetach(tabId: number): void {
+  private consumeExpectedDetach(tabId: number): boolean {
     const pendingExpected = this.expectedDetaches.get(tabId) ?? 0;
-    if (pendingExpected <= 1) this.expectedDetaches.delete(tabId);
+    if (pendingExpected === 0) return false;
+    if (pendingExpected === 1) this.expectedDetaches.delete(tabId);
     else this.expectedDetaches.set(tabId, pendingExpected - 1);
+    return true;
+  }
+
+  private invalidateDetachedSession(tabId: number, session = this.sessions.get(tabId)): void {
+    if (session?.idleTimer) clearTimeout(session.idleTimer);
+    if (session && this.sessions.get(tabId) === session) this.sessions.delete(tabId);
+    void this.invalidateStagedDialogs(tabId);
   }
 
   private async requireFullAutomationRoute(tabId: number, operation: string): Promise<void> {
@@ -509,6 +509,64 @@ export class StandardBrowserRuntime {
         page_revision: await this.revisions.current(tabId),
         actions: completedActions,
       },
+    };
+  }
+
+  async fillCredentials(
+    tabId: number,
+    expectedRevision: unknown,
+    fields: unknown,
+  ): Promise<Record<string, unknown>> {
+    await this.authorizeDebuggerUse(tabId);
+    const pageRevision = await this.revisions.assertExpected(tabId, expectedRevision);
+    await this.requireFullAutomationRoute(tabId, "fill credentials");
+    if (!Array.isArray(fields) || fields.length === 0 || fields.length > 3) {
+      throw Object.assign(new Error("Credential fields must contain between 1 and 3 entries"), {
+        code: "invalid_request",
+      });
+    }
+    for (const field of fields) {
+      if (
+        !isRecord(field) ||
+        typeof field.kind !== "string" ||
+        typeof field.ref !== "string" ||
+        typeof field.value !== "string"
+      ) {
+        throw Object.assign(new Error("Credential field is malformed"), { code: "invalid_request" });
+      }
+      await this.revisions.assertExpected(tabId, pageRevision);
+      const backendNodeId = this.backendNodeId(pageRevision, field.ref);
+      await this.callOnNode(
+        tabId,
+        backendNodeId,
+        `function(value,kind){
+          const input=this;
+          const isInput=input instanceof HTMLInputElement;
+          const isTextarea=input instanceof HTMLTextAreaElement;
+          if(!isInput&&!isTextarea)throw new Error("Credential target is not an input");
+          const type=(isInput?input.type:"text").toLowerCase();
+          const autocomplete=(input.getAttribute("autocomplete")||"").toLowerCase();
+          const valid=kind==="password"
+            ? isInput&&(type==="password"||autocomplete.includes("password"))
+            : kind==="otp"
+              ? isInput&&(autocomplete==="one-time-code"||["text","tel","number"].includes(type))
+              : ["text","email","tel"].includes(type)||isTextarea;
+          if(!valid)throw new Error("Credential target kind does not match the requested field");
+          input.focus();
+          const prototype=isInput?HTMLInputElement.prototype:HTMLTextAreaElement.prototype;
+          const setter=Object.getOwnPropertyDescriptor(prototype,"value")&&Object.getOwnPropertyDescriptor(prototype,"value").set;
+          if(!setter)throw new Error("Credential target has no value setter");
+          setter.call(input,value);
+          input.dispatchEvent(new Event("input",{bubbles:true,composed:true}));
+          input.dispatchEvent(new Event("change",{bubbles:true,composed:true}));
+        }`,
+        [{ value: field.value }, { value: field.kind }],
+      );
+    }
+    return {
+      tab_id: tabId,
+      page_revision: await this.revisions.current(tabId),
+      filled_fields: fields.length,
     };
   }
 
@@ -1630,14 +1688,31 @@ export class StandardBrowserRuntime {
     }, DEBUGGER_IDLE_MS);
   }
 
-  private async send(tabId: number, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async send(
+    tabId: number,
+    method: string,
+    params: Record<string, unknown>,
+    recovered = false,
+  ): Promise<Record<string, unknown>> {
     const session = await this.acquireDebuggerBusyLease(tabId);
+    let detached = false;
     try {
       await this.authorizeDebuggerUse(tabId);
       const result: unknown = await chrome.debugger.sendCommand({ tabId }, method, params);
       return isRecord(result) ? result : {};
+    } catch (error) {
+      if (
+        recovered ||
+        !(error instanceof Error && /debugger is not attached to the tab/i.test(error.message))
+      ) {
+        throw error;
+      }
+      detached = true;
+      this.invalidateDetachedSession(tabId, session);
     } finally {
       this.releaseDebuggerBusyLease(tabId, session);
     }
+    if (detached) return this.send(tabId, method, params, true);
+    throw new Error("unreachable debugger recovery state");
   }
 }

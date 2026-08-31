@@ -1,4 +1,7 @@
 use crate::audit::{canonicalize, now_ms, AuditEntry, AuditLog};
+use crate::credentials::{
+    BrokerError, CredentialBroker, NeedsUserReason, PrepareResult, SelectResult,
+};
 use crate::guardrails::{GuardrailLoadError, Guardrails};
 use crate::handoff::HandoffState;
 use crate::journal::{
@@ -10,11 +13,12 @@ use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTrans
 use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
-    BrowserAction, BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams,
-    BrowserWaitParams, ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload,
-    NativeHandoff, NativePopupCommitEvent, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
-    ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest,
-    RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    BrowserAction, BrowserCommitParams, BrowserCredentialsParams, BrowserHandoffParams,
+    BrowserSnapshotParams, BrowserWaitParams, ConnectionAck, ConnectionInit, MethodParams,
+    NativeEventPayload, NativeHandoff, NativePopupCommitEvent, NativeResponse, NativeStagedCommit,
+    NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod,
+    RpcRequest, RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES,
+    PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -24,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use url::Url;
 use uuid::Uuid;
 const RESPONSE_TASK_BINDING_RESERVE: usize = 512;
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -163,6 +168,7 @@ pub struct Runtime {
     audit: Arc<AuditLog>,
     native: Arc<dyn NativeTransport>,
     handoff: Arc<HandoffState>,
+    credentials: Arc<CredentialBroker>,
     task_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     global_gate: RwLock<()>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
@@ -202,12 +208,16 @@ impl Runtime {
             &paths.audit_log,
             guardrails.audit_enabled(),
         )?);
+        let credentials = Arc::new(CredentialBroker::new(
+            guardrails.one_password_policy().clone(),
+        ));
         let runtime = Arc::new(Self {
             lifecycle,
             journal,
             guardrails,
             audit,
             native,
+            credentials,
             handoff,
             task_locks: Mutex::new(HashMap::new()),
             global_gate: RwLock::new(()),
@@ -1098,6 +1108,9 @@ impl Runtime {
                 return RpcResponse::failure(request_id, Outcome::NotStarted, error);
             }
         }
+        if let MethodParams::Credentials(credentials) = params {
+            return self.dispatch_credentials(connection_id, task_id, request_id, credentials);
+        }
 
         let mut committed_uploads = Vec::new();
         let mut committed_native_token = None;
@@ -1349,6 +1362,201 @@ impl Runtime {
         }
     }
 
+    fn dispatch_credentials(
+        &self,
+        connection_id: Uuid,
+        task_id: Uuid,
+        request_id: &str,
+        params: &BrowserCredentialsParams,
+    ) -> RpcResponse {
+        let (tab_id, expected_page_revision) = match params {
+            BrowserCredentialsParams::Prepare {
+                tab_id,
+                expected_page_revision,
+            }
+            | BrowserCredentialsParams::Fill {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
+            | BrowserCredentialsParams::Next {
+                tab_id,
+                expected_page_revision,
+                ..
+            } => (*tab_id, *expected_page_revision),
+        };
+        let host = match self.credential_host(tab_id) {
+            Ok(host) => host,
+            Err(error) => {
+                return RpcResponse::failure(request_id, Outcome::NotStarted, error);
+            }
+        };
+        if matches!(params, BrowserCredentialsParams::Prepare { .. }) {
+            return match self.credentials.prepare(task_id, tab_id, &host) {
+                PrepareResult::Ready {
+                    credential_token,
+                    candidate_count,
+                    expires_at_ms,
+                } => RpcResponse::success(
+                    request_id,
+                    Outcome::Completed,
+                    json!({
+                        "status": "ready",
+                        "credential_token": credential_token,
+                        "candidate_count": candidate_count,
+                        "expires_at_ms": expires_at_ms,
+                    }),
+                ),
+                PrepareResult::NeedsUser {
+                    reason,
+                    candidate_count,
+                } => credential_needs_user(request_id, reason, Some(candidate_count)),
+            };
+        }
+
+        let (credential_token, username_ref, password_ref, otp_ref, next) = match params {
+            BrowserCredentialsParams::Fill {
+                credential_token,
+                username_ref,
+                password_ref,
+                otp_ref,
+                ..
+            } => (credential_token, username_ref, password_ref, otp_ref, false),
+            BrowserCredentialsParams::Next {
+                credential_token,
+                username_ref,
+                password_ref,
+                otp_ref,
+                ..
+            } => (credential_token, username_ref, password_ref, otp_ref, true),
+            BrowserCredentialsParams::Prepare { .. } => unreachable!(),
+        };
+        let selection = match self.credentials.select(
+            credential_token,
+            task_id,
+            tab_id,
+            &host,
+            next,
+            otp_ref.is_some(),
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::NotStarted,
+                    credential_broker_error(error),
+                );
+            }
+        };
+        let SelectResult::Ready {
+            mut material,
+            attempt_number,
+            remaining_attempts,
+        } = selection
+        else {
+            let SelectResult::NeedsUser { reason } = selection else {
+                unreachable!()
+            };
+            return credential_needs_user(request_id, reason, None);
+        };
+        if (username_ref.is_some() && material.username.is_none())
+            || (password_ref.is_some() && material.password.is_none())
+            || (otp_ref.is_some() && material.otp.is_none())
+        {
+            return credential_needs_user(request_id, NeedsUserReason::UnsupportedCredential, None);
+        }
+        let mut fields = Vec::new();
+        if let (Some(r#ref), Some(value)) = (username_ref, material.username.take()) {
+            fields.push(json!({"kind": "username", "ref": r#ref, "value": value}));
+        }
+        if let (Some(r#ref), Some(value)) = (password_ref, material.password.take()) {
+            fields.push(json!({"kind": "password", "ref": r#ref, "value": value}));
+        }
+        if let (Some(r#ref), Some(value)) = (otp_ref, material.otp.take()) {
+            fields.push(json!({"kind": "otp", "ref": r#ref, "value": value}));
+        }
+        let native_params = json!({
+            "tab_id": tab_id,
+            "expected_page_revision": expected_page_revision,
+            "fields": fields,
+        });
+        let origin_policy = self.guardrails.native_origin_policy(tab_id);
+        let native = match self.native.dispatch(
+            connection_id,
+            task_id,
+            "browser_credentials_fill",
+            native_params,
+            origin_policy,
+            Duration::from_secs(30),
+        ) {
+            Ok(native) => native,
+            Err(error) => return native_failure(request_id, error),
+        };
+        match (native.outcome, native.result, native.error) {
+            (Outcome::Completed, Some(result), None) => {
+                let page_revision = result
+                    .get("page_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(expected_page_revision);
+                RpcResponse::success(
+                    request_id,
+                    Outcome::Completed,
+                    json!({
+                        "status": "filled",
+                        "attempt_number": attempt_number,
+                        "remaining_attempts": remaining_attempts,
+                        "filled_username": username_ref.is_some(),
+                        "filled_password": password_ref.is_some(),
+                        "filled_otp": otp_ref.is_some(),
+                        "page_revision": page_revision,
+                    }),
+                )
+            }
+            (outcome, None, Some(error)) => {
+                RpcResponse::failure(request_id, outcome, self.guardrails.redact_error(error))
+            }
+            _ => RpcResponse::failure(
+                request_id,
+                Outcome::Unknown,
+                RpcError::new(
+                    "invalid_native_response",
+                    "Credential filling did not return exactly one result branch",
+                ),
+            ),
+        }
+    }
+
+    fn credential_host(&self, tab_id: u64) -> Result<String, RpcError> {
+        let tab_url = self.tab_urls.read().get(&tab_id).cloned().ok_or_else(|| {
+            RpcError::new(
+                "tab_origin_unverified",
+                "AgentTab has no verified current origin for this tab",
+            )
+        })?;
+        let url = Url::parse(&tab_url).map_err(|_| {
+            RpcError::new(
+                "credential_origin_unsupported",
+                "Credentials can only be filled on a verified HTTP or HTTPS origin",
+            )
+        })?;
+        let host = url.host_str().ok_or_else(|| {
+            RpcError::new(
+                "credential_origin_unsupported",
+                "Credentials can only be filled on a URL with a hostname",
+            )
+        })?;
+        let secure = url.scheme() == "https"
+            || (url.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1"));
+        if !secure {
+            return Err(RpcError::new(
+                "credential_origin_insecure",
+                "AgentTab will not fill credentials on an insecure remote origin",
+            )
+            .with_recovery("Use HTTPS or sign in manually after verifying the site."));
+        }
+        Ok(host.trim_end_matches('.').to_ascii_lowercase())
+    }
+
     fn attach_task_binding(
         &self,
         connection: &ConnectionContext,
@@ -1371,6 +1579,42 @@ impl Runtime {
     }
 }
 
+fn credential_needs_user(
+    request_id: &str,
+    reason: NeedsUserReason,
+    candidate_count: Option<usize>,
+) -> RpcResponse {
+    let mut result = json!({
+        "status": reason.status(),
+        "recovery": reason.recovery(),
+    });
+    if let Some(candidate_count) = candidate_count {
+        result
+            .as_object_mut()
+            .expect("credential response is an object")
+            .insert("candidate_count".into(), json!(candidate_count));
+    }
+    RpcResponse::success(request_id, Outcome::NeedsUser, result)
+}
+
+fn credential_broker_error(error: BrokerError) -> RpcError {
+    let (code, recovery) = match error {
+        BrokerError::InvalidToken => (
+            "credential_token_invalid",
+            "Prepare credentials again to obtain a fresh bound token.",
+        ),
+        BrokerError::BindingMismatch => (
+            "credential_binding_mismatch",
+            "Prepare credentials again on the current task, tab, and origin.",
+        ),
+        BrokerError::NextBeforeFill => (
+            "credential_next_before_fill",
+            "Fill the current candidate before requesting the next one.",
+        ),
+    };
+    RpcError::new(code, error.to_string()).with_recovery(recovery)
+}
+
 fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
     match params {
         MethodParams::Snapshot(
@@ -1382,6 +1626,22 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Wait(BrowserWaitParams { tab_id, .. }) => Some((*tab_id, None)),
         MethodParams::Act(params) => Some((params.tab_id, Some(params.expected_page_revision))),
         MethodParams::Handoff(params) => Some((params.tab_id, Some(params.expected_page_revision))),
+        MethodParams::Credentials(
+            BrowserCredentialsParams::Prepare {
+                tab_id,
+                expected_page_revision,
+            }
+            | BrowserCredentialsParams::Fill {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
+            | BrowserCredentialsParams::Next {
+                tab_id,
+                expected_page_revision,
+                ..
+            },
+        ) => Some((*tab_id, Some(*expected_page_revision))),
         MethodParams::Open(_)
         | MethodParams::Tabs(_)
         | MethodParams::Commit(_)
@@ -1552,7 +1812,10 @@ pub(crate) enum RequestLockScope {
 pub(crate) fn request_lock_scope(method: RpcMethod, params: &Value) -> RequestLockScope {
     if matches!(
         method,
-        RpcMethod::BrowserSnapshot | RpcMethod::BrowserAct | RpcMethod::BrowserWait
+        RpcMethod::BrowserSnapshot
+            | RpcMethod::BrowserAct
+            | RpcMethod::BrowserWait
+            | RpcMethod::BrowserCredentials
     ) {
         if let Some(tab_id) = params.get("tab_id").and_then(Value::as_u64) {
             return RequestLockScope::Tab(tab_id);

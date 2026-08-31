@@ -7,7 +7,7 @@ AgentTab v2 is currently `2.0.0-rc.1`, a local prerelease. This page records lau
 | Gate | Current source state | Required evidence before promotion |
 | --- | --- | --- |
 | Product identity | Source identifies AgentTab, `dev.agenttab.host`, `agenttab`, and AgentTab Core RPC v1. | Exact-head identity and forbidden-surface gates. |
-| Standard boundary | Source schemas define seven Standard browser tools; Developer mode adds `browser_developer`. | Schema, adapter discovery, and real-extension checks. |
+| Standard boundary | Source schemas define eight Standard browser tools, including a disabled-by-default host-managed credential broker; Developer mode adds `browser_developer`. | Schema, adapter discovery, fake-provider credential isolation, and real-extension checks. |
 | Task safety | Source implements server-bound tasks, visible groups, revisions, Pause, handoff blackout, and staged Commit records. | Controlled browser fixtures covering restart, revocation, stale revisions, and one-use Commit. |
 | Rust runtime | Source contains the Rust host, native bridge, same-user IPC, SQLite journal, and local audit. | Exact-head Rust, IPC, Linux, macOS, and Windows gates. |
 | Installer | Source contains a transactional Node-compatible installer and advanced loopback proxy. | Clean user-home and clean-machine install proof using the packaged signed bytes. |

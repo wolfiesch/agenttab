@@ -4,7 +4,7 @@ AgentTab is a **local browser runtime for AI agents**. It gives an agent task-ow
 
 ## Trust boundary and local attacker model
 
-A task may use the profile already signed in to websites. An agent can therefore act with the permissions of the currently signed-in user on a task-owned tab. AgentTab does not expose raw cookies, storage, saved passwords, or password-manager contents through Standard mode, but that does not make the signed-in session untrusted or isolated.
+A task may use the profile already signed in to websites. An agent can therefore act with the permissions of the currently signed-in user on a task-owned tab. AgentTab does not expose raw cookies, storage, saved-password lists, or credential values through Standard mode. When managed policy explicitly enables the 1Password broker, the host may obtain one origin-matching Login item and send selected values directly to the owned page through the extension. That narrow path does not make the signed-in session untrusted or isolated.
 
 The host authenticates its local IPC peers as the current OS user. This prevents a different local user from connecting through the user socket or named pipe. It does **not** distinguish benign and malicious processes running as that same user. A local attacker that can execute as the account, read AgentTab state, control the browser, or modify the extension/host installation is outside this protection. Use an OS account and a browser profile appropriate for the work, protect the account, and treat local malware as a full compromise.
 
@@ -12,7 +12,7 @@ Task-owned groups constrain ordinary AgentTab execution. They do not prevent a p
 
 ## Standard and Developer mode
 
-Standard mode exposes exactly these seven MCP tools:
+Standard mode exposes exactly these eight MCP tools:
 
 - `browser_open`
 - `browser_snapshot`
@@ -21,12 +21,21 @@ Standard mode exposes exactly these seven MCP tools:
 - `browser_tabs`
 - `browser_handoff`
 - `browser_commit`
+- `browser_credentials`
 
 Developer mode additionally exposes `browser_developer`. It is disabled by default in the host's local managed policy and is visibly marked on a task. Developer mode is intentionally a broader trust decision.
 
-Standard mode has no raw CDP method, arbitrary JavaScript API, raw cookie or storage API, coordinate action, generic browser-global mutation API, or password-value API. The narrow exception is `browser_open` with `placement: "new_window"`, which creates one unfocused normal window for the first tab of an empty task. Internally, the extension uses Chrome debugging APIs for task-scoped accessibility snapshots and precise ref-based actions. That implementation detail is not a Standard-mode escape hatch.
+Standard mode has no raw CDP method, arbitrary JavaScript API, raw cookie or storage API, coordinate action, generic browser-global mutation API, or credential-value API. The narrow exceptions are `browser_open` with `placement: "new_window"`, which creates one unfocused normal window for the first tab of an empty task, and policy-gated `browser_credentials`, which passes an origin-matched login field from 1Password directly to a selected field ref without returning the value. Internally, the extension uses Chrome debugging APIs for task-scoped accessibility snapshots and precise ref-based actions. Those implementation details are not a Standard-mode escape hatch.
 
-Sensitive password, passkey, one-time-code, payment, and similar fields require `browser_handoff`. The human enters the value in Chrome; the value is not placed in an AgentTab request.
+Passkeys, security keys, CAPTCHA, payment secrets, account recovery, and unsupported verification require `browser_handoff`. The human completes the step in Chrome; no secret is placed in an AgentTab request.
+
+## 1Password credential broker
+
+The broker is disabled unless `policy.json` sets `one_password.enabled` to `true`. The host derives the current origin from its verified task-tab inventory, queries only 1Password Login items, and accepts an item only when a URL on that item matches the current host or a recognized authentication subdomain of the same registrable domain. Item titles and unrelated fields do not authorize a match.
+
+`one_password.max_candidates` and `one_password.max_attempts` are each restricted to `1..3`. More than the configured candidate limit returns `needs_user` without selecting or exposing an item. A prepared attempt receives a random, short-lived token bound to the task, tab, origin, candidate position, and attempt count. Tokens are one-use for fill or advance, expire after five minutes, and are invalidated by navigation.
+
+The host invokes the absolute `one_password.executable` when configured, or `op` from its process `PATH` otherwise. JSON output is captured in memory. The broker selects only username, password, and one-time-code fields, then sends them through the private host-to-extension credential method. Core RPC, MCP, OMP, Pi, and audit responses contain only candidate counts, booleans, attempt counters, and opaque tokens. Credential values are neither serialized into an adapter request nor written to audit output. A 1Password authentication timeout, no match, unsupported item, provider failure, exhausted attempts, or ambiguous candidate set returns `needs_user`.
 
 ## Permissions
 
