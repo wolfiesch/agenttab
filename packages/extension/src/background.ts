@@ -1,4 +1,4 @@
-import { StandardBrowserRuntime } from "./browser";
+import { removeTabIfPresent, StandardBrowserRuntime } from "./browser";
 import { HandoffController, HANDOFF_ALARM } from "./handoff";
 import { NativeBridge, RECONNECT_ALARM } from "./native";
 import { OwnershipLedger } from "./ownership";
@@ -90,7 +90,7 @@ browser = new StandardBrowserRuntime(
   async (tabId) => {
     await ownership.revoke(tabId, "tab_removed");
     await browser.detach(tabId);
-    await chrome.tabs.remove(tabId);
+    await removeTabIfPresent(tabId);
   },
   emit,
   authorizeOwnedTab,

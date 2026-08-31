@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, test, vi } from "bun:test";
-import { StandardBrowserRuntime } from "../src/browser";
+import { removeTabIfPresent, StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
 import { OwnershipLedger } from "../src/ownership";
@@ -3098,6 +3098,43 @@ describe("handoff and pause barriers", () => {
   });
 });
 
+describe("tab removal", () => {
+  test("treats a concurrently removed tab as closed without hiding other failures", async () => {
+    tabStore.set(77, {
+      id: 77,
+      windowId: 1,
+      groupId: 5,
+      url: "https://example.test/",
+    });
+    Object.assign(chrome.tabs, {
+      async remove(tabId: number | number[]) {
+        tabStore.delete(Array.isArray(tabId) ? tabId[0] : tabId);
+        throw new Error("No tab with given id");
+      },
+      async get(tabId: number) {
+        const tab = tabStore.get(tabId);
+        if (!tab) throw new Error("No tab with given id");
+        return clone(tab);
+      },
+    });
+
+    await expect(removeTabIfPresent(77)).resolves.toBeUndefined();
+
+    tabStore.set(78, {
+      id: 78,
+      windowId: 1,
+      groupId: 5,
+      url: "https://example.test/",
+    });
+    Object.assign(chrome.tabs, {
+      async remove() {
+        throw new Error("Tabs cannot be edited");
+      },
+    });
+    await expect(removeTabIfPresent(78)).rejects.toThrow("Tabs cannot be edited");
+  });
+});
+
 describe("native bridge transport", () => {
   test("reconciles hello, resets backoff only after ready, and pauses on disconnect", async () => {
     const scheduler = new MutationScheduler();
@@ -3147,12 +3184,21 @@ describe("native bridge transport", () => {
     expect(scheduler.isAccepting()).toBe(true);
     expect(alarmClears).toContain(RECONNECT_ALARM);
 
+    let lastErrorReads = 0;
+    Object.defineProperty(chrome.runtime, "lastError", {
+      configurable: true,
+      get() {
+        lastErrorReads += 1;
+        return { message: "Native host has exited." };
+      },
+    });
     const disconnectedAt = Date.now();
     port.disconnect();
     expect(scheduler.isAccepting()).toBe(false);
     expect(alarmCreates.at(-1)).toMatchObject({ name: RECONNECT_ALARM });
     expect(alarmCreates.at(-1)?.when).toBeGreaterThanOrEqual(disconnectedAt + 30_000);
     expect(alarmCreates.at(-1)?.when).toBeLessThanOrEqual(Date.now() + 30_000);
+    expect(lastErrorReads).toBe(1);
 
     const reconnectPort = new MockNativePort();
     nativePort = reconnectPort;

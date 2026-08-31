@@ -11,6 +11,15 @@ import {
 } from "./protocol";
 import { mutateState, readState } from "./storage";
 
+export async function removeTabIfPresent(tabId: number): Promise<void> {
+  try {
+    await chrome.tabs.remove(tabId);
+  } catch (error) {
+    const tabStillExists = await chrome.tabs.get(tabId).then(() => true, () => false);
+    if (tabStillExists) throw error;
+  }
+}
+
 const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
 // Leaves more than 16 KiB for the Core response envelope and task binding inside
