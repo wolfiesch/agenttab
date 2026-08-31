@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "rpc": {
+    "name": "agenttab.rpc",
+    "version": 1,
+    "supported_versions": [1],
+    "features": [
+      "commit_staging_v1",
+      "idempotency_v1",
+      "operation_outcomes_v1",
+      "task_resume_v1"
+    ],
+    "frame_limits": {
+      "client_to_host": 1048576,
+      "host_to_client": 1048576
+    }
+  },
+  "native": {
+    "name": "agenttab.native",
+    "version": 1,
+    "supported_versions": [1],
+    "features": [
+      "commit_staging_v1",
+      "disconnect_recovery_v1",
+      "event_ack_v1",
+      "inventory_reconciliation_v1"
+    ],
+    "frame_limits": {
+      "host_to_extension": 1048576,
+      "extension_to_host": 67108864
+    },
+    "methods": [
+      "browser_open",
+      "browser_snapshot",
+      "browser_act",
+      "browser_wait",
+      "browser_tabs",
+      "browser_handoff",
+      "browser_commit",
+      "browser_developer",
+      "commit_review_bind",
+      "commit_review_abandon"
+    ],
+    "events": [
+      "inventory",
+      "ownership_revoked",
+      "tab_removed",
+      "group_membership_changed",
+      "pause_changed",
+      "handoff_changed",
+      "commit_expired",
+      "commit_abandoned",
+      "popup_commit_approved",
+      "popup_commit_abandoned",
+      "extension_disconnected"
+    ]
+  },
+  "outcomes": [
+    "completed",
+    "not_started",
+    "unknown",
+    "needs_user",
+    "commit_required"
+  ],
+  "rpc_methods": [
+    {
+      "name": "browser_open",
+      "mutation": true,
+      "schema": "browser-open.schema.json",
+      "exposure": "standard",
+      "description": "Create a task tab, create an unfocused task-owned window, or explicitly adopt the active tab."
+    },
+    {
+      "name": "browser_snapshot",
+      "mutation": false,
+      "schema": "browser-snapshot.schema.json",
+      "exposure": "standard",
+      "description": "Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab."
+    },
+    {
+      "name": "browser_act",
+      "mutation": true,
+      "schema": "browser-act.schema.json",
+      "exposure": "standard",
+      "description": "Run an ordered batch of typed actions against one task-owned tab and page revision."
+    },
+    {
+      "name": "browser_wait",
+      "mutation": false,
+      "schema": "browser-wait.schema.json",
+      "exposure": "standard",
+      "description": "Wait for one schema-defined load, URL, text, selector, network-idle, or download condition."
+    },
+    {
+      "name": "browser_tabs",
+      "mutation": false,
+      "schema": "browser-tabs.schema.json",
+      "exposure": "standard",
+      "description": "List only tabs owned by this task connection."
+    },
+    {
+      "name": "browser_handoff",
+      "mutation": true,
+      "schema": "browser-handoff.schema.json",
+      "exposure": "standard",
+      "description": "Pause agent actions and give the user control for credentials, MFA, CAPTCHA, or other human-only input."
+    },
+    {
+      "name": "browser_commit",
+      "mutation": true,
+      "schema": "browser-commit.schema.json",
+      "exposure": "standard",
+      "description": "Execute one previously staged consequential action after semantic review."
+    },
+    {
+      "name": "browser_developer",
+      "mutation": true,
+      "schema": "browser-developer.schema.json",
+      "exposure": "developer",
+      "description": "Run an explicitly enabled developer-mode action outside the Standard tool surface."
+    },
+    {
+      "name": "agenttab.status",
+      "mutation": false,
+      "schema": "status.schema.json",
+      "exposure": "internal",
+      "description": "Read Core readiness without creating or resuming a browser task."
+    }
+  ],
+  "schema_assets": [
+    "request.schema.json",
+    "response.schema.json",
+    "connection.schema.json"
+  ]
+}

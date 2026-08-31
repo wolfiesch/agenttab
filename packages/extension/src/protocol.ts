@@ -1,69 +1,32 @@
 import { hasOnlyKeys, isBoundedString, isIntegerInRange, isRecord } from "./type-guards";
+import {
+  NATIVE_EVENTS,
+  NATIVE_FEATURES,
+  NATIVE_METHODS,
+  NATIVE_PROTOCOL,
+  NATIVE_SUPPORTED_VERSIONS,
+  PROTOCOL_VERSION,
+  type GeneratedOutcome,
+  type NativeEventName,
+  type NativeMethod,
+} from "./generated/protocol";
 
-export const NATIVE_PROTOCOL = "agenttab.native";
-export const PROTOCOL_VERSION = 1;
+export {
+  NATIVE_EVENTS,
+  NATIVE_FEATURES,
+  NATIVE_METHODS,
+  NATIVE_PROTOCOL,
+  NATIVE_SUPPORTED_VERSIONS,
+  PROTOCOL_VERSION,
+  type NativeEventName,
+  type NativeMethod,
+} from "./generated/protocol";
+
 export const SNAPSHOT_TEXT_MAX_BYTES = 1_000_000;
 export const SCREENSHOT_MAX_BYTES = 750_000;
 export const SCREENSHOT_MAX_DIMENSION = 16_384;
 
-export type NativeMethod =
-  | "browser_open"
-  | "browser_snapshot"
-  | "browser_act"
-  | "browser_wait"
-  | "browser_tabs"
-  | "browser_handoff"
-  | "browser_commit"
-  | "browser_developer"
-  | "commit_review_bind"
-  | "commit_review_abandon";
-
-const CORE_METHODS: Record<NativeMethod, true> = {
-  browser_open: true,
-  browser_snapshot: true,
-  browser_act: true,
-  browser_wait: true,
-  browser_tabs: true,
-  browser_handoff: true,
-  browser_commit: true,
-  browser_developer: true,
-  commit_review_bind: true,
-  commit_review_abandon: true,
-};
-
-const NATIVE_EVENTS: Record<NativeEventName, true> = {
-  inventory: true,
-  ownership_revoked: true,
-  tab_removed: true,
-  group_membership_changed: true,
-  pause_changed: true,
-  handoff_changed: true,
-  commit_expired: true,
-  commit_abandoned: true,
-  popup_commit_approved: true,
-  popup_commit_abandoned: true,
-  extension_disconnected: true,
-};
-
-export type NativeEventName =
-  | "inventory"
-  | "ownership_revoked"
-  | "tab_removed"
-  | "group_membership_changed"
-  | "pause_changed"
-  | "handoff_changed"
-  | "commit_expired"
-  | "commit_abandoned"
-  | "popup_commit_approved"
-  | "popup_commit_abandoned"
-  | "extension_disconnected";
-
-export type Outcome =
-  | "completed"
-  | "not_started"
-  | "unknown"
-  | "needs_user"
-  | "commit_required";
+export type Outcome = GeneratedOutcome;
 
 export interface NativeOriginPolicy {
   tab_id: number;
@@ -111,9 +74,25 @@ export interface NativeReady {
   host_version: string;
   state: "ready" | "paused";
   discard_staged_tokens?: string[];
+  features?: string[];
 }
 
-export type NativeInboundMessage = NativeDispatchCommand | NativeReady | NativeEventAck;
+export interface NativeIncompatible {
+  protocol: typeof NATIVE_PROTOCOL;
+  version: number;
+  kind: "incompatible";
+  requested_protocol: string;
+  requested_version: number;
+  supported_versions: number[];
+  message: string;
+  recovery: string;
+}
+
+export type NativeInboundMessage =
+  | NativeDispatchCommand
+  | NativeReady
+  | NativeEventAck
+  | NativeIncompatible;
 export interface RpcError {
   code: string;
   message: string;
@@ -517,7 +496,7 @@ export function parseCommand(value: unknown): NativeCommand {
     !UUID_PATTERN.test(value.connection_id) || !UUID_PATTERN.test(value.task_id)) {
     throw new Error("native command IDs must be UUIDs");
   }
-  if (typeof value.method !== "string" || !Object.hasOwn(CORE_METHODS, value.method)) {
+  if (typeof value.method !== "string" || !Object.hasOwn(NATIVE_METHODS, value.method)) {
     throw new Error("native command method is unsupported");
   }
   const originPolicy = value.origin_policy === undefined
@@ -553,11 +532,48 @@ function parseCloseTask(value: unknown): NativeCloseTask {
 }
 
 export function parseInboundNativeMessage(value: unknown): NativeInboundMessage {
-  if (!isRecord(value) || value.protocol !== NATIVE_PROTOCOL || value.version !== PROTOCOL_VERSION || typeof value.kind !== "string") {
+  if (!isRecord(value) || value.protocol !== NATIVE_PROTOCOL || typeof value.kind !== "string") {
+    throw new Error("native message protocol or version mismatch");
+  }
+  if (value.kind !== "incompatible" && value.version !== PROTOCOL_VERSION) {
     throw new Error("native message protocol or version mismatch");
   }
   if (value.kind === "command") return parseCommand(value);
   if (value.kind === "close_task") return parseCloseTask(value);
+  if (value.kind === "incompatible") {
+    if (
+      !hasOnlyKeys(value, [
+        "protocol",
+        "version",
+        "kind",
+        "requested_protocol",
+        "requested_version",
+        "supported_versions",
+        "message",
+        "recovery",
+      ]) ||
+      !isIntegerInRange(value.version, 1, 65_535) ||
+      !isBoundedString(value.requested_protocol, 0, 128) ||
+      !isIntegerInRange(value.requested_version, 0, 65_535) ||
+      !Array.isArray(value.supported_versions) ||
+      value.supported_versions.length === 0 ||
+      !value.supported_versions.every((version) => isIntegerInRange(version, 1, 65_535)) ||
+      !isBoundedString(value.message, 1, 2_000) ||
+      !isBoundedString(value.recovery, 1, 2_000)
+    ) {
+      throw new Error("native incompatibility message is invalid");
+    }
+    return {
+      protocol: NATIVE_PROTOCOL,
+      version: value.version,
+      kind: "incompatible",
+      requested_protocol: value.requested_protocol,
+      requested_version: value.requested_version,
+      supported_versions: [...value.supported_versions] as number[],
+      message: value.message,
+      recovery: value.recovery,
+    };
+  }
   if (value.kind === "event_ack") {
     if (
       !hasOnlyKeys(
@@ -616,12 +632,19 @@ export function parseInboundNativeMessage(value: unknown): NativeInboundMessage 
   }
   if (
     value.kind !== "ready" ||
-    !hasOnlyKeys(value, ["protocol", "version", "kind", "host_version", "state"], ["discard_staged_tokens"]) ||
+    !hasOnlyKeys(
+      value,
+      ["protocol", "version", "kind", "host_version", "state"],
+      ["discard_staged_tokens", "features"],
+    ) ||
     !isBoundedString(value.host_version, 1, 128) ||
     (value.state !== "ready" && value.state !== "paused") ||
     (value.discard_staged_tokens !== undefined &&
       (!Array.isArray(value.discard_staged_tokens) ||
-        !value.discard_staged_tokens.every((token) => isBoundedString(token, 16, 256))))
+        !value.discard_staged_tokens.every((token) => isBoundedString(token, 16, 256)))) ||
+    (value.features !== undefined &&
+      (!Array.isArray(value.features) ||
+        !value.features.every((feature) => isBoundedString(feature, 1, 128))))
   ) {
     throw new Error("native ready message is invalid");
   }
@@ -634,6 +657,9 @@ export function parseInboundNativeMessage(value: unknown): NativeInboundMessage 
     ...(value.discard_staged_tokens === undefined
       ? {}
       : { discard_staged_tokens: [...value.discard_staged_tokens] as string[] }),
+    ...(value.features === undefined
+      ? {}
+      : { features: [...value.features] as string[] }),
   };
 }
 export function completed(requestId: string, result: unknown): NativeResponse {
@@ -699,6 +725,7 @@ export function nativeHello(
   paused: boolean,
   handoff: NativeHandoff,
   stagedCommits: PublicStagedCommit[],
+  advertiseCapabilities = true,
 ) {
   return {
     protocol: NATIVE_PROTOCOL,
@@ -709,6 +736,12 @@ export function nativeHello(
     paused,
     handoff,
     staged_commits: stagedCommits,
+    ...(advertiseCapabilities
+      ? {
+        supported_versions: NATIVE_SUPPORTED_VERSIONS,
+        supported_features: NATIVE_FEATURES,
+      }
+      : {}),
   };
 }
 

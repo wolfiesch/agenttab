@@ -114,6 +114,7 @@ jobs:
           bun run workspace:test
           bun run workspace:build
           PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=packages/sdk-python python3 -m unittest discover -s packages/sdk-python/tests -v
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/generate_protocol.py --check
           PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_protocol_schemas.py
           PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_identity.py
           PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_forbidden_surface.py

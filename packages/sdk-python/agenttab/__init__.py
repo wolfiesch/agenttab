@@ -1,5 +1,6 @@
 from .client import (
     AgentTabClient,
+    AgentTabCompatibilityError,
     AgentTabError,
     AgentTabTransportError,
     CLIENT_TO_HOST_MAX_BYTES,
@@ -8,7 +9,9 @@ from .client import (
     DEFAULT_REQUEST_TIMEOUT,
     HOST_TO_CLIENT_MAX_BYTES,
     LONG_OPERATION_TRANSPORT_GRACE,
+    RPC_FEATURES,
     RPC_PROTOCOL,
+    RPC_SUPPORTED_VERSIONS,
     RPC_VERSION,
     encode_frame,
     read_frame,
@@ -19,6 +22,7 @@ from .client import (
 
 __all__ = [
     "AgentTabClient",
+    "AgentTabCompatibilityError",
     "AgentTabError",
     "AgentTabTransportError",
     "CLIENT_TO_HOST_MAX_BYTES",
@@ -27,7 +31,9 @@ __all__ = [
     "DEFAULT_REQUEST_TIMEOUT",
     "HOST_TO_CLIENT_MAX_BYTES",
     "LONG_OPERATION_TRANSPORT_GRACE",
+    "RPC_FEATURES",
     "RPC_PROTOCOL",
+    "RPC_SUPPORTED_VERSIONS",
     "RPC_VERSION",
     "encode_frame",
     "read_frame",

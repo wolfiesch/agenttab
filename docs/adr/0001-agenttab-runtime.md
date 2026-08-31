@@ -80,6 +80,11 @@ TCP and bearer-token access are not Standard transport. They exist only behind t
 
 AgentTab Core RPC and the host-to-extension native protocol are separately versioned. They MUST NOT silently downgrade across an incompatible version.
 
+The canonical protocol catalog, generated artifact workflow, and additive capability negotiation are
+documented in [`docs/protocol-development.md`](../protocol-development.md). An incompatible hello or
+connection receives an explicit compatibility frame before disconnect; v1 peers that omit capability
+fields retain the legacy handshake shape.
+
 MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not alternate hosts. The public Standard surface has exactly seven tools:
 
 1. `browser_open`

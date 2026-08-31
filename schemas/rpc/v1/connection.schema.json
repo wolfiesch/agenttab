@@ -8,10 +8,23 @@
       "required": ["protocol", "version", "kind"],
       "properties": {
         "protocol": { "const": "agenttab.rpc" },
-        "version": { "const": 1 },
+        "version": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "kind": { "const": "connect" },
         "conversation_id": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 }
+        "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 },
+        "supported_versions": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "supported_features": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "maxItems": 64,
+          "uniqueItems": true
+        }
       },
       "additionalProperties": false
     },
@@ -26,7 +39,13 @@
         "resumed": { "type": "boolean" },
         "task_id": { "type": "string", "format": "uuid" },
         "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 },
-        "state": { "enum": ["starting", "reconciling", "ready", "paused", "terminal"] }
+        "state": { "enum": ["starting", "reconciling", "ready", "paused", "terminal"] },
+        "features": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "maxItems": 64,
+          "uniqueItems": true
+        }
       },
       "allOf": [
         {
@@ -61,6 +80,35 @@
         "version": { "const": 1 },
         "kind": { "const": "resume_confirmed" },
         "connection_id": { "type": "string", "format": "uuid" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "protocol",
+        "version",
+        "kind",
+        "requested_protocol",
+        "requested_version",
+        "supported_versions",
+        "message",
+        "recovery"
+      ],
+      "properties": {
+        "protocol": { "const": "agenttab.rpc" },
+        "version": { "const": 1 },
+        "kind": { "const": "incompatible" },
+        "requested_protocol": { "type": "string", "maxLength": 128 },
+        "requested_version": { "type": "integer", "minimum": 0 },
+        "supported_versions": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1, "maximum": 65535 },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "recovery": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": false
     }

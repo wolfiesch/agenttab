@@ -964,6 +964,31 @@ describe("native protocol", () => {
       connection_id: NATIVE_CONNECTION_ID,
     })).toThrow("unknown fields");
   });
+
+  test("parses explicit native compatibility and negotiated features", () => {
+    expect(parseInboundNativeMessage({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "incompatible",
+      requested_protocol: "agenttab.native",
+      requested_version: 2,
+      supported_versions: [1],
+      message: "Native protocol version 2 is unsupported",
+      recovery: "Update AgentTab.",
+    })).toMatchObject({
+      kind: "incompatible",
+      requested_version: 2,
+      supported_versions: [1],
+    });
+    expect(parseInboundNativeMessage({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "2.0.0",
+      state: "ready",
+      features: ["event_ack_v1"],
+    })).toMatchObject({ kind: "ready", features: ["event_ack_v1"] });
+  });
 });
 
 describe("automation route classification", () => {
@@ -3099,6 +3124,152 @@ describe("handoff and pause barriers", () => {
 });
 
 describe("native bridge transport", () => {
+  test("falls back once to legacy v1 after a pre-ready close and keeps recovery bounded", async () => {
+    const scheduler = new MutationScheduler();
+    await seedTask(TASK_A, [44]);
+    const stagedToken = "native-token-survives-v1-fallback";
+    await mutateState((state) => {
+      state.stagedCommits[stagedToken] = {
+        native_token: stagedToken,
+        task_id: TASK_A,
+        tab_id: 44,
+        page_revision: 1,
+        effect: "Submit the staged form",
+        fingerprint: "f".repeat(64),
+        expires_at_ms: Date.now() + 60_000,
+        action: { kind: "click", ref: "r1-1" },
+        preview: { kind: "click" },
+      };
+    });
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const capabilityPort = new MockNativePort();
+    const legacyPort = new MockNativePort();
+    const recoveredPort = new MockNativePort();
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    const discarded: Array<readonly string[]> = [];
+    nativePort = capabilityPort;
+    const bridge = new NativeBridge(
+      scheduler,
+      ownership,
+      async () => {
+        throw new Error("command handler must not run");
+      },
+      undefined,
+      undefined,
+      async (tokens) => {
+        discarded.push([...tokens]);
+        if (tokens.length === 0) {
+          await mutateState((state) => {
+            state.stagedCommits = {};
+          });
+        }
+      },
+      {
+        now: () => 123_000,
+        schedule: (callback, delayMs) => {
+          scheduled.push({ callback, delayMs });
+          return () => undefined;
+        },
+      },
+    );
+
+    await bridge.connect();
+    expect(capabilityPort.posted[0]).toMatchObject({
+      kind: "hello",
+      supported_versions: [1],
+    });
+
+    nativePort = legacyPort;
+    capabilityPort.disconnect();
+    await waitForCondition(() => legacyPort.posted.length === 1);
+    const legacyHello = legacyPort.posted[0] as Record<string, unknown>;
+    expect(legacyHello).toMatchObject({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "hello",
+      extension_version: "2.0.0",
+    });
+    expect(legacyHello).not.toHaveProperty("supported_versions");
+    expect(legacyHello).not.toHaveProperty("supported_features");
+    expect(legacyHello.staged_commits).toEqual([{
+      native_token: stagedToken,
+      task_id: TASK_A,
+      tab_id: 44,
+      page_revision: 1,
+      effect: "Submit the staged form",
+      fingerprint: "f".repeat(64),
+      expires_at_ms: expect.any(Number),
+    }]);
+    expect((await readState()).stagedCommits[stagedToken]).toBeDefined();
+    expect(discarded).toHaveLength(0);
+    expect(scheduled).toHaveLength(0);
+
+    nativePort = recoveredPort;
+    legacyPort.disconnect();
+    await waitForCondition(() => scheduled.length === 1);
+    await waitForCondition(() => discarded.length === 1);
+    expect(discarded).toEqual([[]]);
+    expect((await readState()).stagedCommits[stagedToken]).toBeUndefined();
+    expect(scheduled[0]?.delayMs).toBe(1_000);
+    expect(recoveredPort.posted).toHaveLength(0);
+
+    scheduled[0]?.callback();
+    await waitForCondition(() => recoveredPort.posted.length === 1);
+    expect(recoveredPort.posted[0]).not.toHaveProperty("supported_versions");
+  });
+
+  test("treats an explicit native incompatibility as terminal without legacy fallback", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const capabilityPort = new MockNativePort();
+    const unusedLegacyPort = new MockNativePort();
+    const scheduled: Array<() => void> = [];
+    nativePort = capabilityPort;
+    const bridge = new NativeBridge(
+      scheduler,
+      ownership,
+      async () => {
+        throw new Error("command handler must not run");
+      },
+      undefined,
+      undefined,
+      undefined,
+      {
+        now: () => 123_000,
+        schedule: (callback) => {
+          scheduled.push(callback);
+          return () => undefined;
+        },
+      },
+    );
+    const loggedErrors: unknown[][] = [];
+    const originalConsoleError = console.error;
+    console.error = (...values: unknown[]) => {
+      loggedErrors.push(values);
+    };
+    try {
+      await bridge.connect();
+      nativePort = unusedLegacyPort;
+      capabilityPort.receive({
+        protocol: "agenttab.native",
+        version: 1,
+        kind: "incompatible",
+        requested_protocol: "agenttab.native",
+        requested_version: 2,
+        supported_versions: [1],
+        message: "Native protocol version 2 is unsupported",
+        recovery: "Update AgentTab.",
+      });
+      await waitForCondition(() => capabilityPort.disconnectCount === 1);
+
+      expect(unusedLegacyPort.posted).toHaveLength(0);
+      expect(scheduled).toHaveLength(0);
+      expect(loggedErrors).toHaveLength(1);
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+
   test("reconciles hello, resets backoff only after ready, and pauses on disconnect", async () => {
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
@@ -3133,6 +3304,13 @@ describe("native bridge transport", () => {
       paused: false,
       handoff: { active: false },
       staged_commits: [],
+      supported_versions: [1],
+      supported_features: [
+        "commit_staging_v1",
+        "disconnect_recovery_v1",
+        "event_ack_v1",
+        "inventory_reconciliation_v1",
+      ],
     });
     expect(scheduler.isAccepting()).toBe(false);
 

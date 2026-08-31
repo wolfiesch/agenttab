@@ -1884,6 +1884,8 @@ mod tests {
                 kind: ConnectKind::Connect,
                 conversation_id: None,
                 resume_capability: None,
+                supported_versions: None,
+                supported_features: None,
             })
             .unwrap();
         (temp, runtime, connection)
@@ -1909,6 +1911,8 @@ mod tests {
                 kind: ConnectKind::Connect,
                 conversation_id: None,
                 resume_capability: None,
+                supported_versions: None,
+                supported_features: None,
             })
             .unwrap();
         (temp, runtime, connection)
@@ -1947,6 +1951,8 @@ mod tests {
                 kind: ConnectKind::Connect,
                 conversation_id: None,
                 resume_capability: None,
+                supported_versions: None,
+                supported_features: None,
             })
             .unwrap();
         (temp, runtime, connection, upload_root)
@@ -2238,6 +2244,8 @@ mod tests {
                 kind: ConnectKind::Connect,
                 conversation_id: None,
                 resume_capability: None,
+                supported_versions: None,
+                supported_features: None,
             })
             .unwrap();
         let response = runtime.handle(
@@ -2296,6 +2304,8 @@ mod tests {
                 kind: ConnectKind::Connect,
                 conversation_id: None,
                 resume_capability: None,
+                supported_versions: None,
+                supported_features: None,
             })
             .unwrap();
         own_tab(&runtime, &connection, 7);

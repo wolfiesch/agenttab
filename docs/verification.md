@@ -15,6 +15,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=packages/sdk-python python3 -m unittest dis
 PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_permissions.py
 cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
 PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_protocol_schemas.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/generate_protocol.py --check
 PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_identity.py
 PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_forbidden_surface.py
 cargo fmt --all --manifest-path host-rs/Cargo.toml -- --check

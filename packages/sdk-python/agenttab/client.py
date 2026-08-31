@@ -13,26 +13,24 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, Mapping, Protocol
+from typing import Any, BinaryIO, Callable, Literal, Mapping, Protocol
 
-RPC_PROTOCOL = "agenttab.rpc"
-RPC_VERSION = 1
-CLIENT_TO_HOST_MAX_BYTES = 1024 * 1024
-HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024
+from ._generated_protocol import (
+    CLIENT_TO_HOST_MAX_BYTES,
+    HOST_TO_CLIENT_MAX_BYTES,
+    MUTATIONS,
+    RPC_FEATURES,
+    RPC_PROTOCOL,
+    RPC_SUPPORTED_VERSIONS,
+    RPC_VERSION,
+)
+
 DEFAULT_REQUEST_TIMEOUT = 30.0
 DEFAULT_BROWSER_WAIT_TIMEOUT = 30.0
 DEFAULT_BROWSER_HANDOFF_TIMEOUT = 300.0
 # Core reserves five seconds after a long operation's declared timeout. Keep a
 # second, bounded five-second margin for its response to cross the transports.
 LONG_OPERATION_TRANSPORT_GRACE = 10.0
-MUTATIONS = {
-    "browser_open",
-    "browser_act",
-    "browser_handoff",
-    "browser_commit",
-    "browser_developer",
-}
-
 JsonObject = dict[str, Any]
 
 
@@ -68,6 +66,20 @@ class AgentTabError(RuntimeError):
         self.outcome = str(response.get("outcome", "unknown"))
         self.recovery = details.get("recovery")
         self.details = details.get("details")
+
+
+class AgentTabCompatibilityError(RuntimeError):
+    def __init__(self, response: Mapping[str, Any]) -> None:
+        super().__init__(str(response.get("message", "AgentTab protocol is incompatible")))
+        self.requested_protocol = str(response.get("requested_protocol", ""))
+        self.requested_version = int(response.get("requested_version", 0))
+        supported = response.get("supported_versions")
+        self.supported_versions = tuple(supported) if isinstance(supported, list) else ()
+        self.recovery = str(response.get("recovery", ""))
+
+
+class _RetryLegacyV1Handshake(RuntimeError):
+    pass
 
 
 TransportErrorCode = Literal[
@@ -277,6 +289,7 @@ def _read_exact(
     stream: BinaryIO | socket.socket,
     size: int,
     deadline: float | None = None,
+    on_data: Callable[[], None] | None = None,
 ) -> bytes:
     chunks: list[bytes] = []
     remaining = size
@@ -300,6 +313,8 @@ def _read_exact(
             chunk = stream.read(remaining)
         if not chunk:
             raise EOFError("AgentTab connection closed during a frame")
+        if on_data is not None:
+            on_data()
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -310,12 +325,15 @@ def read_frame(
     limit: int = HOST_TO_CLIENT_MAX_BYTES,
     *,
     timeout: float | None = None,
+    on_data: Callable[[], None] | None = None,
 ) -> JsonObject:
     deadline = None if timeout is None else time.monotonic() + timeout
-    declared = struct.unpack("<I", _read_exact(stream, 4, deadline))[0]
+    declared = struct.unpack("<I", _read_exact(stream, 4, deadline, on_data))[0]
     if declared > limit:
         raise ValueError(f"AgentTab frame declares {declared} bytes; limit is {limit}")
-    value = json.loads(_read_exact(stream, declared, deadline).decode("utf-8"))
+    value = json.loads(
+        _read_exact(stream, declared, deadline, on_data).decode("utf-8")
+    )
     if not isinstance(value, dict):
         raise ValueError("AgentTab frame must contain a JSON object")
     return value
@@ -611,14 +629,27 @@ class AgentTabClient:
         address = endpoint or resolve_endpoint()
         negotiated: tuple[BinaryIO | socket.socket, JsonObject] | None = None
         attempted_capability: str | None = None
+        advertise_capabilities = True
         for capability in candidates:
-            stream, connection = cls._negotiate_connection(
-                address,
-                conversation_id=conversation_id,
-                resume_capability=capability,
-                connect_timeout=connect_timeout,
-                request_timeout=request_timeout,
-            )
+            try:
+                stream, connection = cls._negotiate_connection(
+                    address,
+                    conversation_id=conversation_id,
+                    resume_capability=capability,
+                    connect_timeout=connect_timeout,
+                    request_timeout=request_timeout,
+                    advertise_capabilities=advertise_capabilities,
+                )
+            except _RetryLegacyV1Handshake:
+                advertise_capabilities = False
+                stream, connection = cls._negotiate_connection(
+                    address,
+                    conversation_id=conversation_id,
+                    resume_capability=capability,
+                    connect_timeout=connect_timeout,
+                    request_timeout=request_timeout,
+                    advertise_capabilities=False,
+                )
             if capability is not None and connection.get("resumed") is not True:
                 stream.close()
                 if capability_store is not None and capability != active_capability:
@@ -675,6 +706,7 @@ class AgentTabClient:
         resume_capability: str | None,
         connect_timeout: float,
         request_timeout: float,
+        advertise_capabilities: bool = True,
     ) -> tuple[BinaryIO | socket.socket, JsonObject]:
         if os.name == "nt":
             stream: BinaryIO | socket.socket = _open_windows_named_pipe(address)
@@ -688,16 +720,27 @@ class AgentTabClient:
             "version": RPC_VERSION,
             "kind": "connect",
         }
+        if advertise_capabilities:
+            request["supported_versions"] = list(RPC_SUPPORTED_VERSIONS)
+            request["supported_features"] = list(RPC_FEATURES)
         if conversation_id:
             request["conversation_id"] = conversation_id
         if resume_capability:
             request["resume_capability"] = resume_capability
+        request_started = False
+        received_response_data = False
+
+        def mark_response_data() -> None:
+            nonlocal received_response_data
+            received_response_data = True
+
         try:
             negotiation_deadline = (
                 time.monotonic() + connect_timeout
                 if _uses_windows_named_pipe(stream)
                 else None
             )
+            request_started = True
             cls._write(
                 stream,
                 encode_frame(request),
@@ -710,11 +753,45 @@ class AgentTabClient:
             )
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("AgentTab named-pipe connection negotiation timed out")
-            connection = read_frame(stream, timeout=remaining)
+            connection = read_frame(
+                stream,
+                timeout=remaining,
+                on_data=mark_response_data,
+            )
+            if (
+                connection.get("protocol") == RPC_PROTOCOL
+                and isinstance(connection.get("version"), int)
+                and not isinstance(connection.get("version"), bool)
+                and connection.get("version", 0) > 0
+                and connection.get("kind") == "incompatible"
+                and isinstance(connection.get("requested_protocol"), str)
+                and isinstance(connection.get("requested_version"), int)
+                and not isinstance(connection.get("requested_version"), bool)
+                and isinstance(connection.get("supported_versions"), list)
+                and all(
+                    isinstance(version, int)
+                    and not isinstance(version, bool)
+                    and version > 0
+                    for version in connection["supported_versions"]
+                )
+                and isinstance(connection.get("message"), str)
+                and isinstance(connection.get("recovery"), str)
+            ):
+                raise AgentTabCompatibilityError(connection)
             if (
                 connection.get("protocol") != RPC_PROTOCOL
                 or connection.get("version") != RPC_VERSION
                 or connection.get("kind") != "connected"
+                or (
+                    connection.get("features") is not None
+                    and (
+                        not isinstance(connection.get("features"), list)
+                        or not all(
+                            isinstance(feature, str)
+                            for feature in connection["features"]
+                        )
+                    )
+                )
             ):
                 raise RuntimeError("AgentTab returned an invalid connection acknowledgement")
             if connection.get("resumed") and (
@@ -725,8 +802,18 @@ class AgentTabClient:
                 raise RuntimeError(
                     "AgentTab returned an invalid resumed connection acknowledgement"
                 )
-        except Exception:
+        except Exception as error:
             stream.close()
+            if (
+                advertise_capabilities
+                and request_started
+                and not received_response_data
+                and isinstance(
+                    error,
+                    (EOFError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError),
+                )
+            ):
+                raise _RetryLegacyV1Handshake() from error
             raise
         if isinstance(stream, socket.socket):
             stream.settimeout(request_timeout)

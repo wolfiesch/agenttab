@@ -5,12 +5,14 @@ import { join } from "node:path";
 import { createServer, type Server, type Socket } from "node:net";
 import {
   AgentTabClient,
+  AgentTabCompatibilityError,
   AgentTabError,
   AgentTabTransportError,
   DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS,
   DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
   FrameDecoder,
   LONG_OPERATION_TRANSPORT_GRACE_MS,
+  RPC_FEATURES,
   createUuidV7,
   createResumeCapabilityStore,
   encodeFrame,
@@ -155,6 +157,130 @@ describe("Core RPC transport deadlines", () => {
     })).resolves.toEqual({ matched: true });
     client.close();
   });
+});
+
+test("advertises generated capabilities and surfaces incompatible majors", async () => {
+  let connect: Record<string, unknown> | undefined;
+  let connectionCount = 0;
+  const endpoint = await listen((socket) => {
+    connectionCount += 1;
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        connect = value;
+        socket.write(encodeFrame({
+          protocol: "agenttab.rpc",
+          version: 1,
+          kind: "incompatible",
+          requested_protocol: "agenttab.rpc",
+          requested_version: 2,
+          supported_versions: [1],
+          message: "AgentTab Core does not support protocol version 2",
+          recovery: "Update the AgentTab client and host.",
+        }));
+      }
+    });
+  });
+
+  let error: unknown;
+  try {
+    await AgentTabClient.connect({ endpoint });
+  } catch (cause) {
+    error = cause;
+  }
+  expect(error).toBeInstanceOf(AgentTabCompatibilityError);
+  expect(error).toMatchObject({
+    requestedProtocol: "agenttab.rpc",
+    requestedVersion: 2,
+    supportedVersions: [1],
+  });
+  expect(connect).toMatchObject({
+    kind: "connect",
+    supported_versions: [1],
+    supported_features: [...RPC_FEATURES],
+  });
+  expect(connectionCount).toBe(1);
+});
+
+test("retries once with the exact legacy-v1 handshake after a pre-ack rejection", async () => {
+  const connects: Array<Record<string, unknown>> = [];
+  let connectionCount = 0;
+  const endpoint = await listen((socket) => {
+    connectionCount += 1;
+    const attempt = connectionCount;
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        connects.push(value);
+        if (attempt === 1) {
+          socket.end();
+          return;
+        }
+        socket.write(encodeFrame({
+          protocol: "agenttab.rpc",
+          version: 1,
+          kind: "connected",
+          connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da42",
+          resumed: false,
+          state: "ready",
+        }));
+      }
+    });
+  });
+
+  const client = await AgentTabClient.connect({
+    endpoint,
+    conversationId: "conversation-for-both-attempts",
+  });
+  client.close();
+
+  expect(connectionCount).toBe(2);
+  expect(connects[0]).toMatchObject({
+    kind: "connect",
+    conversation_id: "conversation-for-both-attempts",
+    supported_versions: [1],
+    supported_features: [...RPC_FEATURES],
+  });
+  expect(connects[1]).toEqual({
+    protocol: "agenttab.rpc",
+    version: 1,
+    kind: "connect",
+    conversation_id: "conversation-for-both-attempts",
+  });
+});
+
+test("does not retry again when the exact legacy-v1 handshake is also rejected", async () => {
+  const connects: Array<Record<string, unknown>> = [];
+  const endpoint = await listen((socket) => {
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        connects.push(value);
+        socket.end();
+      }
+    });
+  });
+
+  await expect(AgentTabClient.connect({ endpoint })).rejects.toThrow(
+    "AgentTab closed during connection negotiation",
+  );
+  expect(connects).toHaveLength(2);
+  expect(connects[0]).toHaveProperty("supported_versions", [1]);
+  expect(connects[1]).not.toHaveProperty("supported_versions");
+  expect(connects[1]).not.toHaveProperty("supported_features");
+});
+
+test("does not reinterpret a negotiation timeout as a legacy-v1 rejection", async () => {
+  let connectionCount = 0;
+  const endpoint = await listen((socket) => {
+    connectionCount += 1;
+    socket.on("data", () => undefined);
+  });
+
+  await expect(AgentTabClient.connect({ endpoint, connectTimeoutMs: 100 })).rejects.toThrow(
+    "Timed out after 100 ms",
+  );
+  expect(connectionCount).toBe(1);
 });
 
 if (false) {

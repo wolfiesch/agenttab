@@ -3,6 +3,8 @@ import {
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
+  MUTATING_RPC_METHODS,
+  RPC_TOOL_METADATA,
   SCREENSHOT_MAX_BYTES,
   SCREENSHOT_MAX_DIMENSION,
   SNAPSHOT_TEXT_MAX_BYTES,
@@ -59,13 +61,7 @@ interface ToolExecutionContext {
 
 type ClientFactory = (context?: ToolExecutionContext) => Promise<AgentTabClient>;
 
-const MUTATIONS = new Set<ToolMethod>([
-  "browser_open",
-  "browser_act",
-  "browser_handoff",
-  "browser_commit",
-  "browser_developer",
-]);
+const MUTATIONS = new Set<ToolMethod>(MUTATING_RPC_METHODS);
 const INLINE_RESULT_MAX_BYTES = 8 * 1024;
 const IDEMPOTENCY_KEY_CACHE_MAX_ENTRIES = 4_096;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -137,7 +133,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_open",
       label: "Browser Open",
-      description: "Create a task tab, create an unfocused task-owned window, or explicitly adopt the active tab.",
+      description: RPC_TOOL_METADATA.browser_open.description,
       approval: "write",
       schema: (z) => z.union([
         z.object({
@@ -158,7 +154,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_snapshot",
       label: "Browser Snapshot",
-      description: "Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab.",
+      description: RPC_TOOL_METADATA.browser_snapshot.description,
       approval: "read",
       schema: (z) => z.union([
         z.object({
@@ -190,7 +186,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_act",
       label: "Browser Act",
-      description: "Run an ordered batch of typed actions against one task-owned tab and page revision.",
+      description: RPC_TOOL_METADATA.browser_act.description,
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);
@@ -231,7 +227,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_wait",
       label: "Browser Wait",
-      description: "Wait for one schema-defined load, URL, text, selector, network-idle, or download condition.",
+      description: RPC_TOOL_METADATA.browser_wait.description,
       approval: "read",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
@@ -245,14 +241,14 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_tabs",
       label: "Browser Tabs",
-      description: "List only tabs owned by this task connection.",
+      description: RPC_TOOL_METADATA.browser_tabs.description,
       approval: "read",
       schema: (z) => z.object({}).strict(),
     },
     {
       name: "browser_handoff",
       label: "Browser Handoff",
-      description: "Give the user control for credentials, MFA, CAPTCHA, or other human-only input.",
+      description: RPC_TOOL_METADATA.browser_handoff.description,
       approval: "write",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
@@ -268,7 +264,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_commit",
       label: "Browser Commit",
-      description: "Execute one previously staged consequential action after semantic review.",
+      description: RPC_TOOL_METADATA.browser_commit.description,
       approval: "write",
       schema: (z) => z.object({ staged_token: z.string().min(32).max(256) }).strict(),
     },
@@ -277,7 +273,7 @@ const DEFINITIONS: ReadonlyArray<{
 const DEVELOPER = {
   name: "browser_developer" as const,
   label: "Browser Developer",
-  description: "Run an explicitly enabled developer-mode action outside the Standard tool surface.",
+  description: RPC_TOOL_METADATA.browser_developer.description,
   approval: "write" as const,
   schema: (z: ZodApi) => z.object({
     action: z.string().min(1).max(128),

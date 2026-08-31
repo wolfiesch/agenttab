@@ -6,6 +6,8 @@
     "packages/*"
   ],
   "scripts": {
+    "protocol:generate": "python3 scripts/generate_protocol.py",
+    "protocol:check": "python3 scripts/generate_protocol.py --check",
     "extension:build": "bun run --cwd packages/extension build",
     "extension:check": "bun run --cwd packages/extension typecheck && bun run --cwd packages/extension test && bun run --cwd packages/extension build",
     "workspace:typecheck": "bun run --cwd packages/extension typecheck && bun run --cwd packages/sdk-typescript typecheck && bun run --cwd packages/mcp typecheck && bun run --cwd packages/omp typecheck && bun run --cwd packages/installer typecheck && bun run --cwd packages/site typecheck",
