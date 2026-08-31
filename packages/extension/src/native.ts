@@ -104,7 +104,11 @@ export class NativeBridge {
         if (this.port === port) port.disconnect();
       });
     });
-    port.onDisconnect.addListener(() => void this.onDisconnect(port));
+    port.onDisconnect.addListener(() => {
+      // Reading lastError marks expected native-host disconnect failures as handled.
+      void chrome.runtime.lastError;
+      this.onDisconnect(port);
+    });
     try {
       const state = await readState();
       port.postMessage(nativeHello(
