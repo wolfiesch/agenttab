@@ -1,11 +1,22 @@
 import { RevisionTracker } from "./revisions";
 import { automationRoute, restrictedOriginError } from "./routes";
 import { isRecord } from "./type-guards";
-import { randomToken, sha256Hex, type StagedCommit, type StagedDialog } from "./protocol";
+import {
+  SCREENSHOT_MAX_BYTES,
+  SNAPSHOT_TEXT_MAX_BYTES,
+  randomToken,
+  sha256Hex,
+  type StagedCommit,
+  type StagedDialog,
+} from "./protocol";
 import { mutateState, readState } from "./storage";
 
 const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
+// Leaves more than 16 KiB for the Core response envelope and task binding inside
+// the 1 MiB host-to-client frame. Screenshot base64 data is separately capped at
+// 1,000,000 characters (750,000 decoded bytes).
+const SNAPSHOT_RESULT_BUDGET_BYTES = 1_032_000;
 const TAB_ONLY_ACTIONS: Readonly<Record<string, true>> = {
   navigate: true,
   go_back: true,
@@ -78,6 +89,38 @@ interface AxNode {
 interface PageIdentity {
   documentId?: string;
   loaderId?: string;
+}
+
+const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder();
+
+function utf8Prefix(bytes: Uint8Array, maxBytes: number): string {
+  let end = Math.min(bytes.length, Math.max(0, Math.floor(maxBytes)));
+  while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return utf8Decoder.decode(bytes.subarray(0, end));
+}
+
+function serializedBytes(value: unknown): number {
+  return utf8Encoder.encode(JSON.stringify(value)).length;
+}
+
+function snapshotTooLarge(message: string, recovery: string): Error {
+  return Object.assign(new Error(message), { code: "snapshot_too_large", recovery });
+}
+
+function assertDeliverableSnapshot(result: Record<string, unknown>): Record<string, unknown> {
+  if (serializedBytes(result) <= SNAPSHOT_RESULT_BUDGET_BYTES) return result;
+  throw snapshotTooLarge(
+    "Snapshot cannot fit in the AgentTab Core response budget",
+    "Request a narrower selector, lower max_bytes/max_nodes, or reduce screenshot dimensions and quality.",
+  );
+}
+
+function base64ByteLength(value: string): number | null {
+  if (value.length === 0) return 0;
+  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return null;
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
 }
 
 type CloseTab = (tabId: number) => Promise<void>;
@@ -309,8 +352,12 @@ export class StandardBrowserRuntime {
       throw Object.assign(new Error("Unsupported snapshot mode"), { code: "invalid_request" });
     }
     await this.requireFullAutomationRoute(tabId, `capture a ${mode} snapshot`);
-    if (mode === "text" || mode === "html") return this.scriptSnapshot(tabId, mode, params);
-    if (mode === "screenshot") return this.screenshot(tabId, params);
+    if (mode === "text" || mode === "html") {
+      return assertDeliverableSnapshot(await this.scriptSnapshot(tabId, mode, params));
+    }
+    if (mode === "screenshot") {
+      return assertDeliverableSnapshot(await this.screenshot(tabId, params));
+    }
     const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
     const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
     const before = await this.pageIdentity(tabId);
@@ -348,13 +395,13 @@ export class StandardBrowserRuntime {
       ...(node.description?.value !== undefined ? { description: node.description.value } : {}),
       ...(node.ignored ? { ignored: true } : {}),
     }));
-    return {
+    return assertDeliverableSnapshot({
       tab_id: tabId,
       page_revision: pageRevision,
       mode,
       nodes: encoded,
       truncated: nodes.length > maxNodes,
-    };
+    });
   }
 
   async act(
@@ -730,7 +777,9 @@ export class StandardBrowserRuntime {
   ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const selector = typeof params.selector === "string" ? params.selector : null;
-    const maxBytes = typeof params.max_bytes === "number" ? params.max_bytes : 256_000;
+    const requestedMaxBytes = typeof params.max_bytes === "number"
+      ? Math.min(params.max_bytes, SNAPSHOT_TEXT_MAX_BYTES)
+      : 256_000;
     const before = await this.pageIdentity(tabId);
     const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
     const [{ result }] = await chrome.scripting.executeScript({
@@ -754,25 +803,50 @@ export class StandardBrowserRuntime {
         currentPageRevision,
       });
     }
-    const bytes = new TextEncoder().encode(String(result ?? ""));
-    const bounded = bytes.length > maxBytes ? new TextDecoder().decode(bytes.slice(0, maxBytes)) : String(result ?? "");
-    return {
-      tab_id: tabId,
-      page_revision: pageRevision,
-      mode,
-      content: bounded,
-      truncated: bytes.length > maxBytes,
+    const bytes = utf8Encoder.encode(String(result ?? ""));
+    const requestedBytes = Math.min(bytes.length, requestedMaxBytes);
+    const buildResult = (byteLimit: number): Record<string, unknown> => {
+      const content = utf8Prefix(bytes, byteLimit);
+      const contentBytes = utf8Encoder.encode(content).length;
+      return {
+        tab_id: tabId,
+        page_revision: pageRevision,
+        mode,
+        content,
+        truncated: contentBytes < bytes.length,
+      };
     };
+    const bounded = buildResult(requestedBytes);
+    if (serializedBytes(bounded) <= SNAPSHOT_RESULT_BUDGET_BYTES) return bounded;
+
+    // JSON escaping can expand HTML/text (for example quotes or control bytes).
+    // Binary-search the largest UTF-8 prefix whose complete result remains
+    // deliverable instead of letting Core replace it with response_too_large.
+    let lower = 0;
+    let upper = requestedBytes;
+    while (lower < upper) {
+      const candidate = Math.ceil((lower + upper) / 2);
+      const resultAtCandidate = buildResult(candidate);
+      if (serializedBytes(resultAtCandidate) <= SNAPSHOT_RESULT_BUDGET_BYTES) {
+        lower = candidate;
+      } else {
+        upper = candidate - 1;
+      }
+    }
+    return buildResult(lower);
   }
 
   private async screenshot(tabId: number, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     const before = await this.pageIdentity(tabId);
     const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
+    const format = params.format === "jpeg" || params.format === "webp" ? params.format : "png";
     const capture: Record<string, unknown> = {
-      format: "png",
+      format,
       fromSurface: true,
       captureBeyondViewport: params.full_page === true,
     };
+    if (typeof params.quality === "number") capture.quality = params.quality;
+    let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined;
     if (typeof params.selector === "string") {
       const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
       if (!isRecord(document.root) || typeof document.root.nodeId !== "number") {
@@ -794,24 +868,42 @@ export class StandardBrowserRuntime {
       const points = model.model.border.map(Number);
       const x = Math.min(points[0], points[2], points[4], points[6]);
       const y = Math.min(points[1], points[3], points[5], points[7]);
-      capture.clip = {
+      clip = {
         x,
         y,
         width: Math.max(points[0], points[2], points[4], points[6]) - x,
         height: Math.max(points[1], points[3], points[5], points[7]) - y,
         scale: 1,
       };
-    } else if (params.full_page === true) {
+    } else if (
+      params.full_page === true ||
+      typeof params.max_width === "number" ||
+      typeof params.max_height === "number"
+    ) {
       const metrics = await this.send(tabId, "Page.getLayoutMetrics", {});
-      if (isRecord(metrics.cssContentSize)) {
-        capture.clip = {
-          x: Number(metrics.cssContentSize.x ?? 0),
-          y: Number(metrics.cssContentSize.y ?? 0),
-          width: Number(metrics.cssContentSize.width ?? 0),
-          height: Number(metrics.cssContentSize.height ?? 0),
+      const viewport = params.full_page === true
+        ? metrics.cssContentSize ?? metrics.contentSize
+        : metrics.cssVisualViewport ?? metrics.visualViewport ?? metrics.cssLayoutViewport ?? metrics.layoutViewport;
+      if (isRecord(viewport)) {
+        clip = {
+          x: Number(viewport.x ?? viewport.pageX ?? viewport.offsetX ?? 0),
+          y: Number(viewport.y ?? viewport.pageY ?? viewport.offsetY ?? 0),
+          width: Number(viewport.width ?? viewport.clientWidth ?? 0),
+          height: Number(viewport.height ?? viewport.clientHeight ?? 0),
           scale: 1,
         };
       }
+    }
+    if (clip) {
+      if (![clip.x, clip.y, clip.width, clip.height].every(Number.isFinite) || clip.width <= 0 || clip.height <= 0) {
+        throw Object.assign(new Error("Screenshot capture area is invalid"), { code: "snapshot_failed" });
+      }
+      const maxWidth = typeof params.max_width === "number" ? params.max_width : clip.width;
+      const maxHeight = typeof params.max_height === "number" ? params.max_height : clip.height;
+      clip.scale = Math.min(1, maxWidth / clip.width, maxHeight / clip.height);
+      capture.clip = clip;
+    } else if (typeof params.max_width === "number" || typeof params.max_height === "number") {
+      throw Object.assign(new Error("Could not inspect the screenshot viewport"), { code: "snapshot_failed" });
     }
     const result = await this.send(tabId, "Page.captureScreenshot", capture);
     const after = await this.pageIdentity(tabId);
@@ -826,13 +918,31 @@ export class StandardBrowserRuntime {
         currentPageRevision,
       });
     }
+    if (typeof result.data !== "string") {
+      throw Object.assign(new Error("Chrome returned an invalid screenshot payload"), { code: "snapshot_failed" });
+    }
+    const byteLength = base64ByteLength(result.data);
+    if (byteLength === null) {
+      throw Object.assign(new Error("Chrome returned malformed screenshot data"), { code: "snapshot_failed" });
+    }
+    const maxBytes = typeof params.max_bytes === "number"
+      ? Math.min(params.max_bytes, SCREENSHOT_MAX_BYTES)
+      : SCREENSHOT_MAX_BYTES;
+    if (byteLength > maxBytes) {
+      throw snapshotTooLarge(
+        `Screenshot is ${byteLength} bytes; the requested deliverable limit is ${maxBytes} bytes`,
+        "Use jpeg or webp, lower quality, set max_width/max_height, or capture a narrower selector.",
+      );
+    }
     return {
       tab_id: tabId,
       page_revision: pageRevision,
       mode: "screenshot",
       data: result.data,
       encoding: "base64",
-      media_type: "image/png",
+      media_type: `image/${format}`,
+      format,
+      byte_length: byteLength,
     };
   }
 

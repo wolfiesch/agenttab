@@ -407,6 +407,11 @@ test("Pi mode registers the same tools with TypeBox schemas and Pi metadata", ()
     expect(typeof tool.renderCall).toBe("function");
     expect(typeof tool.renderResult).toBe("function");
   }
+  const snapshot = tools.find((tool) => tool.name === "browser_snapshot");
+  const schema = JSON.stringify(snapshot?.parameters);
+  expect(schema).toContain('"webp"');
+  expect(schema).toContain('"max_width"');
+  expect(schema).toContain('"maximum":750000');
 });
 
 test("Pi tools call the same Core RPC client", async () => {

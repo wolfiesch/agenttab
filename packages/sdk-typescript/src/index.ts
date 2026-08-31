@@ -19,6 +19,9 @@ export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;
 // declared timeout. Keep a second, bounded five-second margin for the response to
 // cross the native and Core transports before the client classifies it as unknown.
 export const LONG_OPERATION_TRANSPORT_GRACE_MS = 10_000;
+export const SNAPSHOT_TEXT_MAX_BYTES = 1_000_000;
+export const SCREENSHOT_MAX_BYTES = 750_000;
+export const SCREENSHOT_MAX_DIMENSION = 16_384;
 
 export type BrowserOpenParams =
   | { mode: "create"; url?: string; placement?: "task"; background?: boolean }
@@ -28,7 +31,17 @@ export type BrowserOpenParams =
 export type BrowserSnapshotParams =
   | { tab_id: number; mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number }
   | { tab_id: number; mode: "text" | "html"; selector?: string; max_bytes?: number }
-  | { tab_id: number; mode: "screenshot"; selector?: string; full_page?: boolean };
+  | {
+    tab_id: number;
+    mode: "screenshot";
+    selector?: string;
+    full_page?: boolean;
+    format?: "png" | "jpeg" | "webp";
+    quality?: number;
+    max_width?: number;
+    max_height?: number;
+    max_bytes?: number;
+  };
 
 export type BrowserAction =
   | { kind: "click"; ref: string }

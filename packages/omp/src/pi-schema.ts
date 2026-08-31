@@ -1,5 +1,10 @@
 import { Type } from "typebox";
-import { STANDARD_ACTION_VALUE_MAX_CHARS } from "../../sdk-typescript/src/index";
+import {
+  SCREENSHOT_MAX_BYTES,
+  SCREENSHOT_MAX_DIMENSION,
+  SNAPSHOT_TEXT_MAX_BYTES,
+  STANDARD_ACTION_VALUE_MAX_CHARS,
+} from "../../sdk-typescript/src/index";
 import type { ToolMethod } from "./tool-method";
 
 const stringEnum = (values: readonly string[]) => Type.String({ enum: [...values] });
@@ -38,13 +43,18 @@ const schemas: Record<ToolMethod, unknown> = {
       tab_id: Type.Integer({ minimum: 0 }),
       mode: stringEnum(["text", "html"]),
       selector: Type.Optional(Type.String({ minLength: 1 })),
-      max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 1_048_576 })),
+      max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: SNAPSHOT_TEXT_MAX_BYTES })),
     }),
     object({
       tab_id: Type.Integer({ minimum: 0 }),
       mode: Type.Literal("screenshot"),
       selector: Type.Optional(Type.String({ minLength: 1 })),
       full_page: Type.Optional(Type.Boolean()),
+      format: Type.Optional(stringEnum(["png", "jpeg", "webp"])),
+      quality: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
+      max_width: Type.Optional(Type.Integer({ minimum: 1, maximum: SCREENSHOT_MAX_DIMENSION })),
+      max_height: Type.Optional(Type.Integer({ minimum: 1, maximum: SCREENSHOT_MAX_DIMENSION })),
+      max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: SCREENSHOT_MAX_BYTES })),
     }),
   ]),
   browser_act: object({

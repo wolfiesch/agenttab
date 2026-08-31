@@ -63,7 +63,7 @@ For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. 
 | Tool | Required input and behavior |
 |---|---|
 | `browser_open` | `mode: "create"` optionally accepts an `http`, `https`, or `about` URL, `background`, and `placement`. The default `placement: "task"` creates a tab in the task's existing window when possible. `placement: "new_window"` creates the first tab of an otherwise empty task in a separate unfocused normal window and rejects `background: false`. `mode: "adopt_active"` explicitly adopts only the currently active tab. The result includes task, tab, window, page-revision, and `automation_route` identifiers. |
-| `browser_snapshot` | Requires `tab_id`. Modes are `accessibility`, `text`, `html`, and `screenshot`. Only accessibility snapshots return revisioned node references. Snapshots require the `full` automation route. |
+| `browser_snapshot` | Requires `tab_id`. Modes are `accessibility`, `text`, `html`, and `screenshot`. Only accessibility snapshots return revisioned node references. Screenshot requests may select `png`, `jpeg`, or `webp`, set JPEG/WebP `quality`, bound dimensions with `max_width`/`max_height`, and cap compressed image size with `max_bytes`. Snapshots require the `full` automation route. |
 | `browser_act` | Requires `tab_id`, `expected_page_revision`, and one to 64 typed actions. Actions are click, type, fill, select, scroll, drag, navigate, history movement, reload, close, dialog decision, and staged file upload. No coordinate action exists in Standard mode. A `tab_only` route accepts explicit navigation, history movement, reload, and close only. Managed origin constraints disable history movement because Chrome does not expose its destination for authorization before navigation; use explicit navigation to an allowed URL instead. |
 | `browser_wait` | Requires `tab_id` and one load, URL, text, selector, network-idle, or download condition. `timeout_ms` is at most 120 seconds. A `tab_only` route accepts load and URL conditions only; network-idle and download attribution require the tab-scoped debugger connection available on the `full` route. |
 | `browser_tabs` | Takes an empty object and lists only the current task's tabs, including each tab's `automation_route`. |
@@ -82,7 +82,7 @@ Every existing-page mutation carries its expected page revision. If navigation o
 
 ### Results and errors
 
-The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `request_id`, `ok`, and an `outcome`. A successful MCP tool call returns both readable MCP text content and `structuredContent`. A Core error is returned as an MCP tool error with `isError: true`; when available, its structured content contains `code`, `outcome`, `recovery`, and `details`.
+The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `request_id`, `ok`, and an `outcome`. A successful MCP tool call returns both readable MCP text content and `structuredContent`. Screenshots instead return native MCP image content plus metadata; their base64 bytes are not repeated in text or structured content. A Core error is returned as an MCP tool error with `isError: true`; when available, its structured content contains `code`, `outcome`, `recovery`, and `details`.
 
 | Outcome | Meaning |
 |---|---|

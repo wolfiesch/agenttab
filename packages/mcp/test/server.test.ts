@@ -38,6 +38,15 @@ describe("AgentTab MCP surface", () => {
     expect(JSON.stringify(openTool.inputSchema)).toContain("\"background\":{\"const\":true}");
   });
 
+  test("browser_snapshot advertises bounded screenshot encodings", () => {
+    const snapshotTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_snapshot")!;
+    const schema = JSON.stringify(snapshotTool.inputSchema);
+    expect(schema).toContain('"format":{"enum":["png","jpeg","webp"]');
+    expect(schema).toContain('"max_width"');
+    expect(schema).toContain('"maximum":750000');
+    expect(schema).toContain('"maximum":1000000');
+  });
+
   test("browser_act advertises no press action", () => {
     const actionTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_act")!;
     expect(actionTool.inputSchema).not.toHaveProperty("$defs.press");
@@ -397,6 +406,61 @@ describe("AgentTab MCP surface", () => {
         },
       },
     ]);
+    server.close();
+  });
+
+  test("returns screenshots as native MCP image content without duplicating base64", async () => {
+    const screenshotData = "c2NyZWVuc2hvdA==";
+    const client = {
+      call: async () => ({
+        tab_id: 7,
+        page_revision: 3,
+        mode: "screenshot",
+        data: screenshotData,
+        encoding: "base64",
+        media_type: "image/webp",
+        format: "webp",
+        byte_length: 10,
+      }),
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ clientFactory: async () => client });
+
+    const result = await server.handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "browser_snapshot",
+        arguments: { tab_id: 7, mode: "screenshot", format: "webp" },
+      },
+    }) as Record<string, unknown>;
+
+    expect(result).toEqual({
+      content: [
+        { type: "image", data: screenshotData, mimeType: "image/webp" },
+        {
+          type: "text",
+          text: JSON.stringify({
+            tab_id: 7,
+            page_revision: 3,
+            mode: "screenshot",
+            format: "webp",
+            byte_length: 10,
+            media_type: "image/webp",
+          }, null, 2),
+        },
+      ],
+      structuredContent: {
+        tab_id: 7,
+        page_revision: 3,
+        mode: "screenshot",
+        format: "webp",
+        byte_length: 10,
+        media_type: "image/webp",
+      },
+    });
+    expect(JSON.stringify(result).split(screenshotData)).toHaveLength(2);
     server.close();
   });
 });

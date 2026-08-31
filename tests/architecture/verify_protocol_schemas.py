@@ -83,6 +83,19 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
             mutation=False,
         ),
         core_request(
+            "browser_snapshot",
+            {
+                "tab_id": 1,
+                "mode": "screenshot",
+                "format": "webp",
+                "quality": 72,
+                "max_width": 1280,
+                "max_height": 720,
+                "max_bytes": 500_000,
+            },
+            mutation=False,
+        ),
+        core_request(
             "browser_act",
             {
                 "tab_id": 1,
@@ -141,6 +154,22 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         mutation=True,
     )
     expect_invalid(request_validator, forbidden_viewport, "Standard browser-global action")
+    invalid_screenshot_quality = core_request(
+        "browser_snapshot",
+        {"tab_id": 1, "mode": "screenshot", "format": "png", "quality": 80},
+        mutation=False,
+    )
+    expect_invalid(
+        request_validator,
+        invalid_screenshot_quality,
+        "PNG screenshot quality",
+    )
+    oversized_screenshot = core_request(
+        "browser_snapshot",
+        {"tab_id": 1, "mode": "screenshot", "max_bytes": 750_001},
+        mutation=False,
+    )
+    expect_invalid(request_validator, oversized_screenshot, "screenshot response budget")
     unknown = dict(requests[0], unexpected=True)
     expect_invalid(request_validator, unknown, "unknown request field")
 
@@ -206,7 +235,7 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
             resume_capability="r" * 32,
         )
     )
-    return len(requests) + 8
+    return len(requests) + 10
 
 
 def verify_native_messages(schemas: dict[Path, dict], registry: Registry) -> int:

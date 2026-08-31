@@ -830,6 +830,45 @@ describe("native protocol", () => {
     })).toThrow("placement must be task or new_window");
   });
 
+  test("validates bounded screenshot encoding parameters", () => {
+    const command = {
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "command",
+      request_id: "018f47b8-2f80-7c20-9c77-f8a38c9e621d",
+      task_id: TASK_A,
+      connection_id: NATIVE_CONNECTION_ID,
+      method: "browser_snapshot",
+      params: {
+        tab_id: 42,
+        mode: "screenshot",
+        format: "webp",
+        quality: 72,
+        max_width: 1280,
+        max_height: 720,
+        max_bytes: 500_000,
+      },
+    };
+
+    expect(parseCommand(command).params).toEqual(command.params);
+    expect(() => parseCommand({
+      ...command,
+      params: { ...command.params, format: "png", quality: 72 },
+    })).toThrow("quality requires format jpeg or webp");
+    expect(() => parseCommand({
+      ...command,
+      params: { ...command.params, max_bytes: 750_001 },
+    })).toThrow("max_bytes must be between 1 and 750000");
+    expect(() => parseCommand({
+      ...command,
+      params: { ...command.params, selector: "main", full_page: true },
+    })).toThrow("screenshot cannot combine selector and full_page");
+    expect(() => parseCommand({
+      ...command,
+      params: { tab_id: 42, mode: "html", max_bytes: 1_000_001 },
+    })).toThrow("max_bytes must be between 1 and 1000000");
+  });
+
   test("rejects removed focus and prompt-input action capabilities", () => {
     const command = {
       protocol: "agenttab.native",
@@ -1470,6 +1509,86 @@ describe("page revision monotonicity", () => {
     expect(debuggerCalls).toContain("Page.getLayoutMetrics");
     expect(debuggerCalls.filter((call) => call === "Page.captureScreenshot")).toHaveLength(1);
     expect((await readState()).revisions["61"]).toMatchObject({ floor: 2, current: 2 });
+  });
+
+  test("passes bounded screenshot encoding and scaling controls to Chrome", async () => {
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.getLayoutMetrics") {
+        return {
+          cssVisualViewport: {
+            pageX: 10,
+            pageY: 20,
+            clientWidth: 2000,
+            clientHeight: 1000,
+          },
+        };
+      }
+      if (method === "Page.captureScreenshot") return { data: "AAAA" };
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(62, {
+      mode: "screenshot",
+      format: "jpeg",
+      quality: 68,
+      max_width: 1000,
+      max_height: 800,
+      max_bytes: 10,
+    });
+
+    expect(result).toMatchObject({
+      mode: "screenshot",
+      format: "jpeg",
+      media_type: "image/jpeg",
+      encoding: "base64",
+      data: "AAAA",
+      byte_length: 3,
+    });
+    const capture = debuggerCommands.find((command) => command.method === "Page.captureScreenshot");
+    expect(capture?.params).toMatchObject({
+      format: "jpeg",
+      quality: 68,
+      clip: { x: 10, y: 20, width: 2000, height: 1000, scale: 0.5 },
+    });
+  });
+
+  test("returns a small actionable error before an oversized screenshot reaches Core", async () => {
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.captureScreenshot") return { data: "A".repeat(1_000_004) };
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    await expect(runtime.snapshot(63, { mode: "screenshot" })).rejects.toMatchObject({
+      code: "snapshot_too_large",
+      recovery: expect.stringContaining("jpeg or webp"),
+    });
+  });
+
+  test("truncates JSON-expanding text snapshots to the deliverable Core budget", async () => {
+    scriptResult = "\u0000".repeat(300_000);
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(64, { mode: "html", max_bytes: 300_000 });
+
+    expect(result.truncated).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(result)).length).toBeLessThanOrEqual(1_032_000);
   });
 
   test("rejects text and HTML snapshots when the document changes during capture", async () => {
