@@ -171,10 +171,7 @@ impl StdioNative {
             .get("version")
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        let kind = value
-            .get("kind")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let kind = value.get("kind").and_then(Value::as_str).map(str::to_owned);
         let supports_host_version = value
             .get("supported_versions")
             .and_then(Value::as_array)

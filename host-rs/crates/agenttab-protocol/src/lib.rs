@@ -2227,10 +2227,7 @@ mod tests {
             "supported_features": ["event_ack_v1", "future_feature"]
         }))
         .unwrap();
-        assert_eq!(
-            hello.negotiated_features().unwrap(),
-            vec!["event_ack_v1"]
-        );
+        assert_eq!(hello.negotiated_features().unwrap(), vec!["event_ack_v1"]);
         assert!(matches!(
             NativeHello::parse(json!({
                 "protocol": NATIVE_PROTOCOL,
