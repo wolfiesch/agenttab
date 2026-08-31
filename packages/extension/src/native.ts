@@ -19,6 +19,7 @@ declare const AGENTTAB_NATIVE_HOST: string;
 const NATIVE_HOST = typeof AGENTTAB_NATIVE_HOST === "string" ? AGENTTAB_NATIVE_HOST : "dev.agenttab.host";
 const RECONNECT_ALARM = "agenttab-native-reconnect";
 const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_ALARM_FLOOR_MS = 30_000;
 const NATIVE_URL_MAX_CHARS = 16_384;
 type CommandHandler = (command: NativeDispatchCommand) => Promise<NativeResponse>;
 type StageDiscarder = (nativeTokens: readonly string[]) => Promise<void>;
@@ -39,6 +40,19 @@ interface NativePort {
   onDisconnect: { addListener(listener: () => void): void };
 }
 
+export interface ReconnectTiming {
+  now(): number;
+  schedule(callback: () => void, delayMs: number): () => void;
+}
+
+const DEFAULT_RECONNECT_TIMING: ReconnectTiming = {
+  now: () => Date.now(),
+  schedule: (callback, delayMs) => {
+    const timer = setTimeout(callback, delayMs);
+    return () => clearTimeout(timer);
+  },
+};
+
 function nativeInventory(inventory: Array<Record<string, unknown>>): NativeTab[] {
   return inventory.map((tab) => {
     const url = String(tab.url ?? "");
@@ -57,6 +71,8 @@ export class NativeBridge {
   private port: NativePort | null = null;
   private ready = false;
   private reconnectAttempt = 0;
+  private cancelReconnectTimer: (() => void) | null = null;
+  private reconnectFallbackAtMs: number | null = null;
   private readonly pendingEventAcks = new Map<string, PendingEventAck>();
   private readyReconciliation: ReadyReconciliation | null = null;
   constructor(
@@ -66,10 +82,12 @@ export class NativeBridge {
     private readonly onEventAcknowledged: (event: string, eventId: string) => void = () => undefined,
     private readonly onReady: () => Promise<void> = async () => undefined,
     private readonly discardStages: StageDiscarder = async () => undefined,
+    private readonly reconnectTiming: ReconnectTiming = DEFAULT_RECONNECT_TIMING,
   ) { }
 
   async connect(): Promise<void> {
     if (this.port) return;
+    this.clearReconnectTimer();
     let port: NativePort;
     try {
       port = chrome.runtime.connectNative(NATIVE_HOST);
@@ -80,6 +98,7 @@ export class NativeBridge {
     this.port = port;
     this.ready = false;
     this.readyReconciliation = null;
+    this.ensureReconnectAlarm(RECONNECT_ALARM_FLOOR_MS);
     port.onMessage.addListener((message: unknown) => {
       void this.onMessage(port, message).catch(() => {
         if (this.port === port) port.disconnect();
@@ -198,7 +217,14 @@ export class NativeBridge {
     });
   }
   async reconnectFromAlarm(alarmName: string): Promise<void> {
-    if (alarmName !== RECONNECT_ALARM || this.port) return;
+    if (alarmName !== RECONNECT_ALARM) return;
+    this.reconnectFallbackAtMs = null;
+    this.clearReconnectTimer();
+    if (this.port) {
+      if (this.ready) return;
+      this.port.disconnect();
+      return;
+    }
     await this.connect();
   }
   private async onMessage(port: NativePort, message: unknown): Promise<void> {
@@ -287,6 +313,8 @@ export class NativeBridge {
     }
     this.ready = true;
     this.reconnectAttempt = 0;
+    this.clearReconnectTimer();
+    this.reconnectFallbackAtMs = null;
     await chrome.alarms.clear(RECONNECT_ALARM);
     if (this.port !== port) return;
     if (parsed.state === "paused") {
@@ -323,9 +351,29 @@ export class NativeBridge {
   }
 
   private scheduleReconnect(): void {
+    if (this.port || this.cancelReconnectTimer) return;
     const delay = Math.min(1000 * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS);
     this.reconnectAttempt += 1;
-    chrome.alarms.create(RECONNECT_ALARM, { when: Date.now() + delay });
+    this.ensureReconnectAlarm(delay);
+    if (delay < RECONNECT_ALARM_FLOOR_MS) {
+      this.cancelReconnectTimer = this.reconnectTiming.schedule(() => {
+        this.cancelReconnectTimer = null;
+        if (!this.port) void this.connect();
+      }, delay);
+    }
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.cancelReconnectTimer === null) return;
+    this.cancelReconnectTimer();
+    this.cancelReconnectTimer = null;
+  }
+
+  private ensureReconnectAlarm(delayMs: number): void {
+    const now = this.reconnectTiming.now();
+    if (this.reconnectFallbackAtMs !== null && this.reconnectFallbackAtMs > now) return;
+    this.reconnectFallbackAtMs = now + Math.max(delayMs, RECONNECT_ALARM_FLOOR_MS);
+    chrome.alarms.create(RECONNECT_ALARM, { when: this.reconnectFallbackAtMs });
   }
 }
 

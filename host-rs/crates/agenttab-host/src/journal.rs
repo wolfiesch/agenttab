@@ -69,6 +69,12 @@ pub enum JournalError {
     NativeTaskCleanup(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryReconciliation {
+    Applied,
+    IgnoredStale,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskLease {
     pub task_id: Uuid,
@@ -411,7 +417,10 @@ impl Journal {
         Ok(())
     }
 
-    pub fn reconcile_inventory(&self, inventory: &[NativeTab]) -> Result<(), JournalError> {
+    pub fn reconcile_inventory(
+        &self,
+        inventory: &[NativeTab],
+    ) -> Result<InventoryReconciliation, JournalError> {
         let now = now_ms();
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -458,9 +467,9 @@ impl Journal {
                 )
                 .optional()?;
             if floor.is_some_and(|floor| page_revision < floor) {
-                return Err(JournalError::InvalidInventory(
-                    "native inventory regressed a persisted page revision".into(),
-                ));
+                // Inventory is an authoritative full snapshot. Ignore all of an older
+                // snapshot rather than partially applying ownership or URL regressions.
+                return Ok(InventoryReconciliation::IgnoredStale);
             }
             *counts.entry(task_id).or_insert(0) += 1;
             owned.push((
@@ -508,7 +517,7 @@ impl Journal {
             )?;
         }
         transaction.commit()?;
-        Ok(())
+        Ok(InventoryReconciliation::Applied)
     }
 
     pub fn update_task_tab_count(&self, task_id: Uuid, tab_count: u64) -> Result<(), JournalError> {
@@ -1974,7 +1983,7 @@ mod tests {
         ));
     }
     #[test]
-    fn ownership_and_revision_floor_reject_stale_task_operations_and_commits() {
+    fn ownership_and_revision_floor_reject_stale_operations_but_ignore_stale_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_journal(&temp);
         let task = journal.create_task(None).unwrap();
@@ -2018,10 +2027,16 @@ mod tests {
             journal.consume_staged_commit(task.task_id, &token.staged_token, Uuid::now_v7()),
             Err(JournalError::StaleStagedCommit)
         ));
-        assert!(matches!(
-            journal.reconcile_inventory(&[owned_tab(task.task_id, 9)]),
-            Err(JournalError::InvalidInventory(_))
-        ));
+        assert_eq!(
+            journal
+                .reconcile_inventory(&[owned_tab(task.task_id, 9)])
+                .unwrap(),
+            InventoryReconciliation::IgnoredStale,
+        );
+        assert_eq!(
+            journal.verify_task_tab(task.task_id, 7, Some(10)).unwrap(),
+            10
+        );
     }
 
     #[test]

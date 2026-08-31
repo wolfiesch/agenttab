@@ -20,6 +20,7 @@ import {
   restrictedOriginError,
 } from "./routes";
 import { MutationScheduler, NotStartedError } from "./scheduler";
+import { IdempotentStartup, StartupOperationQueue } from "./startup";
 import { mutateState, readState } from "./storage";
 import { isRecord } from "./type-guards";
 
@@ -508,40 +509,56 @@ nativeBridge = new NativeBridge(
   },
 );
 
-let startup: Promise<void> | null = null;
-function start(): Promise<void> {
-  if (startup) return startup;
-  startup = (async () => {
-    const state = await readState();
-    browser.restoreDebuggerCandidates(state.automationCleanup.tabIds);
-    automationCleanupPending =
-      automationCleanupPending ||
-      state.automationCleanup.pending ||
-      state.automationCleanup.tabIds.length > 0;
-    automationCleanupEpoch = Math.max(
-      automationCleanupEpoch,
-      state.automationCleanup.epoch,
-    );
-    automationRevocationGeneration = Math.max(
-      automationRevocationGeneration,
-      state.automationCleanup.generation,
-    );
-    scheduler.setInitialPaused(state.paused || state.handoff.active);
-    if (!(await automationEnabled())) scheduler.revokePermissions();
-    const revokedTabIds = await ownership.reconcile();
-    await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
-    await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
-    await browser.expireCommits();
-    await handoff.restore();
-    await nativeBridge?.connect();
-  })();
-  void startup.then(() => {
-    if (!automationCleanupPending) return;
+async function initializeRuntime(): Promise<void> {
+  const state = await readState();
+  browser.restoreDebuggerCandidates(state.automationCleanup.tabIds);
+  automationCleanupPending =
+    automationCleanupPending ||
+    state.automationCleanup.pending ||
+    state.automationCleanup.tabIds.length > 0;
+  automationCleanupEpoch = Math.max(
+    automationCleanupEpoch,
+    state.automationCleanup.epoch,
+  );
+  automationRevocationGeneration = Math.max(
+    automationRevocationGeneration,
+    state.automationCleanup.generation,
+  );
+  scheduler.setInitialPaused(state.paused || state.handoff.active);
+  if (await automationEnabled()) {
+    scheduler.restorePermissions();
+  } else {
+    scheduler.revokePermissions();
+  }
+  const revokedTabIds = await ownership.reconcile();
+  await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
+  await Promise.all(revokedTabIds.map((tabId) => browser.detach(tabId)));
+  await browser.expireCommits();
+  await handoff.restore();
+  await nativeBridge?.connect();
+  if (automationCleanupPending) {
     void queueAutomationCleanup().catch((error) => {
       console.warn("AgentTab restored debugger cleanup failed; retry scheduled", error);
     });
-  });
-  return startup;
+  }
+}
+
+const startup = new IdempotentStartup(initializeRuntime);
+const startupOperations = new StartupOperationQueue(
+  startup,
+  (error) => {
+    console.warn("AgentTab startup failed; the next event will retry initialization", error);
+  },
+  (error) => {
+    console.warn("AgentTab background operation failed", error);
+  },
+);
+function start(): Promise<void> {
+  return startup.start();
+}
+
+function runAfterStart(operation: () => void | Promise<void> = () => undefined): void {
+  startupOperations.enqueue(operation);
 }
 
 async function reconcileOwnership(): Promise<void> {
@@ -551,17 +568,17 @@ async function reconcileOwnership(): Promise<void> {
 }
 
 chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) => {
-  void start().then(() => ownership.adoptOwnedChild(tab));
+  runAfterStart(() => ownership.adoptOwnedChild(tab));
 });
 chrome.tabs.onRemoved.addListener((removedTabId: number) => {
-  void start().then(async () => {
+  runAfterStart(async () => {
     await handoff.cancelForTab(removedTabId);
     await browser.detach(removedTabId);
     await ownership.revoke(removedTabId, "tab_removed");
   });
 });
 chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
-  void start().then(async () => {
+  runAfterStart(async () => {
     const owner = await ownership.taskIdForTab(updatedTabId);
     if (!owner) return;
     if (changeInfo.status === "loading") {
@@ -580,11 +597,11 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
     }
   });
 });
-chrome.tabs.onAttached.addListener(() => void start().then(reconcileOwnership));
-chrome.tabs.onDetached.addListener(() => void start().then(reconcileOwnership));
-chrome.tabGroups.onRemoved.addListener(() => void start().then(reconcileOwnership));
-chrome.runtime.onStartup.addListener(() => void start());
-chrome.runtime.onInstalled.addListener(() => void start());
+chrome.tabs.onAttached.addListener(() => runAfterStart(reconcileOwnership));
+chrome.tabs.onDetached.addListener(() => runAfterStart(reconcileOwnership));
+chrome.tabGroups.onRemoved.addListener(() => runAfterStart(reconcileOwnership));
+chrome.runtime.onStartup.addListener(() => runAfterStart());
+chrome.runtime.onInstalled.addListener(() => runAfterStart());
 chrome.permissions.onRemoved.addListener((permissions) => {
   if (!permissions.permissions?.includes("scripting")) return;
   scheduler.revokePermissions();
@@ -601,7 +618,7 @@ chrome.permissions.onRemoved.addListener((permissions) => {
 
 chrome.permissions.onAdded.addListener((permissions) => {
   if (!permissions.permissions?.includes("scripting")) return;
-  void start().then(async () => {
+  runAfterStart(async () => {
     if (automationCleanupPending) {
       await queueAutomationCleanup().catch((error) => {
         console.warn("AgentTab debugger cleanup after permission restoration failed", error);
@@ -612,7 +629,7 @@ chrome.permissions.onAdded.addListener((permissions) => {
   });
 });
 chrome.alarms.onAlarm.addListener((alarm: { name: string }) => {
-  void start().then(async () => {
+  runAfterStart(async () => {
     if (alarm.name === RECONNECT_ALARM) await nativeBridge?.reconnectFromAlarm(alarm.name);
     if (alarm.name === HANDOFF_ALARM) await handoff.finish(false);
     if (alarm.name === AUTOMATION_CLEANUP_ALARM) {
@@ -732,4 +749,4 @@ chrome.runtime.onMessage.addListener((
   return true;
 });
 
-void start();
+runAfterStart();
