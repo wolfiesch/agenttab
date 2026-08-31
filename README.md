@@ -95,8 +95,8 @@ The source maps host artifacts for macOS on Apple Silicon and Intel, Linux on AR
 | `packages/extension/` | Canonical browser-extension source, tests, and generated `dist/` output |
 | `packages/installer/` | Cross-platform installer and local client configuration |
 | `packages/mcp/`, `packages/omp/` | Agent adapters and tool rendering |
+| `packages/gpt-control-driver/` | Focus-safe external browser driver for GPT-Control |
 | `packages/sdk-python/`, `packages/sdk-typescript/` | Client SDKs |
-| `host-rs/` | Rust native host and protocol crates |
 | `schemas/` | Versioned native and Core RPC contracts |
 | `config/` | Frozen product, migration, and release identity |
 | `tests/architecture/` | Cross-component safety and architecture gates |

@@ -15,6 +15,7 @@ export type NativeMethod =
   | "browser_handoff"
   | "browser_commit"
   | "browser_developer"
+  | "agenttab.close"
   | "commit_review_bind"
   | "commit_review_abandon";
 
@@ -27,6 +28,7 @@ const CORE_METHODS: Record<NativeMethod, true> = {
   browser_handoff: true,
   browser_commit: true,
   browser_developer: true,
+  "agenttab.close": true,
   commit_review_bind: true,
   commit_review_abandon: true,
 };
@@ -294,8 +296,14 @@ function assertAction(value: unknown): Record<string, unknown> {
       }
       return action;
     case "upload_file":
-      assertExactObject(action, ["kind", "ref", "files"], [], "upload_file action");
-      assertBoundedString(action.ref, "upload_file.ref", 1, 256);
+      assertExactObject(action, ["kind", "files"], ["ref", "selector"], "upload_file action");
+      if ((action.ref === undefined) === (action.selector === undefined)) {
+        commandError("upload_file requires exactly one of ref or selector");
+      }
+      if (action.ref !== undefined) assertBoundedString(action.ref, "upload_file.ref", 1, 256);
+      if (action.selector !== undefined) {
+        assertBoundedString(action.selector, "upload_file.selector", 1, 2_048);
+      }
       if (!Array.isArray(action.files) || action.files.length === 0 || action.files.length > 32 ||
         !action.files.every((file) => isBoundedString(file, 1, 16_384))) {
         commandError("upload_file.files must contain between 1 and 32 file paths");
@@ -320,6 +328,7 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
       "max_nodes",
       "selector",
       "max_bytes",
+      "match",
       "full_page",
       "format",
       "quality",
@@ -337,8 +346,14 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
     return params;
   }
   if (params.mode === "text" || params.mode === "html") {
-    assertExactObject(params, ["tab_id", "mode"], ["selector", "max_bytes"], "text or html snapshot parameters");
-    if (params.selector !== undefined) assertBoundedString(params.selector, "selector", 1, 65_536);
+    assertExactObject(params, ["tab_id", "mode"], ["selector", "match", "max_bytes"], "text or html snapshot parameters");
+    if (params.selector !== undefined) assertBoundedString(params.selector, "selector", 1, 2_048);
+    if (params.match !== undefined && params.match !== "first" && params.match !== "last") {
+      commandError("match must be first or last");
+    }
+    if (params.match !== undefined && params.selector === undefined) {
+      commandError("match requires selector");
+    }
     if (params.max_bytes !== undefined && !isIntegerInRange(params.max_bytes, 1, SNAPSHOT_TEXT_MAX_BYTES)) {
       commandError(`max_bytes must be between 1 and ${SNAPSHOT_TEXT_MAX_BYTES}`);
     }
@@ -492,6 +507,8 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
       assertBoundedString(params.native_token, "native_token", 16, 256);
       return params;
     }
+    case "agenttab.close":
+      return assertExactObject(value, [], [], "agenttab.close parameters");
     case "browser_developer":
       return assertDeveloperParams(value);
     case "commit_review_bind":

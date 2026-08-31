@@ -318,6 +318,8 @@ jobs:
           npm pack --pack-destination "$RELEASE_INPUT" ./packages/mcp
           npm pack --pack-destination "$RELEASE_INPUT" ./packages/omp
           mv "$RELEASE_INPUT/getagenttab-omp-${RELEASE_VERSION}.tgz" "$RELEASE_INPUT/agenttab-omp-${RELEASE_VERSION}.tgz"
+          npm pack --pack-destination "$RELEASE_INPUT" ./packages/gpt-control-driver
+          mv "$RELEASE_INPUT/getagenttab-gpt-control-driver-${RELEASE_VERSION}.tgz" "$RELEASE_INPUT/agenttab-gpt-control-driver-${RELEASE_VERSION}.tgz"
           npm pack --pack-destination "$RELEASE_INPUT" ./packages/installer
           python3 -m pip install build==1.3.0
           python3 -m build --wheel --sdist --outdir "$RELEASE_INPUT" packages/sdk-python
@@ -555,6 +557,8 @@ jobs:
             archive: agenttab-mcp
           - package: '@getagenttab/omp'
             archive: agenttab-omp
+          - package: '@getagenttab/gpt-control-driver'
+            archive: agenttab-gpt-control-driver
           - package: agenttab
             archive: agenttab
     if: ${{ needs.prepare.outputs.promote == 'true' }}

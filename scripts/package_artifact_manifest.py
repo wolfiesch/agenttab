@@ -58,6 +58,7 @@ def expected_assets(version: str, python_version: str) -> list[str]:
         f"agenttab-sdk-{version}.tgz",
         f"agenttab-mcp-{version}.tgz",
         f"agenttab-omp-{version}.tgz",
+        f"agenttab-gpt-control-driver-{version}.tgz",
         f"agenttab-{version}.tgz",
         f"agenttab-{python_version}-py3-none-any.whl",
         f"agenttab-{python_version}.tar.gz",

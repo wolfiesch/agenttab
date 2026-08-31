@@ -30,7 +30,7 @@ export type BrowserOpenParams =
 
 export type BrowserSnapshotParams =
   | { tab_id: number; mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number }
-  | { tab_id: number; mode: "text" | "html"; selector?: string; max_bytes?: number }
+  | { tab_id: number; mode: "text" | "html"; selector?: string; match?: "first" | "last"; max_bytes?: number }
   | {
     tab_id: number;
     mode: "screenshot";
@@ -53,7 +53,7 @@ export type BrowserAction =
   | { kind: "go_back" | "go_forward" | "close" }
   | { kind: "reload"; bypass_cache?: boolean }
   | { kind: "dialog"; decision: "accept" | "dismiss" }
-  | { kind: "upload_file"; ref: string; files: string[] };
+  | ({ kind: "upload_file"; files: string[] } & ({ ref: string; selector?: never } | { ref?: never; selector: string }));
 
 export interface BrowserActParams {
   tab_id: number;
@@ -100,6 +100,7 @@ export interface MethodParams {
   browser_commit: BrowserCommitParams;
   browser_developer: BrowserDeveloperParams;
   "agenttab.status": Record<string, never>;
+  "agenttab.close": Record<string, never>;
 }
 
 export type RpcMethod = keyof MethodParams;
@@ -194,6 +195,7 @@ export interface ResumeCapabilityStore {
   save(capability: string): Promise<void>;
   prepareReplacement(currentCapability: string, replacementCapability: string): Promise<void>;
   activateReplacement(replacementCapability: string): Promise<void>;
+  clear(): Promise<void>;
 }
 
 interface StoredResumeCapability {
@@ -352,6 +354,19 @@ export function createResumeCapabilityStore(
         throw new Error("AgentTab resume capability store does not contain the confirmed replacement");
       }
       await saveStoredCapability({ schemaVersion: 1, resumeCapability: replacementCapability });
+    },
+    async clear(): Promise<void> {
+      const exists = await prepareCapabilityDirectory(directory, false);
+      if (!exists) return;
+      await rm(path, { force: true });
+      if (platform() !== "win32") {
+        const directoryHandle = await open(directory, "r");
+        try {
+          await directoryHandle.sync();
+        } finally {
+          await directoryHandle.close();
+        }
+      }
     },
   };
 }
@@ -796,6 +811,16 @@ export class AgentTabClient {
     const response = await this.request<M, T>(method, params, options);
     if (!response.ok) throw new AgentTabError(response);
     return response.result as T;
+  }
+
+  async closeTask(): Promise<void> {
+    if (this.#closed) return;
+    try {
+      await this.call("agenttab.close", {});
+      await this.#capabilityStore?.clear();
+    } finally {
+      this.close();
+    }
   }
 
   close(): void {

@@ -10,7 +10,8 @@
     "mcp": "agenttab-mcp",
     "typescript": "@getagenttab/sdk",
     "python": "agenttab",
-    "omp": "@getagenttab/omp"
+    "omp": "@getagenttab/omp",
+    "gptControlDriver": "@getagenttab/gpt-control-driver"
   },
   "environmentPrefix": "AGENTTAB_",
   "manifestName": "AgentTab",

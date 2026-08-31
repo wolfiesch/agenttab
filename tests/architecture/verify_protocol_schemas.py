@@ -76,10 +76,21 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
 
     requests = [
         core_request("agenttab.status", {}, mutation=False),
+        core_request("agenttab.close", {}, mutation=False),
         core_request("browser_open", {"mode": "create", "background": True}, mutation=True),
         core_request(
             "browser_snapshot",
             {"tab_id": 1, "mode": "accessibility", "max_nodes": 100},
+            mutation=False,
+        ),
+        core_request(
+            "browser_snapshot",
+            {
+                "tab_id": 1,
+                "mode": "html",
+                "selector": "[data-message-author-role='assistant']",
+                "match": "last",
+            },
             mutation=False,
         ),
         core_request(
@@ -101,6 +112,21 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
                 "tab_id": 1,
                 "expected_page_revision": 2,
                 "actions": [{"kind": "click", "ref": "e7"}],
+            },
+            mutation=True,
+        ),
+        core_request(
+            "browser_act",
+            {
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "actions": [
+                    {
+                        "kind": "upload_file",
+                        "selector": "input[type='file']",
+                        "files": ["/tmp/image.png"],
+                    }
+                ],
             },
             mutation=True,
         ),
@@ -170,6 +196,29 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         mutation=False,
     )
     expect_invalid(request_validator, oversized_screenshot, "screenshot response budget")
+    invalid_snapshot_match = core_request(
+        "browser_snapshot",
+        {"tab_id": 1, "mode": "html", "match": "last"},
+        mutation=False,
+    )
+    expect_invalid(request_validator, invalid_snapshot_match, "snapshot match without selector")
+    ambiguous_upload_target = core_request(
+        "browser_act",
+        {
+            "tab_id": 1,
+            "expected_page_revision": 2,
+            "actions": [
+                {
+                    "kind": "upload_file",
+                    "ref": "e7",
+                    "selector": "input[type='file']",
+                    "files": ["/tmp/image.png"],
+                }
+            ],
+        },
+        mutation=True,
+    )
+    expect_invalid(request_validator, ambiguous_upload_target, "ambiguous upload target")
     unknown = dict(requests[0], unexpected=True)
     expect_invalid(request_validator, unknown, "unknown request field")
 
