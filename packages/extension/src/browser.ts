@@ -885,7 +885,9 @@ export class StandardBrowserRuntime {
       target.form_method,
       ...(Array.isArray(target.associated_labels) ? target.associated_labels : []),
       ...(Array.isArray(target.accessible_labels) ? target.accessible_labels : []),
-      target.requested_value,
+      // Classify the page-owned control semantics, never caller-entered text or values.
+      // The selected option label is resolved from the page and can describe an
+      // immediately consequential selection even when its submitted value is opaque.
       target.requested_option_label,
     ].filter((value): value is string => typeof value === "string").join(" ").replace(/\s+/g, " ").trim();
     if (
