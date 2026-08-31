@@ -28,7 +28,7 @@ A task workspace is visible in Chrome. Task-owned tabs are grouped for display, 
 
 **Your Turn** is the human-only input boundary. AgentTab MUST hand control to the user for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other input that automation must not observe or synthesize.
 
-While any Your Turn handoff is active, AgentTab MUST enforce a global observation blackout across every task and client. The extension and host each fail closed. AgentTab MUST NOT capture human keystrokes. Handoff clears only after its declared completion condition or explicit Done, capture scrubbing, and host acknowledgement.
+While Your Turn is active, AgentTab MUST enforce an observation and mutation blackout for its exact task/tab binding across every client. Other tabs MAY continue. The extension MUST detach the handed-off tab before focus, and the host MUST fail closed globally only while the extension's durable binding is unavailable during reconciliation. AgentTab MUST NOT capture human keystrokes. Handoff clears only after its declared completion condition or explicit Done, tab capture scrubbing, and host acknowledgement.
 
 ### Commit
 
@@ -108,15 +108,15 @@ Ownership can be granted only by:
 2. a child tab with an owned `openerTabId`
 3. explicit `browser_open({ mode: "adopt_active" })`
 
-Adoption MUST be visible. It groups the active tab and shows a brief non-blocking indicator. If grouping fails, creation or adoption rolls back with `outcome: "not_started"`. AgentTab MUST NOT retain invisible ownership with `groupId: null`.
+Adoption MUST show a brief non-blocking indicator and SHOULD group the active tab. Grouping is a best-effort presentation step: a failure MUST NOT roll back creation or adoption, and `groupId: null` remains valid authoritative ownership state.
 
-Dedicated-window eligibility MUST be derived from the persisted task record, never from a caller-supplied ownership claim. `placement: "new_window"` MUST fail after the task owns a tab, MUST reject foreground creation, and MUST roll back the created tab if visible grouping fails. Standard mode MUST NOT expose generic focus, resize, move, state-change, or close-window operations. `browser_handoff` remains the sole normal focus transition.
+Dedicated-window eligibility MUST be derived from the persisted task record, never from a caller-supplied ownership claim. `placement: "new_window"` MUST fail after the task owns a tab and MUST reject foreground creation. A cosmetic grouping failure does not revoke the created tab. Standard mode MUST NOT expose generic focus, resize, move, state-change, or close-window operations. `browser_handoff` remains the sole normal focus transition.
 
-Tab groups are display-only. Manual grouping never grants ownership. Ungrouping or moving a tab out of its task group immediately revokes ownership, cancels queued mutations, and notifies the host.
+Tab groups are display-only. Manual grouping never grants, transfers, or revokes ownership. The persisted task ledger remains authoritative when a tab is ungrouped or moved; closing the tab or task revokes it and cancels queued mutations.
 
-Each tab has one serialized writer queue. Separate-tab mutations may overlap. Reads may overlap only when they cannot observe half-applied mutation state. Ordered task mutations preserve delivery order. Browser-global state uses a separate automatic lock. Agent-facing global lease operations do not exist.
+Each tab has one serialized writer queue. Separate-tab mutations may overlap even within one task. Reads may overlap only when they cannot observe half-applied mutation state. Task lifecycle operations preserve per-task delivery order. Explicit global Pause remains a barrier; routine browser work has no browser-global lock. Agent-facing global lease operations do not exist.
 
-Task cleanup persists deletion before calling `chrome.tabs.remove` so `tabs.onRemoved` cannot recreate an empty task record.
+Task cleanup installs a durable tombstone, rejects queued task lifecycle work, and persists deletion before calling `chrome.tabs.remove` so queued opens or `tabs.onRemoved` cannot recreate an empty task record. Durable numeric tab bindings also carry a browser-session epoch mirrored in `chrome.storage.session`; a mismatch clears every old tab-bound capability before startup authorization.
 
 ## Page revisions and references
 

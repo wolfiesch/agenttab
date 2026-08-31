@@ -35,7 +35,7 @@ Standard mode has no TCP listener or bearer token. The advanced `agenttab proxy 
 
 The implemented lifecycle states are `starting`, `reconciling`, `ready`, `paused`, and terminal. Browser work is admitted only in `ready`. In `starting` or `reconciling` it returns `runtime_not_ready`; in `paused` it returns `automation_paused`; in terminal state it returns a protocol-recovery error.
 
-Pause admission is also enforced by the extension scheduler. It closes new admission, waits for in-flight work, persists pause state, and rejects queued work before dispatch. Handoff is a global write barrier and causes a host-side blackout check both before and after request admission.
+Pause admission is also enforced by the extension scheduler. It closes new admission, waits for in-flight work, persists pause state, and rejects queued work before dispatch. Handoff instead acquires the declared tab's ordered path and causes a host-side task/tab blackout check after request admission. Staged Commit tokens are resolved through SQLite to that same tab path before the per-connection queue is issued. Unrelated tabs and tasks continue; an unreconciled extension disconnect temporarily fails closed globally.
 
 ## Durable state
 

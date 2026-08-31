@@ -129,14 +129,14 @@ impl StdioNative {
                 Ok(None) => {
                     self.reconcile_extension_disconnect("native messaging stream closed");
                     self.lifecycle.extension_disconnected();
-                    self.handoff.restore(true);
+                    self.handoff.block_all_until_reconciled();
                     self.fail_all(NativeError::Disconnected);
                     return Ok(());
                 }
                 Err(error) => {
                     self.reconcile_extension_disconnect("native messaging stream failed");
                     self.lifecycle.terminal(error.to_string());
-                    self.handoff.restore(true);
+                    self.handoff.block_all_until_reconciled();
                     self.fail_all(NativeError::Protocol(error.to_string()));
                     return Err(error);
                 }
@@ -144,7 +144,7 @@ impl StdioNative {
             if let Err(error) = self.handle_inbound(value) {
                 self.reconcile_extension_disconnect("native protocol failed");
                 self.lifecycle.terminal(error.to_string());
-                self.handoff.restore(true);
+                self.handoff.block_all_until_reconciled();
                 self.fail_all(NativeError::Protocol(error.to_string()));
                 return Err(error);
             }
@@ -184,7 +184,7 @@ impl StdioNative {
                     sink.reconcile(&hello.inventory, &hello.staged_commits, &hello.handoff)
                         .map_err(ProtocolError::InvalidNativeEvent)?;
                 }
-                self.handoff.restore(hello.handoff.active);
+                self.handoff.restore(&hello.handoff);
                 self.disconnected.store(false, Ordering::Release);
                 self.lifecycle.complete_reconciliation(hello.paused);
                 let state = if hello.paused {
@@ -244,7 +244,7 @@ impl StdioNative {
                         self.lifecycle.set_paused(event.paused);
                     }
                     NativeEventPayload::Handoff(handoff) => {
-                        self.handoff.restore(handoff.active);
+                        self.handoff.restore(&handoff);
                         if !handoff.active {
                             if !applied {
                                 return Err(ProtocolError::InvalidNativeEvent(
@@ -261,7 +261,7 @@ impl StdioNative {
                         }
                     }
                     NativeEventPayload::ExtensionDisconnected(_) => {
-                        self.handoff.restore(true);
+                        self.handoff.block_all_until_reconciled();
                         self.lifecycle.extension_disconnected();
                         self.fail_all(NativeError::Disconnected);
                     }
@@ -278,7 +278,7 @@ impl StdioNative {
             Some("disconnect_recovery") => {
                 let _ = NativeDisconnectRecovery::parse(value)?;
                 self.disconnected.store(true, Ordering::Release);
-                self.handoff.restore(true);
+                self.handoff.block_all_until_reconciled();
                 self.lifecycle.begin_reconciliation();
                 self.fail_all(NativeError::Disconnected);
             }
@@ -332,7 +332,7 @@ impl StdioNative {
             self.reconcile_extension_disconnect("native event acknowledgement failed");
             self.disconnected.store(true, Ordering::Release);
             self.lifecycle.extension_disconnected();
-            self.handoff.restore(true);
+            self.handoff.block_all_until_reconciled();
             self.fail_all(NativeError::Disconnected);
         }
     }
@@ -567,7 +567,7 @@ mod tests {
         lifecycle.begin_reconciliation();
         lifecycle.complete_reconciliation(false);
         let handoff = Arc::new(HandoffState::default());
-        handoff.restore(true);
+        handoff.block_all_until_reconciled();
         let output = SharedWriter::default();
         let native = StdioNative::new(output.clone(), lifecycle, handoff.clone());
         let sink = Arc::new(DurableHandoffSink::default());

@@ -432,11 +432,7 @@ impl Journal {
             let Some(task_id) = tab.task_id else {
                 continue;
             };
-            let Some(group_id) = tab.group_id else {
-                return Err(JournalError::InvalidInventory(
-                    "task-owned tab has no visible group".into(),
-                ));
-            };
+            let group_id = tab.group_id.unwrap_or(-1);
             if tab.tab_id == 0 || tab.window_id == 0 || tab.url.is_empty() {
                 return Err(JournalError::InvalidInventory(
                     "task-owned tab lacks a valid tab, window, or URL".into(),
@@ -856,6 +852,24 @@ impl Journal {
             expires_at_ms,
             upload_paths: serde_json::from_str(&upload_paths_json)?,
         }))
+    }
+
+    pub fn staged_commit_tab_id(
+        &self,
+        task_id: Uuid,
+        host_token: &str,
+    ) -> Result<Option<u64>, JournalError> {
+        let token_hash = capability_hash(host_token);
+        let connection = self.connection.lock();
+        let tab_id: Option<i64> = connection
+            .query_row(
+                "SELECT tab_id FROM staged_commits
+                 WHERE token_hash = ?1 AND task_id = ?2",
+                params![token_hash.as_slice(), task_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tab_id.map(sqlite_to_u64).transpose()
     }
 
     pub fn approve_popup_staged_commit(
@@ -1308,15 +1322,24 @@ impl Journal {
     }
 
     pub fn handoff_active(&self) -> Result<bool, JournalError> {
+        Ok(self.handoff_binding()?.is_some())
+    }
+
+    pub fn handoff_binding(&self) -> Result<Option<(Uuid, u64)>, JournalError> {
         let connection = self.connection.lock();
-        let active: Option<i64> = connection
+        let binding: Option<(i64, Option<String>, Option<i64>)> = connection
             .query_row(
-                "SELECT active FROM handoff_state WHERE singleton = 1",
+                "SELECT active, task_id, tab_id FROM handoff_state WHERE singleton = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        Ok(active == Some(1))
+        match binding {
+            Some((1, Some(task_id), Some(tab_id))) => {
+                Ok(Some((Uuid::parse_str(&task_id)?, sqlite_to_u64(tab_id)?)))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -1723,6 +1746,18 @@ mod tests {
         let token = journal
             .store_staged_commit(&staged, std::slice::from_ref(&upload_path))
             .unwrap();
+        assert_eq!(
+            journal
+                .staged_commit_tab_id(task.task_id, &token.staged_token)
+                .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            journal
+                .staged_commit_tab_id(other.task_id, &token.staged_token)
+                .unwrap(),
+            None
+        );
         assert!(matches!(
             journal.consume_staged_commit(other.task_id, &token.staged_token, Uuid::now_v7()),
             Err(JournalError::InvalidStagedToken)
@@ -1743,6 +1778,12 @@ mod tests {
         };
         assert_eq!(consumed.native_token, staged.native_token);
         assert_eq!(consumed.upload_paths, vec![upload_path.clone()]);
+        assert_eq!(
+            journal
+                .staged_commit_tab_id(task.task_id, &token.staged_token)
+                .unwrap(),
+            Some(7)
+        );
         assert!(matches!(
             journal.consume_staged_commit(task.task_id, &token.staged_token, Uuid::now_v7()),
             Err(JournalError::InvalidStagedToken)
@@ -1750,6 +1791,12 @@ mod tests {
         journal
             .finish_staged_commit(&consumed.native_token)
             .unwrap();
+        assert_eq!(
+            journal
+                .staged_commit_tab_id(task.task_id, &token.staged_token)
+                .unwrap(),
+            None
+        );
         assert!(journal
             .reconcile_staged_commits(std::slice::from_ref(&staged))
             .unwrap()
@@ -2051,6 +2098,10 @@ mod tests {
         };
         journal.reconcile_handoff(&active).unwrap();
         assert!(journal.handoff_active().unwrap());
+        assert_eq!(
+            journal.handoff_binding().unwrap(),
+            Some((active.task_id.unwrap(), 7))
+        );
 
         let clear = NativeHandoff {
             active: false,
@@ -2078,5 +2129,18 @@ mod tests {
         reopened
             .apply_handoff_event(&clear, Some("handoff-clear-0001"))
             .unwrap();
+    }
+
+    #[test]
+    fn task_ownership_survives_missing_cosmetic_group_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let task = journal.create_task(None).unwrap();
+        let mut tab = owned_tab(task.task_id, 3);
+        tab.group_id = None;
+
+        journal.reconcile_inventory(&[tab]).unwrap();
+
+        assert!(journal.verify_task_tab(task.task_id, 7, Some(3)).is_ok());
     }
 }

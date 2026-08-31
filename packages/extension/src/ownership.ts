@@ -5,6 +5,10 @@ import { RevisionTracker } from "./revisions";
 
 const GROUP_COLORS: readonly TaskColor[] = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
 const NO_GROUP = -1;
+const OWNERSHIP_REVOKED = {
+  code: "ownership_revoked",
+  message: "Tab ownership changed before this operation was dispatched",
+};
 
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 
@@ -36,7 +40,9 @@ function groupTitle(task: TaskRecord, developerMode: boolean): string {
 }
 
 export class OwnershipLedger {
-  private transitionTail: Promise<unknown> = Promise.resolve();
+  private globalTransitionTail: Promise<unknown> = Promise.resolve();
+  private readonly actorTransitionTails = new Map<string, Promise<unknown>>();
+  private readonly cosmeticTransitionTails = new Map<string, Promise<unknown>>();
   private inventoryTail: Promise<void> = Promise.resolve();
 
   constructor(
@@ -46,15 +52,19 @@ export class OwnershipLedger {
   ) { }
 
   reconcile(): Promise<number[]> {
-    return this.serialize(() => this.reconcileNow());
+    return this.serializeGlobal(() => this.reconcileNow());
   }
 
   assertOwned(taskId: string, tabId: number): Promise<TaskRecord> {
-    return this.serialize(() => this.assertOwnedNow(taskId, tabId));
+    return this.serializeActors(
+      [this.taskActor(taskId), this.tabActor(tabId)],
+      () => this.assertOwnedNow(taskId, tabId),
+    );
   }
 
-  assertOwnedTab(tabId: number): Promise<TaskRecord> {
-    return this.serialize(async () => {
+  async assertOwnedTab(tabId: number): Promise<TaskRecord> {
+    const taskId = await this.taskIdForTab(tabId);
+    return this.serializeActors(this.owningTabActors(tabId, taskId), async () => {
       const state = await readState();
       const task = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
       if (!task) {
@@ -67,33 +77,83 @@ export class OwnershipLedger {
   }
 
   open(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.serialize(() => this.openNow(taskId, params));
+    return this.serializeActor(this.taskActor(taskId), () => this.openNow(taskId, params));
   }
 
   adoptActive(taskId: string): Promise<Record<string, unknown>> {
-    return this.serialize(() => this.adoptActiveNow(taskId));
+    return this.serializeActor(this.taskActor(taskId), () => this.adoptActiveNow(taskId));
   }
 
-  adoptOwnedChild(tab: TabLike, sourceTabId?: number): Promise<void> {
-    return this.serialize(() => this.adoptOwnedChildNow(tab, sourceTabId));
+  async adoptOwnedChild(tab: TabLike, sourceTabId?: number): Promise<void> {
+    const childTabId = Number.isInteger(tab.id) ? tab.id as number : -1;
+    const openerTabId = Number.isInteger(sourceTabId)
+      ? sourceTabId as number
+      : Number.isInteger(tab.openerTabId)
+        ? tab.openerTabId as number
+        : null;
+    const taskId = openerTabId === null ? null : await this.taskIdForTab(openerTabId);
+    const actors = [this.tabActor(childTabId)];
+    if (openerTabId !== null) actors.push(this.tabActor(openerTabId));
+    if (taskId !== null) actors.push(this.taskActor(taskId));
+    return this.serializeActors(
+      actors,
+      () => this.adoptOwnedChildNow(tab, sourceTabId),
+    );
   }
 
-  revokeIfMoved(tabId: number): Promise<boolean> {
-    return this.serialize(() => this.revokeIfMovedNow(tabId));
+  async revokeIfMoved(tabId: number): Promise<boolean> {
+    const taskId = await this.taskIdForTab(tabId);
+    return this.serializeActors(
+      this.owningTabActors(tabId, taskId),
+      () => this.serializeCosmeticActors(
+        this.owningTabActors(tabId, taskId),
+        () => this.revokeIfMovedNow(tabId),
+      ),
+    );
   }
 
-  revoke(
+  async revoke(
     tabId: number,
     event: "ownership_revoked" | "group_membership_changed" | "tab_removed",
   ): Promise<boolean> {
-    return this.serialize(() => this.revokeNow(tabId, event));
+    const taskId = await this.taskIdForTab(tabId);
+    return this.serializeActors(
+      this.owningTabActors(tabId, taskId),
+      () => this.serializeCosmeticActors(
+        this.owningTabActors(tabId, taskId),
+        () => this.revokeNow(tabId, event),
+      ),
+    );
   }
 
   closeTask(taskId: string): Promise<number[]> {
-    return this.serialize(() => this.closeTaskNow(taskId));
+    return this.scheduler.enqueueTaskClose(
+      taskId,
+      () => this.closeTaskAfterDrainingTabs(taskId),
+    );
   }
 
-  async setTaskState(
+  setTaskState(
+    taskId: string,
+    taskState: "working" | "needs_user" | "completed",
+  ): Promise<void> {
+    return this.serializeActor(
+      this.taskActor(taskId),
+      async () => {
+        const task = (await readState()).tasks[taskId];
+        const actors = [
+          this.taskActor(taskId),
+          ...(task?.tabIds ?? []).map((tabId) => this.tabActor(tabId)),
+        ];
+        return this.serializeCosmeticActors(
+          actors,
+          () => this.setTaskStateNow(taskId, taskState),
+        );
+      },
+    );
+  }
+
+  private async setTaskStateNow(
     taskId: string,
     taskState: "working" | "needs_user" | "completed",
   ): Promise<void> {
@@ -103,39 +163,55 @@ export class OwnershipLedger {
       task.state = taskState;
       task.updatedAt = Date.now();
       return {
+        taskId: task.taskId,
         groupId: task.groupId,
         title: groupTitle(task, state.developerMode),
         color: task.color,
       };
     });
-    if (updated?.groupId !== null && updated?.groupId !== undefined) {
-      await chrome.tabGroups.update(updated.groupId, {
+    if (updated?.groupId === null || updated?.groupId === undefined) return;
+    const groupId = updated.groupId;
+    const current = (await readState()).tasks[updated.taskId];
+    if (!current || current.groupId !== groupId) return;
+    if (await this.groupContainsOwnedTab(groupId, current.tabIds)) {
+      await chrome.tabGroups.update(groupId, {
         title: updated.title,
         color: updated.color,
         collapsed: false,
       }).catch(() => undefined);
+    } else {
+      await this.clearCosmeticGroup(updated.taskId, groupId);
     }
   }
 
-  async setDeveloperMode(enabled: boolean): Promise<void> {
+  setDeveloperMode(enabled: boolean): Promise<void> {
+    return this.serializeGlobal(() => this.setDeveloperModeNow(enabled));
+  }
+
+  private async setDeveloperModeNow(enabled: boolean): Promise<void> {
     const tasks = await mutateState((state) => {
       state.developerMode = enabled;
       return Object.values(state.tasks).map((task) => ({
+        taskId: task.taskId,
         groupId: task.groupId,
+        tabIds: [...task.tabIds],
         title: groupTitle(task, enabled),
         color: task.color,
       }));
     });
     await Promise.all(
-      tasks
-        .filter((task): task is typeof task & { groupId: number } => task.groupId !== null)
-        .map((task) =>
-          chrome.tabGroups.update(task.groupId, {
+      tasks.map(async (task) => {
+        if (task.groupId === null) return;
+        if (await this.groupContainsOwnedTab(task.groupId, task.tabIds)) {
+          await chrome.tabGroups.update(task.groupId, {
             title: task.title,
             color: task.color,
             collapsed: false,
-          }).catch(() => undefined),
-        ),
+          }).catch(() => undefined);
+        } else {
+          await this.clearCosmeticGroup(task.taskId, task.groupId);
+        }
+      }),
     );
   }
 
@@ -147,16 +223,15 @@ export class OwnershipLedger {
     );
     const inventory: Array<Record<string, unknown>> = [];
     for (const task of Object.values(state.tasks)) {
-      if (task.groupId === null) continue;
       for (const tabId of task.tabIds) {
         const tab = byId.get(tabId);
-        if (!tab || tab.groupId !== task.groupId || !Number.isInteger(tab.windowId)) continue;
+        if (!tab || !Number.isInteger(tab.windowId)) continue;
         const url = tab.pendingUrl || tab.url;
         if (!url) continue;
         inventory.push({
           tab_id: tabId,
           window_id: tab.windowId,
-          group_id: task.groupId,
+          group_id: Number.isInteger(tab.groupId) ? tab.groupId : NO_GROUP,
           url,
           page_revision: await this.revisions.ensure(tabId),
           task_id: task.taskId,
@@ -173,7 +248,7 @@ export class OwnershipLedger {
   async taskIdForTab(tabId: number): Promise<string | null> {
     const state = await readState();
     const task = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
-    return task?.groupId === null ? null : task?.taskId ?? null;
+    return task?.taskId ?? null;
   }
 
   async hasOwnedGroup(groupId: number): Promise<boolean> {
@@ -187,23 +262,37 @@ export class OwnershipLedger {
       tabs.filter((tab) => Number.isInteger(tab.id)).map((tab) => [tab.id as number, tab]),
     );
     const changedTasks: Array<{ taskId: string; count: number; revokedTabIds: number[] }> = [];
+    const cosmeticChanges: Array<{ taskId: string; count: number }> = [];
     await mutateState((state) => {
       for (const task of Object.values(state.tasks)) {
-        const revokedTabIds = task.tabIds.filter((tabId) => {
-          const tab = byId.get(tabId);
-          return !tab || task.groupId === null || tab.groupId !== task.groupId;
-        });
-        if (revokedTabIds.length === 0) continue;
-        for (const tabId of revokedTabIds) this.scheduler.revokeTab(tabId);
-        task.tabIds = task.tabIds.filter((tabId) => !revokedTabIds.includes(tabId));
-        if (task.tabIds.length === 0) task.groupId = null;
+        const revokedTabIds = task.tabIds.filter((tabId) => !byId.has(tabId));
+        const retainedTabIds = task.tabIds.filter((tabId) => byId.has(tabId));
+        const staleGroup = task.groupId !== null && !retainedTabIds.some(
+          (tabId) => byId.get(tabId)?.groupId === task.groupId,
+        );
+        if (revokedTabIds.length === 0 && !staleGroup) continue;
+        for (const tabId of revokedTabIds) this.scheduler.blockTab(tabId, OWNERSHIP_REVOKED);
+        task.tabIds = retainedTabIds;
+        if (task.tabIds.length === 0 || staleGroup) task.groupId = null;
         task.updatedAt = Date.now();
-        changedTasks.push({ taskId: task.taskId, count: task.tabIds.length, revokedTabIds });
+        if (revokedTabIds.length > 0) {
+          changedTasks.push({ taskId: task.taskId, count: task.tabIds.length, revokedTabIds });
+        }
+        if (staleGroup) cosmeticChanges.push({ taskId: task.taskId, count: task.tabIds.length });
       }
     });
     for (const changed of changedTasks) {
-      for (const tabId of changed.revokedTabIds) await this.revisions.remove(tabId);
+      for (const tabId of changed.revokedTabIds) {
+        await this.revisions.remove(tabId);
+        this.scheduler.retireTabWhenIdle(tabId);
+      }
       this.emit("ownership_revoked", { task_id: changed.taskId, tab_count: changed.count });
+    }
+    for (const changed of cosmeticChanges) {
+      this.emit("group_membership_changed", {
+        task_id: changed.taskId,
+        tab_count: changed.count,
+      });
     }
     await this.emitInventory();
     return changedTasks.flatMap((changed) => changed.revokedTabIds);
@@ -213,15 +302,18 @@ export class OwnershipLedger {
     const state = await readState();
     const task = state.tasks[taskId];
     const ownerCount = Object.values(state.tasks).filter((candidate) => candidate.tabIds.includes(tabId)).length;
-    if (!task || !task.tabIds.includes(tabId) || task.groupId === null || ownerCount !== 1) {
+    if (!task || !task.tabIds.includes(tabId) || ownerCount !== 1) {
       throw Object.assign(new Error("Tab is not owned by this AgentTab task"), {
         code: "ownership_denied",
       });
     }
     const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
-    if (!tab || tab.groupId !== task.groupId) {
-      await this.revokeNow(tabId, "ownership_revoked");
-      throw Object.assign(new Error("Tab left its AgentTab task group"), {
+    if (!tab) {
+      await this.serializeCosmeticActors(
+        [this.taskActor(taskId), this.tabActor(tabId)],
+        () => this.revokeNow(tabId, "ownership_revoked"),
+      );
+      throw Object.assign(new Error("The task-owned tab no longer exists"), {
         code: "ownership_revoked",
       });
     }
@@ -229,7 +321,6 @@ export class OwnershipLedger {
     const currentTask = current.tasks[taskId];
     if (
       !currentTask ||
-      currentTask.groupId !== task.groupId ||
       !currentTask.tabIds.includes(tabId) ||
       Object.values(current.tasks).filter((candidate) => candidate.tabIds.includes(tabId)).length !== 1
     ) {
@@ -241,6 +332,7 @@ export class OwnershipLedger {
   }
 
   private async openNow(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    await this.assertTaskOpen(taskId);
     if (params.mode === "adopt_active") return this.adoptActiveNow(taskId);
     if (params.mode !== "create") {
       throw Object.assign(new Error("browser_open mode must be create or adopt_active"), {
@@ -273,10 +365,10 @@ export class OwnershipLedger {
       tab = await this.createTabInDedicatedWindow(url);
     } else {
       let taskWindowId: number | undefined;
-      if (existingTask && existingTask.groupId !== null) {
+      if (existingTask) {
         for (const tabId of existingTask.tabIds) {
           const candidate = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
-          if (candidate?.groupId === existingTask.groupId && Number.isInteger(candidate.windowId)) {
+          if (candidate && typeof candidate.windowId === "number" && Number.isInteger(candidate.windowId)) {
             taskWindowId = candidate.windowId;
             break;
           }
@@ -340,14 +432,6 @@ export class OwnershipLedger {
       const child = (await chrome.tabs.get(childTabId).catch(() => null)) as TabLike | null;
       if (!parent || !child) return;
       if (
-        sourceTabId === undefined &&
-        child.groupId !== undefined &&
-        child.groupId !== NO_GROUP &&
-        child.groupId !== ownedParent.groupId
-      ) {
-        return;
-      }
-      if (
         Number.isInteger(parent.windowId) &&
         Number.isInteger(child.windowId) &&
         parent.windowId !== child.windowId
@@ -372,12 +456,19 @@ export class OwnershipLedger {
 
   private async revokeIfMovedNow(tabId: number): Promise<boolean> {
     const state = await readState();
-    const task = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
-    if (!task) return false;
-    const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
-    if (!tab || task.groupId === null || tab.groupId !== task.groupId) {
-      return this.revokeNow(tabId, "group_membership_changed");
+    const current = Object.values(state.tasks).find((candidate) => candidate.tabIds.includes(tabId));
+    if (!current) return false;
+    if (
+      current.groupId !== null &&
+      !(await this.groupContainsOwnedTab(current.groupId, current.tabIds))
+    ) {
+      await this.clearCosmeticGroup(current.taskId, current.groupId);
     }
+    this.emit("group_membership_changed", {
+      task_id: current.taskId,
+      tab_count: current.tabIds.length,
+    });
+    await this.emitInventory();
     return false;
   }
 
@@ -385,32 +476,87 @@ export class OwnershipLedger {
     tabId: number,
     event: "ownership_revoked" | "group_membership_changed" | "tab_removed",
   ): Promise<boolean> {
-    this.scheduler.revokeTab(tabId);
+    this.scheduler.blockTab(tabId, OWNERSHIP_REVOKED);
+    const before = await readState();
+    const ownerBefore = Object.values(before.tasks).find((task) => task.tabIds.includes(tabId));
+    const retainedGroup = ownerBefore?.groupId === null || ownerBefore?.groupId === undefined
+      ? null
+      : (await this.groupContainsOwnedTab(
+        ownerBefore.groupId,
+        ownerBefore.tabIds.filter((ownedTabId) => ownedTabId !== tabId),
+      ))
+        ? ownerBefore.groupId
+        : null;
     const changed = await mutateState((state) => {
       for (const task of Object.values(state.tasks)) {
         if (!task.tabIds.includes(tabId)) continue;
         task.tabIds = task.tabIds.filter((ownedTabId) => ownedTabId !== tabId);
-        if (task.tabIds.length === 0) task.groupId = null;
+        if (task.tabIds.length === 0) {
+          task.groupId = null;
+        } else if (task.groupId === ownerBefore?.groupId) {
+          task.groupId = retainedGroup;
+        }
         task.updatedAt = Date.now();
         return { taskId: task.taskId, count: task.tabIds.length };
       }
       return null;
     });
-    if (!changed) return false;
+    if (!changed) {
+      this.scheduler.retireTabWhenIdle(tabId);
+      return false;
+    }
     await this.revisions.remove(tabId);
     this.emit(event, {
       task_id: changed.taskId,
       tab_count: changed.count,
     });
     await this.emitInventory();
+    this.scheduler.retireTabWhenIdle(tabId);
     return true;
   }
 
+  private async closeTaskAfterDrainingTabs(taskId: string): Promise<number[]> {
+    const drainedTabIds = new Set<number>();
+    while (true) {
+      const snapshotTabIds = [...((await readState()).tasks[taskId]?.tabIds ?? [])];
+      const newlyDiscovered = snapshotTabIds.filter((tabId) => !drainedTabIds.has(tabId));
+      const initialDrains = newlyDiscovered.map((tabId) => {
+        drainedTabIds.add(tabId);
+        return this.scheduler.blockTab(tabId, OWNERSHIP_REVOKED);
+      });
+      await Promise.all(initialDrains);
+
+      const attempt = await this.serializeActors(
+        [this.taskActor(taskId), ...snapshotTabIds.map((tabId) => this.tabActor(tabId))],
+        async () => {
+          const currentTabIds = [...((await readState()).tasks[taskId]?.tabIds ?? [])];
+          const undrained = currentTabIds.filter((tabId) => !drainedTabIds.has(tabId));
+          if (undrained.length > 0) {
+            const drains = undrained.map((tabId) => {
+              drainedTabIds.add(tabId);
+              return this.scheduler.blockTab(tabId, OWNERSHIP_REVOKED);
+            });
+            return { kind: "drain" as const, drains };
+          }
+          const closedTabIds = await this.serializeCosmeticActors(
+            [this.taskActor(taskId), ...currentTabIds.map((tabId) => this.tabActor(tabId))],
+            () => this.closeTaskNow(taskId),
+          );
+          return { kind: "closed" as const, closedTabIds };
+        },
+      );
+      if (attempt.kind === "closed") return attempt.closedTabIds;
+      // The task actor is released before waiting, so an active tab operation
+      // can finish ownership revalidation instead of deadlocking with close.
+      await Promise.all(attempt.drains);
+    }
+  }
+
   private async closeTaskNow(taskId: string): Promise<number[]> {
-    const existing = (await readState()).tasks[taskId];
-    if (!existing) return [];
-    for (const tabId of existing.tabIds) this.scheduler.revokeTab(tabId);
     const tabIds = await mutateState((state) => {
+      if (state.taskTombstones[taskId] === undefined) {
+        state.taskTombstones[taskId] = Date.now();
+      }
       const task = state.tasks[taskId];
       if (!task) return [];
       const ownedTabIds = [...task.tabIds];
@@ -432,43 +578,78 @@ export class OwnershipLedger {
     }
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
+    for (const tabId of tabIds) this.scheduler.retireTabWhenIdle(tabId);
     return closedTabIds;
   }
 
-  private async grant(taskId: string, tabId: number, name: string): Promise<void> {
-    const before = (await chrome.tabs.get(tabId)) as TabLike;
+  private grant(taskId: string, tabId: number, name: string): Promise<void> {
+    return this.serializeCosmeticActors(
+      [this.taskActor(taskId), this.tabActor(tabId)],
+      () => this.grantNow(taskId, tabId, name),
+    );
+  }
+
+  private async grantNow(taskId: string, tabId: number, name: string): Promise<void> {
+    await chrome.tabs.get(tabId);
     const state = await readState();
+    if (state.taskTombstones[taskId] !== undefined) throw this.closedTaskError();
     const currentOwner = Object.values(state.tasks).find((task) => task.tabIds.includes(tabId));
     if (currentOwner && currentOwner.taskId !== taskId) {
       throw Object.assign(new Error("Tab is already owned by another AgentTab task"), {
         code: "ownership_denied",
       });
     }
-    if (currentOwner && currentOwner.groupId === before.groupId && before.groupId !== NO_GROUP) {
+    if (currentOwner) {
       await this.revisions.ensure(tabId);
       return;
     }
-    if (currentOwner) await this.revokeNow(tabId, "ownership_revoked");
 
     const refreshed = await readState();
     const refreshedTask = refreshed.tasks[taskId];
-    let groupId: number;
-    try {
-      if (refreshedTask?.groupId !== null && refreshedTask?.groupId !== undefined) {
-        groupId = await chrome.tabs.group({ tabIds: [tabId], groupId: refreshedTask.groupId });
-      } else {
-        groupId = await chrome.tabs.group({ tabIds: [tabId] });
-      }
-      const previewTask: TaskRecord = refreshedTask ?? {
+    let groupId: number | null = refreshedTask?.groupId ?? null;
+    if (
+      refreshedTask &&
+      groupId !== null &&
+      !(await this.groupContainsOwnedTab(groupId, refreshedTask.tabIds))
+    ) {
+      await this.clearCosmeticGroup(taskId, groupId);
+      groupId = null;
+    }
+    const previewTask: TaskRecord = refreshedTask
+      ? { ...refreshedTask, groupId }
+      : {
         taskId,
         name,
-        groupId,
+        groupId: null,
         tabIds: [],
         color: taskColor(taskId),
         state: "working",
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
+    await this.revisions.ensure(tabId);
+    await mutateState((next) => {
+      if (next.taskTombstones[taskId] !== undefined) throw this.closedTaskError();
+      const conflictingTask = Object.values(next.tasks).find(
+        (task) => task.taskId !== taskId && task.tabIds.includes(tabId),
+      );
+      if (conflictingTask) {
+        throw Object.assign(new Error("Tab ownership changed while it was being adopted"), {
+          code: "ownership_denied",
+        });
+      }
+      const task = next.tasks[taskId] ?? previewTask;
+      if (!task.tabIds.includes(tabId)) task.tabIds.push(tabId);
+      task.updatedAt = Date.now();
+      next.tasks[taskId] = task;
+    });
+
+    try {
+      if (groupId !== null) {
+        groupId = await chrome.tabs.group({ tabIds: [tabId], groupId });
+      } else {
+        groupId = await chrome.tabs.group({ tabIds: [tabId] });
+      }
       await chrome.tabGroups.update(groupId, {
         title: groupTitle(previewTask, refreshed.developerMode),
         color: previewTask.color,
@@ -476,38 +657,51 @@ export class OwnershipLedger {
       });
       const grouped = (await chrome.tabs.get(tabId)) as TabLike;
       if (grouped.groupId !== groupId) throw new Error("Chrome did not preserve the requested tab group");
-      await this.revisions.ensure(tabId);
       await mutateState((next) => {
-        const conflictingTask = Object.values(next.tasks).find(
-          (task) => task.taskId !== taskId && task.tabIds.includes(tabId),
-        );
-        if (conflictingTask) {
-          throw Object.assign(new Error("Tab ownership changed while grouping"), {
-            code: "ownership_denied",
-          });
-        }
-        const task = next.tasks[taskId] ?? previewTask;
-        task.groupId = groupId;
-        if (!task.tabIds.includes(tabId)) task.tabIds.push(tabId);
-        task.updatedAt = Date.now();
-        next.tasks[taskId] = task;
+        const task = next.tasks[taskId];
+        if (task?.tabIds.includes(tabId)) task.groupId = groupId;
       });
-    } catch (error) {
-      if (before.groupId !== undefined && before.groupId >= 0) {
-        await chrome.tabs.group({ tabIds: [tabId], groupId: before.groupId }).catch(() => undefined);
-      } else {
-        await chrome.tabs.ungroup([tabId]).catch(() => undefined);
-      }
-      if (error instanceof Error && "code" in error) throw error;
-      throw Object.assign(new Error(`Could not visibly group AgentTab tab: ${String(error)}`), {
-        code: "grouping_failed",
-      });
+    } catch {
+      // Tab groups are a best-effort visual aid. The durable task ledger is authoritative.
     }
     this.emit("group_membership_changed", {
       task_id: taskId,
       tab_count: (await readState()).tasks[taskId]?.tabIds.length ?? 0,
     });
     await this.emitInventory();
+  }
+
+  private async groupContainsOwnedTab(groupId: number, tabIds: readonly number[]): Promise<boolean> {
+    for (const tabId of tabIds) {
+      const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
+      if (tab?.groupId === groupId) return true;
+    }
+    return false;
+  }
+
+  private async clearCosmeticGroup(taskId: string, expectedGroupId: number): Promise<void> {
+    await mutateState((state) => {
+      const task = state.tasks[taskId];
+      if (!task || task.groupId !== expectedGroupId) return;
+      task.groupId = null;
+      task.updatedAt = Date.now();
+    });
+  }
+
+  private async assertTaskOpen(taskId: string): Promise<void> {
+    if ((await readState()).taskTombstones[taskId] !== undefined) {
+      throw this.closedTaskError();
+    }
+  }
+
+  private closedTaskError(): Error & { code: string; recovery: string } {
+    return Object.assign(
+      new Error("This AgentTab task is closed and cannot own new tabs"),
+      {
+        code: "task_closed",
+        recovery: "Start a new AgentTab task instead of reusing a closed task capability.",
+      },
+    );
   }
 
   private async createTabInDedicatedWindow(url: string): Promise<TabLike> {
@@ -584,7 +778,7 @@ export class OwnershipLedger {
     return {
       tab_id: tabId,
       window_id: tab.windowId,
-      group_id: tab.groupId,
+      group_id: Number.isInteger(tab.groupId) ? tab.groupId : NO_GROUP,
       url,
       page_revision: await this.revisions.current(tabId),
       tab_count: owner?.tabIds.length ?? 0,
@@ -600,12 +794,77 @@ export class OwnershipLedger {
     await publication;
   }
 
-  private serialize<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.transitionTail.then(operation);
-    this.transitionTail = next.then(
+  private taskActor(taskId: string): string {
+    return `task:${taskId}`;
+  }
+
+  private tabActor(tabId: number): string {
+    return `tab:${tabId}`;
+  }
+
+  private serializeActor<T>(actor: string, operation: () => Promise<T>): Promise<T> {
+    return this.serializeActors([actor], operation);
+  }
+
+  private owningTabActors(tabId: number, taskId: string | null): string[] {
+    return taskId === null
+      ? [this.tabActor(tabId)]
+      : [this.taskActor(taskId), this.tabActor(tabId)];
+  }
+
+  private serializeActors<T>(actors: readonly string[], operation: () => Promise<T>): Promise<T> {
+    const uniqueActors = [...new Set(actors)].sort();
+    const priorGlobal = this.globalTransitionTail;
+    const priorActors = uniqueActors.map(
+      (actor) => this.actorTransitionTails.get(actor) ?? Promise.resolve(),
+    );
+    const next = priorGlobal.then(() => Promise.all(priorActors)).then(operation);
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    for (const actor of uniqueActors) this.actorTransitionTails.set(actor, tail);
+    void tail.then(() => {
+      for (const actor of uniqueActors) {
+        if (this.actorTransitionTails.get(actor) === tail) this.actorTransitionTails.delete(actor);
+      }
+    });
+    return next;
+  }
+
+  private serializeGlobal<T>(operation: () => Promise<T>): Promise<T> {
+    const priorGlobal = this.globalTransitionTail;
+    const priorActors = [...this.actorTransitionTails.values()];
+    const next = priorGlobal.then(() => Promise.all(priorActors)).then(operation);
+    this.globalTransitionTail = next.then(
       () => undefined,
       () => undefined,
     );
     return next;
   }
+
+  private serializeCosmeticActors<T>(
+    actors: readonly string[],
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const uniqueActors = [...new Set(actors)].sort();
+    const priorActors = uniqueActors.map(
+      (actor) => this.cosmeticTransitionTails.get(actor) ?? Promise.resolve(),
+    );
+    const next = Promise.all(priorActors).then(operation);
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    for (const actor of uniqueActors) this.cosmeticTransitionTails.set(actor, tail);
+    void tail.then(() => {
+      for (const actor of uniqueActors) {
+        if (this.cosmeticTransitionTails.get(actor) === tail) {
+          this.cosmeticTransitionTails.delete(actor);
+        }
+      }
+    });
+    return next;
+  }
+
 }

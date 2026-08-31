@@ -164,7 +164,6 @@ pub struct Runtime {
     native: Arc<dyn NativeTransport>,
     handoff: Arc<HandoffState>,
     task_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    global_gate: RwLock<()>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
     upload_staging_dir: PathBuf,
 }
@@ -187,8 +186,13 @@ impl Runtime {
     ) -> Result<Arc<Self>, RuntimeBuildError> {
         paths.prepare()?;
         let journal = Arc::new(Journal::open(&paths.state_db)?);
-        if journal.handoff_active()? {
-            handoff.restore(true);
+        if let Some((task_id, tab_id)) = journal.handoff_binding()? {
+            handoff.restore(&NativeHandoff {
+                active: true,
+                task_id: Some(task_id),
+                tab_id: Some(tab_id),
+                started_at_ms: None,
+            });
         }
         let tab_urls = Arc::new(RwLock::new(HashMap::new()));
         let sink = Arc::new(JournalNativeEventSink {
@@ -210,7 +214,6 @@ impl Runtime {
             native,
             handoff,
             task_locks: Mutex::new(HashMap::new()),
-            global_gate: RwLock::new(()),
             tab_urls,
             upload_staging_dir: paths.upload_staging_dir.clone(),
         });
@@ -462,6 +465,43 @@ impl Runtime {
         connection.confirm_resume_capability(confirmation, &self.journal)
     }
 
+    pub(crate) fn request_queue_scope(
+        &self,
+        connection: &ConnectionContext,
+        raw: &Value,
+    ) -> RequestLockScope {
+        let Some(method) = raw
+            .get("method")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<RpcMethod>(value).ok())
+        else {
+            return RequestLockScope::Task;
+        };
+        self.resolved_request_lock_scope(
+            connection.task_id().ok().flatten(),
+            method,
+            raw.get("params").unwrap_or(&Value::Null),
+        )
+    }
+
+    fn resolved_request_lock_scope(
+        &self,
+        task_id: Option<Uuid>,
+        method: RpcMethod,
+        params: &Value,
+    ) -> RequestLockScope {
+        if method == RpcMethod::BrowserCommit {
+            if let (Some(task_id), Some(staged_token)) =
+                (task_id, params.get("staged_token").and_then(Value::as_str))
+            {
+                if let Ok(Some(tab_id)) = self.journal.staged_commit_tab_id(task_id, staged_token) {
+                    return RequestLockScope::Tab(tab_id);
+                }
+            }
+        }
+        request_lock_scope(method, params)
+    }
+
     pub fn handle(&self, connection: &Arc<ConnectionContext>, raw: Value) -> Value {
         let fallback_request_id = raw
             .get("request_id")
@@ -684,7 +724,6 @@ impl Runtime {
             .lifecycle
             .gate(request.method)
             .err()
-            .or_else(|| self.handoff_blackout_error())
             .or_else(|| self.guardrails.authorize(request.method, &params).err());
         if let Some(error) = early_error {
             let response =
@@ -738,12 +777,9 @@ impl Runtime {
                 true,
             );
         }
-        let (_global_read, _global_write) = if request.method == RpcMethod::BrowserHandoff {
-            (None, Some(self.global_gate.write()))
-        } else {
-            (Some(self.global_gate.read()), None)
-        };
-        let lock_key = request_lock_key(task_id, request.method, &params_value);
+        let lock_scope =
+            self.resolved_request_lock_scope(Some(task_id), request.method, &params_value);
+        let lock_key = request_lock_key_for_scope(task_id, lock_scope);
         let task_lock = {
             let mut locks = self.task_locks.lock();
             locks.retain(|_, lock| lock.strong_count() > 0);
@@ -788,7 +824,7 @@ impl Runtime {
                 );
             }
         };
-        if let Some(error) = self.handoff_blackout_error() {
+        if let Some(error) = self.handoff_blackout_error(task_id, request.method, &params) {
             let response =
                 RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
             return self.audited_value(
@@ -1030,14 +1066,17 @@ impl Runtime {
         )
     }
 
-    fn handoff_blackout_error(&self) -> Option<RpcError> {
-        self.handoff.is_active().then(|| {
-            RpcError::new(
-                "handoff_blackout",
-                "Automation is disabled while credential handoff is active",
-            )
-            .with_recovery("Wait for the human to finish or cancel the active handoff.")
-        })
+    fn handoff_blackout_error(
+        &self,
+        task_id: Uuid,
+        method: RpcMethod,
+        params: &MethodParams,
+    ) -> Option<RpcError> {
+        if matches!(method, RpcMethod::BrowserOpen | RpcMethod::BrowserTabs) {
+            return None;
+        }
+        let tab_id = requested_tab(params).map(|(tab_id, _)| tab_id);
+        self.handoff.observation_gate(task_id, tab_id).err()
     }
 
     fn dispatch(
@@ -1051,8 +1090,8 @@ impl Runtime {
         mut params_value: Value,
     ) -> RpcResponse {
         let timeout = dispatch_timeout(params);
-        if method == RpcMethod::BrowserHandoff {
-            if let Err(error) = self.handoff.begin() {
+        if let MethodParams::Handoff(handoff) = params {
+            if let Err(error) = self.handoff.begin(task_id, handoff.tab_id) {
                 return RpcResponse::failure(request_id, Outcome::NotStarted, error);
             }
         }
@@ -1176,7 +1215,7 @@ impl Runtime {
             }
         };
         if method == RpcMethod::BrowserHandoff && native.outcome == Outcome::NotStarted {
-            self.handoff.restore(false);
+            self.handoff.clear();
         }
         if native.outcome == Outcome::CommitRequired {
             let stage_error = match native.staged.as_ref() {
@@ -1340,11 +1379,15 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Wait(BrowserWaitParams { tab_id, .. }) => Some((*tab_id, None)),
         MethodParams::Act(params) => Some((params.tab_id, Some(params.expected_page_revision))),
         MethodParams::Handoff(params) => Some((params.tab_id, Some(params.expected_page_revision))),
+        MethodParams::Developer(params) => params
+            .params
+            .get("tab_id")
+            .and_then(Value::as_u64)
+            .map(|tab_id| (tab_id, None)),
         MethodParams::Open(_)
         | MethodParams::Tabs(_)
         | MethodParams::Commit(_)
-        | MethodParams::Status(_)
-        | MethodParams::Developer(_) => None,
+        | MethodParams::Status(_) => None,
     }
 }
 fn is_tab_only_request(params: &MethodParams) -> bool {
@@ -1502,25 +1545,42 @@ fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RequestLockScope {
-    Global,
+    Task,
     Tab(u64),
 }
 
 pub(crate) fn request_lock_scope(method: RpcMethod, params: &Value) -> RequestLockScope {
     if matches!(
         method,
-        RpcMethod::BrowserSnapshot | RpcMethod::BrowserAct | RpcMethod::BrowserWait
+        RpcMethod::BrowserSnapshot
+            | RpcMethod::BrowserAct
+            | RpcMethod::BrowserWait
+            | RpcMethod::BrowserHandoff
     ) {
         if let Some(tab_id) = params.get("tab_id").and_then(Value::as_u64) {
             return RequestLockScope::Tab(tab_id);
         }
     }
-    RequestLockScope::Global
+    if method == RpcMethod::BrowserDeveloper {
+        if let Some(tab_id) = params
+            .get("params")
+            .and_then(|params| params.get("tab_id"))
+            .and_then(Value::as_u64)
+        {
+            return RequestLockScope::Tab(tab_id);
+        }
+    }
+    RequestLockScope::Task
 }
 
+#[cfg(test)]
 fn request_lock_key(task_id: Uuid, method: RpcMethod, params: &Value) -> String {
-    match request_lock_scope(method, params) {
-        RequestLockScope::Global => "global".into(),
+    request_lock_key_for_scope(task_id, request_lock_scope(method, params))
+}
+
+fn request_lock_key_for_scope(task_id: Uuid, scope: RequestLockScope) -> String {
+    match scope {
+        RequestLockScope::Task => format!("{task_id}:task"),
         RequestLockScope::Tab(tab_id) => format!("{task_id}:tab:{tab_id}"),
     }
 }
@@ -2186,16 +2246,77 @@ mod tests {
     }
 
     #[test]
-    fn browser_global_requests_share_one_lock_across_tasks() {
+    fn request_locks_are_task_scoped_and_tab_specific() {
         let first_task = Uuid::new_v4();
         let second_task = Uuid::new_v4();
-        assert_eq!(
+        assert_ne!(
             request_lock_key(first_task, RpcMethod::BrowserOpen, &json!({})),
             request_lock_key(second_task, RpcMethod::BrowserOpen, &json!({}))
         );
         assert_ne!(
             request_lock_key(first_task, RpcMethod::BrowserAct, &json!({"tab_id": 7})),
             request_lock_key(second_task, RpcMethod::BrowserAct, &json!({"tab_id": 7}))
+        );
+        assert_eq!(
+            request_lock_key(first_task, RpcMethod::BrowserAct, &json!({"tab_id": 7})),
+            request_lock_key(first_task, RpcMethod::BrowserHandoff, &json!({"tab_id": 7}))
+        );
+        assert_eq!(
+            request_lock_key(
+                first_task,
+                RpcMethod::BrowserDeveloper,
+                &json!({"action": "Runtime.evaluate", "params": {"tab_id": 7}}),
+            ),
+            request_lock_key(first_task, RpcMethod::BrowserAct, &json!({"tab_id": 7}))
+        );
+    }
+
+    #[test]
+    fn staged_commit_resolves_to_the_same_tab_queue_as_act_and_handoff() {
+        let (_temp, runtime, connection) = connected_runtime(FakeNative::normal());
+        let task_id = own_tab(&runtime, &connection, 9);
+        let handles = runtime
+            .journal
+            .store_staged_commit(
+                &NativeStagedCommit {
+                    native_token: "native-token-for-ordering".into(),
+                    task_id,
+                    tab_id: 3,
+                    page_revision: 9,
+                    effect: "submit order".into(),
+                    fingerprint: "f".repeat(64),
+                    expires_at_ms: current_time_ms() + 60_000,
+                },
+                &[],
+            )
+            .unwrap();
+        let commit = json!({
+            "method": "browser_commit",
+            "params": {"staged_token": handles.staged_token}
+        });
+
+        assert_eq!(
+            runtime.request_queue_scope(&connection, &commit),
+            RequestLockScope::Tab(3)
+        );
+        assert_eq!(
+            runtime.resolved_request_lock_scope(
+                Some(task_id),
+                RpcMethod::BrowserCommit,
+                &commit["params"],
+            ),
+            RequestLockScope::Tab(3)
+        );
+        assert_eq!(
+            request_lock_scope(RpcMethod::BrowserHandoff, &json!({"tab_id": 3})),
+            RequestLockScope::Tab(3)
+        );
+        assert_eq!(
+            runtime.request_queue_scope(
+                &connection,
+                &json!({"method": "browser_commit", "params": {"staged_token": "missing"}}),
+            ),
+            RequestLockScope::Task
         );
     }
 
@@ -2479,9 +2600,9 @@ mod tests {
     }
 
     #[test]
-    fn handoff_timeout_keeps_global_blackout_active() {
+    fn handoff_timeout_keeps_only_its_tab_blackout_active() {
         let (_temp, runtime, connection) = connected_runtime(Arc::new(TimeoutNative));
-        own_tab(&runtime, &connection, 7);
+        let task_id = own_tab(&runtime, &connection, 7);
         let response = runtime.handle(
             &connection,
             json!({
@@ -2513,10 +2634,11 @@ mod tests {
             }),
         );
         assert_eq!(blocked["error"]["code"], "handoff_blackout");
-        runtime.handoff.restore(false);
+        assert!(runtime.handoff.observation_gate(task_id, Some(4)).is_ok());
+        runtime.handoff.clear();
     }
     #[test]
-    fn rejected_handoff_releases_global_blackout() {
+    fn rejected_handoff_releases_scoped_blackout() {
         let (_temp, runtime, connection) = connected_runtime(Arc::new(RejectedHandoffNative));
         own_tab(&runtime, &connection, 7);
         let response = runtime.handle(

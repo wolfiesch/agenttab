@@ -30,14 +30,16 @@ Use a disposable Chrome profile and a disposable test account. Reload the unpack
 
 1. required `debugger` availability plus optional `scripting` grant and revocation from the popup;
 2. host handshake and reconciliation to ready;
-3. create and adopt-active task tabs, child popup inheritance, visible grouping, and ownership revocation after an ungroup or move;
+3. create and adopt-active task tabs, child popup inheritance, best-effort visible grouping, stale cosmetic-group cleanup, ownership persistence after an ungroup or move, revocation after tab/task closure, and rejection of an open queued behind close;
 4. accessibility, text, HTML, and screenshot snapshots; stale revision/ref rejection; wait conditions; and debugger detach/restart;
 5. ready, working, needs-you, resumed, and finished popup states;
 6. Pause, restart while paused, reconciliation, and Resume;
-7. global blackout during `browser_handoff`, including host and extension restart during the handoff;
+7. exact-tab blackout during `browser_handoff`, same-tab act/handoff/Commit ordering, unrelated-tab progress, fail-closed disconnect recovery, and host/extension restart during the handoff;
 8. recognizable consequential controls staged without side effect, a changed target rejected, one unchanged Commit execution, and harmless controls executed without review.
 
 Never Commit a real send, purchase, delete, permission grant, or upload against a live account merely to prove the barrier. Use controlled fixtures and stop at the staged preview for live authenticated checks.
+
+For the browser-session ownership check, persist an owned tab, fully quit Chrome, and arrange for the next session to contain an unrelated tab with the same numeric test ID. The startup hello must contain no inherited binding, and authorization against that tab must return `ownership_denied`.
 
 ## Platform evidence
 

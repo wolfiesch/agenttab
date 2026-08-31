@@ -26,14 +26,14 @@ AgentTab is a local browser runtime for AI agents. It gives each agent task-owne
 
 AgentTab is for browser tasks that need the Chrome profile already on a user's computer. Its promise is: **Give an agent a tab, not the keys to your browser.**
 
-Each agent begins with a task workspace. AgentTab creates or visibly adopts a tab for that task, permits child-tab inheritance from owned tabs, and serializes writes to the same tab. Task groups make active work visible but are display-only: they never grant ownership. A tab moved out of its task group is no longer available to that task.
+Each agent begins with a task workspace. AgentTab creates or visibly adopts a tab for that task, permits child-tab inheritance from owned tabs, and serializes writes to the same tab. Task groups are a best-effort visual aid: they never grant, transfer, or revoke the ownership recorded in the task ledger.
 
 The runtime is local-only. One minimal MV3 extension connects through Chrome Native Messaging to a local Rust host. MCP and other local adapters connect to the host through a user-owned Unix socket on macOS and Linux or a current-user named pipe on Windows. There is no cloud relay, hosted browser session, telemetry service, or routine remote control plane.
 
 The Standard MCP surface has exactly seven tools: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, and `browser_commit`. A separate `browser_developer` tool exists only after a persistent, explicit Developer mode opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
 AgentTab declares the `<all_urls>` host permission so its defined `chrome.scripting` text, HTML, selector, wait, and scroll paths can operate in task-owned pages that the user directs an agent to use. This supports those bounded paths across sites; it does not add raw cookie, storage, arbitrary JavaScript, CDP, or network APIs to Standard mode.
 
-**Your Turn** is the human handoff state for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. During handoff, AgentTab applies an observation blackout across every task, so standard observations return `needs_user`; it does not capture human keystrokes.
+**Your Turn** is the human handoff state for passwords, passkeys, two-factor authentication, CAPTCHA, payment secrets, and other human-only input. During handoff, AgentTab blackouts the exact handed-off tab while unrelated task tabs continue; it does not capture human keystrokes.
 
 **Commit** is a best-effort review barrier for recognizable send, publish, purchase, delete, upload, authorization, and permission-grant controls. It stages a recognizable action with a preview, requires a human popup approval and the requesting agent's one-use token, and revalidates the page and target before execution. It is not a guarantee that every page-triggered external effect is recognizable.
 

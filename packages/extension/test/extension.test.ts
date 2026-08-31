@@ -8,7 +8,14 @@ import { RevisionTracker } from "../src/revisions";
 import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
 import { MutationScheduler } from "../src/scheduler";
 import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
-import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
+import {
+  BROWSER_SESSION_EPOCH_KEY,
+  mutateState,
+  readState,
+  reconcileBrowserSession,
+  resetStateForTest,
+  STATE_KEY,
+} from "../src/storage";
 import { isRecord } from "../src/type-guards";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
@@ -64,12 +71,15 @@ class MockNativePort {
 }
 
 let persisted: Record<string, unknown>;
+let sessionPersisted: Record<string, unknown>;
 let debuggerCalls: string[];
 let tabStore: Map<number, MockTab>;
 let removedTabIds: number[];
 let failGrouping: boolean;
 let nextTabId: number;
 let nextGroupId: number;
+let tabGroupRequests: Array<{ tabIds: number[]; groupId?: number }>;
+let tabGroupUpdates: Array<{ groupId: number; changes: Record<string, unknown> }>;
 let scriptResult: unknown;
 let scriptingCallCount: number;
 let alarmCreates: Array<{ name: string; when: number }>;
@@ -310,12 +320,15 @@ function emitDebuggerDetach(tabId: number): void {
 
 function installChromeMock(): void {
   persisted = {};
+  sessionPersisted = {};
   debuggerCalls = [];
   tabStore = new Map();
   removedTabIds = [];
   failGrouping = false;
   nextTabId = 100;
   nextGroupId = 50;
+  tabGroupRequests = [];
+  tabGroupUpdates = [];
   scriptResult = true;
   scriptingCallCount = 0;
   alarmCreates = [];
@@ -368,6 +381,20 @@ function installChromeMock(): void {
   Object.assign(globalThis, {
     chrome: {
       storage: {
+        session: {
+          async get(keys: string | string[] | null) {
+            if (keys === null) return clone(sessionPersisted);
+            const selected = Array.isArray(keys) ? keys : [keys];
+            return Object.fromEntries(
+              selected
+                .filter((key) => key in sessionPersisted)
+                .map((key) => [key, clone(sessionPersisted[key])]),
+            );
+          },
+          async set(values: Record<string, unknown>) {
+            Object.assign(sessionPersisted, clone(values));
+          },
+        },
         local: {
           async get(keys: string | string[] | null) {
             storageGetCount += 1;
@@ -516,6 +543,10 @@ function installChromeMock(): void {
         },
         async group(options: { tabIds: number | number[]; groupId?: number }) {
           if (failGrouping) throw new Error("grouping unavailable");
+          tabGroupRequests.push({
+            tabIds: Array.isArray(options.tabIds) ? [...options.tabIds] : [options.tabIds],
+            ...(options.groupId === undefined ? {} : { groupId: options.groupId }),
+          });
           const groupId = options.groupId ?? nextGroupId++;
           for (const tabId of Array.isArray(options.tabIds) ? options.tabIds : [options.tabIds]) {
             const tab = tabStore.get(tabId);
@@ -594,7 +625,9 @@ function installChromeMock(): void {
         },
       },
       tabGroups: {
-        async update() { },
+        async update(groupId: number, changes: Record<string, unknown>) {
+          tabGroupUpdates.push({ groupId, changes: clone(changes) });
+        },
         onRemoved: {
           addListener(listener: TabGroupRemovedListener) {
             tabGroupRemovedListeners.push(listener);
@@ -999,7 +1032,7 @@ describe("mutation scheduler", () => {
       order.push("first-end");
     });
     const second = scheduler.enqueueTab("task-a", 1, async () => { order.push("second"); });
-    const other = scheduler.enqueueTab("task-b", 2, async () => { order.push("other"); });
+    const other = scheduler.enqueueTab("task-a", 2, async () => { order.push("other"); });
     await other;
     expect(order).toEqual(["first-start", "other"]);
     firstGate.resolve();
@@ -1093,6 +1126,80 @@ describe("mutation scheduler", () => {
     await flushPromiseQueue();
     expect(internal.generations.size).toBe(0);
     expect(internal.generationReasons.size).toBe(0);
+  });
+
+  test("scopes a handoff barrier to one tab without blocking sibling task work", async () => {
+    const scheduler = new MutationScheduler();
+    const activeGate = Promise.withResolvers<void>();
+    const activeStarted = Promise.withResolvers<void>();
+    const active = scheduler.enqueueTab(TASK_A, 51, async () => {
+      activeStarted.resolve();
+      await activeGate.promise;
+    });
+    const queued = scheduler.enqueueTab(TASK_A, 51, async () => "must not run");
+    const queuedOutcome = queued.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await activeStarted.promise;
+
+    const blocked = scheduler.blockTab(51);
+    expect(await scheduler.enqueueTab(TASK_A, 52, async () => "sibling")).toBe("sibling");
+    expect(await scheduler.enqueueTab(TASK_B, 53, async () => "other task")).toBe("other task");
+    await expect(scheduler.enqueueTab(TASK_A, 51, async () => "blocked")).rejects.toMatchObject({
+      code: "handoff_blackout",
+    });
+
+    activeGate.resolve();
+    await Promise.all([active, blocked]);
+    expect(await queuedOutcome).toMatchObject({ code: "handoff_blackout" });
+    scheduler.unblockTab(51);
+    expect(await scheduler.enqueueTab(TASK_A, 51, async () => "resumed")).toBe("resumed");
+  });
+
+  test("isolates task lifecycle lanes and cleans completed actor state", async () => {
+    const scheduler = new MutationScheduler();
+    const firstGate = Promise.withResolvers<void>();
+    const firstStarted = Promise.withResolvers<void>();
+    const first = scheduler.enqueueTaskLifecycle(TASK_A, async () => {
+      firstStarted.resolve();
+      await firstGate.promise;
+    });
+    await firstStarted.promise;
+    expect(await scheduler.enqueueTaskLifecycle(TASK_B, async () => "independent")).toBe(
+      "independent",
+    );
+    expect(await scheduler.enqueueTab(TASK_A, 61, async () => "tab-independent")).toBe(
+      "tab-independent",
+    );
+    firstGate.resolve();
+    await first;
+    await Promise.resolve();
+
+    const lanes = scheduler as unknown as {
+      tabTails: Map<number, Promise<unknown>>;
+      taskLifecycleTails: Map<string, Promise<unknown>>;
+    };
+    expect(lanes.tabTails.size).toBe(0);
+    expect(lanes.taskLifecycleTails.size).toBe(0);
+  });
+
+  test("lets an active wait observe a new exact-tab handoff barrier", async () => {
+    const scheduler = new MutationScheduler();
+    const probe = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    const waiting = scheduler.readAfterWrites(71, async () => {
+      started.resolve();
+      await probe.promise;
+      scheduler.assertTabAccepting(71);
+    });
+    await started.promise;
+
+    const blocked = scheduler.blockTab(71);
+    probe.resolve();
+
+    await expect(waiting).rejects.toMatchObject({ code: "handoff_blackout" });
+    await blocked;
   });
 
   test("navigation rejects an admitted mutation before it starts", async () => {
@@ -1207,6 +1314,83 @@ describe("mutation scheduler", () => {
 });
 
 describe("durable extension state", () => {
+  test("preserves ownership across a service-worker restart in the same browser session", async () => {
+    sessionPersisted[BROWSER_SESSION_EPOCH_KEY] = "same-browser-session";
+    await seedTask(TASK_A, [40], 8);
+    await mutateState((state) => {
+      state.browserSessionEpoch = "same-browser-session";
+    });
+    resetStateForTest();
+
+    expect(await reconcileBrowserSession()).toEqual({
+      changed: false,
+      revokedTabIds: [],
+      revokedTaskIds: [],
+    });
+    expect((await readState()).tasks[TASK_A]).toMatchObject({ groupId: 8, tabIds: [40] });
+  });
+
+  test("revokes persisted numeric tab bindings when the browser-session epoch changes", async () => {
+    sessionPersisted[BROWSER_SESSION_EPOCH_KEY] = "current-browser-session";
+    await seedTask(TASK_A, [41], 9);
+    await mutateState((state) => {
+      state.browserSessionEpoch = "previous-browser-session";
+      state.revisions["41"] = { floor: 7, current: 7 };
+      state.tasks[TASK_A].state = "needs_user";
+      state.handoff = {
+        active: true,
+        taskId: TASK_A,
+        tabId: 41,
+        expectedRevision: 7,
+        prompt: "Old browser handoff",
+        completion: { kind: "manual_done" },
+        startedAtMs: 1,
+        timeoutMs: 60_000,
+      };
+      state.automationCleanup.pending = true;
+      state.automationCleanup.tabIds = [41];
+    });
+    // Chrome may reuse 41 for an unrelated tab after a full browser restart.
+    tabStore.set(41, {
+      id: 41,
+      windowId: 3,
+      groupId: 22,
+      url: "https://unrelated.example/",
+    });
+
+    expect(await reconcileBrowserSession()).toEqual({
+      changed: true,
+      revokedTabIds: [41],
+      revokedTaskIds: [TASK_A],
+    });
+
+    const state = await readState();
+    expect(state.browserSessionEpoch).toBe("current-browser-session");
+    expect(state.tasks[TASK_A]).toMatchObject({
+      groupId: null,
+      tabIds: [],
+      state: "working",
+    });
+    expect(state.revisions).toEqual({});
+    expect(state.handoff).toEqual({ active: false });
+    expect(state.automationCleanup).toMatchObject({ pending: false, tabIds: [] });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+    await expect(ownership.assertOwned(TASK_A, 41)).rejects.toMatchObject({
+      code: "ownership_denied",
+    });
+
+    resetStateForTest();
+    expect(await reconcileBrowserSession()).toEqual({
+      changed: false,
+      revokedTabIds: [],
+      revokedTaskIds: [],
+    });
+  });
+
   test("migrates legacy task ownership and verifies the persisted replacement", async () => {
     persisted[LEGACY_TASKS_KEY] = {
       "018f47b8-2f80-7c20-9c77-f8a38c9e621e": {
@@ -1960,7 +2144,7 @@ describe("page revision monotonicity", () => {
     }
   });
 
-  test("stops a browser wait after the user moves its tab out of the task group", async () => {
+  test("keeps a browser wait authorized after a cosmetic task-group move", async () => {
     await seedTask(TASK_A, [61], 5);
     scriptResult = false;
     const scheduler = new MutationScheduler();
@@ -1983,8 +2167,9 @@ describe("page revision monotonicity", () => {
     const tab = tabStore.get(61);
     if (!tab) throw new Error("missing task tab");
     tab.groupId = 9;
+    scriptResult = true;
 
-    await expect(waiting).rejects.toMatchObject({ code: "ownership_revoked" });
+    await expect(waiting).resolves.toMatchObject({ matched: true });
     expect(ownershipChecks).toBeGreaterThan(2);
   });
   test("stops a page-content wait before probing a newly restricted route", async () => {
@@ -2558,17 +2743,37 @@ describe("page revision monotonicity", () => {
 });
 
 describe("ownership and task isolation", () => {
-  test("removes a newly created tab when visible grouping fails", async () => {
+  test("does not retain actor state when a duplicate revocation finds no owner", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+
+    expect(await ownership.revoke(404, "tab_removed")).toBe(false);
+
+    const actorState = scheduler as unknown as {
+      blockedTabs: Map<number, unknown>;
+      generations: Map<number, unknown>;
+    };
+    expect(actorState.blockedTabs.size).toBe(0);
+    expect(actorState.generations.size).toBe(0);
+  });
+
+  test("keeps authoritative ownership when cosmetic grouping fails", async () => {
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
     const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
     failGrouping = true;
 
-    await expect(ownership.open(TASK_A, { mode: "create", url: "https://example.test/new" }))
-      .rejects.toMatchObject({ code: "grouping_failed" });
+    const opened = await ownership.open(TASK_A, {
+      mode: "create",
+      url: "https://example.test/new",
+    });
 
-    expect(removedTabIds).toEqual([100]);
-    expect((await readState()).tasks).toEqual({});
+    expect(opened).toMatchObject({ tab_id: 100, group_id: -1, tab_count: 1 });
+    expect(removedTabIds).toEqual([]);
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([100]);
+    resetStateForTest();
+    expect((await readState()).tasks[TASK_A]).toMatchObject({ groupId: null, tabIds: [100] });
+    expect(await ownership.assertOwned(TASK_A, 100)).toMatchObject({ taskId: TASK_A });
   });
 
   test("creates an unfocused normal window only for an empty task", async () => {
@@ -2647,6 +2852,92 @@ describe("ownership and task isolation", () => {
     expect(tabStore.get(90)).toMatchObject({ windowId: 2, active: true });
   });
 
+  test("runs independent task ownership actors concurrently and cleans their lanes", async () => {
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+    const blockedStarted = Promise.withResolvers<void>();
+    const blockedGate = Promise.withResolvers<void>();
+    const tabs = chrome.tabs as unknown as {
+      create(options: Record<string, unknown>): Promise<MockTab>;
+    };
+    const originalCreate = tabs.create.bind(tabs);
+    tabs.create = async (options) => {
+      if (options.url === "https://blocked.example.test/") {
+        blockedStarted.resolve();
+        await blockedGate.promise;
+      }
+      return originalCreate(options);
+    };
+
+    const blockedOpen = ownership.open(TASK_A, {
+      mode: "create",
+      url: "https://blocked.example.test/",
+    });
+    await blockedStarted.promise;
+    const independentOpen = await ownership.open(TASK_B, {
+      mode: "create",
+      url: "https://independent.example.test/",
+    });
+
+    expect(independentOpen).toMatchObject({ tab_id: 100 });
+    blockedGate.resolve();
+    await expect(blockedOpen).resolves.toMatchObject({ tab_id: 101 });
+    await flushPromiseQueue();
+    const actors = ownership as unknown as { actorTransitionTails: Map<string, unknown> };
+    expect(actors.actorTransitionTails.size).toBe(0);
+  });
+
+  test("makes global ownership reconciliation a barrier across task actors", async () => {
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+    const blockedStarted = Promise.withResolvers<void>();
+    const blockedGate = Promise.withResolvers<void>();
+    const tabs = chrome.tabs as unknown as {
+      create(options: Record<string, unknown>): Promise<MockTab>;
+    };
+    const originalCreate = tabs.create.bind(tabs);
+    tabs.create = async (options) => {
+      if (options.url === "https://barrier.example.test/") {
+        blockedStarted.resolve();
+        await blockedGate.promise;
+      }
+      return originalCreate(options);
+    };
+
+    const blockedOpen = ownership.open(TASK_A, {
+      mode: "create",
+      url: "https://barrier.example.test/",
+    });
+    await blockedStarted.promise;
+    let reconciled = false;
+    const reconciliation = ownership.reconcile().then((result) => {
+      reconciled = true;
+      return result;
+    });
+    let laterTaskOpened = false;
+    const laterOpen = ownership.open(TASK_B, {
+      mode: "create",
+      url: "https://after-barrier.example.test/",
+    }).then((result) => {
+      laterTaskOpened = true;
+      return result;
+    });
+    await flushPromiseQueue();
+    expect(reconciled).toBe(false);
+    expect(laterTaskOpened).toBe(false);
+
+    blockedGate.resolve();
+    await blockedOpen;
+    await reconciliation;
+    await expect(laterOpen).resolves.toMatchObject({ tab_id: 101 });
+  });
+
 
   test("publishes a loading tab's pending URL instead of its previous URL", async () => {
     await seedTask(TASK_A, [31], 7);
@@ -2687,7 +2978,7 @@ describe("ownership and task isolation", () => {
     expect(storageSetCount).toBe(initialSets);
   });
 
-  test("reconciliation revokes a moved tab and its queued mutation", async () => {
+  test("reconciliation preserves ownership and ordering after a cosmetic group move", async () => {
     await seedTask(TASK_A, [11, 12]);
     const moved = tabStore.get(12);
     if (!moved) throw new Error("missing test tab");
@@ -2703,20 +2994,118 @@ describe("ownership and task isolation", () => {
       activeStarted.resolve();
       await activeGate.promise;
     });
-    const queued = scheduler.enqueueTab(TASK_A, 12, async () => "must not run");
-    const queuedOutcome = queued.then(
-      () => null,
-      (error: unknown) => error,
-    );
+    const queued = scheduler.enqueueTab(TASK_A, 12, async () => "ran after active");
     await activeStarted.promise;
 
     await ownership.reconcile();
     activeGate.resolve();
     await active;
 
-    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([11]);
-    expect(await queuedOutcome).toMatchObject({ code: "ownership_revoked" });
-    expect(events).toContain("ownership_revoked");
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([11, 12]);
+    expect((await readState()).tasks[TASK_A]?.groupId).toBe(5);
+    expect(await queued).toBe("ran after active");
+    expect(events).not.toContain("ownership_revoked");
+    expect(await ownership.assertOwned(TASK_A, 12)).toMatchObject({ taskId: TASK_A });
+  });
+
+  test("clears a stale cosmetic group before status updates or new-tab grouping", async () => {
+    await seedTask(TASK_A, [11], 5);
+    const moved = tabStore.get(11);
+    if (!moved) throw new Error("missing task tab");
+    moved.groupId = 9;
+    tabStore.set(90, {
+      id: 90,
+      windowId: 1,
+      groupId: 5,
+      url: "https://user-only.example/",
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    await ownership.revokeIfMoved(11);
+    expect((await readState()).tasks[TASK_A]?.groupId).toBeNull();
+
+    await ownership.setTaskState(TASK_A, "completed");
+    expect(tabGroupUpdates).toEqual([]);
+    const opened = await ownership.open(TASK_A, {
+      mode: "create",
+      url: "https://example.test/new-task-tab",
+    });
+
+    expect(opened).toMatchObject({ tab_id: 100, group_id: 50 });
+    expect(tabGroupRequests.at(-1)).toEqual({ tabIds: [100] });
+    expect(tabStore.get(90)?.groupId).toBe(5);
+    expect(tabGroupUpdates).toContainEqual(expect.objectContaining({ groupId: 50 }));
+  });
+
+  test("serializes task status updates with concurrent last-tab revocations", async () => {
+    await seedTask(TASK_A, [11, 12], 5);
+    await seedTask(TASK_B, [13], 6);
+    tabStore.set(90, {
+      id: 90,
+      windowId: 1,
+      groupId: 5,
+      url: "https://user-only.example/",
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+    const updateStarted = Promise.withResolvers<void>();
+    const updateGate = Promise.withResolvers<void>();
+    const tabGroups = chrome.tabGroups as unknown as {
+      update(groupId: number, changes: Record<string, unknown>): Promise<void>;
+    };
+    const originalUpdate = tabGroups.update.bind(tabGroups);
+    let updateObservedOwnedBinding = false;
+    tabGroups.update = async (groupId, changes) => {
+      if (groupId === 5) {
+        updateStarted.resolve();
+        await updateGate.promise;
+        const task = (await readState()).tasks[TASK_A];
+        updateObservedOwnedBinding = task?.groupId === groupId && task.tabIds.length > 0;
+      }
+      await originalUpdate(groupId, changes);
+    };
+
+    const statusUpdate = ownership.setTaskState(TASK_A, "completed");
+    await updateStarted.promise;
+    await ownership.setTaskState(TASK_B, "completed");
+    expect(tabGroupUpdates).toEqual([
+      expect.objectContaining({ groupId: 6 }),
+    ]);
+    const firstRevocation = ownership.revoke(11, "ownership_revoked");
+    const lastRevocation = ownership.revoke(12, "ownership_revoked");
+    await flushPromiseQueue();
+
+    expect((await readState()).tasks[TASK_A]).toMatchObject({
+      groupId: 5,
+      tabIds: [11, 12],
+    });
+    updateGate.resolve();
+    await Promise.all([statusUpdate, firstRevocation, lastRevocation]);
+
+    expect(updateObservedOwnedBinding).toBe(true);
+    expect(tabGroupUpdates).toEqual([
+      expect.objectContaining({ groupId: 6 }),
+      expect.objectContaining({ groupId: 5 }),
+    ]);
+    expect((await readState()).tasks[TASK_A]).toMatchObject({
+      groupId: null,
+      tabIds: [],
+    });
+    expect(tabStore.get(90)?.groupId).toBe(5);
+    await flushPromiseQueue();
+    const actorState = ownership as unknown as {
+      actorTransitionTails: Map<string, unknown>;
+      cosmeticTransitionTails: Map<string, unknown>;
+    };
+    expect(actorState.actorTransitionTails.size).toBe(0);
+    expect(actorState.cosmeticTransitionTails.size).toBe(0);
   });
 
   test("inherits opener ownership across popup windows without changing the active Chrome window", async () => {
@@ -2763,6 +3152,56 @@ describe("ownership and task isolation", () => {
     expect(taskDeletedBeforeRemove).toBe(true);
     expect(removedTabIds).toEqual([21, 22]);
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
+  });
+
+  test("orders popup child adoption with concurrent opener revocation", async () => {
+    await seedTask(TASK_A, [21]);
+    tabStore.set(22, {
+      id: 22,
+      windowId: 1,
+      groupId: -1,
+      openerTabId: 21,
+      url: "https://example.test/child",
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+    const adoptionValidated = Promise.withResolvers<void>();
+    const adoptionGate = Promise.withResolvers<void>();
+    const tabs = chrome.tabs as unknown as {
+      get(tabId: number): Promise<MockTab>;
+    };
+    const originalGet = tabs.get.bind(tabs);
+    let openerGetCount = 0;
+    tabs.get = async (tabId) => {
+      if (tabId === 21 && (openerGetCount += 1) === 2) {
+        adoptionValidated.resolve();
+        await adoptionGate.promise;
+      }
+      return originalGet(tabId);
+    };
+
+    const adoption = ownership.adoptOwnedChild({ id: 22, openerTabId: 21 });
+    await adoptionValidated.promise;
+    let revocationFinished = false;
+    const revocation = ownership.revoke(21, "ownership_revoked").then((result) => {
+      revocationFinished = true;
+      return result;
+    });
+    await flushPromiseQueue();
+
+    expect(revocationFinished).toBe(false);
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21]);
+    adoptionGate.resolve();
+    await adoption;
+    await expect(revocation).resolves.toBe(true);
+
+    expect((await readState()).tasks[TASK_A]).toMatchObject({
+      groupId: 5,
+      tabIds: [22],
+    });
   });
 
   test("keeps ownership deleted when one Chrome tab is already unavailable", async () => {
@@ -2844,7 +3283,7 @@ describe("ownership and task isolation", () => {
     expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 5, active: false });
   });
 
-  test("preserves a child in a foreign tab group despite its owned opener", async () => {
+  test("inherits an owned opener even when the child starts in a foreign cosmetic group", async () => {
     await seedTask(TASK_A, [21]);
     tabStore.set(22, {
       id: 22,
@@ -2862,8 +3301,8 @@ describe("ownership and task isolation", () => {
 
     await ownership.adoptOwnedChild(tabStore.get(22) ?? {});
 
-    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21]);
-    expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 9, active: false });
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21, 22]);
+    expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 5, active: false });
     expect(removedTabIds).toEqual([]);
   });
 
@@ -2884,19 +3323,185 @@ describe("ownership and task isolation", () => {
     );
 
     await activeStarted.promise;
-    await ownership.closeTask(TASK_A);
+    const closing = ownership.closeTask(TASK_A);
+    await Promise.resolve();
+    expect(removedTabIds).toEqual([]);
     activeGate.resolve();
     await active;
+    await closing;
 
-    expect(await queuedOutcome).toMatchObject({ code: "ownership_revoked" });
+    expect(await queuedOutcome).toMatchObject({ code: "task_closed" });
     expect(removedTabIds).toEqual([23]);
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
+    const actorState = scheduler as unknown as {
+      blockedTabs: Map<number, unknown>;
+      generations: Map<number, unknown>;
+    };
+    expect(actorState.blockedTabs.size).toBe(0);
+    expect(actorState.generations.size).toBe(0);
+  });
+
+  test("drains active wait revalidation before taking task ownership actors", async () => {
+    await seedTask(TASK_A, [23]);
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const revalidationStarted = Promise.withResolvers<void>();
+    const revalidationGate = Promise.withResolvers<void>();
+    const activeWait = scheduler.readAfterWrites(23, async () => {
+      scheduler.assertTabAccepting(23);
+      revalidationStarted.resolve();
+      await revalidationGate.promise;
+      await ownership.assertOwned(TASK_A, 23);
+      scheduler.assertTabAccepting(23, "AgentTab stopped the active browser wait");
+    });
+    const activeOutcome = activeWait.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await revalidationStarted.promise;
+
+    const closing = ownership.closeTask(TASK_A);
+    await waitForCondition(() => scheduler.isTabBlocked(23));
+    revalidationGate.resolve();
+    const closeSettled = await Promise.race([
+      closing.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
+    ]);
+
+    expect(closeSettled).toBe(true);
+    expect(await activeOutcome).toMatchObject({ code: "ownership_revoked" });
+    expect(removedTabIds).toEqual([23]);
+    expect((await readState()).tasks[TASK_A]).toBeUndefined();
+  });
+
+  test("drains an active tab-close ownership callback without actor inversion", async () => {
+    await seedTask(TASK_A, [25]);
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const actionStarted = Promise.withResolvers<void>();
+    const actionGate = Promise.withResolvers<void>();
+    const activeAction = scheduler.enqueueTab(TASK_A, 25, async () => {
+      actionStarted.resolve();
+      await actionGate.promise;
+      tabStore.delete(25);
+      return ownership.revoke(25, "tab_removed");
+    });
+    await actionStarted.promise;
+
+    const closing = ownership.closeTask(TASK_A);
+    await waitForCondition(() => scheduler.isTabBlocked(25));
+    actionGate.resolve();
+    const closeSettled = await Promise.race([
+      closing.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
+    ]);
+
+    expect(closeSettled).toBe(true);
+    expect(await activeAction).toBe(true);
+    expect((await readState()).tasks[TASK_A]).toBeUndefined();
+    expect((await readState()).taskTombstones[TASK_A]).toBeDefined();
+  });
+
+  test("holds closing tab lanes through physical removal against cross-task adoption", async () => {
+    await seedTask(TASK_A, [24]);
+    const activeTab = tabStore.get(24);
+    if (!activeTab) throw new Error("missing active task tab");
+    activeTab.active = true;
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const removalStarted = Promise.withResolvers<void>();
+    const removalGate = Promise.withResolvers<void>();
+    tabRemovalProbe = async () => {
+      removalStarted.resolve();
+      await removalGate.promise;
+    };
+    const tabs = chrome.tabs as unknown as {
+      get(tabId: number): Promise<MockTab>;
+    };
+    const originalGet = tabs.get.bind(tabs);
+    tabs.get = async (tabId) => {
+      if (!tabStore.has(tabId)) throw new Error("No tab with id");
+      return originalGet(tabId);
+    };
+
+    const closing = ownership.closeTask(TASK_A);
+    await removalStarted.promise;
+    let adoptionFinished = false;
+    const adoptionOutcome = ownership.adoptActive(TASK_B).then(
+      (value) => {
+        adoptionFinished = true;
+        return { ok: true as const, value };
+      },
+      (error: unknown) => {
+        adoptionFinished = true;
+        return { ok: false as const, error };
+      },
+    );
+    await flushPromiseQueue();
+    const adoptedBeforeRemoval = adoptionFinished;
+    const taskBeforeRemoval = (await readState()).tasks[TASK_B];
+    removalGate.resolve();
+
+    await expect(closing).resolves.toEqual([24]);
+    const adoption = await adoptionOutcome;
+    expect(adoptedBeforeRemoval).toBe(false);
+    expect(taskBeforeRemoval).toBeUndefined();
+    expect(adoption.ok).toBe(false);
+    expect((await readState()).tasks[TASK_B]).toBeUndefined();
+    expect(tabStore.has(24)).toBe(false);
+  });
+
+  test("tombstones a task before queued lifecycle work can recreate it", async () => {
+    const scheduler = new MutationScheduler();
+    const ownership = new OwnershipLedger(scheduler, new RevisionTracker(), () => undefined);
+    const activeGate = Promise.withResolvers<void>();
+    const activeStarted = Promise.withResolvers<void>();
+    const active = scheduler.enqueueTaskLifecycle(TASK_A, async () => {
+      activeStarted.resolve();
+      await activeGate.promise;
+    });
+    await activeStarted.promise;
+    const queuedOpen = scheduler.enqueueTaskLifecycle(TASK_A, () => ownership.open(TASK_A, {
+      mode: "create",
+      url: "https://example.test/must-not-reopen",
+    }));
+    const queuedOutcome = queuedOpen.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    const closing = ownership.closeTask(TASK_A);
+    expect(scheduler.isTaskClosed(TASK_A)).toBe(true);
+    await expect(scheduler.enqueueTaskLifecycle(TASK_A, async () => undefined)).rejects.toMatchObject({
+      code: "task_closed",
+    });
+    activeGate.resolve();
+    await active;
+    await closing;
+
+    expect(await queuedOutcome).toMatchObject({ code: "task_closed" });
+    expect(nextTabId).toBe(100);
+    expect((await readState()).tasks[TASK_A]).toBeUndefined();
+    expect(typeof (await readState()).taskTombstones[TASK_A]).toBe("number");
+
+    resetStateForTest();
+    const restartedOwnership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+    await expect(restartedOwnership.open(TASK_A, {
+      mode: "create",
+      url: "https://example.test/still-closed",
+    })).rejects.toMatchObject({ code: "task_closed" });
+    expect(nextTabId).toBe(100);
   });
 });
 
 describe("handoff and pause barriers", () => {
-  test("keeps the global pause active until the completion condition matches", async () => {
+  test("keeps only the handed-off tab blocked until the completion condition matches", async () => {
     await seedTask(TASK_A, [31]);
+    await seedTask(TASK_B, [32], 6);
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
     const events: string[] = [];
@@ -2917,19 +3522,29 @@ describe("handoff and pause barriers", () => {
       timeout_ms: 60_000,
     });
 
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(31)).toBe(true);
+    expect(scheduler.isTabBlocked(32)).toBe(false);
+    expect(await scheduler.enqueueTab(TASK_B, 32, async () => "unrelated")).toBe("unrelated");
+    await handoff.pause();
     expect(scheduler.isAccepting()).toBe(false);
+    await handoff.resume();
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(31)).toBe(true);
     expect((await readState()).handoff.active).toBe(true);
     expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
     expect(await handoff.finish(true)).toMatchObject({
       completed: false,
       reason: "The handoff completion condition has not been met",
     });
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(31)).toBe(true);
     expect((await readState()).handoff.active).toBe(true);
 
     scriptResult = true;
     expect(await handoff.finish(true)).toEqual({ completed: true });
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(31)).toBe(true);
     const pendingHandoff = (await readState()).handoff;
     if (!pendingHandoff.active || !pendingHandoff.pendingClearEventId || !clearEventId) {
       throw new Error("handoff completion must await a native acknowledgment");
@@ -2937,6 +3552,7 @@ describe("handoff and pause barriers", () => {
     expect(clearEventId).toBe(pendingHandoff.pendingClearEventId);
     await handoff.acknowledgeEvent("handoff_changed", clearEventId);
     expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(31)).toBe(false);
     expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]?.state).toBe("working");
     expect(events.filter((event) => event === "handoff_changed")).toHaveLength(2);
@@ -2952,9 +3568,9 @@ describe("handoff and pause barriers", () => {
     const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload, eventId) => {
       events.push({ event, payload, eventId });
     });
-    let scrubCalls = 0;
-    handoff.setScrubber(async () => {
-      scrubCalls += 1;
+    const scrubbedTabs: number[] = [];
+    handoff.setScrubber(async (tabId) => {
+      scrubbedTabs.push(tabId);
     });
     const firstRevision = await revisions.ensure(33);
     await handoff.begin(TASK_A, {
@@ -2968,7 +3584,8 @@ describe("handoff and pause barriers", () => {
     expect(await handoff.cancelForTab(33)).toBe(true);
     const firstPending = (await readState()).handoff;
     expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(33)).toBe(true);
     const firstClearEventId = events.at(-1)?.eventId;
     if (!firstPending.active || !firstPending.pendingClearEventId || !firstClearEventId) {
       throw new Error("tab cancellation did not create a pending handoff event");
@@ -2979,6 +3596,7 @@ describe("handoff and pause barriers", () => {
     expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]?.state).toBe("working");
     expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(33)).toBe(false);
 
     const secondRevision = await revisions.ensure(34);
     await handoff.begin(TASK_B, {
@@ -2992,7 +3610,8 @@ describe("handoff and pause barriers", () => {
     expect(await handoff.cancelForTask(TASK_B)).toBe(true);
     const secondPending = (await readState()).handoff;
     expect((await readState()).tasks[TASK_B]?.state).toBe("needs_user");
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(34)).toBe(true);
     const secondClearEventId = events.at(-1)?.eventId;
     if (!secondPending.active || !secondPending.pendingClearEventId || !secondClearEventId) {
       throw new Error("task cancellation did not create a pending handoff event");
@@ -3003,11 +3622,12 @@ describe("handoff and pause barriers", () => {
     expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_B]?.state).toBe("working");
     expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(34)).toBe(false);
     expect(events.filter(({ event, payload, eventId }) =>
       event === "handoff_changed" && payload.active === false && typeof eventId === "string"
     )).toHaveLength(2);
     expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(4);
-    expect(scrubCalls).toBe(2);
+    expect(scrubbedTabs).toEqual([33, 33, 34, 34]);
   });
 
   test("clears a restored handoff for a tab revoked during initial reconciliation", async () => {
@@ -3019,9 +3639,9 @@ describe("handoff and pause barriers", () => {
     const handoff = new HandoffController(scheduler, revisions, ownership, (event, _payload, eventId) => {
       if (event === "handoff_changed" && eventId) clearEventIds.push(eventId);
     });
-    let scrubCalls = 0;
-    handoff.setScrubber(async () => {
-      scrubCalls += 1;
+    const scrubbedTabs: number[] = [];
+    handoff.setScrubber(async (tabId) => {
+      scrubbedTabs.push(tabId);
     });
     const pageRevision = await revisions.ensure(35);
     await handoff.begin(TASK_A, {
@@ -3038,7 +3658,8 @@ describe("handoff and pause barriers", () => {
 
     expect(revokedTabIds).toEqual([35]);
     const pending = (await readState()).handoff;
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
+    expect(scheduler.isTabBlocked(35)).toBe(true);
     const clearEventId = clearEventIds.at(-1);
     if (!pending.active || !pending.pendingClearEventId || !clearEventId) {
       throw new Error("startup reconciliation did not create a pending handoff event");
@@ -3049,7 +3670,8 @@ describe("handoff and pause barriers", () => {
     await handoff.acknowledgeEvent("handoff_changed", clearEventId);
     expect((await readState()).handoff).toEqual({ active: false });
     expect(scheduler.isAccepting()).toBe(true);
-    expect(scrubCalls).toBe(1);
+    expect(scheduler.isTabBlocked(35)).toBe(false);
+    expect(scrubbedTabs).toEqual([35, 35]);
     expect(alarmClears).toContain(HANDOFF_ALARM);
   });
 
@@ -3094,11 +3716,59 @@ describe("handoff and pause barriers", () => {
     expect(state.paused).toBe(true);
     expect(state.tasks[TASK_A]?.state).toBe("working");
     expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isTabBlocked(32)).toBe(false);
     expect(alarmClears).toContain(HANDOFF_ALARM);
   });
 });
 
 describe("native bridge transport", () => {
+  test("reopens unrelated admission without clearing a restored handoff tab", async () => {
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    await seedTask(TASK_A, [44], 12);
+    const pageRevision = await revisions.ensure(44);
+    await mutateState((state) => {
+      state.handoff = {
+        active: true,
+        taskId: TASK_A,
+        tabId: 44,
+        expectedRevision: pageRevision,
+        prompt: "Restored handoff",
+        completion: { kind: "manual_done" },
+        startedAtMs: Date.now(),
+        timeoutMs: 60_000,
+      };
+    });
+    await scheduler.blockTab(44);
+    scheduler.disconnect();
+    const port = new MockNativePort();
+    nativePort = port;
+    const bridge = new NativeBridge(scheduler, ownership, async () => {
+      throw new Error("command handler must not run");
+    });
+
+    await bridge.connect();
+    expect(port.posted[0]).toMatchObject({
+      kind: "hello",
+      handoff: { active: true, task_id: TASK_A, tab_id: 44 },
+    });
+    port.receive({
+      protocol: "agenttab.native",
+      version: 1,
+      kind: "ready",
+      host_version: "0.2.0",
+      state: "ready",
+    });
+
+    await waitForCondition(() => scheduler.isAccepting());
+    expect(scheduler.isTabBlocked(44)).toBe(true);
+    expect(await scheduler.enqueueTab(TASK_B, 45, async () => "unrelated")).toBe("unrelated");
+    await expect(scheduler.enqueueTab(TASK_A, 44, async () => "blocked")).rejects.toMatchObject({
+      code: "handoff_blackout",
+    });
+  });
+
   test("reconciles hello, resets backoff only after ready, and pauses on disconnect", async () => {
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
@@ -4128,6 +4798,18 @@ describe("extension entrypoint admission boundaries", () => {
   test("enforces popup sender, permission, pause, handoff, commit, developer, and cleanup gates", async () => {
     const port = new MockNativePort();
     nativePort = port;
+    sessionPersisted[BROWSER_SESSION_EPOCH_KEY] = "entrypoint-browser-session";
+    await seedTask(TASK_A, [77], 5);
+    await mutateState((state) => {
+      state.browserSessionEpoch = "stale-browser-session";
+      state.revisions["77"] = { floor: 4, current: 4 };
+    });
+    tabStore.set(77, {
+      id: 77,
+      windowId: 1,
+      groupId: 42,
+      url: "https://unrelated-after-restart.example/",
+    });
     // The background entrypoint must load after the Chrome mock is installed.
     await import("../src/background");
     await waitForCondition(() =>
@@ -4138,6 +4820,8 @@ describe("extension entrypoint admission boundaries", () => {
           (message as Record<string, unknown>).kind === "hello",
       ),
     );
+    expect(port.posted[0]).toMatchObject({ kind: "hello", inventory: [] });
+    expect((await readState()).tasks[TASK_A]).toMatchObject({ groupId: null, tabIds: [] });
     port.receive({
       protocol: "agenttab.native",
       version: 1,
@@ -4364,7 +5048,35 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: { code: "handoff_blackout" },
     });
-    expect(debuggerCommands).toHaveLength(deniedBeforePermission);
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6500",
+      TASK_A,
+      "browser_tabs",
+      {},
+    )).toMatchObject({
+      outcome: "completed",
+      result: { tabs: [], handoff: { active: true, tab_id: 100 } },
+    });
+    await seedTask(TASK_B, [99], 49);
+    const scriptingBeforeUnrelatedAction = scriptingCallCount;
+    const unrelatedAction = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6501",
+      TASK_B,
+      "browser_act",
+      {
+        tab_id: 99,
+        expected_page_revision: 1,
+        actions: [{ kind: "scroll", delta_x: 0, delta_y: 1 }],
+      },
+    );
+    expect(unrelatedAction).toMatchObject({ outcome: "completed" });
+    await mutateState((state) => {
+      delete state.tasks[TASK_B];
+      delete state.revisions["99"];
+    });
+    tabStore.delete(99);
+    expect(scriptingCallCount).toBe(scriptingBeforeUnrelatedAction + 1);
+    const debuggerCommandsAfterUnrelatedAction = debuggerCommands.length;
     expect(await sendPopupMessage({ kind: "handoff_finish", completed: true })).toEqual({ completed: true });
     const pendingHandoff = (await readState()).handoff;
     if (!pendingHandoff.active || !pendingHandoff.pendingClearEventId) {
@@ -4393,7 +5105,7 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: { code: "developer_mode_required" },
     });
-    expect(debuggerCommands).toHaveLength(deniedBeforePermission);
+    expect(debuggerCommands).toHaveLength(debuggerCommandsAfterUnrelatedAction);
     expect(await sendPopupMessage({ kind: "developer_mode", enabled: true })).toEqual({ enabled: true });
     const developerEnabled = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6228",
@@ -4612,6 +5324,15 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: { code: "ownership_denied" },
     });
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6502",
+      TASK_A,
+      "browser_open",
+      { mode: "create", url: "https://example.test/must-stay-closed" },
+    )).toMatchObject({
+      outcome: "not_started",
+      error: { code: "task_closed" },
+    });
     expect(taskDeletedBeforeRemove).toBe(true);
     expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
     debuggerAttachedTabIds.add(101);
@@ -4624,7 +5345,7 @@ describe("extension entrypoint admission boundaries", () => {
     for (const listener of permissionRemovedListeners) listener({ permissions: ["scripting"] });
     const tabsDeniedSynchronously = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6236",
-      TASK_A,
+      TASK_B,
       "browser_tabs",
       {},
     );
@@ -4633,8 +5354,9 @@ describe("extension entrypoint admission boundaries", () => {
       error: { code: "permissions_required" },
     });
     await waitForCondition(
-      () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeRevocation + 1,
+      () => debuggerCalls.filter((call) => call === "detach").length > detachCountBeforeRevocation,
     );
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(detachCountBeforeRevocation + 1);
     expect(await sendPopupMessage({ kind: "automation_revocation_state" })).toEqual({ generation: 0 });
     const cleanupAlarm = alarmCreates.find((alarm) => alarm.name === "agenttabAutomationCleanup");
     expect(cleanupAlarm).toBeDefined();
@@ -4653,7 +5375,7 @@ describe("extension entrypoint admission boundaries", () => {
     });
     const deniedDuringRegrantCleanup = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6301",
-      TASK_A,
+      TASK_B,
       "browser_tabs",
       {},
     );
@@ -4678,7 +5400,7 @@ describe("extension entrypoint admission boundaries", () => {
     });
     expect(await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6302",
-      TASK_A,
+      TASK_B,
       "browser_tabs",
       {},
     )).toMatchObject({ outcome: "completed" });
@@ -4797,11 +5519,27 @@ describe("extension entrypoint admission boundaries", () => {
     if (!movedTab) throw new Error("task tab for move test is unavailable");
     movedTab.groupId = 99;
     for (const listener of tabUpdatedListeners) listener(101, { groupId: 99 });
-    await waitForCondition(
-      () => debuggerCalls.filter((call) => call === "detach").length === detachCountBeforeMove + 1,
-    );
-    expect(debuggerAttachedTabIds.has(101)).toBe(false);
-    expect((await readState()).automationCleanup.tabIds).toEqual([]);
-    expect((await readState()).tasks[TASK_B]).toMatchObject({ groupId: null, tabIds: [] });
+    for (
+      let attempt = 0;
+      attempt < 100 && (await readState()).tasks[TASK_B]?.groupId !== null;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(debuggerCalls.filter((call) => call === "detach")).toHaveLength(detachCountBeforeMove);
+    expect(debuggerAttachedTabIds.has(101)).toBe(true);
+    expect((await readState()).automationCleanup.tabIds).toEqual([101]);
+    expect((await readState()).tasks[TASK_B]).toMatchObject({ groupId: null, tabIds: [101] });
+    expect(await sendPopupMessage({ kind: "close_task", task_id: TASK_B })).toEqual({ closed: true });
+    expect((await readState()).taskTombstones[TASK_B]).toBeDefined();
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6503",
+      TASK_B,
+      "browser_open",
+      { mode: "create", url: "https://example.test/popup-closed" },
+    )).toMatchObject({
+      outcome: "not_started",
+      error: { code: "task_closed" },
+    });
   });
 });
