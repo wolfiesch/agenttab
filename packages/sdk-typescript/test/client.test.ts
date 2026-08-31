@@ -7,10 +7,14 @@ import {
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
+  DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS,
+  DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
   FrameDecoder,
+  LONG_OPERATION_TRANSPORT_GRACE_MS,
   createUuidV7,
   createResumeCapabilityStore,
   encodeFrame,
+  resolveTransportTimeoutMs,
   type BrowserAction,
 } from "../src/index";
 
@@ -85,6 +89,71 @@ describe("Core RPC framing", () => {
     const value = createUuidV7(1_787_524_800_000);
     expect(value).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(Number.parseInt(value.replaceAll("-", "").slice(0, 12), 16)).toBe(1_787_524_800_000);
+  });
+});
+
+describe("Core RPC transport deadlines", () => {
+  test("derives bounded long-operation deadlines from requested and protocol-default timeouts", () => {
+    expect(resolveTransportTimeoutMs(
+      "browser_wait",
+      { tab_id: 1, condition: { kind: "load" } },
+    )).toBe(DEFAULT_BROWSER_WAIT_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs(
+      "browser_wait",
+      { tab_id: 1, condition: { kind: "load" }, timeout_ms: 120_000 },
+    )).toBe(120_000 + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs(
+      "browser_handoff",
+      {
+        tab_id: 1,
+        expected_page_revision: 1,
+        prompt: "Complete MFA",
+        completion: { kind: "manual_done" },
+      },
+    )).toBe(DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs("browser_tabs", {}, 45_000)).toBe(45_000);
+    expect(resolveTransportTimeoutMs(
+      "browser_wait",
+      { tab_id: 1, condition: { kind: "load" }, timeout_ms: 1 },
+      45_000,
+    )).toBe(45_000);
+  });
+
+  test("lets a requested browser_wait outlive a shorter generic client timeout", async () => {
+    const endpoint = await listen((socket) => {
+      const decoder = new FrameDecoder(1024 * 1024);
+      socket.on("data", (chunk) => {
+        for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+          if (value.kind === "connect") {
+            socket.write(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da42",
+              resumed: false,
+              state: "ready",
+            }, 1024 * 1024));
+            continue;
+          }
+          setTimeout(() => socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            request_id: value.request_id,
+            ok: true,
+            outcome: "completed",
+            result: { matched: true },
+          }, 1024 * 1024)), 30);
+        }
+      });
+    });
+
+    const client = await AgentTabClient.connect({ endpoint, requestTimeoutMs: 10 });
+    await expect(client.call("browser_wait", {
+      tab_id: 1,
+      condition: { kind: "load" },
+      timeout_ms: 1,
+    })).resolves.toEqual({ matched: true });
+    client.close();
   });
 });
 

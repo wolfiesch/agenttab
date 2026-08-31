@@ -12,6 +12,13 @@ export const CLIENT_TO_HOST_MAX_BYTES = 1024 * 1024;
 export const HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024;
 
 export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_BROWSER_WAIT_TIMEOUT_MS = 30_000;
+export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;
+// Core gives long-running extension operations five seconds to return after their
+// declared timeout. Keep a second, bounded five-second margin for the response to
+// cross the native and Core transports before the client classifies it as unknown.
+export const LONG_OPERATION_TRANSPORT_GRACE_MS = 10_000;
 
 export type BrowserOpenParams =
   | { mode: "create"; url?: string; placement?: "task"; background?: boolean }
@@ -369,6 +376,39 @@ const MUTATIONS = new Set<RpcMethod>([
   "browser_developer",
 ]);
 
+function longOperationTimeoutMs(
+  method: RpcMethod,
+  params: MethodParams[RpcMethod],
+): number | undefined {
+  let defaultTimeoutMs: number;
+  if (method === "browser_wait") {
+    defaultTimeoutMs = DEFAULT_BROWSER_WAIT_TIMEOUT_MS;
+  } else if (method === "browser_handoff") {
+    defaultTimeoutMs = DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS;
+  } else {
+    return undefined;
+  }
+  const requestedTimeoutMs = (params as { timeout_ms?: unknown }).timeout_ms;
+  return typeof requestedTimeoutMs === "number"
+    && Number.isSafeInteger(requestedTimeoutMs)
+    && requestedTimeoutMs > 0
+    ? requestedTimeoutMs
+    : defaultTimeoutMs;
+}
+
+export function resolveTransportTimeoutMs(
+  method: RpcMethod,
+  params: MethodParams[RpcMethod],
+  requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+): number {
+  const operationTimeoutMs = longOperationTimeoutMs(method, params);
+  if (operationTimeoutMs === undefined) return requestTimeoutMs;
+  return Math.max(
+    requestTimeoutMs,
+    operationTimeoutMs + LONG_OPERATION_TRANSPORT_GRACE_MS,
+  );
+}
+
 export function createUuidV7(now = Date.now()): string {
   const bytes = randomBytes(16);
   let timestamp = BigInt(now);
@@ -645,7 +685,7 @@ export class AgentTabClient {
     const client = new AgentTabClient(
       socket,
       connected,
-      options.requestTimeoutMs ?? 30_000,
+      options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       store,
     );
     client.#startReader(decoder);
@@ -687,7 +727,13 @@ export class AgentTabClient {
       );
     }
     const requestId = randomUUID();
-    const timeoutMs = options.timeoutMs ?? this.#requestTimeoutMs;
+    // A caller-supplied per-request timeout remains authoritative. Otherwise,
+    // long-running methods inherit their operation timeout plus transport grace.
+    const timeoutMs = options.timeoutMs ?? resolveTransportTimeoutMs(
+      method,
+      params,
+      this.#requestTimeoutMs,
+    );
     const idempotencyKey = MUTATIONS.has(method)
       ? options.idempotencyKey ?? createUuidV7()
       : undefined;

@@ -19,6 +19,12 @@ RPC_PROTOCOL = "agenttab.rpc"
 RPC_VERSION = 1
 CLIENT_TO_HOST_MAX_BYTES = 1024 * 1024
 HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024
+DEFAULT_REQUEST_TIMEOUT = 30.0
+DEFAULT_BROWSER_WAIT_TIMEOUT = 30.0
+DEFAULT_BROWSER_HANDOFF_TIMEOUT = 300.0
+# Core reserves five seconds after a long operation's declared timeout. Keep a
+# second, bounded five-second margin for its response to cross the transports.
+LONG_OPERATION_TRANSPORT_GRACE = 10.0
 MUTATIONS = {
     "browser_open",
     "browser_act",
@@ -28,6 +34,29 @@ MUTATIONS = {
 }
 
 JsonObject = dict[str, Any]
+
+
+def resolve_transport_timeout(
+    method: str,
+    params: Mapping[str, Any],
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+) -> float:
+    if method == "browser_wait":
+        default_timeout = DEFAULT_BROWSER_WAIT_TIMEOUT
+    elif method == "browser_handoff":
+        default_timeout = DEFAULT_BROWSER_HANDOFF_TIMEOUT
+    else:
+        return request_timeout
+    requested_timeout_ms = params.get("timeout_ms")
+    if (
+        isinstance(requested_timeout_ms, int)
+        and not isinstance(requested_timeout_ms, bool)
+        and requested_timeout_ms > 0
+    ):
+        operation_timeout = requested_timeout_ms / 1000
+    else:
+        operation_timeout = default_timeout
+    return max(request_timeout, operation_timeout + LONG_OPERATION_TRANSPORT_GRACE)
 
 
 class AgentTabError(RuntimeError):
@@ -253,6 +282,11 @@ def _read_exact(
     remaining = size
     while remaining:
         if isinstance(stream, socket.socket):
+            if deadline is not None:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError("AgentTab socket read timed out")
+                stream.settimeout(timeout)
             chunk = stream.recv(remaining)
         elif _uses_windows_named_pipe(stream):
             if deadline is None:
@@ -533,7 +567,7 @@ class AgentTabClient:
         self,
         stream: BinaryIO | socket.socket,
         connection: JsonObject,
-        request_timeout: float = 30.0,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
         capability_store: ResumeCapabilityStore | None = None,
     ) -> None:
         self._stream = stream
@@ -554,7 +588,7 @@ class AgentTabClient:
         resume_capability: str | None = None,
         endpoint: str | None = None,
         connect_timeout: float = 5.0,
-        request_timeout: float = 30.0,
+        request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
         capability_store: ResumeCapabilityStore | None = None,
     ) -> AgentTabClient:
         if capability_store is not None and resume_capability is not None:
@@ -750,20 +784,31 @@ class AgentTabClient:
         except (AttributeError, OSError):
             pass
 
-    def _exchange(self, payload: bytes) -> JsonObject:
+    def _exchange(self, payload: bytes, timeout: float) -> JsonObject:
         if isinstance(self._stream, socket.socket) or _uses_windows_named_pipe(self._stream):
             with self._lock:
+                deadline = time.monotonic() + timeout
                 if _uses_windows_named_pipe(self._stream):
-                    deadline = time.monotonic() + self.request_timeout
-                    self._write(self._stream, payload, timeout=self.request_timeout)
+                    self._write(self._stream, payload, timeout=timeout)
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError(
-                            f"AgentTab request timed out after {self.request_timeout} seconds"
+                            f"AgentTab request timed out after {timeout} seconds"
                         )
                     return read_frame(self._stream, timeout=remaining)
-                self._write(self._stream, payload)
-                return read_frame(self._stream)
+                previous_timeout = self._stream.gettimeout()
+                try:
+                    self._stream.settimeout(timeout)
+                    self._write(self._stream, payload)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"AgentTab request timed out after {timeout} seconds"
+                        )
+                    self._stream.settimeout(remaining)
+                    return read_frame(self._stream, timeout=remaining)
+                finally:
+                    self._stream.settimeout(previous_timeout)
 
         responses: list[JsonObject] = []
         failures: list[Exception] = []
@@ -781,7 +826,7 @@ class AgentTabClient:
 
         worker = threading.Thread(target=exchange, daemon=True)
         worker.start()
-        if not finished.wait(self.request_timeout):
+        if not finished.wait(timeout):
             self._closed = True
             self._cancel_windows_io(worker)
             threading.Thread(
@@ -789,7 +834,7 @@ class AgentTabClient:
                 daemon=True,
             ).start()
             raise TimeoutError(
-                f"AgentTab request timed out after {self.request_timeout} seconds"
+                f"AgentTab request timed out after {timeout} seconds"
             )
         if failures:
             raise failures[0]
@@ -842,6 +887,7 @@ class AgentTabClient:
         params: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        timeout: float | None = None,
     ) -> JsonObject:
         if self._closed:
             raise RuntimeError("AgentTab client is closed")
@@ -865,8 +911,15 @@ class AgentTabClient:
         if mutation_idempotency_key is not None:
             request["idempotency_key"] = mutation_idempotency_key
         payload = encode_frame(request)
+        transport_timeout = (
+            timeout
+            if timeout is not None
+            else resolve_transport_timeout(method, params, self.request_timeout)
+        )
+        if transport_timeout <= 0:
+            raise ValueError("AgentTab request timeout must be greater than zero")
         try:
-            response = self._exchange(payload)
+            response = self._exchange(payload, transport_timeout)
         except (OSError, EOFError) as error:
             if not self._closed:
                 self._close_after_transport_failure()
@@ -920,8 +973,14 @@ class AgentTabClient:
         params: Mapping[str, Any],
         *,
         idempotency_key: str | None = None,
+        timeout: float | None = None,
     ) -> Any:
-        response = self.request(method, params, idempotency_key=idempotency_key)
+        response = self.request(
+            method,
+            params,
+            idempotency_key=idempotency_key,
+            timeout=timeout,
+        )
         if not response.get("ok"):
             raise AgentTabError(response)
         return response.get("result")

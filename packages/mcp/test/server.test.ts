@@ -338,4 +338,65 @@ describe("AgentTab MCP surface", () => {
     });
     server.close();
   });
+
+  test("MCP forwards long-operation timeouts for SDK deadline selection", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      call: async (method: string, params: unknown) => {
+        calls.push({ method, params });
+        return { matched: true };
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ developer: false, clientFactory: async () => client });
+    await server.handle({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "browser_wait",
+        arguments: {
+          tab_id: 7,
+          condition: { kind: "load" },
+          timeout_ms: 120_000,
+        },
+      },
+    });
+    await server.handle({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "browser_handoff",
+        arguments: {
+          tab_id: 7,
+          expected_page_revision: 3,
+          prompt: "Complete MFA",
+          completion: { kind: "manual_done" },
+          timeout_ms: 900_000,
+        },
+      },
+    });
+    expect(calls).toEqual([
+      {
+        method: "browser_wait",
+        params: {
+          tab_id: 7,
+          condition: { kind: "load" },
+          timeout_ms: 120_000,
+        },
+      },
+      {
+        method: "browser_handoff",
+        params: {
+          tab_id: 7,
+          expected_page_revision: 3,
+          prompt: "Complete MFA",
+          completion: { kind: "manual_done" },
+          timeout_ms: 900_000,
+        },
+      },
+    ]);
+    server.close();
+  });
 });

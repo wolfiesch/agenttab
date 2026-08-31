@@ -13,7 +13,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agenttab import AgentTabClient, AgentTabError, AgentTabTransportError, encode_frame, read_frame, uuid7
+from agenttab import (
+    AgentTabClient,
+    AgentTabError,
+    AgentTabTransportError,
+    DEFAULT_BROWSER_HANDOFF_TIMEOUT,
+    DEFAULT_BROWSER_WAIT_TIMEOUT,
+    LONG_OPERATION_TRANSPORT_GRACE,
+    encode_frame,
+    read_frame,
+    resolve_transport_timeout,
+    uuid7,
+)
 from agenttab.client import create_resume_capability_store
 
 
@@ -64,6 +75,93 @@ class FramingTests(unittest.TestCase):
 
 @unittest.skipIf(not hasattr(socket, "AF_UNIX"), "requires Unix sockets")
 class ClientTests(unittest.TestCase):
+    def test_long_operation_transport_deadlines_follow_protocol_timeouts(self) -> None:
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_wait",
+                {"tab_id": 1, "condition": {"kind": "load"}},
+            ),
+            DEFAULT_BROWSER_WAIT_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
+        )
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_wait",
+                {
+                    "tab_id": 1,
+                    "condition": {"kind": "load"},
+                    "timeout_ms": 120_000,
+                },
+            ),
+            120 + LONG_OPERATION_TRANSPORT_GRACE,
+        )
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_handoff",
+                {
+                    "tab_id": 1,
+                    "expected_page_revision": 1,
+                    "prompt": "Complete MFA",
+                    "completion": {"kind": "manual_done"},
+                },
+            ),
+            DEFAULT_BROWSER_HANDOFF_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
+        )
+        self.assertEqual(resolve_transport_timeout("browser_tabs", {}, 45), 45)
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_wait",
+                {"tab_id": 1, "condition": {"kind": "load"}, "timeout_ms": 1},
+                45,
+            ),
+            45,
+        )
+
+    def test_requested_browser_wait_outlives_shorter_generic_client_timeout(self) -> None:
+        class DelayedResponseStream(io.RawIOBase):
+            def __init__(self) -> None:
+                super().__init__()
+                self.response = io.BytesIO()
+                self.delayed = False
+
+            def write(self, payload: bytes | bytearray) -> int:
+                request = read_frame(io.BytesIO(payload))
+                self.response = io.BytesIO(
+                    encode_frame(
+                        {
+                            "protocol": "agenttab.rpc",
+                            "version": 1,
+                            "request_id": request["request_id"],
+                            "ok": True,
+                            "outcome": "completed",
+                            "result": {"matched": True},
+                        }
+                    )
+                )
+                return len(payload)
+
+            def read(self, size: int = -1) -> bytes:
+                if not self.delayed:
+                    self.delayed = True
+                    time.sleep(0.03)
+                return self.response.read(size)
+
+            def flush(self) -> None:
+                return None
+
+        client = AgentTabClient(DelayedResponseStream(), {}, request_timeout=0.01)
+        self.assertEqual(
+            client.call(
+                "browser_wait",
+                {
+                    "tab_id": 1,
+                    "condition": {"kind": "load"},
+                    "timeout_ms": 1,
+                },
+            ),
+            {"matched": True},
+        )
+        client.close()
+
     def test_connection_and_typed_request(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             endpoint = str(Path(root) / "agenttab.sock")
