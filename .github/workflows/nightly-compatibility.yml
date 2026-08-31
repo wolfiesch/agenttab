@@ -1,4 +1,4 @@
-name: Nightly compatibility
+name: Nightly release compatibility
 
 on:
   workflow_dispatch:
@@ -10,28 +10,24 @@ permissions:
   contents: read
 
 concurrency:
-  group: nightly-compatibility
+  group: nightly-release-compatibility
   cancel-in-progress: true
 
 jobs:
-  fresh-install:
-    runs-on: ${{ fromJSON(vars.M1_CI_ENABLED == 'true' && '["self-hosted","macOS","ARM64","wolfie-m1","trusted","chrome-bridge"]' || '"macos-latest"') }}
+  release-and-live-smoke:
+    runs-on: ${{ fromJSON(vars.M1_CI_ENABLED == 'true' && '["self-hosted","macOS","ARM64","wolfie-m1","trusted"]' || '"macos-latest"') }}
     timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
-        if: ${{ runner.name != 'wolfie-m1-chrome-bridge' }}
+        if: ${{ !startsWith(runner.name, 'wolfie-m1') }}
         with:
           python-version: "3.11"
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
       - name: Validate the provisioned M1 browser and Python
-        if: ${{ runner.name == 'wolfie-m1-chrome-bridge' }}
+        if: ${{ startsWith(runner.name, 'wolfie-m1') }}
         shell: bash
         run: |
           python_root=/opt/homebrew/opt/python@3.11/libexec/bin
@@ -43,33 +39,97 @@ jobs:
           test -n "$chrome_binary"
           "$chrome_binary" --version
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare persistent M1 build cache
+        if: ${{ startsWith(runner.name, 'wolfie-m1') }}
+        shell: bash
+        run: |
+          cache_root="$HOME/Library/Caches/agenttab-ci/rust-1.97"
+          python3 scripts/prepare_ci_cache.py --root "$cache_root"
+          echo "CARGO_TARGET_DIR=$cache_root/cargo-target" >> "$GITHUB_ENV"
 
       - name: Create an isolated Python environment
         shell: bash
         run: |
-          python3 -m venv "$RUNNER_TEMP/chrome-bridge-nightly-venv"
-          echo "$RUNNER_TEMP/chrome-bridge-nightly-venv/bin" >> "$GITHUB_PATH"
+          python3 -m venv --clear "$RUNNER_TEMP/agenttab-nightly-venv"
+          echo "$RUNNER_TEMP/agenttab-nightly-venv/bin" >> "$GITHUB_PATH"
 
-      - name: Install the MCP bridge
-        run: python3 -m pip install -e ./mcp
+      - name: Install AgentTab workspace dependencies
+        run: |
+          python3 -m pip install -e packages/sdk-python
+          bun install --frozen-lockfile
 
-      - name: Repeat fresh-profile install smoke
+      - name: Validate the nightly harness and release inputs
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_background_reliability -v
+          PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile scripts/background_reliability.py
+          bun run --cwd packages/installer typecheck
+          bun run --cwd packages/installer test
+          bun run --cwd packages/installer build
+          AGENTTAB_EXTENSION_CHANNEL=store bun run --cwd packages/extension build
+          python3 scripts/package_extension_store.py \
+            --source packages/extension/dist \
+            --out "$RUNNER_TEMP/agenttab-extension-store.zip" \
+            --check-js
+          bun run --cwd packages/extension build
+
+      - name: Repeat locked host archive smoke
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in 1 2 3 4 5; do
-            echo "Fresh-profile attempt $attempt of 5"
-            PYTHONDONTWRITEBYTECODE=1 ./verify_live_install_smoke.py
+          target="$(rustc -vV | awk '/^host: / { print $2 }')"
+          version="$(node -p "require('./config/identity.json').version")"
+          cargo_target_dir="${CARGO_TARGET_DIR:-$RUNNER_TEMP/agenttab-nightly-cargo}"
+          export CARGO_TARGET_DIR="$cargo_target_dir"
+          cargo build --release --locked --manifest-path host-rs/Cargo.toml -p agenttab-host
+          for attempt in 1 2 3; do
+            release_dir="$RUNNER_TEMP/agenttab-nightly-release-$attempt"
+            mkdir -p "$release_dir"
+            python3 scripts/package_host_archive.py \
+              --version "$version" \
+              --target "$target" \
+              --binary "$cargo_target_dir/release/agenttab-host" \
+              --out-dir "$release_dir"
+            python3 scripts/verify_release_archives.py \
+              --host-archive "$release_dir/agenttab-host-v$version-$target.tar.gz" \
+              --target "$target"
           done
 
-      - name: Verify a cold locked native-host build
+      - name: Reload the provisioned AgentTab extension
+        if: ${{ startsWith(runner.name, 'wolfie-m1') }}
+        env:
+          AGENTTAB_CHROME_APP: Google Chrome for Testing
+        run: scripts/reload_unpacked_extension.sh --chrome-app "$AGENTTAB_CHROME_APP"
+
+      - name: Verify background-tab reliability through Core RPC v2
+        if: ${{ startsWith(runner.name, 'wolfie-m1') }}
+        env:
+          AGENTTAB_CHROME_APP: Google Chrome for Testing
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/background_reliability.py \
+            --duration-seconds 60 \
+            --output "$RUNNER_TEMP/agenttab-background-reliability.json"
+
+      - name: Upload background reliability evidence
+        if: ${{ always() && startsWith(runner.name, 'wolfie-m1') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: agenttab-background-reliability
+          path: ${{ runner.temp }}/agenttab-background-reliability.json
+          if-no-files-found: warn
+
+      - name: Enforce persistent M1 cache bounds
+        if: ${{ always() && startsWith(runner.name, 'wolfie-m1') }}
         shell: bash
         run: |
-          set -euo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/chrome-bridge-nightly-cargo"
-          cargo build --release --locked --manifest-path host-rs/Cargo.toml
-          python3 scripts/package_release.py \
-            --version nightly \
-            --dist "$RUNNER_TEMP/chrome-bridge-nightly-dist"
-          PYTHONDONTWRITEBYTECODE=1 ./verify_rust_host.py
+          python3 scripts/prepare_ci_cache.py \
+            --root "$HOME/Library/Caches/agenttab-ci/rust-1.97"

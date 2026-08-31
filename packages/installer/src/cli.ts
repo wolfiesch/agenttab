@@ -6,34 +6,58 @@ import { install, InstallError } from "./install";
 import { runProxy } from "./proxy";
 
 interface ParsedArgs {
-  positional: string[];
   flags: Map<string, string | true>;
 }
 
-function parseArgs(args: string[]): ParsedArgs {
-  const positional: string[] = [];
+type FlagKind = "boolean" | "string";
+
+const COMMAND_FLAGS: Record<string, Readonly<Record<string, FlagKind>>> = {
+  install: {
+    development: "boolean",
+    "dry-run": "boolean",
+    home: "string",
+    "manifest-url": "string",
+    "no-open-browser": "boolean",
+    "public-key": "string",
+    "signature-url": "string",
+    "state-dir": "string",
+    "verify-readiness": "boolean",
+    version: "string",
+  },
+  status: {},
+  doctor: { layer: "string" },
+  mcp: {},
+  proxy: { port: "string", "token-file": "string" },
+};
+
+function parseArgs(command: string, args: string[]): ParsedArgs {
+  const allowed = COMMAND_FLAGS[command];
+  if (!allowed) throw new Error(`Unknown command: ${command}`);
   const flags = new Map<string, string | true>();
   for (let index = 0; index < args.length; index += 1) {
     const value = args[index];
     if (!value.startsWith("--")) {
-      positional.push(value);
-      continue;
+      throw new Error(`Unexpected argument for agenttab ${command}: ${value}`);
     }
     const equals = value.indexOf("=");
-    if (equals >= 0) {
-      flags.set(value.slice(2, equals), value.slice(equals + 1));
+    const name = value.slice(2, equals >= 0 ? equals : undefined);
+    const kind = allowed[name];
+    if (!name || !kind) throw new Error(`Unknown option for agenttab ${command}: --${name}`);
+    if (flags.has(name)) throw new Error(`Duplicate option for agenttab ${command}: --${name}`);
+    if (kind === "boolean") {
+      if (equals >= 0) throw new Error(`--${name} does not take a value`);
+      flags.set(name, true);
       continue;
     }
-    const name = value.slice(2);
-    const next = args[index + 1];
-    if (next && !next.startsWith("--")) {
-      flags.set(name, next);
-      index += 1;
-    } else {
-      flags.set(name, true);
+    const inlineValue = equals >= 0 ? value.slice(equals + 1) : undefined;
+    const next = inlineValue ?? args[index + 1];
+    if (!next || (inlineValue === undefined && next.startsWith("--"))) {
+      throw new Error(`--${name} requires a value`);
     }
+    flags.set(name, next);
+    if (inlineValue === undefined) index += 1;
   }
-  return { positional, flags };
+  return { flags };
 }
 
 function stringFlag(args: ParsedArgs, name: string): string | undefined {
@@ -46,16 +70,21 @@ function boolFlag(args: ParsedArgs, name: string): boolean {
   return args.flags.get(name) === true;
 }
 
-function usage(): never {
-  console.error([
-    "Usage:",
-    "  agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]",
-    "  agenttab status",
-    "  agenttab doctor [--layer ipc|extension]",
-    "  agenttab mcp",
-    "  agenttab proxy --token-file PATH [--port 9224]",
-  ].join("\n"));
-  process.exit(2);
+const USAGE = [
+  "Usage:",
+  "  agenttab --help",
+  "  agenttab --version",
+  "  agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]",
+  "  agenttab status",
+  "  agenttab doctor [--layer ipc|extension]",
+  "  agenttab mcp",
+  "  agenttab proxy --token-file PATH [--port 9224]",
+].join("\n");
+
+function usage(exitCode: 0 | 2 = 2): never {
+  if (exitCode === 0) console.log(USAGE);
+  else console.error(USAGE);
+  process.exit(exitCode);
 }
 
 async function status(): Promise<unknown> {
@@ -68,9 +97,18 @@ async function status(): Promise<unknown> {
 }
 
 async function run(): Promise<void> {
-  const parsed = parseArgs(process.argv.slice(2));
-  const command = parsed.positional[0];
+  const argv = process.argv.slice(2);
+  if (argv.length === 1 && argv[0] === "--help") usage(0);
+  if (argv.length === 1 && argv[0] === "--version") {
+    console.log(packageJson.version);
+    return;
+  }
+  const command = argv[0];
   if (!command) usage();
+  if (command.startsWith("--")) throw new Error(`Unknown global option: ${command}`);
+  if (!COMMAND_FLAGS[command]) throw new Error(`Unknown command: ${command}`);
+  if (argv.length === 2 && argv[1] === "--help") usage(0);
+  const parsed = parseArgs(command, argv.slice(1));
 
   if (command === "mcp") {
     await mcpMain();
@@ -103,6 +141,9 @@ async function run(): Promise<void> {
     const tokenFile = stringFlag(parsed, "token-file");
     if (!tokenFile) throw new Error("agenttab proxy requires --token-file");
     const portValue = stringFlag(parsed, "port");
+    if (portValue !== undefined && (!/^\d+$/.test(portValue) || Number(portValue) > 65_535)) {
+      throw new Error("--port must be an integer from 0 to 65535");
+    }
     await runProxy({
       tokenFile,
       ...(portValue ? { port: Number(portValue) } : {}),

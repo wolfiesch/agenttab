@@ -58,7 +58,7 @@ The store package is produced locally by `scripts/package_extension_store.py`. V
 
 For each release candidate, record the source commit, tag, target triple, unsigned staging digest, final artifact digest, artifact-manifest signature, platform signature result, installer version mapping, and clean-machine install result. The installer expects an Ed25519-signed artifact manifest plus Apple code signing on macOS, Authenticode on Windows, and signed-manifest verification on Linux.
 
-The checked-in release trust configuration currently contains no public signing key. Therefore no signed artifact or installed package is verified by this checkout alone.
+The checked-in release trust configuration contains the stable Ed25519 verification public key. That key alone does not prove that a release was signed, published, or installed; verify the signature and platform signing of the exact artifacts independently.
 
 ## Publication evidence
 
@@ -68,7 +68,7 @@ These external gates are **unverified** until independently observed on the exac
 - GitHub release assets and checksums;
 - npm, PyPI, and prerelease-channel package ownership and publication;
 - signing, notarization, Authenticode timestamping, provenance, and SBOM publication;
-- Chrome Web Store item, package upload, review, trusted-tester install, and production availability;
+- Chrome Web Store item ownership and status, package upload, review, trusted-tester install, and production availability;
 - a controlled site and privacy-policy URL;
 - final domain, support, and store links.
 

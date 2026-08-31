@@ -7,6 +7,8 @@ Commands intended to be copied contain no user-controlled paths, shell interpola
 ## Command summary
 
 ```text
+agenttab --help
+agenttab --version
 agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]
 agenttab status
 agenttab doctor [--layer ipc|extension]
@@ -15,6 +17,8 @@ agenttab proxy --token-file PATH [--port 9224]
 ```
 
 There is no `agenttab uninstall`, no Standard-mode `--port`, no Standard-mode token command, no Python-host command, and no legacy task or lease command.
+
+The CLI rejects unknown commands, unknown or duplicate options, missing option values, and positional arguments after a command. Boolean options do not accept values: use `--dry-run` to enable a dry run and omit it otherwise. In particular, `--dry-run false` and `--dry-run=false` are errors rather than real-install requests.
 
 ## `agenttab install`
 
@@ -43,7 +47,7 @@ It is not usable until the package and signed release artifacts are public. The 
 
 The CLI prints a semantic diff before changing files, skips malformed supported client configuration instead of mutating it, backs up prior changed files, and rolls back touched files if the multi-file transaction fails. It does not silently enable a browser extension. When an extension must be loaded manually, the result includes its directory and instructions.
 
-The current source has no configured stable trust key and no public package. Therefore the default command deliberately cannot demonstrate a live installation yet.
+The current source contains the stable Ed25519 verification public key, but no matching signed release artifacts or public package have been verified or published. Therefore the default command cannot complete a live installation yet.
 
 ## `agenttab status`
 
