@@ -236,6 +236,10 @@ export class StandardBrowserRuntime {
     return [...this.debuggerCandidates];
   }
 
+  tracksTab(tabId: number): boolean {
+    return this.sessions.has(tabId) || this.debuggerCandidates.has(tabId);
+  }
+
   restoreDebuggerCandidates(tabIds: readonly number[]): void {
     for (const tabId of tabIds) this.debuggerCandidates.add(tabId);
   }

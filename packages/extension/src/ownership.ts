@@ -176,6 +176,11 @@ export class OwnershipLedger {
     return task?.groupId === null ? null : task?.taskId ?? null;
   }
 
+  async hasOwnedGroup(groupId: number): Promise<boolean> {
+    const state = await readState();
+    return Object.values(state.tasks).some((task) => task.groupId === groupId);
+  }
+
   private async reconcileNow(): Promise<number[]> {
     const tabs = (await chrome.tabs.query({})) as TabLike[];
     const byId = new Map(
