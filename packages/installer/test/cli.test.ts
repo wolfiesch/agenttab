@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -82,6 +82,7 @@ describe("installer CLI arguments", () => {
     const stateDir = join(root, "state");
     const uploadRoot = join(root, "workspace");
     await mkdir(uploadRoot);
+    const canonicalUploadRoot = await realpath(uploadRoot);
 
     const result = await runCli([
       "policy",
@@ -93,7 +94,7 @@ describe("installer CLI arguments", () => {
 
     expect(result.exitCode).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({
-      allowedRoot: uploadRoot,
+      allowedRoot: canonicalUploadRoot,
       added: true,
       restartRequired: true,
     });

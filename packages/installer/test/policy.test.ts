@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allowUploadRoot } from "../src/policy";
@@ -61,13 +61,14 @@ describe("upload policy", () => {
       audit_enabled: false,
       allowed_origins: ["https://example.test"],
     }));
+    const canonicalUploadRoot = await realpath(uploadRoot);
 
     const first = await allowUploadRoot(uploadRoot, { stateDir });
-    expect(first).toMatchObject({ allowedRoot: uploadRoot, added: true, restartRequired: true });
+    expect(first).toMatchObject({ allowedRoot: canonicalUploadRoot, added: true, restartRequired: true });
     expect(JSON.parse(await readFile(join(stateDir, "policy.json"), "utf8"))).toEqual({
       audit_enabled: false,
       allowed_origins: ["https://example.test"],
-      dlp_allowed_roots: [uploadRoot],
+      dlp_allowed_roots: [canonicalUploadRoot],
     });
     if (process.platform !== "win32") {
       expect((await stat(join(stateDir, "policy.json"))).mode & 0o777).toBe(0o600);
@@ -82,6 +83,7 @@ describe("upload policy", () => {
       mkdir(stateDir, { recursive: true }),
       mkdir(uploadRoot, { recursive: true }),
     ]);
+    const canonicalUploadRoot = await realpath(uploadRoot);
     await allowUploadRoot(uploadRoot, { stateDir });
     const before = await readFile(join(stateDir, "policy.json"), "utf8");
 
@@ -89,7 +91,7 @@ describe("upload policy", () => {
 
     expect(result).toEqual({
       policyFile: join(stateDir, "policy.json"),
-      allowedRoot: uploadRoot,
+      allowedRoot: canonicalUploadRoot,
       added: false,
       restartRequired: false,
     });
@@ -101,11 +103,12 @@ describe("upload policy", () => {
     const stateDir = join(root, "state");
     const uploadRoots = Array.from({ length: 8 }, (_, index) => join(root, `workspace-${index}`));
     await Promise.all(uploadRoots.map((uploadRoot) => mkdir(uploadRoot, { recursive: true })));
+    const canonicalUploadRoots = await Promise.all(uploadRoots.map((uploadRoot) => realpath(uploadRoot)));
 
     await Promise.all(uploadRoots.map((uploadRoot) => allowUploadRootInChild(uploadRoot, stateDir)));
 
     const policy = JSON.parse(await readFile(join(stateDir, "policy.json"), "utf8"));
-    expect([...policy.dlp_allowed_roots].sort()).toEqual([...uploadRoots].sort());
+    expect([...policy.dlp_allowed_roots].sort()).toEqual([...canonicalUploadRoots].sort());
   });
 
   test("rejects files, filesystem roots, and malformed existing policy", async () => {
