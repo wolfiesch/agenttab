@@ -29,49 +29,58 @@ async function runCli(args: string[]) {
 }
 
 describe("installer CLI arguments", () => {
-  test("prints help without starting a command", async () => {
-    const result = await runCli(["--help"]);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("Usage:");
-    expect(result.stdout).toContain("agenttab install");
-    expect(result.stderr).toBe("");
+  test("prints lifecycle help and package version without starting a command", async () => {
+    const help = await runCli(["--help"]);
+    expect(help.exitCode).toBe(0);
+    expect(help.stdout).toContain("agenttab update --version X.Y.Z");
+    expect(help.stdout).toContain("agenttab uninstall");
+    expect(help.stderr).toBe("");
+
+    const version = await runCli(["--version"]);
+    expect(version.exitCode).toBe(0);
+    expect(version.stdout.trim()).toBe(packageJson.version);
+    expect(version.stderr).toBe("");
   });
 
-  test("prints the package version", async () => {
-    const result = await runCli(["--version"]);
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe(packageJson.version);
-    expect(result.stderr).toBe("");
-  });
-
-  test("rejects a value after a boolean flag before installation can start", async () => {
-    const root = await mkdtemp(join(tmpdir(), "agenttab-cli-test-"));
+  test("requires an exact update version before download or mutation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttab-cli-update-test-"));
     temporaryRoots.push(root);
     const stateDir = join(root, "state");
-    const result = await runCli([
-      "install",
-      "--dry-run",
-      "false",
-      "--state-dir",
-      stateDir,
-    ]);
+    const result = await runCli(["update", "--state-dir", stateDir]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("Unexpected argument for agenttab install: false");
+    expect(result.stderr).toContain("agenttab update requires an exact --version X.Y.Z");
     expect(existsSync(stateDir)).toBe(false);
   });
 
-  test("rejects typo, duplicate, and command-specific options", async () => {
+  test("rejects malformed lifecycle and install flags before mutation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agenttab-cli-flags-test-"));
+    temporaryRoots.push(root);
+    const stateDir = join(root, "state");
     const cases = [
-      [["install", "--dry-rnu"], "Unknown option for agenttab install: --dry-rnu"],
-      [["install", "--dry-run", "--dry-run"], "Duplicate option for agenttab install: --dry-run"],
-      [["status", "--layer", "ipc"], "Unknown option for agenttab status: --layer"],
-      [["install", "--version"], "--version requires a value"],
-      [["install", "--dry-run=false"], "--dry-run does not take a value"],
+      [["install", "--dry-run", "false", "--state-dir", stateDir], "Unexpected argument for agenttab install: false"],
+      [["uninstall", "--dry-run=false", "--state-dir", stateDir], "--dry-run does not take a value"],
+      [["rollback", "--dry-rnu", "--state-dir", stateDir], "Unknown option for agenttab rollback: --dry-rnu"],
+      [["prune", "--keep", "-1", "--state-dir", stateDir], "--keep must be a non-negative integer"],
+      [["doctor", "--layer", "status", "--state-dir", stateDir], "--layer must be installation, ipc, protocol, host, extension, or all"],
     ] as const;
     for (const [args, message] of cases) {
       const result = await runCli([...args]);
       expect(result.exitCode).toBe(1);
       expect(result.stderr).toContain(message);
     }
-  });
+    expect(existsSync(stateDir)).toBe(false);
+  }, 20_000);
+
+  test("rejects duplicate and command-specific options", async () => {
+    const cases = [
+      [["install", "--dry-run", "--dry-run"], "Duplicate option for agenttab install: --dry-run"],
+      [["status", "--layer", "ipc"], "Unknown option for agenttab status: --layer"],
+      [["install", "--version"], "--version requires a value"],
+    ] as const;
+    for (const [args, message] of cases) {
+      const result = await runCli([...args]);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(message);
+    }
+  }, 20_000);
 });

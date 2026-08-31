@@ -11,9 +11,11 @@ import {
   detectLegacy,
   install,
   targetTriple,
+  update,
   verifySignedManifest,
   type RuntimeAssets,
 } from "../src/install";
+import { rollback } from "../src/lifecycle";
 import { applyTransaction } from "../src/transaction";
 import { AgentTabClient, AgentTabError } from "../../sdk-typescript/src/index";
 
@@ -202,10 +204,13 @@ async function signedFixture(root: string, version = "2.0.0-rc.1", assetUrl?: st
   const source = join(root, "source");
   await mkdir(source, { recursive: true });
   const binaryName = process.platform === "win32" ? "agenttab-host.exe" : "agenttab-host";
+  const shimName = process.platform === "win32" ? "agenttab-native.exe" : "agenttab-native";
   await copyFile(systemExecutable(), join(source, binaryName));
+  await copyFile(systemExecutable(), join(source, shimName));
   await chmod(join(source, binaryName), 0o755);
+  await chmod(join(source, shimName), 0o755);
   const archivePath = join(root, assetName);
-  execFileSync("tar", ["-czf", archivePath, "-C", source, binaryName]);
+  execFileSync("tar", ["-czf", archivePath, "-C", source, binaryName, shimName]);
   return signedArchiveFixture(root, {
     archive: await readFile(archivePath),
     assetName,
@@ -290,6 +295,7 @@ describe("release trust", () => {
       try {
         const result = await install(options);
         expect(result.readiness).toEqual({ passed: false, skipped: true, reason: "dry_run" });
+        expect(result.service.status).toBe("planned");
         expect(fetchMock).toHaveBeenCalledTimes(3);
       } finally {
         fetchMock.mockRestore();
@@ -333,11 +339,19 @@ describe("Windows host archives", () => {
     const executable = process.platform === "win32"
       ? await readFile(systemExecutable())
       : Buffer.from("AgentTab Windows host fixture");
-    const fixture = await signedWindowsZipFixture(root, zipArchive([{
-      name: "agenttab-host.exe",
-      bytes: executable,
-    }]));
+    const fixture = await signedWindowsZipFixture(root, zipArchive([
+      { name: "agenttab-host.exe", bytes: executable },
+      { name: "agenttab-native.exe", bytes: executable },
+    ]));
     const restorePowerShell = await addPowerShellShim(root);
+    const registryShim = join(root, "reg.exe");
+    await writeFile(
+      registryShim,
+      `#!/bin/sh\necho 'Registrierungswert wurde nicht gefunden.' >&2\nexit 3\n`,
+      { mode: 0o700 },
+    );
+    const previousRegistryExecutable = process.env.AGENTTAB_REG_EXE;
+    process.env.AGENTTAB_REG_EXE = registryShim;
     try {
       const result = await install({
         version: "2.0.0-rc.1",
@@ -355,8 +369,11 @@ describe("Windows host archives", () => {
         print: () => undefined,
       });
       expect(result.target).toBe("x86_64-pc-windows-msvc");
-      expect(result.transaction.changed).toEqual([]);
+      expect(result.transaction.changed.some((path) => path.endsWith("agenttab-host.exe"))).toBe(true);
+      expect(existsSync(join(root, "state"))).toBe(false);
     } finally {
+      if (previousRegistryExecutable === undefined) delete process.env.AGENTTAB_REG_EXE;
+      else process.env.AGENTTAB_REG_EXE = previousRegistryExecutable;
       restorePowerShell();
     }
   });
@@ -476,15 +493,77 @@ describe("end-to-end development install", () => {
       status: "manual_load_required",
     });
     expect(first.readiness).toEqual({ passed: false, skipped: true, reason: "manual_extension_load" });
+    expect(first.service.status).toBe("shim_fallback");
     expect(output.join("\n")).toContain("Open chrome://extensions in Chrome.");
     expect(output.join("\n")).toContain("Choose Load unpacked and select");
     expect(output.join("\n")).not.toContain("bridge_policy.json\n{}");
+
+    const targetRoot = join(stateDir, "versions", "v2.0.0-rc.1", targetTriple());
+    const nativeManifestPath = process.platform === "darwin"
+      ? join(home, "Library", "Application Support", "Google", "Chrome", "NativeMessagingHosts", "dev.agenttab.host.json")
+      : join(home, ".config", "google-chrome", "NativeMessagingHosts", "dev.agenttab.host.json");
+    if (process.platform !== "win32") {
+      expect(JSON.parse(await readFile(nativeManifestPath, "utf8")).path).toBe(
+        join(targetRoot, "agenttab-native"),
+      );
+    }
+    expect(JSON.parse(await readFile(join(targetRoot, "agenttab-runtime.json"), "utf8"))).toEqual({
+      schemaVersion: 1,
+      stateDir,
+    });
 
     const mtimes = new Map<string, number>();
     for (const path of first.transaction.changed) mtimes.set(path, (await stat(path)).mtimeMs);
     const second = await install(options);
     expect(second.transaction.changed).toEqual([]);
     for (const [path, mtime] of mtimes) expect((await stat(path)).mtimeMs).toBe(mtime);
+  });
+
+  test("same-version install aborts without replacing a drifted installed file", async () => {
+    const root = await temporaryRoot();
+    const home = join(root, "home");
+    const stateDir = join(home, ".agenttab");
+    const fixture = await signedFixture(root);
+    const assets = await runtimeAssets(root);
+    const options = {
+      version: "2.0.0-rc.1",
+      development: true,
+      manifestUrl: fixture.manifestUrl,
+      signatureUrl: fixture.signatureUrl,
+      publicKeyPem: fixture.publicKeyPem,
+      home,
+      stateDir,
+      runtimeAssets: assets,
+      openBrowser: false,
+      print: () => undefined,
+    } as const;
+    await install(options);
+
+    const cliPath = join(stateDir, "versions", "v2.0.0-rc.1", "agenttab-cli.mjs");
+    const activePath = join(stateDir, "active-install.json");
+    const activeBefore = await readFile(activePath);
+    await writeFile(cliPath, "user-edited-cli\n");
+
+    await expect(install(options)).rejects.toThrow();
+    expect(await readFile(cliPath, "utf8")).toBe("user-edited-cli\n");
+    expect(await readFile(activePath)).toEqual(activeBefore);
+
+    await writeFile(cliPath, await readFile(assets.cliBundlePath), { mode: 0o755 });
+    await expect(install({
+      ...options,
+      beforeTransaction: async () => writeFile(cliPath, "edit-after-repeat-preflight\n"),
+    })).rejects.toThrow("changed before transaction preparation");
+    expect(await readFile(cliPath, "utf8")).toBe("edit-after-repeat-preflight\n");
+    expect(await readFile(activePath)).toEqual(activeBefore);
+
+    await writeFile(cliPath, await readFile(assets.cliBundlePath), { mode: 0o755 });
+    const wrapperPath = join(stateDir, "bin", "agenttab");
+    await expect(install({
+      ...options,
+      beforeTransaction: async () => writeFile(wrapperPath, "activation-edit-after-repeat-preflight\n"),
+    })).rejects.toThrow("changed before transaction preparation");
+    expect(await readFile(wrapperPath, "utf8")).toBe("activation-edit-after-repeat-preflight\n");
+    expect(await readFile(activePath)).toEqual(activeBefore);
   });
 
   test("dry-run verifies artifacts and produces no installation state", async () => {
@@ -506,25 +585,76 @@ describe("end-to-end development install", () => {
       openBrowser: false,
       print: () => undefined,
     });
-    expect(result.transaction.changed).toEqual([]);
+    expect(result.transaction.changed.length).toBeGreaterThan(0);
+    expect(result.transaction.changed).toContain(join(stateDir, "active-install.json"));
     expect(existsSync(stateDir)).toBe(false);
     expect(result.extension.status).toBe("planned");
     expect(result.readiness).toEqual({ passed: false, skipped: true, reason: "dry_run" });
   });
 
-  test("waits for the ready lifecycle and retries a pre-dispatch readiness race", async () => {
+  test("activates only a newer exact update and can roll back to the prior wrapper", async () => {
+    const firstRoot = await temporaryRoot();
+    const home = join(firstRoot, "home");
+    const stateDir = join(home, ".agenttab");
+    const firstFixture = await signedFixture(firstRoot, "2.0.0");
+    const assets = await runtimeAssets(firstRoot);
+    const firstOptions = {
+      version: "2.0.0",
+      development: true,
+      manifestUrl: firstFixture.manifestUrl,
+      signatureUrl: firstFixture.signatureUrl,
+      publicKeyPem: firstFixture.publicKeyPem,
+      home,
+      stateDir,
+      runtimeAssets: assets,
+      openBrowser: false,
+      print: () => undefined,
+    } as const;
+    await install(firstOptions);
+    const wrapper = join(stateDir, "bin", process.platform === "win32" ? "agenttab.cmd" : "agenttab");
+    expect(await readFile(wrapper, "utf8")).toContain(join(stateDir, "versions", "v2.0.0"));
+
+    await expect(update(firstOptions)).rejects.toThrow("requires a version newer than 2.0.0");
+    await expect(update({
+      ...firstOptions,
+      version: "2.0.1",
+      runtimeAssets: { ...assets, version: "2.0.0" },
+    })).rejects.toThrow("installer runtime 2.0.0 cannot activate AgentTab 2.0.1");
+    const secondRoot = await temporaryRoot();
+    const secondFixture = await signedFixture(secondRoot, "2.0.1");
+    await update({
+      ...firstOptions,
+      version: "2.0.1",
+      manifestUrl: secondFixture.manifestUrl,
+      signatureUrl: secondFixture.signatureUrl,
+      publicKeyPem: secondFixture.publicKeyPem,
+    });
+    expect(JSON.parse(await readFile(join(stateDir, "active-install.json"), "utf8")).version).toBe("2.0.1");
+    expect(await readFile(wrapper, "utf8")).toContain(join(stateDir, "versions", "v2.0.1"));
+
+    await rollback({ stateDir, home, platform: process.platform });
+    expect(JSON.parse(await readFile(join(stateDir, "active-install.json"), "utf8")).version).toBe("2.0.0");
+    expect(await readFile(wrapper, "utf8")).toContain(join(stateDir, "versions", "v2.0.0"));
+  });
+
+  test("checks exact host/protocol readiness and retries a pre-dispatch extension race", async () => {
     const root = await temporaryRoot();
     const fixture = await signedFixture(root);
     const calls: string[] = [];
-    let statusCalls = 0;
     let openCalls = 0;
     const fakeClient = {
-      connection: { state: "starting" },
+      connection: {
+        protocol: "agenttab.rpc",
+        version: 1,
+        kind: "connected",
+        connection_id: "readiness-fixture",
+        resumed: false,
+        state: "ready",
+      },
       call: async (method: string): Promise<Record<string, unknown>> => {
         calls.push(method);
         if (method === "agenttab.status") {
-          statusCalls += 1;
-          return { state: statusCalls === 1 ? "reconciling" : "ready" };
+          return { state: "ready", protocol_version: 1, host_version: "2.0.0-rc.1", extension_version: "2.0.0" };
         }
         if (method === "browser_open") {
           openCalls += 1;
@@ -543,8 +673,6 @@ describe("end-to-end development install", () => {
           }
           return { tab_id: 41, page_revision: 7 };
         }
-        if (method === "browser_snapshot") return { page_revision: 8 };
-        if (method === "browser_act") return {};
         throw new Error(`unexpected readiness method: ${method}`);
       },
       close: () => undefined,
@@ -571,9 +699,58 @@ describe("end-to-end development install", () => {
         "agenttab.status",
         "browser_open",
         "browser_open",
-        "browser_snapshot",
-        "browser_act",
       ]);
+    } finally {
+      connect.mockRestore();
+    }
+  });
+
+  test("rolls back files and client config when readiness rejects the activated host version", async () => {
+    const root = await temporaryRoot();
+    const fixture = await signedFixture(root);
+    const home = join(root, "readiness-rollback-home");
+    const stateDir = join(home, ".agenttab");
+    const configPath = join(home, ".config", "mcp", "mcp.json");
+    const originalConfig = `${JSON.stringify({ mcpServers: { user: { command: "user" } } }, null, 2)}\n`;
+    await mkdir(join(home, ".config", "mcp"), { recursive: true });
+    await writeFile(configPath, originalConfig);
+    const fakeClient = {
+      connection: {
+        protocol: "agenttab.rpc",
+        version: 1,
+        kind: "connected",
+        connection_id: "wrong-host-fixture",
+        resumed: false,
+        state: "ready",
+      },
+      call: async (method: string): Promise<Record<string, unknown>> => {
+        if (method === "agenttab.status") {
+          return { state: "ready", protocol_version: 1, host_version: "9.9.9", extension_version: "2.0.0" };
+        }
+        if (method === "browser_open") return { tab_id: 9, page_revision: 1 };
+        throw new Error(`unexpected method: ${method}`);
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const connect = spyOn(AgentTabClient, "connect").mockResolvedValue(fakeClient);
+
+    try {
+      await expect(install({
+        version: "2.0.0-rc.1",
+        development: true,
+        manifestUrl: fixture.manifestUrl,
+        signatureUrl: fixture.signatureUrl,
+        publicKeyPem: fixture.publicKeyPem,
+        home,
+        stateDir,
+        runtimeAssets: await runtimeAssets(root),
+        verifyReadiness: true,
+        openBrowser: false,
+        print: () => undefined,
+      })).rejects.toThrow("running host 9.9.9 does not match active receipt 2.0.0-rc.1");
+      expect(await readFile(configPath, "utf8")).toBe(originalConfig);
+      expect(existsSync(join(stateDir, "active-install.json"))).toBe(false);
+      expect(existsSync(join(stateDir, "bin", "agenttab"))).toBe(false);
     } finally {
       connect.mockRestore();
     }

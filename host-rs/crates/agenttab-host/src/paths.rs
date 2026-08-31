@@ -3,6 +3,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InstalledRuntimeConfig {
+    schema_version: u8,
+    state_dir: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentTabPaths {
     pub root: PathBuf,
@@ -14,6 +21,8 @@ pub struct AgentTabPaths {
     pub lock_file: PathBuf,
     #[cfg(unix)]
     pub socket_file: PathBuf,
+    #[cfg(unix)]
+    pub native_socket_file: PathBuf,
 }
 
 impl AgentTabPaths {
@@ -53,6 +62,35 @@ impl AgentTabPaths {
         Self::from_root_and_run(root, run_dir)
     }
 
+    pub fn discover_for_shim(shim: &Path) -> io::Result<Self> {
+        let config_path = shim
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "shim has no parent"))?
+            .join("agenttab-runtime.json");
+        let bytes = match fs::read(&config_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Self::discover(),
+            Err(error) => return Err(error),
+        };
+        let config: InstalledRuntimeConfig = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid {}: {error}", config_path.display()),
+            )
+        })?;
+        if config.schema_version != 1 || !config.state_dir.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed runtime config must use schemaVersion 1 and an absolute stateDir",
+            ));
+        }
+        #[cfg(unix)]
+        let run_dir = runtime_directory(&config.state_dir)?;
+        #[cfg(windows)]
+        let run_dir = config.state_dir.join("run");
+        Ok(Self::from_root_and_run(config.state_dir, run_dir))
+    }
+
     fn from_root_and_run(root: PathBuf, run_dir: PathBuf) -> Self {
         Self {
             state_db: root.join("state.sqlite3"),
@@ -62,6 +100,8 @@ impl AgentTabPaths {
             lock_file: run_dir.join("host.lock"),
             #[cfg(unix)]
             socket_file: run_dir.join("agenttab.sock"),
+            #[cfg(unix)]
+            native_socket_file: run_dir.join("agenttab-native.sock"),
             run_dir,
             root,
         }
@@ -128,6 +168,11 @@ mod tests {
         assert_eq!(paths.upload_staging_dir, paths.root.join("upload-staging"));
         assert_eq!(paths.lock_file, paths.run_dir.join("host.lock"));
         #[cfg(unix)]
+        assert_eq!(
+            paths.native_socket_file,
+            paths.run_dir.join("agenttab-native.sock")
+        );
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
@@ -143,5 +188,24 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn installed_shim_config_selects_the_installer_state_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("versions/v2/target");
+        fs::create_dir_all(&target).unwrap();
+        let state = temp.path().join("custom-state");
+        fs::write(
+            target.join("agenttab-runtime.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "stateDir": state,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let paths = AgentTabPaths::discover_for_shim(&target.join("agenttab-native")).unwrap();
+        assert_eq!(paths.root, temp.path().join("custom-state"));
     }
 }

@@ -47,31 +47,45 @@ def run(command: list[str], *, cwd: Path, env: dict[str, str]) -> None:
         raise SmokeError(f"command failed ({' '.join(command[:2])}): {detail[-1000:]}")
 
 
-def host_binary_name(target: str) -> str:
-    return "agenttab-host.exe" if target.endswith("windows-msvc") else "agenttab-host"
+def executable_names(target: str) -> tuple[str, str]:
+    suffix = ".exe" if target.endswith("windows-msvc") else ""
+    return f"agenttab-host{suffix}", f"agenttab-native{suffix}"
 
 
-def archive_binary(archive: Path, target: str) -> bytes:
-    expected = host_binary_name(target)
+def archive_binaries(archive: Path, target: str) -> dict[str, bytes]:
+    expected = executable_names(target)
     try:
         if target.endswith("windows-msvc"):
             with zipfile.ZipFile(archive) as contents:
                 members = contents.infolist()
-                if len(members) != 1 or members[0].filename != expected or members[0].is_dir():
-                    raise SmokeError(f"{archive.name} must contain exactly {expected}")
-                if members[0].filename.startswith("/") or ".." in Path(members[0].filename).parts:
-                    raise SmokeError(f"{archive.name} has an unsafe member path")
-                return contents.read(members[0])
+                if len(members) != 2 or tuple(member.filename for member in members) != expected:
+                    raise SmokeError(f"{archive.name} must contain exactly {' and '.join(expected)}")
+                if any(
+                    member.is_dir()
+                    or member.filename.startswith("/")
+                    or ".." in Path(member.filename).parts
+                    for member in members
+                ):
+                    raise SmokeError(f"{archive.name} has an unsafe or non-file member")
+                return {member.filename: contents.read(member) for member in members}
         with tarfile.open(archive, "r:gz") as contents:
             members = contents.getmembers()
-            if len(members) != 1 or members[0].name != expected or not members[0].isfile():
-                raise SmokeError(f"{archive.name} must contain exactly {expected}")
-            if members[0].name.startswith("/") or ".." in Path(members[0].name).parts:
-                raise SmokeError(f"{archive.name} has an unsafe member path")
-            extracted = contents.extractfile(members[0])
-            if extracted is None:
-                raise SmokeError(f"{archive.name} does not contain an executable payload")
-            return extracted.read()
+            if len(members) != 2 or tuple(member.name for member in members) != expected:
+                raise SmokeError(f"{archive.name} must contain exactly {' and '.join(expected)}")
+            if any(
+                not member.isfile()
+                or member.name.startswith("/")
+                or ".." in Path(member.name).parts
+                for member in members
+            ):
+                raise SmokeError(f"{archive.name} has an unsafe or non-file member")
+            payloads: dict[str, bytes] = {}
+            for member in members:
+                extracted = contents.extractfile(member)
+                if extracted is None:
+                    raise SmokeError(f"{archive.name} does not contain {member.name}")
+                payloads[member.name] = extracted.read()
+            return payloads
     except (OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
         raise SmokeError(f"cannot read host archive {archive}: {exc}") from exc
 
@@ -98,15 +112,17 @@ def current_target() -> str | None:
 def smoke_host(archive: Path, target: str, root: Path) -> None:
     if not archive.is_file():
         raise SmokeError(f"missing host archive: {archive}")
-    payload = archive_binary(archive, target)
-    if not payload:
-        raise SmokeError(f"host archive is empty: {archive}")
+    payloads = archive_binaries(archive, target)
+    if any(not payload for payload in payloads.values()):
+        raise SmokeError(f"host archive contains an empty executable: {archive}")
     if current_target() != target:
         return
     root.mkdir(parents=True, exist_ok=True)
-    binary = root / host_binary_name(target)
-    binary.write_bytes(payload)
-    binary.chmod(0o755)
+    for name, payload in payloads.items():
+        binary = root / name
+        binary.write_bytes(payload)
+        binary.chmod(0o755)
+    binary = root / executable_names(target)[0]
     home = root / "home"
     home.mkdir()
     env = os.environ.copy()

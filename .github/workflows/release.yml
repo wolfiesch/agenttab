@@ -117,7 +117,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_protocol_schemas.py
           PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_identity.py
           PYTHONDONTWRITEBYTECODE=1 python3 tests/architecture/verify_forbidden_surface.py
-          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_package_host_archive scripts.test_package_artifact_manifest scripts.test_verify_release_asset_set
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.test_package_host_archive scripts.test_verify_release_archives scripts.test_package_artifact_manifest scripts.test_verify_release_asset_set
           cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
 
   build-host:
@@ -161,13 +161,17 @@ jobs:
           set -euo pipefail
           cargo build --release --locked --manifest-path host-rs/Cargo.toml --package agenttab-host --target "$TARGET"
           binary="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-host"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
-          unsigned_copy="$RUNNER_TEMP/agenttab-host-${TARGET}-unsigned"
-          cp "$binary" "$unsigned_copy"
+          shim="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-native"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; shim="${shim}.exe"; fi
+          unsigned_host="$RUNNER_TEMP/agenttab-host-${TARGET}-unsigned"
+          unsigned_shim="$RUNNER_TEMP/agenttab-native-${TARGET}-unsigned"
+          cp "$binary" "$unsigned_host"
+          cp "$shim" "$unsigned_shim"
           cargo clean --release --locked --manifest-path host-rs/Cargo.toml --package agenttab-host --target "$TARGET"
           cargo build --release --locked --manifest-path host-rs/Cargo.toml --package agenttab-host --target "$TARGET"
-          cmp "$unsigned_copy" "$binary"
-          rm -f "$unsigned_copy"
+          cmp "$unsigned_host" "$binary"
+          cmp "$unsigned_shim" "$shim"
+          rm -f "$unsigned_host" "$unsigned_shim"
       - name: Sign and notarize macOS host
         if: ${{ runner.os == 'macOS' }}
         env:
@@ -192,9 +196,11 @@ jobs:
           keychain="$RUNNER_TEMP/agenttab-signing.keychain-db"
           keychain_password="$(openssl rand -hex 32)"
           notarization_zip="$RUNNER_TEMP/agenttab-notarization-${TARGET}.zip"
+          notarization_root="$RUNNER_TEMP/agenttab-notarization-${TARGET}"
           cleanup() {
             security delete-keychain "$keychain" >/dev/null 2>&1 || true
             rm -f "$certificate" "$notary_key" "$notarization_zip"
+            rm -rf "$notarization_root"
           }
           trap cleanup EXIT
           printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | /usr/bin/base64 -D > "$certificate"
@@ -206,9 +212,14 @@ jobs:
           security import "$certificate" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
           binary="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-host"
-          /usr/bin/codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$MACOS_SIGNING_IDENTITY" "$binary"
-          /usr/bin/codesign --verify --strict --verbose=2 "$binary"
-          /usr/bin/ditto -c -k --keepParent "$binary" "$notarization_zip"
+          shim="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-native"
+          for executable in "$binary" "$shim"; do
+            /usr/bin/codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$MACOS_SIGNING_IDENTITY" "$executable"
+            /usr/bin/codesign --verify --strict --verbose=2 "$executable"
+          done
+          mkdir -p "$notarization_root"
+          cp "$binary" "$shim" "$notarization_root/"
+          /usr/bin/ditto -c -k --keepParent "$notarization_root" "$notarization_zip"
           xcrun notarytool submit "$notarization_zip" \
             --key "$notary_key" \
             --key-id "$APPLE_NOTARY_KEY_ID" \
@@ -246,12 +257,17 @@ jobs:
               Sort-Object FullName -Descending |
               Select-Object -First 1
             if ($null -eq $signTool) { throw "signtool.exe was not found" }
-            $binary = Join-Path $env:GITHUB_WORKSPACE "host-rs\target\$env:TARGET\release\agenttab-host.exe"
-            & $signTool.FullName sign /sha1 $certificate.Thumbprint /fd SHA256 `
-              /tr http://timestamp.digicert.com /td SHA256 $binary
-            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
-            & $signTool.FullName verify /pa /all $binary
-            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE" }
+            $executables = @(
+              (Join-Path $env:GITHUB_WORKSPACE "host-rs\target\$env:TARGET\release\agenttab-host.exe"),
+              (Join-Path $env:GITHUB_WORKSPACE "host-rs\target\$env:TARGET\release\agenttab-native.exe")
+            )
+            foreach ($executable in $executables) {
+              & $signTool.FullName sign /sha1 $certificate.Thumbprint /fd SHA256 `
+                /tr http://timestamp.digicert.com /td SHA256 $executable
+              if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
+              & $signTool.FullName verify /pa /all $executable
+              if ($LASTEXITCODE -ne 0) { throw "signtool verify failed with exit code $LASTEXITCODE" }
+            }
           } finally {
             if ($null -ne $certificate) {
               Remove-Item "Cert:\CurrentUser\My\$($certificate.Thumbprint)" -Force -ErrorAction SilentlyContinue
@@ -267,8 +283,9 @@ jobs:
         run: |
           set -euo pipefail
           binary="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-host"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
-          python scripts/package_host_archive.py --version "$RELEASE_VERSION" --target "$TARGET" --binary "$binary" --out-dir "$RELEASE_DIR"
+          shim="$GITHUB_WORKSPACE/host-rs/target/$TARGET/release/agenttab-native"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; shim="${shim}.exe"; fi
+          python scripts/package_host_archive.py --version "$RELEASE_VERSION" --target "$TARGET" --binary "$binary" --shim "$shim" --out-dir "$RELEASE_DIR"
           archive="$RELEASE_DIR/agenttab-host-v${RELEASE_VERSION}-${TARGET}.$([[ "$TARGET" == *windows-msvc ]] && printf zip || printf tar.gz)"
           python scripts/verify_release_archives.py --host-archive "$archive" --target "$TARGET"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

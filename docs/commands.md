@@ -10,13 +10,17 @@ Commands intended to be copied contain no user-controlled paths, shell interpola
 agenttab --help
 agenttab --version
 agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]
+agenttab update --version X.Y.Z [--verify-readiness]
+agenttab rollback [--dry-run]
+agenttab uninstall [--dry-run]
+agenttab prune [--keep N] [--dry-run]
 agenttab status
-agenttab doctor [--layer ipc|extension]
+agenttab doctor [--layer installation|ipc|protocol|host|extension|all]
 agenttab mcp
 agenttab proxy --token-file PATH [--port 9224]
 ```
 
-There is no `agenttab uninstall`, no Standard-mode `--port`, no Standard-mode token command, no Python-host command, and no legacy task or lease command.
+There is no Standard-mode `--port`, no Standard-mode token command, no Python-host command, and no legacy task or lease command.
 
 The CLI rejects unknown commands, unknown or duplicate options, missing option values, and positional arguments after a command. Boolean options do not accept values: use `--dry-run` to enable a dry run and omit it otherwise. In particular, `--dry-run false` and `--dry-run=false` are errors rather than real-install requests.
 
@@ -28,7 +32,7 @@ The intended post-launch install command is:
 npx agenttab install
 ```
 
-It is not usable until the package and signed release artifacts are public. The installer always resolves an exact version rather than `latest`, verifies the signed artifact manifest, requires the matching immutable `vX.Y.Z` asset, verifies the asset hash and platform signature, installs transactionally, writes an install receipt, registers `dev.agenttab.host`, and plans supported local client configuration updates. See [Setup](setup.md) for current source, prerelease, and future stable state.
+It is not usable until the package and signed release artifacts are public. The installer always resolves an exact version rather than `latest`, verifies the signed artifact manifest, requires the matching immutable `vX.Y.Z` asset, verifies the archive plus both host executables, installs transactionally, writes an install receipt, registers the `agenttab-native` relay as `dev.agenttab.host`, and plans supported local client configuration updates. Stable installs also attempt to start the persistent Core with the platform's per-user service manager; on-demand shim startup remains the no-elevation fallback. See [Setup](setup.md) for current source, prerelease, and future stable state.
 
 ### Install options
 
@@ -42,10 +46,20 @@ It is not usable until the package and signed release artifacts are public. The 
 | `--state-dir PATH` | Overrides the installer staging, version, receipt, extension, and wrapper directory. This is distinct from the Rust host default on Windows. |
 | `--home PATH` | Overrides the home root used to locate per-user browser registration and supported client configuration files. |
 | `--dry-run` | Renders the proposed transaction and returns a planned extension state without applying the file transaction. |
-| `--verify-readiness` | After installation, connects through the local IPC path, creates a disposable background task tab, captures an accessibility snapshot, and closes the tab. |
+| `--verify-readiness` | Before committing activation, verifies the receipt, IPC endpoint, exact RPC version, exact running host version, and extension routing with one disposable background tab. A failure rolls files, client configuration, and Windows default registry values back together. |
 | `--no-open-browser` | With readiness verification, prevents the installer from launching Chrome before it waits for IPC. |
 
-The CLI prints a semantic diff before changing files, skips malformed supported client configuration instead of mutating it, backs up prior changed files, and rolls back touched files if the multi-file transaction fails. It does not silently enable a browser extension. When an extension must be loaded manually, the result includes its directory and instructions.
+The CLI prints a semantic diff before changing files, skips malformed supported client configuration instead of mutating it, backs up prior changed files, and rolls back touched files if the multi-file transaction or readiness gate fails. The schema-v2 receipt records exact hashes and modes for installed files, the previous file values, semantic client-configuration values, Windows registry default values, and the prior active receipt. Receipts are mode `0600`. It does not silently enable a browser extension. When an extension must be loaded manually, the result includes its directory and instructions.
+
+## Update, rollback, uninstall, and prune
+
+`agenttab update --version X.Y.Z` requires an exact version newer than the active receipt. The executing installer bundle must itself be that exact version, because its CLI, OMP adapter, and extension bytes are part of the activation; an older installed CLI tells the user to run the exact newer installer package instead of mixing versions. It verifies the same immutable signed inputs as install, stages the new version beside the old one, then activates the wrapper, native-host registration, supported client entries, receipt, and optional readiness check as one transaction. It never resolves `latest`; a downgrade uses `agenttab rollback`.
+
+`agenttab rollback` restores the immediately previous activation recorded by the active receipt. It preflights every owned activation file, client entry, and Windows registry default and aborts the whole rollback before changing anything if any one of them drifted. Version artifacts remain available until prune or uninstall. `agenttab uninstall` walks the authenticated active receipt chain, restores values that still exactly match AgentTab's installed values, and removes exact version artifacts. `agenttab prune --keep N` replays inactive artifact ownership newest to oldest, restoring any pre-existing file recorded by the receipt rather than blindly deleting it; it retains receipts as an audit trail.
+
+All lifecycle commands are conservative. A file with a changed hash or mode, an edited `mcpServers.agenttab` value, an edited OMP sequence item, or a changed Windows registry default value is reported as preserved; rollback treats any such preservation as a reason to abort without flipping the active receipt. JSON/YAML cleanup changes only the owned property or sequence item and preserves unrelated edits. Windows cleanup uses default-value deletion (`/ve`) and never recursively deletes a browser/vendor registry key. No command recursively deletes a home, state, version, config, or registry tree. Use `--dry-run` to inspect the complete changed-resource list without applying it.
+
+Install, update, rollback, uninstall, and prune take one cross-process lock for the selected state directory before reading authoritative state. Before their first mutation they record exact before/installed file states and Windows default values, and they preflight the same-directory hard links required on every target filesystem. Unsupported filesystems such as configurations of exFAT or SMB fail before a target is changed. If a process stops before its commit marker is durable, the next mutating command recovers that intent while holding the same lock. Recovery restores only resources that still equal either side of the recorded transaction; a concurrent edit is preserved and blocks further mutation with the exact conflicting resource named. Unix transaction namespace boundaries request filesystem durability with directory barriers. Node does not expose the equivalent Windows directory barrier, so Windows recovery is process-crash atomic but does not claim sudden power-loss atomicity; `agenttab doctor --layer installation` reports that limitation.
 
 The current source contains the stable Ed25519 verification public key, but no matching signed release artifacts or public package have been verified or published. Therefore the default command cannot complete a live installation yet.
 
@@ -55,7 +69,7 @@ The current source contains the stable Ed25519 verification public key, but no m
 agenttab status
 ```
 
-Connects to local AgentTab IPC and prints the Core `agenttab.status` result as JSON. The status response reports the host lifecycle state, protocol version, whether a handoff is active, and the current connection's task identifier when one exists.
+Connects to local AgentTab IPC and prints the Core `agenttab.status` result as JSON. The status response reports the host lifecycle state, exact host version, protocol version, whether a handoff is active, and the current connection's task identifier when one exists.
 
 Use this only after the extension and native host are installed. It does not start a browser, create a task, use a port, or authenticate with a token.
 
@@ -69,12 +83,15 @@ agenttab doctor --layer ipc
 agenttab doctor --layer extension
 ```
 
-`--layer` accepts only `ipc` or `extension`; it defaults to `ipc`. The command runs the same status request and prints JSON. On failure, it returns a layer-specific recovery message:
+`--layer` accepts `installation`, `ipc`, `protocol`, `host`, `extension`, or `all`; it defaults to `all`. These are distinct checks:
 
-- `ipc`: open Chrome with AgentTab enabled, then rerun `agenttab doctor --layer ipc`.
-- `extension`: reload AgentTab in `chrome://extensions`, then rerun `agenttab doctor --layer extension`.
+- `installation` verifies the active receipt and its exact files, semantic client entries, and Windows default values. Its evidence also reports the platform's transaction-recovery scope, including the Windows power-loss limitation.
+- `ipc` proves a connection to the per-user host endpoint.
+- `protocol` compares the SDK, connection acknowledgment, and host-reported RPC versions.
+- `host` requires the ready lifecycle and an exact running-host version match with the active receipt.
+- `extension` compares the connected extension's native hello version with the bundled extension version in the active receipt, then creates one disposable background `about:blank` task tab and validates its tab/revision response. The initial task capability is intentionally not confirmed; closing the diagnostic connection invokes the host's exact-task cleanup.
 
-The extension layer is a diagnostic label around the status check. It does not reload Chrome for you.
+The command prints independent evidence and recovery for every selected layer. It does not relabel a single status RPC as an extension check and does not reload Chrome for you.
 
 ## `agenttab mcp` and `agenttab-mcp`
 

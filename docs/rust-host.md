@@ -1,6 +1,8 @@
 # AgentTab Rust host
 
-`agenttab-host` is the production AgentTab host. It is a Rust workspace with `agenttab-protocol` and `agenttab-host` crates. There is no Python production host or Python fallback in the v2 runtime.
+`agenttab-host` is the production AgentTab Core. It is a Rust workspace with `agenttab-protocol` and `agenttab-host` crates. Release archives also contain the thin Rust `agenttab-native` Native Messaging relay. There is no Python production host or Python fallback in the v2 runtime.
+
+The proposed persistent layout runs `agenttab-host daemon` independently of Chrome's native-port lifetime and registers `agenttab-native` with Chrome. A normal extension disconnect leaves Core IPC alive in `reconciling`; a replacement native port reconciles against the same journal and returns it to ready. Running `agenttab-host` without arguments preserves the combined stdio/Core process for source compatibility. See [ADR 0002](adr/0002-persistent-core-daemon.md).
 
 ## Architecture
 
@@ -17,7 +19,7 @@ Core RPC and the native bridge are separate protocols. Both reject unsupported v
 
 ## Native bridge
 
-Chrome launches the native host named `dev.agenttab.host`; the extension maintains the Native Messaging connection. Native frames are an unsigned 32-bit little-endian length followed by UTF-8 JSON. Host-to-extension messages are capped at 1 MiB and extension-to-host messages at 64 MiB. The extension sends `hello` inventory, paused state, handoff state, and staged Commit state. The host becomes ready only after compatible hello and reconciliation, then returns `ready` with `ready` or `paused` state.
+Chrome connects to the native host named `dev.agenttab.host`; installed manifests launch `agenttab-native`, while the source-compatibility path can still launch the combined host directly. Native frames are an unsigned 32-bit little-endian length followed by UTF-8 JSON. Host-to-extension messages are capped at 1 MiB and extension-to-host messages at 64 MiB. The extension sends `hello` inventory, paused state, handoff state, and staged Commit state. Core becomes ready only after compatible hello and reconciliation, then returns `ready` with `ready` or `paused` state.
 
 A native disconnect returns the host to reconciliation. A protocol mismatch is terminal rather than a compatibility fallback.
 
@@ -33,7 +35,7 @@ Standard mode has no TCP listener or bearer token. The advanced `agenttab proxy 
 
 ## Lifecycle and admission
 
-The implemented lifecycle states are `starting`, `reconciling`, `ready`, `paused`, and terminal. Browser work is admitted only in `ready`. In `starting` or `reconciling` it returns `runtime_not_ready`; in `paused` it returns `automation_paused`; in terminal state it returns a protocol-recovery error.
+The implemented lifecycle states are `starting`, `reconciling`, `ready`, `paused`, and terminal. Browser work is admitted only in `ready`. In `starting` or `reconciling` it returns `runtime_not_ready`; in `paused` it returns `automation_paused`; in terminal state it returns a protocol-recovery error. `agenttab.status` also reports the compiled host package version, RPC protocol version, and connected extension hello version so installer diagnostics can compare the running components with the exact active receipt.
 
 Pause admission is also enforced by the extension scheduler. It closes new admission, waits for in-flight work, persists pause state, and rejects queued work before dispatch. Handoff is a global write barrier and causes a host-side blackout check both before and after request admission.
 

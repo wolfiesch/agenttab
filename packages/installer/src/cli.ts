@@ -2,7 +2,8 @@ import { readFile } from "node:fs/promises";
 import { AgentTabClient } from "../../sdk-typescript/src/index";
 import { main as mcpMain } from "../../mcp/src/server";
 import packageJson from "../package.json" with { type: "json" };
-import { install, InstallError } from "./install";
+import { install, InstallError, update, type InstallOptions } from "./install";
+import { doctor, prune, rollback, uninstall, type DoctorLayer, type LifecycleOptions } from "./lifecycle";
 import { runProxy } from "./proxy";
 
 interface ParsedArgs {
@@ -11,21 +12,33 @@ interface ParsedArgs {
 
 type FlagKind = "boolean" | "string";
 
+const ARTIFACT_FLAGS: Readonly<Record<string, FlagKind>> = {
+  development: "boolean",
+  "dry-run": "boolean",
+  home: "string",
+  "manifest-url": "string",
+  "no-open-browser": "boolean",
+  "public-key": "string",
+  "signature-url": "string",
+  "state-dir": "string",
+  "verify-readiness": "boolean",
+  version: "string",
+};
+
+const LIFECYCLE_FLAGS: Readonly<Record<string, FlagKind>> = {
+  "dry-run": "boolean",
+  home: "string",
+  "state-dir": "string",
+};
+
 const COMMAND_FLAGS: Record<string, Readonly<Record<string, FlagKind>>> = {
-  install: {
-    development: "boolean",
-    "dry-run": "boolean",
-    home: "string",
-    "manifest-url": "string",
-    "no-open-browser": "boolean",
-    "public-key": "string",
-    "signature-url": "string",
-    "state-dir": "string",
-    "verify-readiness": "boolean",
-    version: "string",
-  },
+  install: ARTIFACT_FLAGS,
+  update: ARTIFACT_FLAGS,
+  rollback: LIFECYCLE_FLAGS,
+  uninstall: LIFECYCLE_FLAGS,
+  prune: { ...LIFECYCLE_FLAGS, keep: "string" },
   status: {},
-  doctor: { layer: "string" },
+  doctor: { home: "string", layer: "string", "state-dir": "string" },
   mcp: {},
   proxy: { port: "string", "token-file": "string" },
 };
@@ -75,8 +88,12 @@ const USAGE = [
   "  agenttab --help",
   "  agenttab --version",
   "  agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]",
+  "  agenttab update --version X.Y.Z [--verify-readiness]",
+  "  agenttab rollback [--dry-run]",
+  "  agenttab uninstall [--dry-run]",
+  "  agenttab prune [--keep N] [--dry-run]",
   "  agenttab status",
-  "  agenttab doctor [--layer ipc|extension]",
+  "  agenttab doctor [--layer installation|ipc|protocol|host|extension|all]",
   "  agenttab mcp",
   "  agenttab proxy --token-file PATH [--port 9224]",
 ].join("\n");
@@ -94,6 +111,34 @@ async function status(): Promise<unknown> {
   } finally {
     client.close();
   }
+}
+
+function lifecycleOptions(parsed: ParsedArgs): LifecycleOptions {
+  return {
+    stateDir: stringFlag(parsed, "state-dir"),
+    home: stringFlag(parsed, "home"),
+    dryRun: boolFlag(parsed, "dry-run"),
+  };
+}
+
+async function artifactOptions(parsed: ParsedArgs, requireVersion: boolean): Promise<InstallOptions> {
+  const development = boolFlag(parsed, "development");
+  const publicKeyPath = stringFlag(parsed, "public-key");
+  if (publicKeyPath && !development) throw new Error("--public-key is allowed only with --development");
+  const version = stringFlag(parsed, "version");
+  if (requireVersion && !version) throw new Error("agenttab update requires an exact --version X.Y.Z");
+  return {
+    version: version ?? packageJson.version,
+    development,
+    manifestUrl: stringFlag(parsed, "manifest-url"),
+    signatureUrl: stringFlag(parsed, "signature-url"),
+    stateDir: stringFlag(parsed, "state-dir"),
+    home: stringFlag(parsed, "home"),
+    publicKeyPem: publicKeyPath ? await readFile(publicKeyPath, "utf8") : undefined,
+    dryRun: boolFlag(parsed, "dry-run"),
+    verifyReadiness: boolFlag(parsed, "verify-readiness"),
+    openBrowser: !boolFlag(parsed, "no-open-browser"),
+  };
 }
 
 async function run(): Promise<void> {
@@ -119,22 +164,17 @@ async function run(): Promise<void> {
     return;
   }
   if (command === "doctor") {
-    const layer = stringFlag(parsed, "layer") ?? "ipc";
-    if (layer !== "ipc" && layer !== "extension") throw new Error("--layer must be ipc or extension");
-    try {
-      const result = await status();
-      console.log(JSON.stringify({ success: true, layer, result }, null, 2));
-    } catch (error) {
-      console.log(JSON.stringify({
-        success: false,
-        layer,
-        error: error instanceof Error ? error.message : String(error),
-        recovery: layer === "ipc"
-          ? "Open Chrome with the AgentTab extension enabled, then rerun agenttab doctor --layer ipc."
-          : "Reload AgentTab in chrome://extensions, then rerun agenttab doctor --layer extension.",
-      }, null, 2));
-      process.exitCode = 1;
+    const layer = stringFlag(parsed, "layer") ?? "all";
+    if (!["installation", "ipc", "protocol", "host", "extension", "all"].includes(layer)) {
+      throw new Error("--layer must be installation, ipc, protocol, host, extension, or all");
     }
+    const result = await doctor({
+      stateDir: stringFlag(parsed, "state-dir"),
+      home: stringFlag(parsed, "home"),
+      layer: layer as DoctorLayer | "all",
+    });
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.success) process.exitCode = 1;
     return;
   }
   if (command === "proxy") {
@@ -150,23 +190,23 @@ async function run(): Promise<void> {
     });
     return;
   }
-  if (command === "install") {
-    const development = boolFlag(parsed, "development");
-    const publicKeyPath = stringFlag(parsed, "public-key");
-    if (publicKeyPath && !development) throw new Error("--public-key is allowed only with --development");
-    const result = await install({
-      version: stringFlag(parsed, "version") ?? packageJson.version,
-      development,
-      manifestUrl: stringFlag(parsed, "manifest-url"),
-      signatureUrl: stringFlag(parsed, "signature-url"),
-      stateDir: stringFlag(parsed, "state-dir"),
-      home: stringFlag(parsed, "home"),
-      publicKeyPem: publicKeyPath ? await readFile(publicKeyPath, "utf8") : undefined,
-      dryRun: boolFlag(parsed, "dry-run"),
-      verifyReadiness: boolFlag(parsed, "verify-readiness"),
-      openBrowser: !boolFlag(parsed, "no-open-browser"),
-    });
-    console.log(JSON.stringify(result, null, 2));
+  if (command === "install" || command === "update") {
+    const options = await artifactOptions(parsed, command === "update");
+    console.log(JSON.stringify(command === "install" ? await install(options) : await update(options), null, 2));
+    return;
+  }
+  if (command === "rollback") {
+    console.log(JSON.stringify(await rollback(lifecycleOptions(parsed)), null, 2));
+    return;
+  }
+  if (command === "uninstall") {
+    console.log(JSON.stringify(await uninstall(lifecycleOptions(parsed)), null, 2));
+    return;
+  }
+  if (command === "prune") {
+    const keepValue = stringFlag(parsed, "keep");
+    if (keepValue !== undefined && !/^\d+$/.test(keepValue)) throw new Error("--keep must be a non-negative integer");
+    console.log(JSON.stringify(await prune({ ...lifecycleOptions(parsed), ...(keepValue ? { keep: Number(keepValue) } : {}) }), null, 2));
     return;
   }
   usage();

@@ -4,6 +4,7 @@ pub mod handoff;
 pub mod journal;
 pub mod lifecycle;
 pub mod native;
+pub mod native_relay;
 pub mod paths;
 pub mod runtime;
 pub mod server;

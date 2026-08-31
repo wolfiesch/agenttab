@@ -50,7 +50,7 @@ cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
 
 On Windows, additionally prove the current-user SID pipe name, DACL, remote-client rejection, and client SID verification. On Unix, prove the private runtime directory, socket mode, same-user peer check, stale-socket handling, and second-host lock. Source-level success on one platform is not portability evidence for another.
 
-Installer tests use temporary user/config homes and cover transactional configuration changes, malformed configuration preservation, rollback, proxy authentication, and repeat-install behavior. A successful test fixture is not a clean-machine install of a signed release.
+Installer tests use temporary user/config homes and cover transactional configuration changes, malformed configuration preservation, exact-version update activation, rollback, uninstall, prune, later-edit preservation, proxy authentication, and repeat-install behavior. Fault injection verifies rollback of file deletion, active-state activation, readiness failure, and Windows default-value changes. Windows registry fixtures reject any recursive key deletion; Unix fixtures verify hash/mode ownership and semantic JSON/YAML cleanup. Layered doctor fixtures independently exercise installation, IPC, protocol, exact host-version, and extension-route evidence. A successful test fixture is not a clean-machine install of a signed release.
 
 ## Packaged artifact evidence
 

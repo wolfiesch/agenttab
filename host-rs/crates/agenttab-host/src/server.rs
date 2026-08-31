@@ -283,7 +283,7 @@ pub fn windows_pipe_name(current_user_sid: &str) -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn create_windows_pipe(
+pub(crate) fn create_windows_pipe(
     pipe_name: &str,
     current_user_sid: &str,
     first: bool,
@@ -343,13 +343,13 @@ fn create_windows_pipe(
 }
 
 #[cfg(windows)]
-fn current_user_sid() -> io::Result<String> {
+pub(crate) fn current_user_sid() -> io::Result<String> {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     sid_for_windows_process(unsafe { GetCurrentProcess() })
 }
 
 #[cfg(windows)]
-fn verify_windows_pipe_client(
+pub(crate) fn verify_windows_pipe_client(
     pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
     expected_sid: &str,
 ) -> io::Result<()> {
@@ -762,7 +762,7 @@ fn response_carries_new_capability(response: &Value) -> bool {
         .is_some()
 }
 
-async fn read_frame_async<R: AsyncRead + Unpin>(
+pub(crate) async fn read_frame_async<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_bytes: usize,
 ) -> io::Result<Option<Value>> {
@@ -851,7 +851,7 @@ fn socket_owned_by_current_user(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-fn peer_is_current_user(stream: &UnixStream) -> bool {
+pub(crate) fn peer_is_current_user(stream: &UnixStream) -> bool {
     peer_uid(stream).is_some_and(|uid| uid == unsafe { libc::geteuid() })
 }
 
