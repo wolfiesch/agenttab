@@ -1,6 +1,7 @@
 import type { StagedCommit } from "./protocol";
 
 export const STATE_KEY = "agenttabStateV1";
+export const BROWSER_SESSION_EPOCH_KEY = "agenttabBrowserSessionEpochV1";
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
 const SCHEMA_VERSION = 1;
@@ -51,6 +52,7 @@ export interface AutomationCleanupRecord {
 
 export interface ExtensionState {
   schemaVersion: typeof SCHEMA_VERSION;
+  browserSessionEpoch: string | null;
   paused: boolean;
   developerMode: boolean;
   showAgentPointer: boolean;
@@ -58,16 +60,27 @@ export interface ExtensionState {
   revisions: Record<string, RevisionRecord>;
   handoff: HandoffRecord;
   stagedCommits: Record<string, StagedCommit>;
+  // Closed task capabilities are retained deliberately: pruning without a host
+  // retirement acknowledgement would let a delayed capability recreate ownership.
+  taskTombstones: Record<string, number>;
   automationCleanup: AutomationCleanupRecord;
+}
+
+export interface BrowserSessionReconciliation {
+  changed: boolean;
+  revokedTabIds: number[];
+  revokedTaskIds: string[];
 }
 
 let mutationQueue: Promise<unknown> = Promise.resolve();
 let initialization: Promise<ExtensionState> | null = null;
 let initializedState: ExtensionState | null = null;
+let browserSessionInitialization: Promise<string> | null = null;
 
 function defaultState(): ExtensionState {
   return {
     schemaVersion: SCHEMA_VERSION,
+    browserSessionEpoch: null,
     paused: false,
     developerMode: false,
     showAgentPointer: true,
@@ -75,6 +88,7 @@ function defaultState(): ExtensionState {
     revisions: {},
     handoff: { active: false },
     stagedCommits: {},
+    taskTombstones: {},
     automationCleanup: {
       pending: false,
       tabIds: [],
@@ -131,6 +145,9 @@ function parseState(value: unknown): ExtensionState | null {
   const revisionsValue = objectValue(raw.revisions);
   const handoffValue = objectValue(raw.handoff);
   const commitsValue = objectValue(raw.stagedCommits);
+  const tombstonesValue = raw.taskTombstones === undefined
+    ? {}
+    : objectValue(raw.taskTombstones);
   const cleanupValue = raw.automationCleanup === undefined
     ? {
       pending: false,
@@ -139,7 +156,16 @@ function parseState(value: unknown): ExtensionState | null {
       epoch: 0,
     }
     : objectValue(raw.automationCleanup);
-  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue || !cleanupValue) return null;
+  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue || !tombstonesValue || !cleanupValue) {
+    return null;
+  }
+  if (
+    raw.browserSessionEpoch !== undefined &&
+    raw.browserSessionEpoch !== null &&
+    (typeof raw.browserSessionEpoch !== "string" || raw.browserSessionEpoch.length === 0)
+  ) {
+    return null;
+  }
   if (
     typeof cleanupValue.pending !== "boolean" ||
     !Array.isArray(cleanupValue.tabIds) ||
@@ -153,7 +179,6 @@ function parseState(value: unknown): ExtensionState | null {
 
   const tasks: Record<string, TaskRecord> = {};
   const assignedTabIds = new Set<number>();
-  const assignedGroupIds = new Map<number, string>();
   for (const [taskId, candidate] of Object.entries(tasksValue)) {
     const task = objectValue(candidate);
     if (
@@ -173,14 +198,11 @@ function parseState(value: unknown): ExtensionState | null {
     const tabIds = task.tabIds as number[];
     if (
       new Set(tabIds).size !== tabIds.length ||
-      (task.groupId === null && tabIds.length > 0) ||
-      tabIds.some((tabId) => assignedTabIds.has(tabId)) ||
-      (task.groupId !== null && assignedGroupIds.has(task.groupId as number))
+      tabIds.some((tabId) => assignedTabIds.has(tabId))
     ) {
       return null;
     }
     for (const tabId of tabIds) assignedTabIds.add(tabId);
-    if (task.groupId !== null) assignedGroupIds.set(task.groupId as number, taskId);
     tasks[taskId] = task as unknown as TaskRecord;
   }
 
@@ -249,8 +271,17 @@ function parseState(value: unknown): ExtensionState | null {
     stagedCommits[token] = commit as unknown as StagedCommit;
   }
 
+  const taskTombstones: Record<string, number> = {};
+  for (const [taskId, closedAt] of Object.entries(tombstonesValue)) {
+    if (taskId.length === 0 || !finiteInteger(closedAt)) return null;
+    taskTombstones[taskId] = closedAt;
+  }
+
   return {
     schemaVersion: SCHEMA_VERSION,
+    browserSessionEpoch: typeof raw.browserSessionEpoch === "string"
+      ? raw.browserSessionEpoch
+      : null,
     paused: raw.paused,
     developerMode: raw.developerMode,
     showAgentPointer: raw.showAgentPointer,
@@ -258,6 +289,7 @@ function parseState(value: unknown): ExtensionState | null {
     revisions,
     handoff: handoffValue as unknown as HandoffRecord,
     stagedCommits,
+    taskTombstones,
     automationCleanup: cleanupValue as unknown as AutomationCleanupRecord,
   };
 }
@@ -269,7 +301,6 @@ function legacyTasks(value: unknown): Record<string, TaskRecord> {
   const now = Date.now();
   const migrated: Record<string, TaskRecord> = {};
   const assignedTabIds = new Set<number>();
-  const assignedGroupIds = new Set<number>();
   for (const [taskId, candidate] of Object.entries(raw)) {
     const session = objectValue(candidate);
     if (
@@ -283,14 +314,11 @@ function legacyTasks(value: unknown): Record<string, TaskRecord> {
     const tabIds = session.tabIds as number[];
     const groupId = finiteInteger(session.groupId) ? session.groupId : null;
     if (
-      (groupId === null && tabIds.length > 0) ||
-      tabIds.some((tabId) => assignedTabIds.has(tabId)) ||
-      (groupId !== null && assignedGroupIds.has(groupId))
+      tabIds.some((tabId) => assignedTabIds.has(tabId))
     ) {
       throw new Error("Legacy AgentTab task state has ambiguous ownership");
     }
     for (const tabId of tabIds) assignedTabIds.add(tabId);
-    if (groupId !== null) assignedGroupIds.add(groupId);
     migrated[taskId] = {
       taskId,
       name: typeof session.name === "string" ? session.name : "Imported browser task",
@@ -367,6 +395,66 @@ export async function readState(): Promise<ExtensionState> {
   return initializeState();
 }
 
+async function currentBrowserSessionEpoch(): Promise<string> {
+  if (!browserSessionInitialization) {
+    browserSessionInitialization = (async () => {
+      if (!chrome.storage?.session) {
+        throw new Error("AgentTab requires chrome.storage.session for browser-session ownership");
+      }
+      const stored = await chrome.storage.session.get(BROWSER_SESSION_EPOCH_KEY);
+      const existing = stored[BROWSER_SESSION_EPOCH_KEY];
+      if (typeof existing === "string" && existing.length > 0) return existing;
+      const created = crypto.randomUUID();
+      await chrome.storage.session.set({ [BROWSER_SESSION_EPOCH_KEY]: created });
+      const verified = (await chrome.storage.session.get(BROWSER_SESSION_EPOCH_KEY))[
+        BROWSER_SESSION_EPOCH_KEY
+      ];
+      if (verified !== created) {
+        throw new Error("AgentTab browser-session ownership marker read-back failed");
+      }
+      return created;
+    })().catch((error) => {
+      browserSessionInitialization = null;
+      throw error;
+    });
+  }
+  return browserSessionInitialization;
+}
+
+export async function reconcileBrowserSession(): Promise<BrowserSessionReconciliation> {
+  const epoch = await currentBrowserSessionEpoch();
+  return mutateState((state) => {
+    if (state.browserSessionEpoch === epoch) {
+      return { changed: false, revokedTabIds: [], revokedTaskIds: [] };
+    }
+
+    const revokedTabIds = new Set<number>();
+    const revokedTaskIds: string[] = [];
+    const now = Date.now();
+    for (const task of Object.values(state.tasks)) {
+      if (task.tabIds.length > 0) revokedTaskIds.push(task.taskId);
+      for (const tabId of task.tabIds) revokedTabIds.add(tabId);
+      if (task.tabIds.length > 0 || task.groupId !== null || task.state === "needs_user") {
+        task.tabIds = [];
+        task.groupId = null;
+        if (task.state === "needs_user") task.state = "working";
+        task.updatedAt = now;
+      }
+    }
+    state.browserSessionEpoch = epoch;
+    state.revisions = {};
+    state.stagedCommits = {};
+    state.handoff = { active: false };
+    state.automationCleanup.pending = false;
+    state.automationCleanup.tabIds = [];
+    return {
+      changed: true,
+      revokedTabIds: [...revokedTabIds],
+      revokedTaskIds,
+    };
+  });
+}
+
 export function mutateState<T>(
   mutator: (state: ExtensionState) => T | Promise<T>,
 ): Promise<T> {
@@ -398,5 +486,6 @@ export function mutateState<T>(
 export function resetStateForTest(): void {
   initialization = null;
   initializedState = null;
+  browserSessionInitialization = null;
   mutationQueue = Promise.resolve();
 }

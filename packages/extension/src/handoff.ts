@@ -11,7 +11,7 @@ type OriginGuard = () => Promise<void>;
 
 export class HandoffController {
   private transitionTail: Promise<unknown> = Promise.resolve();
-  private scrubber: (() => Promise<void>) | null = null;
+  private scrubber: ((tabId: number) => Promise<void>) | null = null;
 
   constructor(
     private readonly scheduler: MutationScheduler,
@@ -20,7 +20,7 @@ export class HandoffController {
     private readonly emit: EventSink,
   ) { }
 
-  setScrubber(scrubber: () => Promise<void>): void {
+  setScrubber(scrubber: (tabId: number) => Promise<void>): void {
     this.scrubber = scrubber;
   }
 
@@ -63,7 +63,7 @@ export class HandoffController {
   private async restoreNow(): Promise<void> {
     const state = await readState();
     if (!state.handoff.active) return;
-    const barrier = this.scheduler.pause();
+    const barrier = this.scheduler.blockTab(state.handoff.tabId);
     await barrier;
     const restored = await readState();
     if (!restored.handoff.active) return;
@@ -122,7 +122,7 @@ export class HandoffController {
       timeoutMs: Number(timeoutMs),
     };
 
-    const barrier = this.scheduler.pause();
+    const barrier = this.scheduler.blockTab(numericTabId);
     let recorded = false;
     try {
       await mutateState((state) => {
@@ -139,6 +139,7 @@ export class HandoffController {
       await this.ownership.assertOwned(taskId, numericTabId);
       await this.revisions.assertExpected(numericTabId, next.expectedRevision);
       if (originGuard) await originGuard();
+      await this.scrubber?.(numericTabId);
       await this.ownership.setTaskState(taskId, "needs_user");
       chrome.alarms.create(HANDOFF_ALARM, { when: startedAt + next.timeoutMs });
       const tab = await chrome.tabs.update(numericTabId, { active: true });
@@ -177,8 +178,7 @@ export class HandoffController {
         });
         await chrome.alarms.clear(HANDOFF_ALARM);
       }
-      const recovered = await readState();
-      if (!recovered.paused && !recovered.handoff.active) this.scheduler.resume();
+      this.scheduler.unblockTab(numericTabId);
       throw error;
     }
   }
@@ -193,7 +193,7 @@ export class HandoffController {
     if (completed && !(await this.completionMatched(handoff))) {
       return { completed: false, reason: "The handoff completion condition has not been met" };
     }
-    await this.scrubber?.();
+    await this.scrubber?.(handoff.tabId);
     const eventId = crypto.randomUUID();
     await mutateState((state) => {
       const active = state.handoff;
@@ -225,8 +225,7 @@ export class HandoffController {
     });
     await chrome.alarms.clear(HANDOFF_ALARM);
     await this.ownership.setTaskState(handoff.taskId, "working");
-    const current = await readState();
-    if (!current.paused && !current.handoff.active) this.scheduler.resume();
+    this.scheduler.unblockTab(handoff.tabId);
   }
 
   private async cancelMatchingNow(
@@ -234,7 +233,7 @@ export class HandoffController {
   ): Promise<boolean> {
     const handoff = (await readState()).handoff;
     if (!handoff.active || !matches(handoff)) return false;
-    await this.scrubber?.();
+    await this.scrubber?.(handoff.tabId);
     const eventId = crypto.randomUUID();
     const pendingEventId = await mutateState((state) => {
       const active = state.handoff;
@@ -259,19 +258,8 @@ export class HandoffController {
   }
 
   private async resumeNow(): Promise<void> {
-    const state = await readState();
-    if (state.handoff.active) {
-      throw Object.assign(new Error("Finish or cancel credential handoff before resuming"), {
-        code: "handoff_in_progress",
-      });
-    }
     await this.ownership.reconcile();
     await mutateState((next) => {
-      if (next.handoff.active) {
-        throw Object.assign(new Error("Finish or cancel credential handoff before resuming"), {
-          code: "handoff_in_progress",
-        });
-      }
       next.paused = false;
     });
     this.scheduler.resume();

@@ -793,7 +793,6 @@ function assertNativeTab(value: unknown): asserts value is NativeTab {
   if (!isIntegerInRange(tab.page_revision, 0)) commandError("page_revision must be a non-negative integer");
   if (tab.task_id !== undefined && tab.task_id !== null) {
     assertUuid(tab.task_id, "task_id");
-    if (tab.group_id < 0) commandError("task-owned native tabs must have a visible group");
   }
 }
 

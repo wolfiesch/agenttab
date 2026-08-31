@@ -1,6 +1,6 @@
-use crate::runtime::{request_lock_scope, RequestLockScope, Runtime};
+use crate::runtime::{RequestLockScope, Runtime};
 use agenttab_protocol::{
-    ConnectionInit, Outcome, ResumeCapabilityConfirm, RpcError, RpcMethod, RpcResponse,
+    ConnectionInit, Outcome, ResumeCapabilityConfirm, RpcError, RpcResponse,
     CLIENT_TO_HOST_MAX_BYTES, HOST_TO_CLIENT_MAX_BYTES,
 };
 #[cfg(all(test, unix))]
@@ -522,17 +522,6 @@ impl PendingResponse {
     }
 }
 
-fn request_queue_scope(request: &Value) -> RequestLockScope {
-    let Some(method) = request
-        .get("method")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<RpcMethod>(value).ok())
-    else {
-        return RequestLockScope::Global;
-    };
-    request_lock_scope(method, request.get("params").unwrap_or(&Value::Null))
-}
-
 async fn handle_connection<S>(runtime: Arc<Runtime>, mut stream: S) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -686,8 +675,9 @@ where
             Some((bootstrap_queue.clone(), ticket))
         };
         request_queues.retain(|_, queue| Arc::strong_count(queue) > 1);
+        let queue_scope = runtime.request_queue_scope(&connection, &request);
         let queue = request_queues
-            .entry(request_queue_scope(&request))
+            .entry(queue_scope)
             .or_insert_with(|| Arc::new(OrderedQueue::default()))
             .clone();
         let ticket = queue.issue();

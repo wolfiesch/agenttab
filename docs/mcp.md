@@ -100,9 +100,11 @@ Raw TypeScript and Python SDK clients raise `AgentTabTransportError` for an ambi
 
 ### Your Turn handoff
 
-Call `browser_handoff` before the user enters credentials or completes another human-only step. AgentTab activates a global blackout, focuses the declared tab, opens its user-facing handoff state, and denies browser observation and capture for every task while the handoff is active. Automation resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the handoff is cleared.
+Call `browser_handoff` before the user enters credentials or completes another human-only step. AgentTab drains and blackouts the declared task tab, detaches its debugger session, focuses it, and opens the user-facing handoff state. Other task tabs and independent tasks remain available for unattended work. Automation on the handed-off tab resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the durable handoff clear is acknowledged.
 
-The agent must not attempt snapshots, page reads, or mutations during this interval. It should report the handoff prompt to the user and wait for the terminal tool result or an explicit user completion.
+While a handoff is active, `browser_tabs` remains usable but omits the handed-off tab's page metadata and returns its identifier in `handoff`. This lets the task discover and continue unrelated work without observing the human-controlled page.
+
+The requesting agent must not attempt snapshots, page reads, or mutations on that tab during this interval. It should report the handoff prompt to the user and wait for the terminal tool result or an explicit user completion.
 
 ### Staged Commit
 

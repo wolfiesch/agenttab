@@ -42,7 +42,9 @@ AgentTab classifies every opened or listed task tab as `automation_route: "full"
 
 ## Ownership, revisions, and human control
 
-A tab becomes owned only when AgentTab creates it, when Chrome reports it as a child of an owned opener, or through `browser_open` with `mode: "adopt_active"`. The visible Chrome group is evidence of that ownership, not an authority grant by itself. Moving or ungrouping a tab revokes ownership and cancels queued work. A grouping failure rolls creation or adoption back rather than retaining invisible ownership. A caller may request `placement: "new_window"`, but the extension derives eligibility from its stored task record: the task must own no tabs, the window is created unfocused in normal state, and a failed group grant removes the created tab. A client-supplied ownership claim cannot authorize an existing window.
+A tab becomes owned only when AgentTab creates it, when Chrome reports it as a child of an owned opener, or through `browser_open` with `mode: "adopt_active"`. The persisted task ledger is authoritative; the visible Chrome group is cosmetic and never grants, transfers, or revokes ownership. Moving, ungrouping, or failing to group a tab therefore does not interrupt unattended work. Closing the tab or task revokes ownership and cancels queued work. A caller may request `placement: "new_window"`, but the extension derives eligibility from its stored task record: the task must own no tabs and the window is created unfocused in normal state. A client-supplied ownership claim cannot authorize an existing window.
+
+Chrome may reuse numeric tab IDs after a full browser restart. AgentTab binds durable ownership to a browser-session epoch mirrored through `chrome.storage.session`; an epoch mismatch clears old tab-bound authority before native reconciliation. Closing a task also writes a durable tombstone, so queued or later opens cannot recreate it, including after an extension worker restart.
 
 Actions that operate on an existing page carry an expected page revision. Navigation and document replacement advance that revision; stale refs and stale revisions fail instead of being applied to a later document.
 
@@ -58,7 +60,7 @@ Commit is a best-effort semantic barrier, not proof that an action is harmless. 
 
 ## Your Turn blackout
 
-During a `browser_handoff`, AgentTab pauses browser work and applies a global blackout across tasks. Page observations and captures are denied while the human enters information. The extension persists the active handoff before focusing the tab; the host restores the blackout from durable state after restart. Completion requires the declared condition or explicit completion, capture scrubbing, and host acknowledgement before automation resumes.
+During a `browser_handoff`, AgentTab drains and blackouts the declared tab while the human enters information. The extension detaches that tab's debugger session before focus, persists the exact task/tab binding, and the host restores it from durable state after restart. Other tabs can continue unattended work. Completion requires the declared condition or explicit completion, tab capture scrubbing, and host acknowledgement before automation resumes on that tab. If extension state is unavailable during a disconnect, the host temporarily blocks all tabs until reconciliation.
 
 This reduces exposure during handoff. It cannot protect secrets from a compromised device, a malicious webpage, or browser extensions with their own access.
 

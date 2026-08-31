@@ -20,10 +20,12 @@ export class MutationScheduler {
     message: "AgentTab is paused",
   };
   private readonly tabTails = new Map<number, Promise<unknown>>();
-  private readonly taskTails = new Map<string, Promise<unknown>>();
+  private readonly taskLifecycleTails = new Map<string, Promise<unknown>>();
   private globalTail: Promise<unknown> = Promise.resolve();
   private readonly generations = new Map<number, number>();
   private readonly generationReasons = new Map<number, { code: string; message: string }>();
+  private readonly blockedTabs = new Map<number, { code: string; message: string }>();
+  private readonly closedTasks = new Set<string>();
   private readonly pending = new Set<Promise<unknown>>();
 
   setInitialPaused(paused: boolean): void {
@@ -45,6 +47,20 @@ export class MutationScheduler {
     return this.accepting;
   }
 
+  restoreClosedTasks(taskIds: readonly string[]): void {
+    for (const taskId of taskIds) this.closedTasks.add(taskId);
+  }
+
+  isTaskClosed(taskId: string): boolean {
+    return this.closedTasks.has(taskId);
+  }
+
+  assertTabAccepting(tabId: number, pausedMessage?: string): void {
+    if (!this.accepting) throw this.notStarted(pausedMessage);
+    const blocked = this.blockedTabs.get(tabId);
+    if (blocked) throw new NotStartedError(blocked.code, blocked.message);
+  }
+
   notStarted(message?: string): NotStartedError {
     if (!this.permissionsAvailable) {
       return new NotStartedError(
@@ -58,16 +74,32 @@ export class MutationScheduler {
     );
   }
 
+  taskClosed(): NotStartedError {
+    return new NotStartedError(
+      "task_closed",
+      "This AgentTab task is closed and cannot admit more browser work",
+    );
+  }
+
   enqueueTab<T>(taskId: string, tabId: number, work: Work<T>): Promise<T> {
-    if (!this.accepting) return Promise.reject(this.notStarted());
+    if (this.closedTasks.has(taskId)) return Promise.reject(this.taskClosed());
+    try {
+      this.assertTabAccepting(tabId);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     const admissionEpoch = this.admissionEpoch;
     const generation = this.generations.get(tabId) ?? 0;
     const priorGlobal = this.globalTail;
-    const priorTask = this.taskTails.get(taskId) ?? Promise.resolve();
     const priorTab = this.tabTails.get(tabId) ?? Promise.resolve();
-    const result = priorGlobal.then(() => Promise.all([priorTask, priorTab])).then(async () => {
+    const result = priorGlobal.then(() => priorTab).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
         throw this.notStarted("AgentTab paused before this mutation was dispatched");
+      }
+      if (this.closedTasks.has(taskId)) throw this.taskClosed();
+      const currentBlock = this.blockedTabs.get(tabId);
+      if (currentBlock) {
+        throw new NotStartedError(currentBlock.code, currentBlock.message);
       }
       if ((this.generations.get(tabId) ?? 0) !== generation) {
         const reason = this.generationReasons.get(tabId) ?? {
@@ -78,9 +110,46 @@ export class MutationScheduler {
       }
       return work();
     });
-    this.rememberTabTail(taskId, tabId, result);
+    this.rememberTabTail(tabId, result);
     this.track(result);
     return result;
+  }
+
+  enqueueTaskLifecycle<T>(taskId: string, work: Work<T>): Promise<T> {
+    if (this.closedTasks.has(taskId)) return Promise.reject(this.taskClosed());
+    if (!this.accepting) return Promise.reject(this.notStarted());
+    const admissionEpoch = this.admissionEpoch;
+    const priorTask = this.taskLifecycleTails.get(taskId) ?? Promise.resolve();
+    const result = priorTask.then(async () => {
+      if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
+        throw this.notStarted("AgentTab paused before this task operation was dispatched");
+      }
+      if (this.closedTasks.has(taskId)) throw this.taskClosed();
+      return work();
+    });
+    this.rememberTaskLifecycleTail(taskId, result);
+    this.track(result);
+    return result;
+  }
+
+  enqueueTaskClose<T>(taskId: string, work: Work<T>): Promise<T> {
+    this.closedTasks.add(taskId);
+    const priorTask = this.taskLifecycleTails.get(taskId) ?? Promise.resolve();
+    const result = priorTask.then(work);
+    this.rememberTaskLifecycleTail(taskId, result);
+    this.track(result);
+    return result;
+  }
+
+  private rememberTaskLifecycleTail<T>(taskId: string, result: Promise<T>): void {
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.taskLifecycleTails.set(taskId, tail);
+    void tail.then(() => {
+      if (this.taskLifecycleTails.get(taskId) === tail) this.taskLifecycleTails.delete(taskId);
+    });
   }
 
   enqueueGlobal<T>(work: Work<T>): Promise<T> {
@@ -104,6 +173,13 @@ export class MutationScheduler {
 
   readAfterWrites<T>(tabId: number | undefined, work: Work<T>): Promise<T> {
     if (!this.accepting) return Promise.reject(this.notStarted());
+    if (tabId !== undefined) {
+      try {
+        this.assertTabAccepting(tabId);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
     const admissionEpoch = this.admissionEpoch;
     const priorGlobal = this.globalTail;
     if (tabId === undefined) {
@@ -126,9 +202,13 @@ export class MutationScheduler {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
         throw this.notStarted("AgentTab paused before this observation was dispatched");
       }
+      const currentBlock = this.blockedTabs.get(tabId);
+      if (currentBlock) {
+        throw new NotStartedError(currentBlock.code, currentBlock.message);
+      }
       return work();
     });
-    this.rememberTabTail(undefined, tabId, result);
+    this.rememberTabTail(tabId, result);
     this.track(result);
     return result;
   }
@@ -145,6 +225,47 @@ export class MutationScheduler {
       code: "stale_revision",
       message: "Page navigation invalidated this queued mutation",
     });
+  }
+
+  blockTab(
+    tabId: number,
+    reason = {
+      code: "handoff_blackout",
+      message: "Automation is disabled while the human controls this tab",
+    },
+  ): Promise<void> {
+    this.blockedTabs.set(tabId, reason);
+    this.generationReasons.set(tabId, reason);
+    this.generations.set(tabId, (this.generations.get(tabId) ?? 0) + 1);
+    const tail = this.tabTails.get(tabId);
+    return tail ? tail.then(() => undefined) : Promise.resolve();
+  }
+
+  unblockTab(tabId: number): void {
+    this.blockedTabs.delete(tabId);
+    if (!this.tabTails.has(tabId)) {
+      this.generations.delete(tabId);
+      this.generationReasons.delete(tabId);
+    }
+  }
+
+  isTabBlocked(tabId: number): boolean {
+    return this.blockedTabs.has(tabId);
+  }
+
+  retireTabWhenIdle(tabId: number): void {
+    const tail = this.tabTails.get(tabId);
+    const retire = () => {
+      this.tabTails.delete(tabId);
+      this.blockedTabs.delete(tabId);
+      this.generations.delete(tabId);
+      this.generationReasons.delete(tabId);
+    };
+    if (!tail) {
+      retire();
+      return;
+    }
+    void tail.then(retire);
   }
 
   revokePermissions(): void {
@@ -194,21 +315,19 @@ export class MutationScheduler {
     };
   }
 
-  private rememberTabTail<T>(taskId: string | undefined, tabId: number, result: Promise<T>): void {
+  private rememberTabTail<T>(tabId: number, result: Promise<T>): void {
     const tail = result.then(
       () => undefined,
       () => undefined,
     );
     this.tabTails.set(tabId, tail);
-    if (taskId !== undefined) this.taskTails.set(taskId, tail);
     void tail.then(() => {
       if (this.tabTails.get(tabId) === tail) {
         this.tabTails.delete(tabId);
-        this.generations.delete(tabId);
-        this.generationReasons.delete(tabId);
-      }
-      if (taskId !== undefined && this.taskTails.get(taskId) === tail) {
-        this.taskTails.delete(taskId);
+        if (!this.blockedTabs.has(tabId)) {
+          this.generations.delete(tabId);
+          this.generationReasons.delete(tabId);
+        }
       }
     });
   }

@@ -21,7 +21,7 @@ import {
 } from "./routes";
 import { MutationScheduler, NotStartedError } from "./scheduler";
 import { IdempotentStartup, StartupOperationQueue } from "./startup";
-import { mutateState, readState } from "./storage";
+import { mutateState, readState, reconcileBrowserSession } from "./storage";
 import { isRecord } from "./type-guards";
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
@@ -43,6 +43,7 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   no_active_tab: true,
   permissions_required: true,
   stale_revision: true,
+  task_closed: true,
   stale_ref: true,
   paused: true,
   developer_mode_required: true,
@@ -102,7 +103,7 @@ browser = new StandardBrowserRuntime(
   },
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
-handoff.setScrubber(() => browser.scrubForHandoff());
+handoff.setScrubber((tabId) => browser.detach(tabId));
 
 async function automationEnabled(): Promise<boolean> {
   if (automationCleanupPending) return false;
@@ -372,12 +373,6 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await browser.abandonNativeStage(command.task_id, params.native_token, params.tab_id),
       );
     }
-    if ((await readState()).handoff.active) {
-      throw Object.assign(new Error("Automation is disabled while credential handoff is active"), {
-        code: "handoff_blackout",
-        recovery: "Wait for the human to finish or cancel the active handoff.",
-      });
-    }
     if (
       command.method !== "browser_open" &&
       command.method !== "browser_tabs" &&
@@ -387,14 +382,22 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       throw automationRequired();
     }
     if (command.method === "browser_open") {
-      return completed(command.request_id, await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params)));
+      return completed(
+        command.request_id,
+        await scheduler.enqueueTaskLifecycle(command.task_id, () => ownership.open(command.task_id, params)),
+      );
     }
     if (command.method === "browser_tabs") {
-      const result = await scheduler.enqueueGlobal(() => ownership.inventory());
+      const result = await scheduler.enqueueTaskLifecycle(command.task_id, () => ownership.inventory());
+      const state = await readState();
+      const handoffTabId = state.handoff.active && state.handoff.taskId === command.task_id
+        ? state.handoff.tabId
+        : null;
       return completed(command.request_id, {
         tabs: result
-          .filter((tab) => tab.task_id === command.task_id)
+          .filter((tab) => tab.task_id === command.task_id && tab.tab_id !== handoffTabId)
           .map((tab) => ({ ...tab, ...automationRouteFields(typeof tab.url === "string" ? tab.url : undefined) })),
+        ...(handoffTabId === null ? {} : { handoff: { active: true, tab_id: handoffTabId } }),
       });
     }
     if (command.method === "browser_handoff") {
@@ -450,14 +453,10 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
           return browser.snapshot(targetTabId, params);
         }
         const revalidate = async () => {
-          if (!scheduler.isAccepting()) {
-            throw scheduler.notStarted("AgentTab stopped the active browser wait");
-          }
+          scheduler.assertTabAccepting(targetTabId, "AgentTab stopped the active browser wait");
           await ownership.assertOwned(command.task_id, targetTabId);
           await assertCurrentOrigin(targetTabId, command.origin_policy);
-          if (!scheduler.isAccepting()) {
-            throw scheduler.notStarted("AgentTab stopped the active browser wait");
-          }
+          scheduler.assertTabAccepting(targetTabId, "AgentTab stopped the active browser wait");
         };
         return browser.wait(targetTabId, params, revalidate);
       });
@@ -510,7 +509,9 @@ nativeBridge = new NativeBridge(
 );
 
 async function initializeRuntime(): Promise<void> {
+  await reconcileBrowserSession();
   const state = await readState();
+  scheduler.restoreClosedTasks(Object.keys(state.taskTombstones));
   browser.restoreDebuggerCandidates(state.automationCleanup.tabIds);
   automationCleanupPending =
     automationCleanupPending ||
@@ -524,7 +525,8 @@ async function initializeRuntime(): Promise<void> {
     automationRevocationGeneration,
     state.automationCleanup.generation,
   );
-  scheduler.setInitialPaused(state.paused || state.handoff.active);
+  scheduler.setInitialPaused(state.paused);
+  if (state.handoff.active) await scheduler.blockTab(state.handoff.tabId);
   if (await automationEnabled()) {
     scheduler.restorePermissions();
   } else {
@@ -597,11 +599,7 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
       await revisions.markNavigation(updatedTabId);
     }
     if ("groupId" in changeInfo) {
-      const revoked = await ownership.revokeIfMoved(updatedTabId);
-      if (revoked) {
-        await handoff.cancelForTab(updatedTabId);
-        await browser.detach(updatedTabId);
-      }
+      await ownership.revokeIfMoved(updatedTabId);
     }
     if (typeof changeInfo.url === "string" || changeInfo.status === "complete") {
       await ownership.publishInventory();
@@ -615,7 +613,6 @@ const reconcileOwnedTab = (tabId: number): void => {
   });
 };
 chrome.tabs.onAttached.addListener(reconcileOwnedTab);
-chrome.tabs.onDetached.addListener(reconcileOwnedTab);
 chrome.tabGroups.onRemoved.addListener((group: { id?: number }) => {
   if (!Number.isInteger(group.id)) return;
   runAfterStart(async () => {

@@ -22,17 +22,21 @@ Only three paths can grant tab ownership:
 2. Chrome reports a child tab whose opener is already owned.
 3. The user permits `browser_open` with `mode: "adopt_active"` for the currently active tab.
 
-AgentTab gives owned tabs a visible task group. The group makes work legible to the user, but group membership alone never grants authority. Manual grouping does not adopt a tab. If Chrome cannot create or preserve the group, creation or adoption fails rather than keeping hidden ownership.
+AgentTab tries to give owned tabs a visible task group. The group makes work legible to the user, but the persisted task ledger is authoritative: group membership never grants, transfers, or revokes ownership. Manual grouping does not adopt a tab, and a Chrome grouping failure does not block creation or adoption.
 
 `browser_open` defaults to placing a new tab in the task's existing window. `placement: "new_window"` is intentionally narrower than a general window-control capability: it is accepted only while the task owns no tabs, it always creates an unfocused normal window, and the extension grants ownership from the persisted task record. It cannot focus, resize, move, change, or close an unrelated window. `browser_handoff` remains the sole normal focus transition.
 
-Moving an owned tab out of its task group, ungrouping it, closing it, or finding inconsistent ownership immediately revokes it. Revocation increments the tab generation and rejects queued work before it is dispatched. A child-popup grouping race does not give AgentTab authority to close a user tab.
+Moving or ungrouping an owned tab changes only its presentation. Closing it or explicitly closing its task revokes ownership, increments the tab generation, and rejects queued work before dispatch. A child-popup grouping race does not give AgentTab authority to close a user tab.
+
+Numeric Chrome tab IDs are authoritative only within one browser session. The extension mirrors a random browser-session epoch between `chrome.storage.session` and durable local state. If the marker changes after a full browser restart, extension reload, or update, AgentTab clears persisted tab, revision, staged-action, debugger-cleanup, and handoff bindings before the native handshake. A newly reused numeric tab ID therefore cannot inherit an earlier task's authority.
 
 ## Ordering and concurrency
 
-Mutations for one tab are ordered. Reads wait behind the relevant tab mutation so they do not observe an in-progress change. Browser-global operations use a separate global barrier.
+Mutations for one tab are ordered. Reads wait behind the relevant tab mutation so they do not observe an in-progress change. Lightweight task lifecycle work is ordered per task.
 
-The current extension scheduler also maintains an ordered tail per task. It therefore does **not** promise parallel mutation execution for separate tabs in the same task, even though separate connections and host request handling can be concurrent. Different tasks can make progress independently unless a global barrier applies. Do not build an adapter that depends on cross-tab write parallelism.
+Separate tabs can make progress concurrently, including tabs owned by the same task. Separate tasks use independent host request locks and extension ownership actors, so a slow create or assertion in one task does not hold up another. Full ownership reconciliation is a cross-actor barrier. There is no browser-global queue in the routine request path; only explicit lifecycle barriers such as Pause stop unrelated work.
+
+Task close installs a durable tombstone before admitting further lifecycle work. It waits behind already-running task lifecycle work, rejects queued or later opens, drains the task's tab actors, persists task deletion, and only then asks Chrome to remove the tabs. Native and popup close use the same path. Tombstones are intentionally not TTL-pruned: without an explicit host retirement acknowledgement, expiry could let a delayed closed-task capability recreate ownership. On the host, `browser_act`, `browser_handoff`, and the `browser_commit` token derived from an act resolve to the same tab queue, so arrival order cannot reverse at the handoff/commit boundary.
 
 Every existing-page mutation includes `expected_page_revision`. The host and extension reject actions when ownership, document revision, or ref epoch no longer matches. A page snapshot does not grant an indefinite right to act on a later page.
 
@@ -42,11 +46,11 @@ Pause is a barrier, not an optimistic UI toggle. It stops new admissions, lets a
 
 A host that has not completed its native handshake and reconciliation remains unavailable for browser work. The connection status can report its lifecycle, but callers must retry only after it becomes ready or the user resumes it.
 
-## Global Your Turn blackout
+## Tab-scoped Your Turn blackout
 
-Only one handoff can be active. Starting `browser_handoff` pauses the scheduler, records the marker durably, and focuses the human's task tab. While it is active, page observations, captures, and browser work are denied across every task and connection. The host independently enforces this blackout and restores it after restart from SQLite state.
+Only one handoff can be active in the popup at a time. Starting `browser_handoff` blocks and drains the declared tab, records the marker durably, detaches that tab's debugger session, and focuses it for the human. Work on that tab is denied across connections while unrelated tabs and tasks continue. The host independently enforces the exact task/tab binding and restores it after restart from SQLite state. If the extension disconnects before its binding can be reconciled, the host temporarily fails closed for all tabs.
 
-Automation resumes only after the declared completion condition or explicit completion, capture scrubbing, an acknowledged handoff-clear event, and a non-paused state. Handoff is the sole normal AgentTab focus transition for human input.
+Automation on the handed-off tab resumes only after the declared completion condition or explicit completion, tab capture scrubbing, and an acknowledged handoff-clear event. A manual global Pause remains independent and can keep all automation paused. Handoff is the sole normal AgentTab focus transition for human input.
 
 ## Consequential work across agents
 

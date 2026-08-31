@@ -1134,11 +1134,6 @@ impl NativeTab {
                 "native tab id, window id, and URL must be present".into(),
             ));
         }
-        if self.task_id.is_some() && self.group_id.is_none() {
-            return Err(ProtocolError::InvalidNativeMessage(
-                "task-owned native tabs must have a visible group".into(),
-            ));
-        }
         Ok(())
     }
 }
@@ -2153,6 +2148,32 @@ mod tests {
         let mut unknown = message;
         unknown["unexpected"] = json!(true);
         assert!(NativeCloseTask::parse(unknown).is_err());
+    }
+
+    #[test]
+    fn native_inventory_accepts_owned_tabs_without_a_cosmetic_group() {
+        let task_id = Uuid::new_v4();
+        let hello = NativeHello::parse(json!({
+            "protocol": NATIVE_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "kind": "hello",
+            "extension_version": "2.0.0-rc.1",
+            "inventory": [{
+                "tab_id": 7,
+                "window_id": 3,
+                "group_id": null,
+                "url": "https://example.test/",
+                "page_revision": 1,
+                "task_id": task_id,
+            }],
+            "paused": false,
+            "handoff": {"active": false},
+            "staged_commits": [],
+        }))
+        .unwrap();
+
+        assert_eq!(hello.inventory[0].task_id, Some(task_id));
+        assert_eq!(hello.inventory[0].group_id, None);
     }
 
     #[test]
