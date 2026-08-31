@@ -9,7 +9,7 @@ The adapter is stdio only. Standard mode uses local AgentTab IPC behind the adap
 Before starting the adapter, an approved local installation must have:
 
 1. An enabled AgentTab extension in Chrome 127 or later.
-2. Chrome's required `debugger` permission present from installation and the optional `scripting` permission granted from the AgentTab popup.
+2. Chrome's required `debugger` and `scripting` permissions present from installation.
 3. A running `dev.agenttab.host` connected to the extension through Native Messaging.
 4. Local IPC readiness. Check it with `agenttab doctor --layer ipc` after the command is available.
 
@@ -106,7 +106,7 @@ The agent must not attempt snapshots, page reads, or mutations during this inter
 
 ### Staged Commit
 
-`browser_act` is the Standard mutation choke point. For recognizable send, publish, purchase, delete, upload, authorization, and permission-grant controls, AgentTab can stop before the side effect and return:
+`browser_act` is the Standard mutation choke point. Under Review selected or Strict, recognizable send, publish, purchase, delete, upload, authorization, and permission-grant controls can stop before the side effect and return:
 
 ```json
 {
@@ -126,7 +126,7 @@ The token is bound to the task, tab, effect, page revision, and element fingerpr
 
 A `browser_act` batch is sequential and non-atomic. The extension stops before the first recognizable staged action and does not execute later actions implicitly. The current host response preserves the staged token and binding metadata, but does not publicly return the extension's completed-prefix list or staged index. Clients must not infer how many preceding actions ran from a `commit_required` response; inspect the page before deciding the next action. This is a source limitation, not a guarantee of an atomic batch.
 
-Commit reduces recognizable risk only. It requires both the popup's human approval and the agent's later `browser_commit`, but it cannot prove that a page's labels, event handlers, or side effects are benign.
+Autopilot does not insert semantic Commit stages. Fresh installs start there; existing pre-policy state migrates to Strict. Review selected stages recognizable effects while allowing owned-tab close; Strict also stages owned-tab close. A popup approval may be remembered for the same effect in the current task, on the current site, or on all sites. Commit reduces recognizable risk only: it cannot prove that a page's labels, event handlers, or side effects are benign. See [Action policy](action-policy.md).
 
 ## Schemas and related documentation
 

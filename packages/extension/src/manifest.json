@@ -12,9 +12,7 @@
     "tabs",
     "tabGroups",
     "storage",
-    "alarms"
-  ],
-  "optional_permissions": [
+    "alarms",
     "scripting"
   ],
   "host_permissions": [

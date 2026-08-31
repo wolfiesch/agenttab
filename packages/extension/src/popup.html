@@ -36,18 +36,6 @@
       <p id="review-error" class="error" role="alert" hidden></p>
     </section>
 
-    <section id="permission" class="panel" aria-labelledby="permission-title" hidden>
-      <h2 id="permission-title" class="label">Automation is off</h2>
-      <p id="permission-detail" class="note">
-        Reading and acting on pages needs Chrome's <code>scripting</code> permission. Granting it once
-        keeps AgentTab inside its own task tabs.
-      </p>
-      <div class="actions">
-        <button id="enable" type="button">Enable AgentTab automation</button>
-      </div>
-      <p id="permission-error" class="error" role="alert" hidden></p>
-    </section>
-
     <section class="panel" aria-labelledby="admission-title">
       <div class="row">
         <div class="row-copy">
@@ -80,12 +68,23 @@
 
     <details id="settings" class="panel settings">
       <summary>Settings</summary>
-      <div id="automation-setting" class="settings-row" hidden>
+      <label class="settings-row" for="policy-profile">
         <span class="row-copy">
-          <strong>Automation access</strong>
-          <small>Remove Chrome's optional scripting permission until you enable it again.</small>
+          <strong>Action policy</strong>
+          <small id="policy-detail">Autopilot runs actions without Commit prompts.</small>
         </span>
-        <button id="disable" type="button" class="quiet">Turn off</button>
+        <select id="policy-profile">
+          <option value="autopilot">Autopilot</option>
+          <option value="review_selected">Review selected</option>
+          <option value="strict">Strict</option>
+        </select>
+      </label>
+      <div id="allowance-setting" class="settings-row" hidden>
+        <span class="row-copy">
+          <strong>Remembered approvals</strong>
+          <small id="allowance-detail"></small>
+        </span>
+        <button id="clear-allowances" type="button" class="quiet">Clear</button>
       </div>
       <label class="toggle-row" for="pointer">
         <span class="row-copy">

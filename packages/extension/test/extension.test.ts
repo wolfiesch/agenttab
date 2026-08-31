@@ -8,7 +8,13 @@ import { RevisionTracker } from "../src/revisions";
 import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
 import { MutationScheduler } from "../src/scheduler";
 import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
-import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
+import {
+  mutateState,
+  policyAllowanceKey,
+  readState,
+  resetStateForTest,
+  STATE_KEY,
+} from "../src/storage";
 import { isRecord } from "../src/type-guards";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
@@ -144,6 +150,7 @@ function clone<T>(value: T): T {
 
 class PopupTestElement {
   textContent = "";
+  value = "";
   hidden = false;
   className = "";
   title = "";
@@ -151,6 +158,7 @@ class PopupTestElement {
   disabled = false;
   checked = false;
   readonly dataset: Record<string, string> = {};
+  readonly children: PopupTestElement[] = [];
   readonly style = { setProperty() { } };
   private readonly listeners = new Map<string, Array<() => void>>();
 
@@ -164,8 +172,12 @@ class PopupTestElement {
     for (const listener of this.listeners.get(type) ?? []) listener();
   }
 
-  append(..._children: PopupTestElement[]): void { }
-  replaceChildren(..._children: PopupTestElement[]): void { }
+  append(...children: PopupTestElement[]): void {
+    this.children.push(...children);
+  }
+  replaceChildren(...children: PopupTestElement[]): void {
+    this.children.splice(0, this.children.length, ...children);
+  }
   setAttribute(_name: string, _value: string): void { }
   focus(): void { }
 }
@@ -174,6 +186,7 @@ class PopupTestSpanElement extends PopupTestElement { }
 class PopupTestButtonElement extends PopupTestElement { }
 class PopupTestParagraphElement extends PopupTestElement { }
 class PopupTestInputElement extends PopupTestElement { }
+class PopupTestSelectElement extends PopupTestElement { }
 class PopupTestDivElement extends PopupTestElement { }
 class PopupTestListElement extends PopupTestElement { }
 
@@ -211,6 +224,11 @@ function installPopupDocument(): PopupTestSurface {
   add("pointer", PopupTestInputElement);
   add("pointer-detail", PopupTestElement);
   add("settings-error", PopupTestParagraphElement);
+  add("policy-profile", PopupTestSelectElement);
+  add("policy-detail", PopupTestElement);
+  add("allowance-setting", PopupTestDivElement);
+  add("allowance-detail", PopupTestElement);
+  add("clear-allowances", PopupTestButtonElement);
   add("reviews", PopupTestElement);
   add("review-list", PopupTestListElement);
   add("review-error", PopupTestParagraphElement);
@@ -229,6 +247,7 @@ function installPopupDocument(): PopupTestSurface {
     HTMLButtonElement: PopupTestButtonElement,
     HTMLParagraphElement: PopupTestParagraphElement,
     HTMLInputElement: PopupTestInputElement,
+    HTMLSelectElement: PopupTestSelectElement,
     HTMLDivElement: PopupTestDivElement,
     HTMLUListElement: PopupTestListElement,
   });
@@ -254,6 +273,8 @@ function popupUiState(paused = false): Record<string, unknown> {
     automation_enabled: true,
     paused,
     developer_mode: false,
+    policy_profile: "autopilot",
+    policy_allowance_count: 0,
     show_agent_pointer: false,
     handoff: null,
     tasks: [],
@@ -810,6 +831,81 @@ describe("popup background responses", () => {
     expect(popup.get("runtime-error").hidden).toBe(false);
     expect(popup.get("runtime-error").textContent).toBe("Native host disconnected.");
   });
+
+  test("persists the selected action policy without changing browser permissions", async () => {
+    let profile = "autopilot";
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "get_ui_state") {
+        return { ...popupUiState(), policy_profile: profile };
+      }
+      if (message.kind === "set_policy_profile" && typeof message.profile === "string") {
+        profile = message.profile;
+        return { profile };
+      }
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    popup.get("policy-profile").value = "strict";
+    popup.get("policy-profile").dispatch("change");
+    await flushPromiseQueue();
+
+    expect(profile).toBe("strict");
+    expect(popup.get("policy-detail").textContent).toContain("owned-tab close");
+    expect(permissionRequests).toEqual([]);
+  });
+
+  test("clears remembered approvals from settings", async () => {
+    let allowanceCount = 2;
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "get_ui_state") {
+        return { ...popupUiState(), policy_allowance_count: allowanceCount };
+      }
+      if (message.kind === "clear_policy_allowances") {
+        const cleared = allowanceCount;
+        allowanceCount = 0;
+        return { cleared };
+      }
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    expect(popup.get("allowance-setting").hidden).toBe(false);
+    expect(popup.get("allowance-detail").textContent).toBe("2 remembered decisions");
+    popup.get("clear-allowances").dispatch("click");
+    await flushPromiseQueue();
+
+    expect(allowanceCount).toBe(0);
+    expect(popup.get("allowance-setting").hidden).toBe(true);
+  });
+
+  test("labels a global effect allowance as applying on all sites", async () => {
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "get_ui_state") {
+        return {
+          ...popupUiState(),
+          reviews: [{
+            review_handle: "review-handle-global-label",
+            task_id: TASK_A,
+            tab_id: 7,
+            effect: "Send message",
+            expires_at_ms: Date.now() + 60_000,
+            policy_effect: "external_communication",
+            origin: "https://example.test",
+          }],
+        };
+      }
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    const reviewRow = popup.get("review-list").children[0];
+    const scope = reviewRow?.children[2]?.children[0];
+    const labels = scope?.children.map((option) => option.textContent) ?? [];
+
+    expect(labels).toContain("Remember on all sites");
+    expect(labels).not.toContain("Remember effect category");
+  });
 });
 
 describe("native protocol", () => {
@@ -1221,6 +1317,7 @@ describe("durable extension state", () => {
     const state = await readState();
     expect(Object.values(state.tasks)[0]).toMatchObject({ groupId: 9, tabIds: [41], legacyImported: true });
     expect(state.showAgentPointer).toBe(false);
+    expect(state.policyProfile).toBe("strict");
     expect(persisted[STATE_KEY]).toBeDefined();
     expect(persisted[LEGACY_TASKS_KEY]).toBeUndefined();
     expect(persisted[LEGACY_PREFERENCES_KEY]).toBeUndefined();
@@ -1278,6 +1375,52 @@ describe("durable extension state", () => {
     resetStateForTest();
 
     await expect(readState()).rejects.toThrow("Persisted AgentTab state is malformed");
+  });
+
+  test("defaults fresh state to Autopilot but migrates incomplete policy state to Strict", async () => {
+    await readState();
+    const freshState = clone(persisted[STATE_KEY]) as Record<string, unknown>;
+    expect(freshState).toMatchObject({ policyProfile: "autopilot", policyAllowances: {} });
+
+    for (const missingFields of [
+      ["policyProfile"],
+      ["policyAllowances"],
+      ["policyProfile", "policyAllowances"],
+    ]) {
+      const existingState = clone(freshState);
+      if (missingFields.length === 1 && missingFields[0] === "policyProfile") {
+        existingState.policyAllowances = {
+          [policyAllowanceKey("effect", "external_communication")]: {
+            scope: "effect",
+            effect: "external_communication",
+            createdAt: 1,
+          },
+        };
+      }
+      if (missingFields.length === 1 && missingFields[0] === "policyAllowances") {
+        existingState.policyProfile = "review_selected";
+      }
+      for (const field of missingFields) delete existingState[field];
+      persisted[STATE_KEY] = existingState;
+      resetStateForTest();
+
+      expect(await readState()).toMatchObject({
+        policyProfile: "strict",
+        policyAllowances: {},
+      });
+      expect(persisted[STATE_KEY]).toMatchObject({
+        policyProfile: "strict",
+        policyAllowances: {},
+      });
+    }
+
+    persisted[STATE_KEY] = { ...freshState, policyProfile: "invalid" };
+    resetStateForTest();
+    await expect(readState()).rejects.toThrow("Persisted AgentTab state is malformed");
+
+    persisted[STATE_KEY] = { ...freshState, policyProfile: "review_selected" };
+    resetStateForTest();
+    expect((await readState()).policyProfile).toBe("review_selected");
   });
 });
 
@@ -2758,11 +2901,31 @@ describe("ownership and task isolation", () => {
     tabRemovalProbe = async () => {
       taskDeletedBeforeRemove = (await readState()).tasks[TASK_A] === undefined;
     };
+    await mutateState((state) => {
+      state.policyAllowances[policyAllowanceKey("task", "financial", TASK_A)] = {
+        scope: "task",
+        taskId: TASK_A,
+        effect: "financial",
+        createdAt: 1,
+      };
+      state.policyAllowances[policyAllowanceKey("effect", "upload")] = {
+        scope: "effect",
+        effect: "upload",
+        createdAt: 2,
+      };
+    });
     await ownership.closeTask(TASK_A);
 
     expect(taskDeletedBeforeRemove).toBe(true);
     expect(removedTabIds).toEqual([21, 22]);
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
+    expect((await readState()).policyAllowances).toEqual({
+      [policyAllowanceKey("effect", "upload")]: {
+        scope: "effect",
+        effect: "upload",
+        createdAt: 2,
+      },
+    });
   });
 
   test("keeps ownership deleted when one Chrome tab is already unavailable", async () => {
@@ -3134,7 +3297,11 @@ describe("native bridge transport", () => {
       handoff: { active: false },
       staged_commits: [],
     });
+    expect(port.posted[0]).not.toHaveProperty("policy_profile");
     expect(scheduler.isAccepting()).toBe(false);
+    await mutateState((state) => {
+      state.policyProfile = "strict";
+    });
 
     port.receive({
       protocol: "agenttab.native",
@@ -3146,6 +3313,7 @@ describe("native bridge transport", () => {
     await waitForCondition(() => scheduler.isAccepting());
     expect(scheduler.isAccepting()).toBe(true);
     expect(alarmClears).toContain(RECONNECT_ALARM);
+    expect(port.posted).not.toContainEqual(expect.objectContaining({ event: "policy_changed" }));
 
     const disconnectedAt = Date.now();
     port.disconnect();
@@ -3640,7 +3808,255 @@ describe("startup lifecycle", () => {
   });
 });
 
+describe("action policy profiles", () => {
+  test("defaults to unattended Autopilot while preserving review profiles", async () => {
+    tabStore.set(7, {
+      id: 7,
+      windowId: 1,
+      groupId: -1,
+      active: false,
+      url: "https://shop.example.test/cart",
+    });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const pageRevision = await revisions.ensure(7);
+
+    expect((await readState()).policyProfile).toBe("autopilot");
+    const automaticPurchase = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    expect(automaticPurchase).toMatchObject({
+      result: { actions: [{ kind: "click", completed: true }] },
+    });
+    expect(automaticPurchase.staged).toBeUndefined();
+    const automaticUpload = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "upload_file", ref: `r${pageRevision}-23`, files: ["/staged/report.pdf"] },
+    ]);
+    expect(automaticUpload).toMatchObject({
+      result: { actions: [{ kind: "upload_file", completed: true }] },
+    });
+    expect(debuggerCommands).toContainEqual({
+      method: "DOM.setFileInputFiles",
+      params: { backendNodeId: 23, files: ["/staged/report.pdf"] },
+    });
+    emitDebuggerEvent(7, "Page.javascriptDialogOpening", {
+      type: "confirm",
+      message: "Continue?",
+    });
+    const automaticDialog = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "dialog", decision: "accept" },
+    ]);
+    expect(automaticDialog).toMatchObject({
+      result: { actions: [{ kind: "dialog", completed: true }] },
+    });
+    expect(debuggerCommands).toContainEqual({
+      method: "Page.handleJavaScriptDialog",
+      params: { accept: true },
+    });
+    const automaticClose = await runtime.act(TASK_A, 7, pageRevision, [{ kind: "close" }]);
+    expect(automaticClose).toMatchObject({
+      result: { actions: [{ kind: "close", completed: true }] },
+    });
+
+    await mutateState((state) => {
+      state.policyProfile = "review_selected";
+    });
+    const reviewedPurchase = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    expect(reviewedPurchase.staged).toMatchObject({
+      preview: { policy_effect: "financial", origin: "https://shop.example.test" },
+    });
+    const selectedClose = await runtime.act(TASK_A, 7, pageRevision, [{ kind: "close" }]);
+    expect(selectedClose.staged).toBeUndefined();
+
+    await mutateState((state) => {
+      state.policyProfile = "strict";
+    });
+    const strictClose = await runtime.act(TASK_A, 7, pageRevision, [{ kind: "close" }]);
+    expect(strictClose.staged).toMatchObject({
+      preview: { policy_effect: "owned_tab_close", origin: "https://shop.example.test" },
+    });
+  });
+
+  test("remembers an approval for the selected site and effect", async () => {
+    tabStore.set(8, {
+      id: 8,
+      windowId: 1,
+      groupId: -1,
+      url: "https://shop.example.test/cart",
+    });
+    await mutateState((state) => {
+      state.policyProfile = "review_selected";
+    });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const pageRevision = await revisions.ensure(8);
+    const first = await runtime.act(TASK_A, 8, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    const token = first.staged?.native_token;
+    if (!token) throw new Error("expected a reviewed purchase");
+    const reviewHandle = "review-handle-policy-remember";
+    await runtime.bindReview(TASK_A, {
+      native_token: token,
+      review_handle: reviewHandle,
+      tab_id: 8,
+    });
+    await expect(runtime.approveReview(reviewHandle, "domain")).resolves.toBe(true);
+    expect(Object.values((await readState()).policyAllowances)).toContainEqual(
+      expect.objectContaining({
+        scope: "domain",
+        origin: "https://shop.example.test",
+        effect: "financial",
+      }),
+    );
+
+    const repeated = await runtime.act(TASK_A, 8, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    expect(repeated.staged).toBeUndefined();
+    expect(repeated).toMatchObject({
+      result: { actions: [{ kind: "click", completed: true }] },
+    });
+  });
+
+  test("keeps task and global-effect approvals category-bound", async () => {
+    tabStore.set(9, {
+      id: 9,
+      windowId: 1,
+      groupId: -1,
+      url: "https://shop.example.test/cart",
+    });
+    await mutateState((state) => {
+      state.policyProfile = "review_selected";
+    });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const pageRevision = await revisions.ensure(9);
+    const first = await runtime.act(TASK_A, 9, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    if (!first.staged?.native_token) throw new Error("expected a task-scoped review");
+    await runtime.bindReview(TASK_A, {
+      native_token: first.staged.native_token,
+      review_handle: "review-handle-task-scope",
+      tab_id: 9,
+    });
+    await runtime.approveReview("review-handle-task-scope", "task");
+
+    const tab = tabStore.get(9);
+    if (!tab) throw new Error("missing action-policy test tab");
+    tab.url = "https://other.example.test/checkout";
+    expect((await runtime.act(TASK_A, 9, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ])).staged).toBeUndefined();
+
+    const otherTask = await runtime.act(TASK_B, 9, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    if (!otherTask.staged?.native_token) throw new Error("task approval crossed task boundary");
+    await runtime.bindReview(TASK_B, {
+      native_token: otherTask.staged.native_token,
+      review_handle: "review-handle-effect-scope",
+      tab_id: 9,
+    });
+    await runtime.approveReview("review-handle-effect-scope", "effect");
+
+    tab.url = "https://third.example.test/cart";
+    expect((await runtime.act(TASK_C, 9, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ])).staged).toBeUndefined();
+
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return { result: { value: { tag: "BUTTON", text: "Delete account" } } };
+      }
+      return undefined;
+    };
+    const destructive = await runtime.act(TASK_C, 9, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+    expect(destructive.staged?.preview).toMatchObject({ policy_effect: "destructive" });
+  });
+
+  test("treats Send payment as financial despite a global communication allowance", async () => {
+    tabStore.set(10, {
+      id: 10,
+      windowId: 1,
+      groupId: -1,
+      url: "https://pay.example.test/confirm",
+    });
+    await mutateState((state) => {
+      state.policyProfile = "review_selected";
+      state.policyAllowances[policyAllowanceKey("effect", "external_communication")] = {
+        scope: "effect",
+        effect: "external_communication",
+        createdAt: 1,
+      };
+    });
+    debuggerCommandOverride = (method, params) => {
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("const f=this.form")
+      ) {
+        return {
+          result: {
+            value: {
+              tag: "BUTTON",
+              text: "Send payment",
+              aria_label: "Send payment",
+            },
+          },
+        };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const pageRevision = await revisions.ensure(10);
+
+    const result = await runtime.act(TASK_A, 10, pageRevision, [
+      { kind: "click", ref: `r${pageRevision}-22` },
+    ]);
+
+    expect(result.staged?.preview).toMatchObject({
+      policy_effect: "financial",
+      origin: "https://pay.example.test",
+    });
+  });
+});
+
 describe("consequential action staging", () => {
+  beforeEach(async () => {
+    await mutateState((state) => {
+      state.policyProfile = "review_selected";
+    });
+  });
+
   test("stages a purchase-like click, commits it once, and consumes the token", async () => {
     tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
@@ -3818,7 +4234,7 @@ describe("consequential action staging", () => {
       review_handle: "popup-review-handle",
       tab_id: 7,
     });
-    expect(await runtime.reviewBinding("popup-review-handle")).toEqual({
+    expect(await runtime.reviewBinding("popup-review-handle")).toMatchObject({
       task_id: TASK_A,
       tab_id: 7,
     });
@@ -4277,12 +4693,12 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: {
         code: "permissions_required",
-        recovery: "Open the AgentTab popup and choose Enable automation.",
+        recovery: "Reload or reinstall AgentTab so Chrome restores its required permissions.",
       },
     });
     expect(debuggerCommands).toHaveLength(deniedBeforePermission);
 
-    // The popup calls chrome.permissions.request directly inside the user click.
+    // Pause is logical state; the popup never mutates required Chrome permissions.
     automationPermission = true;
     expect(permissionRequests).toEqual([]);
 
@@ -4408,6 +4824,12 @@ describe("extension entrypoint admission boundaries", () => {
       ),
     ).toBe(true);
 
+    expect(await sendPopupMessage({
+      kind: "set_policy_profile",
+      profile: "review_selected",
+    })).toEqual({ profile: "review_selected" });
+    expect((await readState()).policyProfile).toBe("review_selected");
+    expect(port.posted).not.toContainEqual(expect.objectContaining({ event: "policy_changed" }));
 
     const staged = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6229",
@@ -4538,6 +4960,8 @@ describe("extension entrypoint admission boundaries", () => {
       error: { code: "invalid_staged_token" },
     });
 
+    expect(await sendPopupMessage({ kind: "set_policy_profile", profile: "strict" }))
+      .toEqual({ profile: "strict" });
     const abandoned = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6232",
       TASK_A,

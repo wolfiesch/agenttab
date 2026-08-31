@@ -2,20 +2,19 @@
 """Verify AgentTab's offline permission decision and explicit PR3 live lifecycle.
 
 Without ``--live-lifecycle`` this remains the PR1 decision gate: it validates
-the canonical required/optional split and a normalized copy in memory. It
+the canonical required permission set and a normalized copy in memory. It
 neither writes extension files, opens Chrome, reloads an extension, nor changes
 Chrome permissions.
 
 The explicit live mode runs only against a preloaded AgentTab candidate on the
-trusted macOS runner. It observes permission changes made by a human through
-the AgentTab UI; this probe never calls ``chrome.permissions.request`` or
-``chrome.permissions.remove``. Probe-initiated mutations are local fixture HTTP
+trusted macOS runner. Required browser permissions remain installed while the
+human exercises logical Pause and Resume; this probe never calls
+``chrome.permissions.request`` or ``chrome.permissions.remove``. Probe-initiated mutations are local fixture HTTP
 requests, task-owned tabs created through AgentTab Core RPC, a transient
 DevTools download route into the explicit test directory, a background AgentTab
 control page recreated after deliberate extension reloads, and the reviewed
 extension/host restart commands supplied by the operator. Cleanup closes
-task-owned tabs, restores the original optional-scripting state through the
-human UI checkpoint, and removes only the exact fixture download.
+task-owned tabs and removes only the exact fixture download.
 """
 
 from __future__ import annotations
@@ -50,12 +49,13 @@ EXTENSION_SOURCE = ROOT / "packages" / "extension" / "src"
 REQUIRED_PERMISSIONS = (
     "nativeMessaging",
     "debugger",
+    "scripting",
     "tabs",
     "tabGroups",
     "storage",
     "alarms",
 )
-OPTIONAL_PERMISSIONS = ("scripting",)
+OPTIONAL_PERMISSIONS: tuple[str, ...] = ()
 REMOVED_PERMISSIONS = (
     "activeTab",
     "bookmarks",
@@ -106,7 +106,10 @@ def string_set(manifest: dict[str, Any], key: str) -> set[str]:
 def reduced_manifest(source: dict[str, Any]) -> dict[str, Any]:
     staged = json.loads(json.dumps(source))
     staged["permissions"] = list(REQUIRED_PERMISSIONS)
-    staged["optional_permissions"] = list(OPTIONAL_PERMISSIONS)
+    if OPTIONAL_PERMISSIONS:
+        staged["optional_permissions"] = list(OPTIONAL_PERMISSIONS)
+    else:
+        staged.pop("optional_permissions", None)
     staged["host_permissions"] = list(HOST_PERMISSIONS)
     return staged
 
@@ -116,7 +119,7 @@ def canonical_bytes(value: dict[str, Any]) -> bytes:
 
 
 def verify_extension_permission_contract() -> None:
-    """Check the canonical Automation source cannot dynamically toggle debugger."""
+    """Check required browser capabilities are not used as a routine UI toggle."""
     background = manifest_bytes(EXTENSION_SOURCE / "background.ts").decode("utf-8")
     for required in (
         "automationEnabled",
@@ -133,14 +136,11 @@ def verify_extension_permission_contract() -> None:
         raise GateFailure("background must not dynamically request or remove debugger")
 
     popup = manifest_bytes(EXTENSION_SOURCE / "popup.ts").decode("utf-8")
-    for required in (
-        "changeOptionalScriptingPermission",
-        'permissions: ["scripting"]',
-        "optional scripting",
-        "install-time debugger grant stays installed",
-    ):
-        if required not in popup:
-            raise GateFailure(f"popup permission disclosure omits {required!r}")
+    scripting_mutation = re.compile(
+        r"permissions\.(?:request|remove)\s*\(\s*\{\s*permissions\s*:\s*\[\s*['\"]scripting['\"]"
+    )
+    if scripting_mutation.search(popup):
+        raise GateFailure("popup must not request or remove required scripting access")
     if debugger_mutation.search(popup):
         raise GateFailure("popup must not request or remove debugger")
 
@@ -161,6 +161,8 @@ def verify() -> dict[str, Any]:
         raise GateFailure("source manifest required permissions differ from the ADR target")
     if source_optional != set(OPTIONAL_PERMISSIONS):
         raise GateFailure("source manifest optional permissions differ from the ADR target")
+    if not OPTIONAL_PERMISSIONS and "optional_permissions" in source:
+        raise GateFailure("source manifest must omit the empty optional_permissions surface")
     if source_host != set(HOST_PERMISSIONS):
         raise GateFailure("source manifest host permissions differ from the ADR target")
 
@@ -191,7 +193,7 @@ def verify() -> dict[str, Any]:
         "host_permissions": list(HOST_PERMISSIONS),
         "removed_permissions": list(REMOVED_PERMISSIONS),
         "debugger_required_at_install": True,
-        "scripting_optional_at_runtime": True,
+        "scripting_required_at_install": True,
         "active_tab_retained": False,
         "source_manifest_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "staged_manifest_sha256": hashlib.sha256(staged_bytes).hexdigest(),
@@ -832,13 +834,6 @@ class ChromeInspector:
             raise ChromeOperationFailure("chrome.debugger.getTargets unavailable while required debugger is granted")
         return tab_id in state["debugger_attached_tab_ids"]
 
-    def assert_no_debugger_attachments(self, operation: str) -> None:
-        state = self.state()
-        if state["debugger_required_granted"] and not state["debugger_targets_available"]:
-            raise ChromeOperationFailure(f"{operation}: chrome.debugger.getTargets unavailable")
-        if state["debugger_attached_tab_ids"]:
-            raise ChromeOperationFailure(f"{operation}: scripting is off but AgentTab retained debugger attachments")
-
     def task_ids(self) -> set[str]:
         return set(self.state()["task_ids"])
 
@@ -850,16 +845,6 @@ class ChromeInspector:
         value = result.get("runtime_instance")
         if not isinstance(value, str) or not value:
             raise ChromeOperationFailure("AgentTab candidate omitted its private runtime instance")
-        return value
-
-    def automation_revocation_generation(self) -> int:
-        result = self._evaluate(
-            "chrome.runtime.sendMessage({ kind: 'automation_revocation_state' })",
-            "candidate-automation-revocation-state",
-        )
-        value = result.get("generation")
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ChromeOperationFailure("AgentTab candidate omitted its private revocation generation")
         return value
 
     def assert_candidate_files(self, file_digests: dict[str, str]) -> None:
@@ -1185,6 +1170,8 @@ def validate_candidate(candidate_dir: Path) -> tuple[str, str, dict[str, str], s
         raise GateFailure("candidate manifest required permissions differ from the locked target")
     if string_set(manifest, "optional_permissions") != set(OPTIONAL_PERMISSIONS):
         raise GateFailure("candidate manifest optional permissions differ from the locked target")
+    if not OPTIONAL_PERMISSIONS and "optional_permissions" in manifest:
+        raise GateFailure("candidate manifest must omit the empty optional_permissions surface")
     if string_set(manifest, "host_permissions") != set(HOST_PERMISSIONS):
         raise GateFailure("candidate manifest host permissions differ from the locked target")
 
@@ -1238,7 +1225,6 @@ class LiveLifecycleProbe:
         self.candidate_file_digests = candidate_file_digests
         self.owned_tabs: set[int] = set()
         self.replay_request: tuple[dict[str, Any], str] | None = None
-        self.initial_automation_permissions: bool | None = None
 
     def prompt(self, phase: str, instruction: str) -> None:
         if not self.args.interactive or not sys.stdin.isatty():
@@ -1340,23 +1326,6 @@ class LiveLifecycleProbe:
             raise GateFailure(f"{operation}: mutation did not receive an idempotency key")
         result = require_completed(operation, response)
         return result, key
-
-    def assert_scripting_denied(self, tab_id: int, operation: str) -> None:
-        response, _ = self.client.call("browser_snapshot", {"tab_id": tab_id, "mode": "text"})
-        require_denied(
-            operation,
-            response,
-            allowed_codes={
-                "automation_disabled",
-                "permissions_required",
-                "scripting_not_granted",
-                "scripting_permission_required",
-                "scripting_required",
-            },
-        )
-        error = response.get("error")
-        if not isinstance(error, dict) or not isinstance(error.get("recovery"), str) or not error["recovery"]:
-            raise GateFailure(f"{operation}: scripting denial omitted enablement recovery")
 
     def assert_raw_cdp_denied(self, tab_id: int) -> None:
         response, _ = self.client.call(
@@ -1572,34 +1541,11 @@ class LiveLifecycleProbe:
         run_start_permissions = initial_state["scripting"]
         if initial_state["debugger_required_granted"] is not True:
             raise ChromeOperationFailure("AgentTab's required debugger install grant is unavailable")
-        if self.initial_automation_permissions is None:
-            self.initial_automation_permissions = run_start_permissions
-        if run_start_permissions:
-            denial_instruction = (
-                "Open AgentTab Settings and choose Turn off under Automation access. "
-                "The popup must return to Automation is off."
-            )
-        else:
-            denial_instruction = "Leave AgentTab at Automation is off; no Chrome permission prompt is expected."
-        self.prompt(f"run {run_number}: automation denial state", denial_instruction)
-        self.inspector.assert_permission_model(False, "denial observation")
+        if run_start_permissions is not True:
+            raise ChromeOperationFailure("AgentTab's required scripting install grant is unavailable")
+        self.inspector.assert_permission_model(True, "required install grants")
         self.connect()
         self.status("initial lifecycle status")
-        selection_before = self.inspector.selection()
-        response, _ = self.client.call(
-            "browser_open",
-            {"mode": "create", "url": fixture.base_url, "background": True},
-            mutation=True,
-        )
-        require_denied("browser_open while scripting denied", response, {"permissions_required"})
-        self.inspector.assert_selection_unchanged(selection_before, "browser_open permission denial")
-        self.inspector.assert_no_debugger_attachments("initial automation denial")
-
-        self.prompt(
-            f"run {run_number}: optional automation grant",
-            "Choose Enable AgentTab automation. Chrome grants only optional scripting; the required debugger grant remains installed.",
-        )
-        self.inspector.assert_permission_model(True, "grant observation")
         selection_before = self.inspector.selection()
         tab_id, _ = self.open_tab(fixture.base_url, "browser_open background task")
         self.inspector.assert_selection_unchanged(selection_before, "browser_open background task")
@@ -1634,29 +1580,6 @@ class LiveLifecycleProbe:
         self.assert_replayed_once(tab_id)
         self.inspector.assert_selection_unchanged(selection_before_host_restart, "Rust host crash recovery")
         self.assert_handoff(fixture, run_number)
-
-        self.snapshot(tab_id, "accessibility", "browser_snapshot debugger revocation source")
-        if not self.inspector.debugger_is_attached(tab_id):
-            raise ChromeOperationFailure("debugger revocation source tab was not attached")
-        revocation_generation = self.inspector.automation_revocation_generation()
-        self.prompt(
-            f"run {run_number}: optional automation revocation",
-            "Open AgentTab Settings and choose Turn off under Automation access. This removes optional scripting only.",
-        )
-        self.inspector.assert_permission_model(False, "revocation observation")
-        detach_deadline = time.monotonic() + self.args.timeout_seconds
-        while self.inspector.automation_revocation_generation() <= revocation_generation:
-            if time.monotonic() >= detach_deadline:
-                raise ChromeOperationFailure("automation revocation did not acknowledge debugger-session cleanup")
-            time.sleep(0.1)
-        self.inspector.assert_no_debugger_attachments("automation revocation")
-        self.assert_scripting_denied(tab_id, "browser_snapshot after automation revocation")
-        self.prompt(
-            f"run {run_number}: optional automation re-grant",
-            "Choose Enable AgentTab automation. This restores optional scripting only.",
-        )
-        self.inspector.assert_permission_model(True, "re-grant observation")
-        self.snapshot(tab_id, "accessibility", "browser_snapshot after automation re-grant")
 
         self.prompt(
             f"run {run_number}: pause",
@@ -1717,8 +1640,8 @@ class LiveLifecycleProbe:
             "run": run_number,
             "task_cleanup": True,
             "active_window_tab_preserved": True,
-            "automation_permission_lifecycle_observed": True,
-            "debugger_detach_on_revocation_observed": True,
+            "required_permission_continuity_observed": True,
+            "pause_without_permission_revocation_observed": True,
             "raw_cdp_standard_denied": True,
             "handoff_blackout_observed": True,
             "crash_recovery_observed": True,
@@ -1736,22 +1659,6 @@ class LiveLifecycleProbe:
                 self.close_owned_tabs()
             if fixture_filename:
                 self.remove_fixture_download(fixture_filename)
-            if self.initial_automation_permissions is not None:
-                expected = "granted" if self.initial_automation_permissions else "not granted"
-                action = (
-                    "choose Enable AgentTab automation"
-                    if self.initial_automation_permissions
-                    else "open AgentTab Settings and choose Turn off under Automation access"
-                )
-                self.prompt(
-                    "transactional restoration",
-                    f"Restore AgentTab automation permissions to their state before this run ({expected}): {action}. "
-                    "Ensure the extension remains enabled, agents are resumed, and any active handoff is complete.",
-                )
-                self.inspector.assert_permission_model(
-                    self.initial_automation_permissions,
-                    "transactional restoration",
-                )
         finally:
             self.client.close()
             self.inspector.close()
@@ -1815,7 +1722,7 @@ def print_live_prerequisites() -> None:
     print("  2. Chrome was started with a loopback remote-debugging endpoint and an AgentTab extension page is open.")
     print("  3. The AgentTab Rust host is READY on a current-user 0600 Unix socket; no TCP token endpoint is accepted.")
     print("  4. --download-dir already exists and is disposable; the probe temporarily routes Chrome downloads there.")
-    print("  5. An operator can perform the prompted AgentTab/Chrome UI permission, pause, disable, and restore steps.")
+    print("  5. An operator can perform the prompted AgentTab Pause, Resume, disable, and restore steps.")
     print("  6. --host-restart-command is the runner's reviewed Rust-host restart argv encoded as JSON; it is never shell-evaluated.")
     print("")
     print("CLI (run only after the prerequisites are deliberately prepared):")
@@ -1843,7 +1750,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, help="write the scrubbed JSON report")
     parser.add_argument("--print-live-prerequisites", action="store_true", help="print live CLI/environment prerequisites and exit")
     parser.add_argument("--live-lifecycle", action="store_true", help="run the explicit PR3 macOS lifecycle matrix")
-    parser.add_argument("--interactive", action="store_true", help="allow prompts for human Chrome UI permission/state changes")
+    parser.add_argument("--interactive", action="store_true", help="allow prompts for human Chrome UI lifecycle changes")
     parser.add_argument(
         "--request-extension-reload",
         action="store_true",

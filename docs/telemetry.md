@@ -28,7 +28,7 @@ A user-visible website confirmation, transaction receipt, or download is indepen
 
 ## Extension local state
 
-The extension keeps task state, paused state, active handoff marker, staged Commit records, and revision information in Chrome extension storage. This lets it restore safety barriers after service-worker restart. Chrome may sync or back up browser-profile data according to the user's browser/account configuration; AgentTab does not initiate a telemetry upload.
+The extension keeps task state, paused state, action-policy profile and remembered allow decisions, active handoff marker, staged Commit records, and revision information in Chrome extension storage. This lets it restore runtime policy and safety barriers after service-worker restart. Chrome may sync or back up browser-profile data according to the user's browser/account configuration; AgentTab does not initiate a telemetry upload.
 
 ## Explicit network paths
 

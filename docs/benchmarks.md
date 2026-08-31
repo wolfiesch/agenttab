@@ -9,7 +9,7 @@ Every measured claim must retain a raw artifact and record:
 - the exact source commit, dirty-state status, build identity, host version, extension version, and adapter version;
 - the complete scenario and success criterion, including URL or controlled fixture, requested action, payload size, and whether an external side effect was intentionally avoided;
 - hardware, OS, browser channel/version, Chrome profile class, network conditions, and display/browser state where relevant;
-- configuration that can affect the result, including Standard or Developer mode, optional permissions, policy, IPC endpoint, proxy use, and timeout;
+- configuration that can affect the result, including Standard or Developer mode, browser permissions, action policy, IPC endpoint, proxy use, and timeout;
 - iteration count, warmup policy, cache state, concurrency, retry policy, start/end time, and per-iteration raw output;
 - summary method, exclusions, failures, timeouts, and the raw artifact path.
 

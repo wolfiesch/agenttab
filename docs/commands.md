@@ -12,6 +12,7 @@ agenttab --version
 agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]
 agenttab status
 agenttab doctor [--layer ipc|extension]
+agenttab policy allow-upload PATH [--state-dir PATH]
 agenttab mcp
 agenttab proxy --token-file PATH [--port 9224]
 ```
@@ -55,7 +56,7 @@ The current source contains the stable Ed25519 verification public key, but no m
 agenttab status
 ```
 
-Connects to local AgentTab IPC and prints the Core `agenttab.status` result as JSON. The status response reports the host lifecycle state, protocol version, whether a handoff is active, and the current connection's task identifier when one exists.
+Connects to local AgentTab IPC and prints the Core `agenttab.status` result as JSON. The status response reports the host lifecycle state, protocol version, current action-policy profile, whether a handoff is active, and the current connection's task identifier when one exists.
 
 Use this only after the extension and native host are installed. It does not start a browser, create a task, use a port, or authenticate with a token.
 
@@ -75,6 +76,18 @@ agenttab doctor --layer extension
 - `extension`: reload AgentTab in `chrome://extensions`, then rerun `agenttab doctor --layer extension`.
 
 The extension layer is a diagnostic label around the status check. It does not reload Chrome for you.
+
+## `agenttab policy allow-upload`
+
+```text
+agenttab policy allow-upload PATH
+```
+
+Canonicalizes an existing current-user directory and adds it once to the host's `dlp_allowed_roots`. Updates targeting the same state directory are serialized across CLI processes so distinct concurrent roots are merged rather than lost. Repeating the same command is idempotent and reports `added: false` with `restartRequired: false`. Existing valid managed-policy fields are preserved, and an unknown or malformed policy is rejected instead of overwritten.
+
+The command writes the host `policy.json` with owner-only permissions where the platform supports them. The default file is `~/.agenttab/policy.json` on Unix and `%LOCALAPPDATA%\AgentTab\policy.json` on Windows. `--state-dir PATH` selects an explicit host state directory. Restart the AgentTab host only when the result reports `restartRequired: true`; the running host does not hot-reload policy.
+
+This is a one-time source-directory grant, not approval of a particular destination or webpage action. Whether an allowed upload also requires Commit is determined separately by the popup's [action policy](action-policy.md).
 
 ## `agenttab mcp` and `agenttab-mcp`
 
@@ -125,5 +138,6 @@ Malformed JSON or YAML is reported and left untouched. The installer does not in
 
 - [Setup, identities, endpoints, migration, and uninstall status](setup.md)
 - [MCP setup, tools, outcomes, Commit, and handoff](mcp.md)
+- [Action policy profiles and remembered approvals](action-policy.md)
 - [Core RPC request schema](../schemas/rpc/v1/request.schema.json)
 - [Core RPC response schema](../schemas/rpc/v1/response.schema.json)

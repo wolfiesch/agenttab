@@ -21,7 +21,8 @@ import {
 } from "./routes";
 import { MutationScheduler, NotStartedError } from "./scheduler";
 import { IdempotentStartup, StartupOperationQueue } from "./startup";
-import { mutateState, readState } from "./storage";
+import { POLICY_PROFILES, mutateState, readState, type PolicyProfile } from "./storage";
+import type { PolicyRememberScope } from "./policy";
 import { isRecord } from "./type-guards";
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
@@ -116,9 +117,9 @@ async function automationEnabled(): Promise<boolean> {
 }
 
 function automationRequired(): Error {
-  return Object.assign(new Error("AgentTab automation permissions have not been enabled"), {
+  return Object.assign(new Error("AgentTab required browser permissions are unavailable"), {
     code: "permissions_required",
-    recovery: "Open the AgentTab popup and choose Enable automation.",
+    recovery: "Reload or reinstall AgentTab so Chrome restores its required permissions.",
   });
 }
 
@@ -676,6 +677,8 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
       automation_enabled: await automationEnabled(),
       paused: state.paused,
       developer_mode: state.developerMode,
+      policy_profile: state.policyProfile,
+      policy_allowance_count: Object.keys(state.policyAllowances).length,
       handoff: state.handoff.active ? { prompt: state.handoff.prompt } : null,
       show_agent_pointer: state.showAgentPointer,
       tasks: Object.values(state.tasks).map((task) => ({
@@ -693,8 +696,30 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
           tab_id: staged.tab_id,
           effect: staged.effect,
           expires_at_ms: staged.expires_at_ms,
+          ...(typeof staged.preview.policy_effect === "string"
+            ? { policy_effect: staged.preview.policy_effect }
+            : {}),
+          ...(typeof staged.preview.origin === "string" ? { origin: staged.preview.origin } : {}),
         })),
     };
+  }
+  if (
+    message.kind === "set_policy_profile" &&
+    POLICY_PROFILES.includes(message.profile as PolicyProfile)
+  ) {
+    const profile = message.profile as PolicyProfile;
+    await mutateState((state) => {
+      state.policyProfile = profile;
+    });
+    return { profile };
+  }
+  if (message.kind === "clear_policy_allowances") {
+    const cleared = await mutateState((state) => {
+      const count = Object.keys(state.policyAllowances).length;
+      state.policyAllowances = {};
+      return count;
+    });
+    return { cleared };
   }
   if (message.kind === "set_pointer" && typeof message.enabled === "boolean") {
     const enabled = message.enabled;
@@ -731,11 +756,33 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
     }
     try {
       const approving = message.kind === "approve_popup_commit";
+      const rememberScope = message.remember_scope ?? "once";
+      if (
+        approving &&
+        !["once", "task", "domain", "effect"].includes(String(rememberScope))
+      ) {
+        throw Object.assign(new Error("Unknown remembered approval scope"), {
+          code: "invalid_request",
+        });
+      }
+      if (approving && rememberScope !== "once" && binding.policy_effect === undefined) {
+        throw Object.assign(new Error("This staged action cannot create a remembered policy decision"), {
+          code: "policy_scope_unavailable",
+        });
+      }
+      if (approving && rememberScope === "domain" && binding.origin === undefined) {
+        throw Object.assign(new Error("This review has no HTTP or HTTPS site to remember"), {
+          code: "policy_scope_unavailable",
+        });
+      }
       const result = approving
         ? await bridge.approvePopupCommit(message.review_handle, binding.task_id, binding.tab_id)
         : await bridge.abandonPopupCommit(message.review_handle, binding.task_id, binding.tab_id);
       if (approving) {
-        await browser.approveReview(message.review_handle);
+        await browser.approveReview(
+          message.review_handle,
+          rememberScope as PolicyRememberScope,
+        );
       } else {
         await browser.abandonReview(message.review_handle);
       }

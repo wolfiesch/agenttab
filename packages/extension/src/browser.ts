@@ -9,7 +9,14 @@ import {
   type StagedCommit,
   type StagedDialog,
 } from "./protocol";
-import { mutateState, readState } from "./storage";
+import {
+  classifyControlEffect,
+  policyOrigin,
+  policyRequiresReview,
+  rememberPolicyAllowance,
+  type PolicyRememberScope,
+} from "./policy";
+import { POLICY_EFFECTS, mutateState, readState, type PolicyEffect } from "./storage";
 
 const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
@@ -141,6 +148,8 @@ interface PreparedDialog {
 
 interface StagedConsequence {
   effect: string;
+  policyEffect: PolicyEffect;
+  origin?: string;
   target: Record<string, unknown>;
   dialog?: PreparedDialog;
 }
@@ -446,7 +455,7 @@ export class StandardBrowserRuntime {
         });
       }
       await this.revisions.assertExpected(tabId, pageRevision);
-      const stagedConsequence = await this.consequence(tabId, pageRevision, action);
+      const stagedConsequence = await this.consequence(taskId, tabId, pageRevision, action);
       if (stagedConsequence) {
         const staged: StagedCommit = {
           native_token: randomToken(),
@@ -465,6 +474,8 @@ export class StandardBrowserRuntime {
           action: { action },
           preview: {
             effect: stagedConsequence.effect,
+            policy_effect: stagedConsequence.policyEffect,
+            ...(stagedConsequence.origin === undefined ? {} : { origin: stagedConsequence.origin }),
             kind: action.kind,
             target: stagedConsequence.target,
             ...(typeof action.ref === "string" ? { ref: action.ref } : {}),
@@ -536,7 +547,13 @@ export class StandardBrowserRuntime {
     return { review_bound: true };
   }
 
-  async reviewBinding(reviewHandle: string): Promise<{ task_id: string; tab_id: number }> {
+  async reviewBinding(reviewHandle: string): Promise<{
+    task_id: string;
+    tab_id: number;
+    effect: string;
+    policy_effect?: PolicyEffect;
+    origin?: string;
+  }> {
     const staged = Object.values((await readState()).stagedCommits).find(
       (candidate) => candidate.review_handle === reviewHandle && candidate.approved !== true,
     );
@@ -545,15 +562,42 @@ export class StandardBrowserRuntime {
         code: "invalid_staged_token",
       });
     }
-    return { task_id: staged.task_id, tab_id: staged.tab_id };
+    return {
+      task_id: staged.task_id,
+      tab_id: staged.tab_id,
+      effect: staged.effect,
+      ...(POLICY_EFFECTS.includes(staged.preview.policy_effect as PolicyEffect)
+        ? { policy_effect: staged.preview.policy_effect as PolicyEffect }
+        : {}),
+      ...(typeof staged.preview.origin === "string" ? { origin: staged.preview.origin } : {}),
+    };
   }
 
-  async approveReview(reviewHandle: string): Promise<boolean> {
+  async approveReview(
+    reviewHandle: string,
+    rememberScope: PolicyRememberScope = "once",
+  ): Promise<boolean> {
     return mutateState((state) => {
       const staged = Object.values(state.stagedCommits).find(
         (candidate) => candidate.review_handle === reviewHandle && candidate.approved !== true,
       );
       if (!staged) return false;
+      if (rememberScope !== "once") {
+        const effect = staged.preview.policy_effect;
+        if (!POLICY_EFFECTS.includes(effect as PolicyEffect)) {
+          throw Object.assign(
+            new Error("This staged action cannot create a remembered policy decision"),
+            { code: "policy_scope_unavailable" },
+          );
+        }
+        rememberPolicyAllowance(
+          state,
+          rememberScope,
+          staged.task_id,
+          typeof staged.preview.origin === "string" ? staged.preview.origin : undefined,
+          effect as PolicyEffect,
+        );
+      }
       staged.approved = true;
       return true;
     });
@@ -952,28 +996,61 @@ export class StandardBrowserRuntime {
 
 
   private async consequence(
+    taskId: string,
     tabId: number,
     pageRevision: number,
     action: Record<string, unknown>,
   ): Promise<StagedConsequence | null> {
+    if (
+      action.kind !== "close" &&
+      action.kind !== "upload_file" &&
+      action.kind !== "click" &&
+      action.kind !== "select" &&
+      action.kind !== "fill" &&
+      action.kind !== "type" &&
+      !(action.kind === "dialog" && action.decision === "accept")
+    ) {
+      return null;
+    }
+    const state = await readState();
+    // Autopilot inserts no semantic Commit stage. Keep a preflight descriptor
+    // only for value-entry controls so sensitive fields fail before dispatch;
+    // clicks and structural actions take the default fast path.
+    if (
+      state.policyProfile === "autopilot" &&
+      action.kind !== "fill" &&
+      action.kind !== "type" &&
+      action.kind !== "select"
+    ) return null;
+    const tab = await chrome.tabs.get(tabId);
+    const origin = policyOrigin(tab.url ?? tab.pendingUrl);
     if (action.kind === "close") {
+      if (!policyRequiresReview(state, taskId, origin, "owned_tab_close")) return null;
       return {
         effect: "Close an AgentTab-owned browser tab",
+        policyEffect: "owned_tab_close",
+        ...(origin === undefined ? {} : { origin }),
         target: { kind: action.kind },
       };
     }
     if (action.kind === "upload_file") {
       const count = Array.isArray(action.files) ? action.files.length : 0;
+      if (!policyRequiresReview(state, taskId, origin, "upload")) return null;
       return {
         effect: `Upload ${count} ${count === 1 ? "file" : "files"} to the page`,
+        policyEffect: "upload",
+        ...(origin === undefined ? {} : { origin }),
         target: typeof action.ref === "string"
           ? await this.targetDescriptor(tabId, pageRevision, action.ref)
           : { kind: action.kind },
       };
     }
     if (action.kind === "dialog" && action.decision === "accept") {
+      if (!policyRequiresReview(state, taskId, origin, "dialog_accept")) return null;
       return {
         effect: "Accept a browser confirmation dialog",
+        policyEffect: "dialog_accept",
+        ...(origin === undefined ? {} : { origin }),
         target: { kind: action.kind },
         dialog: await this.stageDialog(tabId),
       };
@@ -987,6 +1064,7 @@ export class StandardBrowserRuntime {
       return null;
     }
     const target = await this.targetDescriptor(tabId, pageRevision, action.ref, action);
+    if (state.policyProfile === "autopilot") return null;
     const label = [
       target.role,
       target.text,
@@ -1004,13 +1082,12 @@ export class StandardBrowserRuntime {
       // immediately consequential selection even when its submitted value is opaque.
       target.requested_option_label,
     ].filter((value): value is string => typeof value === "string").join(" ").replace(/\s+/g, " ").trim();
-    if (
-      /\b(buy|purchase|pay|send|transfer|delete|remove|publish|post|deploy|merge|approve|authorize|grant|revoke|unsubscribe|cancel subscription|place order|checkout|submit order|confirm order|permission)\b/i.test(
-        label,
-      )
-    ) {
+    const policyEffect = classifyControlEffect(label);
+    if (policyEffect && policyRequiresReview(state, taskId, origin, policyEffect)) {
       return {
         effect: `${action.kind === "click" ? "Activate" : "Change"} consequential control: ${label.slice(0, 160)}`,
+        policyEffect,
+        ...(origin === undefined ? {} : { origin }),
         target,
       };
     }
@@ -1155,9 +1232,8 @@ export class StandardBrowserRuntime {
     }
     if (kind === "dialog") {
       if (action.decision === "accept") {
-        throw Object.assign(new Error("Accepting a dialog requires a staged Commit"), {
-          code: "invalid_request",
-        });
+        await this.send(tabId, "Page.handleJavaScriptDialog", { accept: true });
+        return { kind, completed: true };
       }
       await this.send(tabId, "Page.handleJavaScriptDialog", { accept: false });
       return { kind, completed: true };

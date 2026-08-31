@@ -76,12 +76,12 @@
           <h2 id="boundaries-title">Security boundaries and limits</h2>
           <p>Task ownership limits agent execution and coordination to visible task workspaces. It is not cookie, identity, or browser-profile isolation. Standard mode does not provide raw cookies, storage, passwords, arbitrary JavaScript, raw Chrome DevTools Protocol access, or coordinate actions.</p>
           <p>For passwords, passkeys, 2FA, CAPTCHAs, payment secrets, and other human-only input, AgentTab uses Your Turn handoff. During handoff, the agent is not allowed to observe or capture that interaction.</p>
-          <p>Commit stages recognizable sends, publishing, purchases, deletion, uploads, authorization, and permission grants for review. This is a best-effort safety measure. Prompt injection and page behavior can still create risks, and Commit cannot guarantee recognition of every external effect.</p>
+          <p>The action policy controls Commit. Autopilot executes recognized effects directly; Review selected and Strict stage recognizable sends, publishing, purchases, deletion, uploads, authorization, and permission grants for review. This is a best-effort measure, and Commit cannot guarantee recognition of every external effect.</p>
         </section>
 
         <aside class="policy-note" aria-labelledby="policy-note-title">
           <h2 id="policy-note-title">Use deliberate review</h2>
-          <p>Review the active website, the agent request, and every staged consequential action before proceeding. Do not treat a website label or a staged action as proof of the page's intent.</p>
+          <p>Use a review profile when you want staged approval. Review the active website, the agent request, and every staged consequential action before proceeding. Do not treat a website label or a staged action as proof of the page's intent.</p>
         </aside>
 
         <p class="back-link"><a href="../"><span aria-hidden="true">←</span> Back to AgentTab</a></p>
