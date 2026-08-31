@@ -4,8 +4,10 @@ import {
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
+  createUuidV7,
   createResumeCapabilityStore,
   type MethodParams,
+  type MutationMethod,
   type RpcMethod,
 } from "../../sdk-typescript/src/index";
 import openSchema from "../../../schemas/rpc/v1/browser-open.schema.json" with { type: "json" };
@@ -22,6 +24,52 @@ const SERVER_NAME = "agenttab-mcp";
 const SERVER_VERSION = packageJson.version;
 const MCP_PROTOCOL_VERSION = "2025-03-26";
 export const MCP_MAX_LINE_BYTES = 1024 * 1024 + 64 * 1024;
+export const MCP_INLINE_RESULT_MAX_BYTES = 8 * 1024;
+const IDEMPOTENCY_KEY_CACHE_MAX_ENTRIES = 4_096;
+
+const MUTATIONS = new Set<RpcMethod>([
+  "browser_open",
+  "browser_act",
+  "browser_handoff",
+  "browser_commit",
+  "browser_developer",
+]);
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+class InvocationIdempotencyKeys {
+  readonly #keys = new Map<string, string>();
+
+  for(invocationId: string | number | null, method: RpcMethod, params: Record<string, unknown>): string {
+    const scopedId = `${typeof invocationId}:${String(invocationId)}:${method}:${canonicalJson(params)}`;
+    if (typeof invocationId === "string" && UUID_V7.test(invocationId)) {
+      return invocationId.toLowerCase();
+    }
+    const current = this.#keys.get(scopedId);
+    if (current !== undefined) return current;
+    const created = createUuidV7();
+    if (this.#keys.size >= IDEMPOTENCY_KEY_CACHE_MAX_ENTRIES) {
+      const oldest = this.#keys.keys().next().value;
+      if (oldest !== undefined) this.#keys.delete(oldest);
+    }
+    this.#keys.set(scopedId, created);
+    return created;
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isRecord(value)) {
+    const fields = Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`);
+    return `{${fields.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function isMutation(method: RpcMethod): method is MutationMethod {
+  return MUTATIONS.has(method);
+}
 
 export type BoundedLine = { line: string } | { error: string };
 
@@ -160,51 +208,89 @@ function parseRequest(line: string): JsonRpcRequest {
   return value as unknown as JsonRpcRequest;
 }
 
-function respond(id: JsonRpcRequest["id"], result: unknown): void {
-  if (id === undefined) return;
-  stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
+function responseLine(id: Exclude<JsonRpcRequest["id"], undefined>, result: unknown): string {
+  return `${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`;
 }
 
-function respondError(id: JsonRpcRequest["id"], code: number, message: string, data?: unknown): void {
-  if (id === undefined) return;
-  stdout.write(`${JSON.stringify({
+function errorLine(
+  id: Exclude<JsonRpcRequest["id"], undefined>,
+  code: number,
+  message: string,
+  data?: unknown,
+): string {
+  return `${JSON.stringify({
     jsonrpc: "2.0",
     id,
     error: { code, message, ...(data === undefined ? {} : { data }) },
-  })}\n`);
+  })}\n`;
 }
 
-function toolResult(value: unknown): Record<string, unknown> {
+function attachPresentation(
+  value: unknown,
+  presentation: { outcome: string; taskId?: string },
+): Record<string, unknown> {
+  const metadata = {
+    outcome: presentation.outcome,
+    ...(presentation.taskId ? { task_id: presentation.taskId } : {}),
+  };
+  return isRecord(value)
+    ? { ...value, _agenttab: metadata }
+    : { value, _agenttab: metadata };
+}
+
+function screenshotResult(value: unknown): {
+  data: string;
+  mediaType: string;
+  metadata: Record<string, unknown>;
+} | undefined {
   if (
-    isRecord(value) &&
-    value.mode === "screenshot" &&
-    value.encoding === "base64" &&
-    typeof value.data === "string" &&
-    typeof value.media_type === "string" &&
-    /^image\/(png|jpeg|webp)$/.test(value.media_type)
+    !isRecord(value) ||
+    value.mode !== "screenshot" ||
+    value.encoding !== "base64" ||
+    typeof value.data !== "string" ||
+    typeof value.media_type !== "string" ||
+    !/^image\/(png|jpeg|webp)$/.test(value.media_type)
   ) {
-    const { data, encoding: _encoding, media_type: mediaType, ...metadata } = value;
-    return {
-      content: [
-        { type: "image", data, mimeType: mediaType },
-        { type: "text", text: JSON.stringify({ ...metadata, media_type: mediaType }, null, 2) },
-      ],
-      structuredContent: { ...metadata, media_type: mediaType },
-    };
+    return undefined;
   }
+  const { data, encoding: _encoding, media_type: mediaType, ...metadata } = value;
   return {
-    content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
-    structuredContent: value,
+    data,
+    mediaType,
+    metadata: { ...metadata, media_type: mediaType },
   };
 }
 
-function toolError(error: unknown): Record<string, unknown> {
+function toolResult(
+  value: unknown,
+  presentation: { outcome: string; taskId?: string },
+): Record<string, unknown> {
+  const screenshot = screenshotResult(value);
+  if (screenshot) {
+    return {
+      content: [{ type: "image", data: screenshot.data, mimeType: screenshot.mediaType }],
+      structuredContent: attachPresentation(screenshot.metadata, presentation),
+    };
+  }
+  const serialized = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const serializedBytes = Buffer.byteLength(serialized, "utf8");
+  const text = serializedBytes <= MCP_INLINE_RESULT_MAX_BYTES
+    ? serialized
+    : `AgentTab ${presentation.outcome}; full structured result attached (${serializedBytes} bytes).`;
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: attachPresentation(value, presentation),
+  };
+}
+
+function toolError(error: unknown, taskId?: string): Record<string, unknown> {
   if (error instanceof AgentTabError) {
     const structuredContent = {
       code: error.code,
       outcome: error.outcome,
       ...(error.recovery ? { recovery: error.recovery } : {}),
       ...(error.details ? { details: error.details } : {}),
+      ...(taskId ? { _agenttab: { outcome: error.outcome, task_id: taskId } } : {}),
     };
     return {
       content: [{ type: "text", text: error.message }],
@@ -218,6 +304,7 @@ function toolError(error: unknown): Record<string, unknown> {
       outcome: error.outcome,
       method: error.method,
       ...(error.idempotencyKey ? { idempotency_key: error.idempotencyKey } : {}),
+      ...(taskId ? { _agenttab: { outcome: error.outcome, task_id: taskId } } : {}),
     };
     return {
       content: [{ type: "text", text: error.message }],
@@ -235,6 +322,10 @@ export class McpServer {
   readonly #developer: boolean;
   readonly #clientFactory: () => Promise<AgentTabClient>;
   #client?: AgentTabClient;
+  #connecting?: Promise<AgentTabClient>;
+  #taskId?: string;
+  #closed = false;
+  readonly #invocationKeys = new InvocationIdempotencyKeys();
 
   constructor(options: { developer?: boolean; clientFactory?: () => Promise<AgentTabClient> } = {}) {
     this.#developer = options.developer ?? process.env.AGENTTAB_DEVELOPER === "1";
@@ -270,17 +361,37 @@ export class McpServer {
       case "tools/list":
         return { tools: listedTools(this.#developer) };
       case "tools/call":
-        return this.#callTool(request.params);
+        return this.#callTool(request.params, request.id ?? null);
       default:
         throw Object.assign(new Error(`Method not found: ${request.method}`), { jsonRpcCode: -32601 });
     }
   }
 
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
     this.#client?.close();
   }
 
-  async #callTool(params: unknown): Promise<Record<string, unknown>> {
+  async #getClient(): Promise<AgentTabClient> {
+    if (this.#closed) throw new Error("AgentTab MCP server is closed");
+    if (this.#client !== undefined && !this.#client.closed) return this.#client;
+    const pending = this.#connecting ??= this.#clientFactory();
+    try {
+      const connected = await pending;
+      if (this.#closed) {
+        connected.close();
+        throw new Error("AgentTab MCP server closed while connecting");
+      }
+      this.#client = connected;
+      this.#taskId = this.#client.connection.task_id ?? this.#taskId;
+      return this.#client;
+    } finally {
+      if (this.#connecting === pending) this.#connecting = undefined;
+    }
+  }
+
+  async #callTool(params: unknown, invocationId: string | number | null): Promise<Record<string, unknown>> {
     if (!isRecord(params) || typeof params.name !== "string") {
       throw Object.assign(new Error("tools/call requires a tool name"), { jsonRpcCode: -32602 });
     }
@@ -294,17 +405,83 @@ export class McpServer {
     }
     let client: AgentTabClient | undefined;
     try {
-      client = this.#client ??= await this.#clientFactory();
-      const result = await client.call(
-        params.name as RpcMethod,
+      client = await this.#getClient();
+      const method = params.name as RpcMethod;
+      const response = await client.request(
+        method,
         argumentsValue as MethodParams[RpcMethod],
+        isMutation(method)
+          ? { idempotencyKey: this.#invocationKeys.for(invocationId, method, argumentsValue) }
+          : {},
       );
-      return toolResult(result);
+      this.#taskId = response.task?.task_id ?? this.#taskId;
+      if (!response.ok) throw new AgentTabError(response);
+      return toolResult(response.result, { outcome: response.outcome, taskId: this.#taskId });
     } catch (error) {
       if (client?.closed && this.#client === client) this.#client = undefined;
-      return toolError(error);
+      return toolError(error, this.#taskId);
     }
   }
+}
+
+export async function serveMcp(
+  server: McpServer,
+  input: AsyncIterable<Uint8Array | string>,
+  writeLine: (line: string) => void | Promise<void>,
+  shouldStop: () => boolean = () => false,
+): Promise<void> {
+  const active = new Set<Promise<void>>();
+  let outputTail = Promise.resolve();
+  let outputError: unknown;
+  const emit = (line: string): Promise<void> => {
+    const write = outputTail.then(() => writeLine(line));
+    outputTail = write.catch((error) => {
+      outputError ??= error;
+    });
+    return write;
+  };
+  const track = (operation: Promise<void>): void => {
+    active.add(operation);
+    void operation.finally(() => active.delete(operation)).catch(() => undefined);
+  };
+
+  for await (const entry of readBoundedLines(input)) {
+    if (shouldStop()) break;
+    if ("error" in entry) {
+      track(emit(errorLine(null, -32700, entry.error)));
+      continue;
+    }
+    const { line } = entry;
+    if (!line.trim()) continue;
+    let request: JsonRpcRequest;
+    try {
+      request = parseRequest(line);
+    } catch (error) {
+      track(emit(errorLine(null, -32700, error instanceof Error ? error.message : String(error))));
+      continue;
+    }
+    if (request.id === undefined) continue;
+    const operation = Promise.resolve()
+      .then(() => server.handle(request))
+      .then(
+        (result) => responseLine(request.id!, result),
+        (error) => {
+          const code = isRecord(error) && typeof error.jsonRpcCode === "number" ? error.jsonRpcCode : -32603;
+          return errorLine(request.id!, code, error instanceof Error ? error.message : String(error));
+        },
+      )
+      .then(emit);
+    track(operation);
+  }
+  await Promise.allSettled([...active]);
+  await outputTail;
+  if (outputError !== undefined) throw outputError;
+}
+
+function writeStdout(line: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    stdout.write(line, (error) => error ? reject(error) : resolve());
+  });
 }
 
 export async function main(): Promise<void> {
@@ -317,29 +494,9 @@ export async function main(): Promise<void> {
   };
   process.once("SIGINT", shutdown);
   process.once("SIGTERM", shutdown);
-
-  for await (const entry of readBoundedLines(stdin)) {
-    if (shuttingDown) break;
-    if ("error" in entry) {
-      respondError(null, -32700, entry.error);
-      continue;
-    }
-    const { line } = entry;
-    if (!line.trim()) continue;
-    let request: JsonRpcRequest;
-    try {
-      request = parseRequest(line);
-    } catch (error) {
-      respondError(null, -32700, error instanceof Error ? error.message : String(error));
-      continue;
-    }
-    if (request.id === undefined) continue;
-    try {
-      respond(request.id, await server.handle(request));
-    } catch (error) {
-      const code = isRecord(error) && typeof error.jsonRpcCode === "number" ? error.jsonRpcCode : -32603;
-      respondError(request.id, code, error instanceof Error ? error.message : String(error));
-    }
+  try {
+    await serveMcp(server, stdin, writeStdout, () => shuttingDown);
+  } finally {
+    server.close();
   }
-  server.close();
 }

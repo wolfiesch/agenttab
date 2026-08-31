@@ -59,10 +59,12 @@ function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
 async function executeTool(
   tool: Record<string, unknown> | undefined,
   args: Record<string, unknown> = {},
+  invocationId = "call-1",
+  context?: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const execute = tool?.execute;
   if (typeof execute !== "function") throw new Error("Registered tool has no execute function.");
-  const value: unknown = await execute("call-1", args);
+  const value: unknown = await execute(invocationId, args, undefined, undefined, context);
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Registered tool returned a non-object result.");
   }
@@ -110,7 +112,10 @@ test("registered tools call Core RPC without TCP or lease verbs", async () => {
   const { tools, calls } = register(false);
   const result = await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
   expect(calls).toEqual([{ method: "browser_tabs", params: {} }]);
-  expect(result.structuredContent).toEqual({ tabs: [] });
+  expect(result.structuredContent).toEqual({
+    tabs: [],
+    _agenttab: { outcome: "committed", task_id: "task-test-1234" },
+  });
   expect(result.details).toEqual({
     tabs: [],
     _agenttab: { outcome: "committed", task_id: "task-test-1234" },
@@ -160,6 +165,10 @@ test("default OMP and Pi sessions confirm the initial capability before the next
     const previousSocket = process.env.AGENTTAB_SOCKET;
     const previousStateDir = process.env.AGENTTAB_STATE_DIR;
     const previousConversationId = process.env.AGENTTAB_CONVERSATION_ID;
+    const sessionId = runtime === "omp"
+      ? "018f22b2-4126-7c1a-8c31-3f45a783da45"
+      : "018f22b2-4126-7c1a-8c31-3f45a783da46";
+    const conversationIds: unknown[] = [];
     const methods: string[] = [];
     let confirmed = false;
     let activeSocket: Socket | undefined;
@@ -169,6 +178,7 @@ test("default OMP and Pi sessions confirm the initial capability before the next
       socket.on("data", (chunk) => {
         for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
           if (value.kind === "connect") {
+            conversationIds.push(value.conversation_id);
             socket.write(encodeFrame({
               protocol: "agenttab.rpc",
               version: 1,
@@ -225,12 +235,15 @@ test("default OMP and Pi sessions confirm the initial capability before the next
       const first = await executeTool(
         tools.find((tool) => tool.name === "browser_open"),
         { mode: "create" },
+        "call-open",
+        { sessionManager: { getSessionId: () => sessionId } },
       );
-      expect(first.structuredContent).toEqual({ tab_id: 1 });
+      expect(first.details).toMatchObject({ tab_id: 1 });
       expect(confirmed).toBe(true);
       const second = await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
-      expect(second.structuredContent).toEqual({ tabs: [] });
+      expect(second.details).toMatchObject({ tabs: [] });
       expect(methods).toEqual(["browser_open", "browser_tabs"]);
+      expect(conversationIds).toEqual([sessionId]);
     } finally {
       activeSocket?.destroy();
       await new Promise<void>((resolve) => nativeServer.close(() => resolve()));
@@ -242,6 +255,124 @@ test("default OMP and Pi sessions confirm the initial capability before the next
       else process.env.AGENTTAB_CONVERSATION_ID = previousConversationId;
       rmSync(root, { recursive: true, force: true });
     }
+  }
+});
+
+test("default OMP reconnect resumes the same task with the original capability store", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agenttab-omp-reconnect-"));
+  const endpoint = join(root, "agenttab.sock");
+  const previousSocket = process.env.AGENTTAB_SOCKET;
+  const previousStateDir = process.env.AGENTTAB_STATE_DIR;
+  const previousConversationId = process.env.AGENTTAB_CONVERSATION_ID;
+  const sessionId = "018f22b2-4126-7c1a-8c31-3f45a783da47";
+  const taskId = "018f22b2-4126-7c1a-8c31-3f45a783da48";
+  const capabilities: unknown[] = [];
+  const confirmations: unknown[] = [];
+  const sockets: Socket[] = [];
+  let connectionCount = 0;
+  const nativeServer = createServer((socket) => {
+    sockets.push(socket);
+    const connectionNumber = ++connectionCount;
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          capabilities.push(value.resume_capability);
+          socket.write(encodeFrame(connectionNumber === 1
+            ? {
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da49",
+              resumed: false,
+              state: "ready",
+            }
+            : {
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da4a",
+              resumed: true,
+              task_id: taskId,
+              resume_capability: "b".repeat(32),
+              state: "ready",
+            }));
+        } else if (value.kind === "resume_confirm") {
+          confirmations.push(value.resume_capability);
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "resume_confirmed",
+            connection_id: value.connection_id,
+          }));
+        } else {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            request_id: value.request_id,
+            ok: true,
+            outcome: "completed",
+            result: connectionNumber === 1 ? { tab_id: 1 } : { tabs: [{ tab_id: 1 }] },
+            ...(connectionNumber === 1
+              ? { task: { task_id: taskId, resume_capability: "a".repeat(32) } }
+              : {}),
+          }));
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    nativeServer.once("error", reject);
+    nativeServer.listen(endpoint, resolve);
+  });
+
+  try {
+    process.env.AGENTTAB_SOCKET = endpoint;
+    process.env.AGENTTAB_STATE_DIR = join(root, "state");
+    delete process.env.AGENTTAB_CONVERSATION_ID;
+    const tools: Array<Record<string, unknown>> = [];
+    makeExtension()({
+      zod,
+      registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+    } as unknown as AgentApi);
+    const context = { sessionManager: { getSessionId: () => sessionId } };
+    const opened = await executeTool(
+      tools.find((tool) => tool.name === "browser_open"),
+      { mode: "create" },
+      "call-open",
+      context,
+    );
+    expect(opened.details).toMatchObject({ tab_id: 1 });
+
+    const firstSocket = sockets[0];
+    if (!firstSocket) throw new Error("Expected the initial OMP socket");
+    const closed = new Promise<void>((resolve) => firstSocket.once("close", resolve));
+    firstSocket.destroy();
+    await closed;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+    const tabs = await executeTool(
+      tools.find((tool) => tool.name === "browser_tabs"),
+      {},
+      "call-tabs",
+      context,
+    );
+    expect(tabs.details).toMatchObject({
+      tabs: [{ tab_id: 1 }],
+      _agenttab: { task_id: taskId },
+    });
+    expect(capabilities).toEqual([undefined, "a".repeat(32)]);
+    expect(confirmations).toEqual(["a".repeat(32), "b".repeat(32)]);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => nativeServer.close(() => resolve()));
+    if (previousSocket === undefined) delete process.env.AGENTTAB_SOCKET;
+    else process.env.AGENTTAB_SOCKET = previousSocket;
+    if (previousStateDir === undefined) delete process.env.AGENTTAB_STATE_DIR;
+    else process.env.AGENTTAB_STATE_DIR = previousStateDir;
+    if (previousConversationId === undefined) delete process.env.AGENTTAB_CONVERSATION_ID;
+    else process.env.AGENTTAB_CONVERSATION_ID = previousConversationId;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -376,9 +507,149 @@ test("OMP retains a live client after an RPC error", async () => {
     isError: true,
   });
   const second = await executeTool(tool);
-  expect(second.structuredContent).toEqual({ tabs: ["tab-live"] });
+  expect(second.details).toMatchObject({ tabs: ["tab-live"] });
   expect(connections).toBe(1);
   expect(calls).toEqual(["browser_tabs", "browser_tabs"]);
+});
+
+test("OMP reuses one UUIDv7 idempotency key for retries of a mutation invocation", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const keys: unknown[] = [];
+  const client = {
+    connection: { task_id: "task-idempotent" },
+    get closed() {
+      return false;
+    },
+    request: async (_method: string, _params: unknown, options: { idempotencyKey?: string }) => {
+      keys.push(options.idempotencyKey);
+      return {
+        ok: true,
+        outcome: "completed",
+        request_id: "request-idempotent",
+        result: { tab_id: 7 },
+      };
+    },
+  } as unknown as AgentTabClient;
+  makeExtension(async () => client)({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  } as unknown as AgentApi);
+  const tool = tools.find((candidate) => candidate.name === "browser_open");
+  await executeTool(tool, { mode: "create" }, "provider-call-a");
+  await executeTool(tool, { mode: "create" }, "provider-call-a");
+  await executeTool(tool, { mode: "create" }, "provider-call-b");
+  expect(keys[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(keys[1]).toBe(keys[0]);
+  expect(keys[2]).not.toBe(keys[0]);
+});
+
+test("OMP returns screenshots as one native image payload", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const client = {
+    connection: { task_id: "task-image" },
+    get closed() {
+      return false;
+    },
+    request: async () => ({
+      ok: true,
+      outcome: "completed",
+      request_id: "request-image",
+      result: {
+        mode: "screenshot",
+        encoding: "base64",
+        data: "aW1hZ2U=",
+        media_type: "image/webp",
+        format: "webp",
+        page_revision: 4,
+      },
+    }),
+  } as unknown as AgentTabClient;
+  makeExtension(async () => client)({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  } as unknown as AgentApi);
+  const result = await executeTool(
+    tools.find((candidate) => candidate.name === "browser_snapshot"),
+    { tab_id: 1, mode: "screenshot", format: "webp" },
+  );
+  expect(result.content).toEqual([{ type: "image", data: "aW1hZ2U=", mimeType: "image/webp" }]);
+  expect(result.details).toEqual({
+    mode: "screenshot",
+    media_type: "image/webp",
+    format: "webp",
+    page_revision: 4,
+    _agenttab: { outcome: "completed", task_id: "task-image" },
+  });
+  expect(JSON.stringify(result.details)).not.toContain("aW1hZ2U=");
+  expect(result.structuredContent).toBeUndefined();
+});
+
+test("OMP keeps large snapshot content out of duplicate structured fields", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const content = "x".repeat(12_000);
+  const client = {
+    connection: { task_id: "task-large" },
+    get closed() {
+      return false;
+    },
+    request: async () => ({
+      ok: true,
+      outcome: "completed",
+      request_id: "request-large",
+      result: { mode: "text", content, page_revision: 5 },
+    }),
+  } as unknown as AgentTabClient;
+  makeExtension(async () => client)({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  } as unknown as AgentApi);
+  const result = await executeTool(
+    tools.find((candidate) => candidate.name === "browser_snapshot"),
+    { tab_id: 1, mode: "text" },
+  );
+  expect(result.content).toEqual([{
+    type: "text",
+    text: JSON.stringify({ mode: "text", content, page_revision: 5 }, null, 2),
+  }]);
+  expect(result.details).toMatchObject({
+    mode: "text",
+    content_characters: 12_000,
+    page_revision: 5,
+    _agenttab: { outcome: "completed", task_id: "task-large" },
+  });
+  expect(JSON.stringify(result.details)).not.toContain(content);
+  expect(result.structuredContent).toBeUndefined();
+});
+
+test("OMP shares one in-flight Core connection across concurrent first calls", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  let connections = 0;
+  const client = {
+    connection: { task_id: "task-shared-connect" },
+    get closed() {
+      return false;
+    },
+    request: async () => ({
+      ok: true,
+      outcome: "completed",
+      request_id: "request-shared-connect",
+      result: { tabs: [] },
+    }),
+  } as unknown as AgentTabClient;
+  makeExtension(async () => {
+    connections += 1;
+    await Promise.resolve();
+    return client;
+  })({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  } as unknown as AgentApi);
+  const tool = tools.find((candidate) => candidate.name === "browser_tabs");
+  await Promise.all([
+    executeTool(tool, {}, "call-tabs-1"),
+    executeTool(tool, {}, "call-tabs-2"),
+  ]);
+  expect(connections).toBe(1);
 });
 
 test("OMP tools expose compact and expanded custom renderers", () => {

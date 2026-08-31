@@ -91,7 +91,7 @@ The installer writes supported MCP client entries as an absolute local AgentTab 
 | Variable | Current adapter behavior |
 |---|---|
 | `AGENTTAB_DEVELOPER=1` | Adds `browser_developer` to MCP and OMP discovery. The extension still rejects it unless the user has enabled persistent Developer mode in the AgentTab popup. |
-| `AGENTTAB_CONVERSATION_ID` | Scopes an MCP or OMP durable resume-capability store to one conversation. It is metadata, not authorization. |
+| `AGENTTAB_CONVERSATION_ID` | Overrides the durable resume-capability scope. OMP and Pi otherwise use their stable harness session ID automatically; stdio MCP can use this variable when its client has a stable conversation scope across process restarts. It is metadata, not authorization. |
 | `AGENTTAB_STATE_DIR` | Overrides the adapter capability-store root and the Unix socket fallback. The Rust host also honors it as its state root. |
 | `AGENTTAB_SOCKET` | Overrides the local endpoint used by an adapter. |
 | `AGENTTAB_PIPE_NAME` | Overrides the local Windows named-pipe endpoint used by an adapter. |
