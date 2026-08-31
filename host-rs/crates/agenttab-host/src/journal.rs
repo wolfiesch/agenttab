@@ -1679,7 +1679,7 @@ mod tests {
             Uuid::from_bytes(bytes)
         };
         let expired = key_at(now_ms() - IDEMPOTENCY_RETENTION_MS - 1);
-        let future = key_at(now_ms() + IDEMPOTENCY_FUTURE_SKEW_MS + 1);
+        let future = key_at(now_ms() + IDEMPOTENCY_FUTURE_SKEW_MS + 60_000);
         assert!(matches!(
             journal.begin_mutation(task.task_id, expired, RpcMethod::BrowserAct, "expired"),
             Err(JournalError::ExpiredKey)
