@@ -117,6 +117,42 @@ test("registered tools call Core RPC without TCP or lease verbs", async () => {
   });
 });
 
+test("OMP forwards long-operation timeouts for SDK deadline selection", async () => {
+  const { tools, calls } = register(false);
+  await executeTool(tools.find((tool) => tool.name === "browser_wait"), {
+    tab_id: 7,
+    condition: { kind: "load" },
+    timeout_ms: 120_000,
+  });
+  await executeTool(tools.find((tool) => tool.name === "browser_handoff"), {
+    tab_id: 7,
+    expected_page_revision: 3,
+    prompt: "Complete MFA",
+    completion: { kind: "manual_done" },
+    timeout_ms: 900_000,
+  });
+  expect(calls).toEqual([
+    {
+      method: "browser_wait",
+      params: {
+        tab_id: 7,
+        condition: { kind: "load" },
+        timeout_ms: 120_000,
+      },
+    },
+    {
+      method: "browser_handoff",
+      params: {
+        tab_id: 7,
+        expected_page_revision: 3,
+        prompt: "Complete MFA",
+        completion: { kind: "manual_done" },
+        timeout_ms: 900_000,
+      },
+    },
+  ]);
+});
+
 test("default OMP and Pi sessions confirm the initial capability before the next tool call", async () => {
   for (const runtime of ["omp", "pi"] as const) {
     const root = mkdtempSync(join(tmpdir(), `agenttab-${runtime}-`));
