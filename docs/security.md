@@ -12,7 +12,7 @@ Task-owned groups constrain ordinary AgentTab execution. They do not prevent a p
 
 ## Standard and Developer mode
 
-Standard mode exposes exactly these eight MCP tools:
+Standard mode exposes exactly these nine MCP tools:
 
 - `browser_open`
 - `browser_snapshot`
@@ -22,6 +22,7 @@ Standard mode exposes exactly these eight MCP tools:
 - `browser_handoff`
 - `browser_commit`
 - `browser_credentials`
+- `browser_finish`
 
 Developer mode additionally exposes `browser_developer`. It is disabled by default in the host's local managed policy and is visibly marked on a task. Developer mode is intentionally a broader trust decision.
 

@@ -512,8 +512,7 @@ export function makeExtension(clientFactory?: ClientFactory) {
                     disposition,
                     deferred: "not_started",
                     closed_tab_ids: [],
-                    released_tab_ids: [],
-                    kept_tab_ids: [],
+                    retained_tab_ids: [],
                   },
                   { outcome: "not_started", taskId: completedTaskId },
                 );

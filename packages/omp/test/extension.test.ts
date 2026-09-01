@@ -166,6 +166,29 @@ test("browser_finish finalizes the current AgentTab task", async () => {
   });
 });
 
+test("browser_finish preserves its result shape when the task was not started", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const client = {
+    closed: true,
+    connection: { task_id: "task-not-started" },
+  } as unknown as AgentTabClient;
+  const api = {
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  } as unknown as AgentApi;
+  makeExtension(async () => client)(api);
+
+  const result = await executeTool(tools.find((tool) => tool.name === "browser_finish"));
+
+  expect(result.details).toMatchObject({
+    finished: false,
+    disposition: "auto",
+    deferred: "not_started",
+    closed_tab_ids: [],
+    retained_tab_ids: [],
+  });
+});
+
 test("OMP session switch finalizes the current browser task", async () => {
   const tools: Array<Record<string, unknown>> = [];
   const handlers = new Map<string, (event: Record<string, unknown>) => void | Promise<void>>();
