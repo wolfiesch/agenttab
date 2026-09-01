@@ -492,15 +492,14 @@ impl NativeTransport for StdioNative {
                 "native finish_task cleanup was not confirmed by the extension".into(),
             ));
         }
-        let result: NativeTaskFinish = serde_json::from_value(
-            response.result.ok_or_else(|| NativeError::Protocol(
-                "native finish_task response omitted its result".into(),
-            ))?,
-        )
-        .map_err(|error| NativeError::Protocol(error.to_string()))?;
-        if result.task_id != task_id ||
-            (result.finished && result.deferred.is_some()) ||
-            (!result.finished && result.deferred.is_none())
+        let result: NativeTaskFinish =
+            serde_json::from_value(response.result.ok_or_else(|| {
+                NativeError::Protocol("native finish_task response omitted its result".into())
+            })?)
+            .map_err(|error| NativeError::Protocol(error.to_string()))?;
+        if result.task_id != task_id
+            || (result.finished && result.deferred.is_some())
+            || (!result.finished && result.deferred.is_none())
         {
             return Err(NativeError::Protocol(
                 "native finish_task result is internally inconsistent".into(),

@@ -852,7 +852,11 @@ impl MethodParams {
                     format!("keep_tab_ids must contain at most {MAX_KEEP_TAB_IDS} items"),
                 )?;
                 for (index, tab_id) in params.keep_tab_ids.iter().enumerate() {
-                    require(method, *tab_id > 0, "keep_tab_ids must contain positive tab IDs")?;
+                    require(
+                        method,
+                        *tab_id > 0,
+                        "keep_tab_ids must contain positive tab IDs",
+                    )?;
                     require(
                         method,
                         !params.keep_tab_ids[..index].contains(tab_id),
@@ -2475,12 +2479,7 @@ mod tests {
     fn native_finish_task_is_strict_and_versioned() {
         let request_id = Uuid::new_v4();
         let task_id = Uuid::new_v4();
-        let message = native_finish_task(
-            request_id,
-            task_id,
-            FinishDisposition::Auto,
-            &[17],
-        );
+        let message = native_finish_task(request_id, task_id, FinishDisposition::Auto, &[17]);
         let parsed = NativeFinishTask::parse(message.clone()).unwrap();
         assert_eq!(parsed.request_id, request_id);
         assert_eq!(parsed.task_id, task_id);

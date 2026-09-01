@@ -14,11 +14,11 @@ use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
     AgenttabFinishParams, BrowserAction, BrowserCommitParams, BrowserCredentialsParams,
-    BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams, ConnectionAck,
-    ConnectionInit, MethodParams, NativeEventPayload, NativeHandoff, NativePopupCommitEvent,
-    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ResumeCapabilityConfirm,
-    ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest, RpcResponse, TaskBinding,
-    WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams, ConnectionAck, ConnectionInit,
+    MethodParams, NativeEventPayload, NativeHandoff, NativePopupCommitEvent, NativeResponse,
+    NativeStagedCommit, NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed,
+    RpcError, RpcMethod, RpcRequest, RpcResponse, TaskBinding, WaitCondition,
+    HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -522,10 +522,13 @@ impl Runtime {
         if request.method == RpcMethod::AgenttabFinish {
             let task_id = connection.task_id().ok().flatten();
             let response = match (task_id, params) {
-                (Some(task_id), MethodParams::Finish(AgenttabFinishParams {
-                    disposition,
-                    keep_tab_ids,
-                })) => self
+                (
+                    Some(task_id),
+                    MethodParams::Finish(AgenttabFinishParams {
+                        disposition,
+                        keep_tab_ids,
+                    }),
+                ) => self
                     .native
                     .finish_task(task_id, disposition, &keep_tab_ids, CLOSE_TASK_TIMEOUT)
                     .map_err(|error| JournalError::NativeTaskCleanup(error.to_string()))
@@ -537,16 +540,25 @@ impl Runtime {
                         }
                         Ok(result)
                     })
-                    .map(|result| RpcResponse::success(
-                        request.request_id.clone(),
-                        if result.finished { Outcome::Completed } else { Outcome::NeedsUser },
-                        serde_json::to_value(result).expect("native task finish result serializes"),
-                    ))
-                    .unwrap_or_else(|error| RpcResponse::failure(
-                        request.request_id.clone(),
-                        Outcome::Unknown,
-                        journal_rpc_error(error),
-                    )),
+                    .map(|result| {
+                        RpcResponse::success(
+                            request.request_id.clone(),
+                            if result.finished {
+                                Outcome::Completed
+                            } else {
+                                Outcome::NeedsUser
+                            },
+                            serde_json::to_value(result)
+                                .expect("native task finish result serializes"),
+                        )
+                    })
+                    .unwrap_or_else(|error| {
+                        RpcResponse::failure(
+                            request.request_id.clone(),
+                            Outcome::Unknown,
+                            journal_rpc_error(error),
+                        )
+                    }),
                 (None, MethodParams::Finish(_)) => RpcResponse::success(
                     request.request_id.clone(),
                     Outcome::Completed,
