@@ -1549,7 +1549,7 @@ impl Runtime {
                     .get("page_revision")
                     .and_then(Value::as_u64)
                     .unwrap_or(expected_page_revision);
-                let filled_password = password_ref.is_some();
+                let field_was_filled = password_ref.is_some();
                 RpcResponse::success(
                     request_id,
                     Outcome::Completed,
@@ -1558,7 +1558,7 @@ impl Runtime {
                         "attempt_number": attempt_number,
                         "remaining_attempts": remaining_attempts,
                         "filled_username": username_ref.is_some(),
-                        "filled_password": filled_password,
+                        "filled_password": field_was_filled,
                         "filled_otp": otp_ref.is_some(),
                         "page_revision": page_revision,
                     }),
