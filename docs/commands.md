@@ -82,7 +82,7 @@ The extension layer is a diagnostic label around the status check. It does not r
 agenttab mcp
 ```
 
-Starts the AgentTab MCP server over stdin and stdout. It accepts no CLI options. The packaged `agenttab-mcp` binary starts the same server and also accepts no CLI options. Both expose eight Standard tools by default. Use the configured `agenttab` wrapper after a local installation, or the `agenttab-mcp` package binary only after that package is published.
+Starts the AgentTab MCP server over stdin and stdout. It accepts no CLI options. The packaged `agenttab-mcp` binary starts the same server and also accepts no CLI options. Both expose nine Standard tools by default. Use the configured `agenttab` wrapper after a local installation, or the `agenttab-mcp` package binary only after that package is published.
 
 The installer writes supported MCP client entries as an absolute local AgentTab wrapper plus `mcp`. For a manual configuration, use `agenttab mcp` only when that wrapper is on the client's `PATH`. The exact stdio configuration and protocol behavior are in [MCP](mcp.md).
 

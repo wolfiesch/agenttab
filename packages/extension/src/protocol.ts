@@ -95,7 +95,17 @@ export interface NativeCloseTask {
   task_id: string;
 }
 
-export type NativeDispatchCommand = NativeCommand | NativeCloseTask;
+export interface NativeFinishTask {
+  protocol: typeof NATIVE_PROTOCOL;
+  version: typeof PROTOCOL_VERSION;
+  kind: "finish_task";
+  request_id: string;
+  task_id: string;
+  disposition: "auto" | "close" | "keep";
+  keep_tab_ids: number[];
+}
+
+export type NativeDispatchCommand = NativeCommand | NativeCloseTask | NativeFinishTask;
 
 export interface NativeEventAck {
   protocol: typeof NATIVE_PROTOCOL;
@@ -604,12 +614,45 @@ function parseCloseTask(value: unknown): NativeCloseTask {
   };
 }
 
+function parseFinishTask(value: unknown): NativeFinishTask {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(
+      value,
+      ["protocol", "version", "kind", "request_id", "task_id", "disposition", "keep_tab_ids"],
+    )
+  ) {
+    commandError("native finish_task contains missing or unknown fields");
+  }
+  if (
+    value.protocol !== NATIVE_PROTOCOL ||
+    value.version !== PROTOCOL_VERSION ||
+    value.kind !== "finish_task" ||
+    (value.disposition !== "auto" && value.disposition !== "close" && value.disposition !== "keep") ||
+    !Array.isArray(value.keep_tab_ids) ||
+    !value.keep_tab_ids.every((tabId) => Number.isInteger(tabId) && tabId > 0) ||
+    new Set(value.keep_tab_ids).size !== value.keep_tab_ids.length
+  ) {
+    commandError("native finish_task protocol or parameters are invalid");
+  }
+  return {
+    protocol: NATIVE_PROTOCOL,
+    version: PROTOCOL_VERSION,
+    kind: "finish_task",
+    request_id: assertUuid(value.request_id, "request_id"),
+    task_id: assertUuid(value.task_id, "task_id"),
+    disposition: value.disposition,
+    keep_tab_ids: value.keep_tab_ids,
+  };
+}
+
 export function parseInboundNativeMessage(value: unknown): NativeInboundMessage {
   if (!isRecord(value) || value.protocol !== NATIVE_PROTOCOL || value.version !== PROTOCOL_VERSION || typeof value.kind !== "string") {
     throw new Error("native message protocol or version mismatch");
   }
   if (value.kind === "command") return parseCommand(value);
   if (value.kind === "close_task") return parseCloseTask(value);
+  if (value.kind === "finish_task") return parseFinishTask(value);
   if (value.kind === "event_ack") {
     if (
       !hasOnlyKeys(

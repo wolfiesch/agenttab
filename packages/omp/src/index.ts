@@ -49,6 +49,10 @@ export interface AgentApi {
   zod?: ZodApi;
   setLabel?(label: string): void;
   registerTool(tool: Record<string, unknown>): void;
+  on?(
+    event: "session_before_switch" | "session_shutdown" | "agent_end",
+    handler: (event: Record<string, unknown>) => void | Promise<void>,
+  ): void;
 }
 
 interface ToolExecutionContext {
@@ -273,6 +277,16 @@ const DEFINITIONS: ReadonlyArray<{
       approval: "write",
       schema: (z) => z.object({ staged_token: z.string().min(32).max(256) }).strict(),
     },
+    {
+      name: "browser_finish",
+      label: "Browser Finish",
+      description: "Finish the current browser task after its work is complete. Close task-created tabs by default, preserve adopted or explicitly kept tabs, and release ownership.",
+      approval: "write",
+      schema: (z) => z.object({
+        disposition: z.enum(["auto", "close", "keep"]).optional(),
+        keep_tab_ids: z.array(z.number().int().min(1)).optional(),
+      }).strict(),
+    },
   ];
 
 const DEVELOPER = {
@@ -391,8 +405,48 @@ export function makeExtension(clientFactory?: ClientFactory) {
     let client: AgentTabClient | undefined;
     let connecting: Promise<AgentTabClient> | undefined;
     let taskId: string | undefined;
+    const ORPHAN_GRACE_MS = 5 * 60_000;
+    let orphanTimer: NodeJS.Timeout | undefined;
+    const cancelOrphanCleanup = () => {
+      if (orphanTimer === undefined) return;
+      clearTimeout(orphanTimer);
+      orphanTimer = undefined;
+    };
+    const finishCurrentTask = async (
+      disposition: "auto" | "close" | "keep" = "auto",
+      keepTabIds: number[] = [],
+      closeConnection = false,
+    ) => {
+      cancelOrphanCleanup();
+      const current = client ?? (connecting === undefined ? undefined : await connecting);
+      if (current === undefined || current.closed) return undefined;
+      try {
+        const result = await current.finishTask({
+          disposition,
+          keep_tab_ids: keepTabIds,
+        });
+        if (result.finished) {
+          if (client === current) client = undefined;
+          taskId = undefined;
+        }
+        return result;
+      } finally {
+        if (closeConnection && !current.closed) current.close();
+        if (closeConnection && client === current) client = undefined;
+      }
+    };
+    const armOrphanCleanup = () => {
+      cancelOrphanCleanup();
+      if (client === undefined || client.closed) return;
+      orphanTimer = setTimeout(() => {
+        orphanTimer = undefined;
+        void finishCurrentTask("auto", [], true).catch(() => undefined);
+      }, ORPHAN_GRACE_MS);
+      orphanTimer.unref?.();
+    };
     const invocationKeys = new InvocationIdempotencyKeys();
     const getClient = async (context?: ToolExecutionContext): Promise<AgentTabClient> => {
+      cancelOrphanCleanup();
       if (client !== undefined && !client.closed) return client;
       const pending = connecting ??= connectClient(context);
       try {
@@ -442,9 +496,36 @@ export function makeExtension(clientFactory?: ClientFactory) {
           let invocationClient: AgentTabClient | undefined;
           try {
             invocationClient = await getClient(context);
+            if (definition.name === "browser_finish") {
+              const disposition = params.disposition === "close" || params.disposition === "keep"
+                ? params.disposition
+                : "auto";
+              const keepTabIds = Array.isArray(params.keep_tab_ids)
+                ? params.keep_tab_ids.filter((tabId): tabId is number => Number.isInteger(tabId) && tabId > 0)
+                : [];
+              const completedTaskId = taskId;
+              const result = await finishCurrentTask(disposition, keepTabIds);
+              if (result === undefined) {
+                return success(
+                  {
+                    finished: false,
+                    disposition,
+                    deferred: "not_started",
+                    closed_tab_ids: [],
+                    released_tab_ids: [],
+                    kept_tab_ids: [],
+                  },
+                  { outcome: "not_started", taskId: completedTaskId },
+                );
+              }
+              return success(result, {
+                outcome: result.finished ? "completed" : "needs_user",
+                taskId: completedTaskId,
+              });
+            }
             const response = await invocationClient.request(
               definition.name,
-              params as MethodParams[ToolMethod],
+              params as MethodParams[Exclude<ToolMethod, "browser_finish">],
               isMutation(definition.name)
                 ? { idempotencyKey: invocationKeys.for(invocationId) }
                 : {},
@@ -461,6 +542,17 @@ export function makeExtension(clientFactory?: ClientFactory) {
     };
     for (const definition of DEFINITIONS) register(definition);
     if (process.env.AGENTTAB_DEVELOPER === "1") register(DEVELOPER);
+    pi.on?.("agent_end", (event) => {
+      if (event.willContinue !== true) armOrphanCleanup();
+    });
+    pi.on?.("session_before_switch", async () => {
+      await finishCurrentTask("auto", [], true);
+      defaultConnection = undefined;
+    });
+    pi.on?.("session_shutdown", async () => {
+      await finishCurrentTask("auto", [], true);
+      defaultConnection = undefined;
+    });
   };
 }
 

@@ -80,7 +80,7 @@ TCP and bearer-token access are not Standard transport. They exist only behind t
 
 AgentTab Core RPC and the host-to-extension native protocol are separately versioned. They MUST NOT silently downgrade across an incompatible version.
 
-MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not alternate hosts. The public Standard surface has exactly eight tools:
+MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not alternate hosts. The public Standard surface has exactly nine tools:
 
 1. `browser_open`
 2. `browser_snapshot`
@@ -90,10 +90,13 @@ MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not a
 6. `browser_handoff`
 7. `browser_commit`
 8. `browser_credentials`
+9. `browser_finish`
 
 `browser_credentials` is disabled by managed policy unless explicitly enabled. It MUST derive the page origin and task ownership in the host, enforce a candidate and attempt limit no greater than three, use one-use short-lived tokens, and keep credential values out of Core RPC, adapters, responses, and audit output.
 
-`browser_developer` is the ninth tool and is absent unless Developer mode is enabled.
+`browser_finish` applies the task's cleanup policy, closes task-created tabs unless retained, preserves adopted tabs by default, ungroups retained tabs, and releases task ownership. Active handoff, staged Commit review, or another in-flight task operation MUST defer finalization rather than destroy resumability.
+
+`browser_developer` is the tenth tool and is absent unless Developer mode is enabled.
 
 Core RPC schemas are normative. Unknown fields and methods fail closed. Every mutation requires a UUIDv7 `idempotency_key`. Existing-page mutations also require the authoritative `tab_id` and expected `page_revision`. `browser_commit` is bound by its staged record rather than caller-supplied tab or revision.
 

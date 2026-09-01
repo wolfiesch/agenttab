@@ -9,11 +9,14 @@ export type TaskState = "working" | "needs_user" | "completed";
 
 export type TaskColor = "purple" | "cyan" | "green" | "yellow" | "orange" | "red" | "pink" | "blue";
 
+export type CleanupPolicy = "automatic" | "ask" | "keep";
+
 export interface TaskRecord {
   taskId: string;
   name: string;
   groupId: number | null;
   tabIds: number[];
+  createdTabIds: number[];
   color: TaskColor;
   state: TaskState;
   createdAt: number;
@@ -54,6 +57,7 @@ export interface ExtensionState {
   paused: boolean;
   developerMode: boolean;
   showAgentPointer: boolean;
+  cleanupPolicy: CleanupPolicy;
   tasks: Record<string, TaskRecord>;
   revisions: Record<string, RevisionRecord>;
   handoff: HandoffRecord;
@@ -71,6 +75,7 @@ function defaultState(): ExtensionState {
     paused: false,
     developerMode: false,
     showAgentPointer: true,
+    cleanupPolicy: "automatic",
     tasks: {},
     revisions: {},
     handoff: { active: false },
@@ -163,6 +168,10 @@ function parseState(value: unknown): ExtensionState | null {
       !(task.groupId === null || finiteInteger(task.groupId)) ||
       !Array.isArray(task.tabIds) ||
       !task.tabIds.every((tabId) => finiteInteger(tabId)) ||
+      !(task.createdTabIds === undefined || (
+        Array.isArray(task.createdTabIds) &&
+        task.createdTabIds.every((tabId) => finiteInteger(tabId))
+      )) ||
       !taskColors.includes(task.color as TaskColor) ||
       !["working", "needs_user", "completed"].includes(String(task.state)) ||
       !finiteInteger(task.createdAt) ||
@@ -171,8 +180,11 @@ function parseState(value: unknown): ExtensionState | null {
       return null;
     }
     const tabIds = task.tabIds as number[];
+    const createdTabIds = (task.createdTabIds ?? []) as number[];
     if (
       new Set(tabIds).size !== tabIds.length ||
+      new Set(createdTabIds).size !== createdTabIds.length ||
+      createdTabIds.some((tabId) => !tabIds.includes(tabId)) ||
       (task.groupId === null && tabIds.length > 0) ||
       tabIds.some((tabId) => assignedTabIds.has(tabId)) ||
       (task.groupId !== null && assignedGroupIds.has(task.groupId as number))
@@ -181,7 +193,10 @@ function parseState(value: unknown): ExtensionState | null {
     }
     for (const tabId of tabIds) assignedTabIds.add(tabId);
     if (task.groupId !== null) assignedGroupIds.set(task.groupId as number, taskId);
-    tasks[taskId] = task as unknown as TaskRecord;
+    tasks[taskId] = {
+      ...(task as unknown as TaskRecord),
+      createdTabIds,
+    };
   }
 
   const revisions: Record<string, RevisionRecord> = {};
@@ -249,11 +264,14 @@ function parseState(value: unknown): ExtensionState | null {
     stagedCommits[token] = commit as unknown as StagedCommit;
   }
 
+  const cleanupPolicy = raw.cleanupPolicy ?? "automatic";
+  if (!["automatic", "ask", "keep"].includes(String(cleanupPolicy))) return null;
   return {
     schemaVersion: SCHEMA_VERSION,
     paused: raw.paused,
     developerMode: raw.developerMode,
     showAgentPointer: raw.showAgentPointer,
+    cleanupPolicy: cleanupPolicy as CleanupPolicy,
     tasks,
     revisions,
     handoff: handoffValue as unknown as HandoffRecord,
@@ -296,6 +314,7 @@ function legacyTasks(value: unknown): Record<string, TaskRecord> {
       name: typeof session.name === "string" ? session.name : "Imported browser task",
       groupId,
       tabIds,
+      createdTabIds: [],
       color: taskColors.includes(session.color as TaskColor) ? (session.color as TaskColor) : "purple",
       state: ["working", "needs_user", "completed"].includes(String(session.state))
         ? (session.state as TaskState)

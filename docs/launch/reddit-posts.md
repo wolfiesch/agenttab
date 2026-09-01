@@ -43,7 +43,7 @@ The handoff model is called **Your Turn**. A disabled-by-default local 1Password
 
 For recognizable consequential actions, **Commit** stages instead of acting. It is designed for sends, publishes, purchases, deletes, uploads, authorizations, and permission grants. Approval happens in a human popup and is bound to the requesting agent's one-use token, the task, the tab, the target fingerprint, and the current page state. The final execution checks those bindings again. That reduces recognizable risk, but it cannot guarantee that a page has not attached a hidden effect to an innocent-looking control.
 
-The Standard MCP interface has eight tools and excludes raw cookies, browser storage, arbitrary scripts, raw CDP, raw network access, and credential-value responses. A separate Developer-only tool requires a persistent explicit opt-in.
+The Standard MCP interface has nine tools, including explicit provenance-aware task finalization, and excludes raw cookies, browser storage, arbitrary scripts, raw CDP, raw network access, and credential-value responses. A separate Developer-only tool requires a persistent explicit opt-in.
 The extension also declares the `<all_urls>` host permission for the defined `chrome.scripting` text, HTML, selector, wait, and scroll paths in task-owned pages. It is needed across the sites a person directs an agent to use, not to expose raw browser-data or browser-control APIs in Standard mode.
 
 The important caveat is that task ownership is coordination, not a security container around an identity. The profile remains the profile the person is signed into. Prompt injection, misleading content, and a poorly trusted local agent remain meaningful risks.

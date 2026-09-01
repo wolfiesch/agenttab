@@ -13,12 +13,12 @@ use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTrans
 use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
-    BrowserAction, BrowserCommitParams, BrowserCredentialsParams, BrowserHandoffParams,
-    BrowserSnapshotParams, BrowserWaitParams, ConnectionAck, ConnectionInit, MethodParams,
-    NativeEventPayload, NativeHandoff, NativePopupCommitEvent, NativeResponse, NativeStagedCommit,
-    NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod,
-    RpcRequest, RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES,
-    PROTOCOL_VERSION,
+    AgenttabFinishParams, BrowserAction, BrowserCommitParams, BrowserCredentialsParams,
+    BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams, ConnectionAck,
+    ConnectionInit, MethodParams, NativeEventPayload, NativeHandoff, NativePopupCommitEvent,
+    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ResumeCapabilityConfirm,
+    ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest, RpcResponse, TaskBinding,
+    WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -510,6 +510,57 @@ impl Runtime {
             return self.audited_value(
                 connection,
                 connection.task_id().ok().flatten(),
+                &request,
+                &params_value,
+                response,
+                started_at_ms,
+                started,
+                false,
+                false,
+            );
+        }
+        if request.method == RpcMethod::AgenttabFinish {
+            let task_id = connection.task_id().ok().flatten();
+            let response = match (task_id, params) {
+                (Some(task_id), MethodParams::Finish(AgenttabFinishParams {
+                    disposition,
+                    keep_tab_ids,
+                })) => self
+                    .native
+                    .finish_task(task_id, disposition, &keep_tab_ids, CLOSE_TASK_TIMEOUT)
+                    .map_err(|error| JournalError::NativeTaskCleanup(error.to_string()))
+                    .and_then(|result| {
+                        if result.finished {
+                            self.journal.close_task(task_id)?;
+                            connection.cancel();
+                            self.native.cancel_connection(connection.connection_id);
+                        }
+                        Ok(result)
+                    })
+                    .map(|result| RpcResponse::success(
+                        request.request_id.clone(),
+                        if result.finished { Outcome::Completed } else { Outcome::NeedsUser },
+                        serde_json::to_value(result).expect("native task finish result serializes"),
+                    ))
+                    .unwrap_or_else(|error| RpcResponse::failure(
+                        request.request_id.clone(),
+                        Outcome::Unknown,
+                        journal_rpc_error(error),
+                    )),
+                (None, MethodParams::Finish(_)) => RpcResponse::success(
+                    request.request_id.clone(),
+                    Outcome::Completed,
+                    json!({
+                        "finished": false,
+                        "closed_tab_ids": [],
+                        "retained_tab_ids": [],
+                    }),
+                ),
+                _ => unreachable!("protocol parser returns method-matched parameters"),
+            };
+            return self.audited_value(
+                connection,
+                task_id,
                 &request,
                 &params_value,
                 response,
@@ -1646,6 +1697,7 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Tabs(_)
         | MethodParams::Commit(_)
         | MethodParams::Status(_)
+        | MethodParams::Finish(_)
         | MethodParams::Close(_)
         | MethodParams::Developer(_) => None,
     }
@@ -1912,10 +1964,11 @@ fn enforce_response_limit(response: RpcResponse) -> RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::NativeTaskFinish;
     use agenttab_protocol::{
-        ConnectKind, NativeInventoryEvent, NativeOriginPolicy, NativeResponse, NativeResponseKind,
-        NativeStagedCommit, NativeTab, ResumeCapabilityConfirm, ResumeCapabilityConfirmKind,
-        RPC_PROTOCOL,
+        ConnectKind, FinishDisposition, NativeInventoryEvent, NativeOriginPolicy, NativeResponse,
+        NativeResponseKind, NativeStagedCommit, NativeTab, ResumeCapabilityConfirm,
+        ResumeCapabilityConfirmKind, RPC_PROTOCOL,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -2100,6 +2153,22 @@ mod tests {
                 return Err(NativeError::Disconnected);
             }
             Ok(())
+        }
+        fn finish_task(
+            &self,
+            task_id: Uuid,
+            _disposition: FinishDisposition,
+            keep_tab_ids: &[u64],
+            _timeout: Duration,
+        ) -> Result<NativeTaskFinish, NativeError> {
+            self.closed_tasks.lock().push(task_id);
+            Ok(NativeTaskFinish {
+                task_id,
+                finished: true,
+                closed_tab_ids: vec![31, 32],
+                retained_tab_ids: keep_tab_ids.to_vec(),
+                deferred: None,
+            })
         }
     }
     #[derive(Debug)]
@@ -2405,6 +2474,54 @@ mod tests {
         );
         assert_eq!(rejected["outcome"], "not_started");
         assert_eq!(rejected["error"]["code"], "connection_cancelled");
+    }
+
+    #[test]
+    fn agenttab_finish_finalizes_the_task_with_cleanup_receipts() {
+        let native = FakeNative::normal();
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let opened = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "tabs",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+        let capability = opened["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let task_id = opened["task"]["task_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap();
+        confirm_new_capability(&runtime, &connection, capability.clone());
+
+        let finished = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "finish",
+                "method": "agenttab.finish",
+                "params": {
+                    "disposition": "auto",
+                    "keep_tab_ids": [41]
+                }
+            }),
+        );
+
+        assert_eq!(finished["outcome"], "completed");
+        assert_eq!(finished["result"]["finished"], true);
+        assert_eq!(finished["result"]["closed_tab_ids"], json!([31, 32]));
+        assert_eq!(finished["result"]["retained_tab_ids"], json!([41]));
+        assert_eq!(*native.closed_tasks.lock(), vec![task_id]);
+        assert!(connection.is_cancelled());
+        assert!(runtime.journal.resume_task(&capability).unwrap().is_none());
     }
 
     fn confirm_new_capability(

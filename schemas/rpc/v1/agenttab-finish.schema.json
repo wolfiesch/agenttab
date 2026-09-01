@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/agenttab-finish.schema.json",
+  "title": "AgentTab task finalization parameters",
+  "type": "object",
+  "properties": {
+    "disposition": { "enum": ["auto", "close", "keep"], "default": "auto" },
+    "keep_tab_ids": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1 },
+      "uniqueItems": true,
+      "default": []
+    }
+  },
+  "additionalProperties": false
+}

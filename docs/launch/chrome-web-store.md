@@ -28,7 +28,7 @@ An agent starts with a task workspace, not general access to every tab. AgentTab
 
 The runtime consists of one minimal MV3 extension, a local Rust host, and per-user operating-system-native IPC. The extension uses Chrome Native Messaging to reach the local host. Client adapters, including MCP, connect to the host through a user-owned Unix socket on macOS and Linux or a current-user named pipe on Windows. AgentTab has no cloud relay, remote browser session, telemetry service, or routine network control plane.
 
-Standard MCP access exposes exactly eight tools: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, `browser_commit`, and `browser_credentials`. The credential tool is inert unless managed policy explicitly enables the local 1Password broker, and it never returns a credential value. `browser_developer` is available only after a persistent, explicit Developer mode opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
+Standard MCP access exposes exactly nine tools: `browser_open`, `browser_snapshot`, `browser_act`, `browser_wait`, `browser_tabs`, `browser_handoff`, `browser_commit`, `browser_credentials`, and `browser_finish`. The finalization tool applies provenance-aware cleanup: task-created tabs close by default, adopted tabs are retained, retained tabs are ungrouped, and task ownership is released. The credential tool is inert unless managed policy explicitly enables the local 1Password broker, and it never returns a credential value. `browser_developer` is available only after a persistent, explicit Developer mode opt-in. Standard mode does not expose raw cookie, storage, arbitrary script, CDP, or network APIs.
 
 ### Human controls
 
@@ -68,7 +68,7 @@ These notes are for a controlled reviewer package only. They are not public inst
 5. Demonstrate Your Turn with a harmless test page. Verify that observations from every task return `needs_user` during the handoff and that the agent resumes only after Done or the declared completion condition.
 6. Demonstrate Commit with a controlled test control labelled as a send, upload, delete, authorization, or permission action. Verify that no side effect occurs before the human popup approves the staged action with the requesting agent's one-use token. Do not use a real message, purchase, upload, deletion, or authorization.
 7. Demonstrate Pause and Resume, including that queued work does not start after Pause and that task status remains visible after recovery.
-8. Verify that Standard discovery exposes exactly the eight Standard tools, that `browser_credentials` returns a disabled-policy result before any provider call, and that the Developer-only tool is absent until the reviewer explicitly enables Developer mode.
+8. Verify that Standard discovery exposes exactly the nine Standard tools, that `browser_finish` retains an adopted tab while releasing its task ownership, that `browser_credentials` returns a disabled-policy result before any provider call, and that the Developer-only tool is absent until the reviewer explicitly enables Developer mode.
 
 ## Privacy declaration draft
 

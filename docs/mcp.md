@@ -46,7 +46,7 @@ The package coordinate for the direct stdio binary is `agenttab-mcp`; its execut
 
 The same `agenttab mcp` entry is the manual shape for Claude Desktop, Cursor, Windsurf, and another stdio-MCP client. Do not put a profile path, port, token, or `AGENTTAB_SOCKET` override in routine client configuration.
 
-For OMP and Pi, the release's public package coordinate is `@getagenttab/omp`. The package advertises both `omp.extensions` and `pi.extensions`, each pointing to the same built adapter. OMP receives native Zod schemas, approval metadata, and discoverable strict tools; Pi receives native TypeBox schemas. Both runtimes register the same eight Standard tools and render the same browser operation cards. Cards identify task and tab ownership, separate intent, policy decision, execution, and observation, surface browser effects and recovery instructions, and keep sensitive inputs out of collapsed output. Expanded results remain bounded and redact tokens, credentials, cookies, authorization, passwords, and secrets. The installer adds the local built extension path to OMP configuration transactionally.
+For OMP and Pi, the release's public package coordinate is `@getagenttab/omp`. The package advertises both `omp.extensions` and `pi.extensions`, each pointing to the same built adapter. OMP receives native Zod schemas, approval metadata, and discoverable strict tools; Pi receives native TypeBox schemas. Both runtimes register the same nine Standard tools and render the same browser operation cards. Cards identify task and tab ownership, separate intent, policy decision, execution, and observation, surface browser effects and recovery instructions, and keep sensitive inputs out of collapsed output. Expanded results remain bounded and redact tokens, credentials, cookies, authorization, passwords, and secrets. The installer adds the local built extension path to OMP and Pi configuration without replacing unrelated extensions.
 
 ## Connection and durable resume
 
@@ -58,7 +58,7 @@ OMP and Pi automatically use the harness session ID as their stable private conv
 
 For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. Each hashes the supplied conversation scope into the owner-only filename. See [Commands](commands.md#adapter-environment) for environment variables and [Core RPC connection schema](../schemas/rpc/v1/connection.schema.json) for the connection envelope.
 
-## Eight Standard tools
+## Nine Standard tools
 
 | Tool | Required input and behavior |
 |---|---|
@@ -70,6 +70,7 @@ For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. 
 | `browser_handoff` | Requires a task tab, expected page revision, prompt, completion condition, and optional timeout. Completion can be navigation, manual completion, a URL, or a selector. It remains available on a `tab_only` route because AgentTab blocks agent observation while the human controls the tab, but selector completion requires the `full` route. |
 | `browser_commit` | Requires the staged token returned by a prior `commit_required` action and executes that one staged operation. On a `tab_only` route, only a staged close can execute; page-dependent staged actions require the `full` route. |
 | `browser_credentials` | `prepare` requires a task tab and expected page revision, then returns an opaque short-lived token only when managed policy enables 1Password and one through three Login items match the host-derived current origin. `fill` consumes that token and selected username, password, or one-time-code field refs without returning any value. `next` advances to another bounded candidate. It never submits the form. |
+| `browser_finish` | Accepts `disposition: "auto" | "close" | "keep"` and optional task-owned `keep_tab_ids`. Automatic mode follows the popup cleanup policy: close task-created tabs while retaining adopted tabs, ask for confirmation, or retain all tabs. Successful finalization ungroups retained tabs, releases ownership, closes the Core connection, and returns closed and retained tab IDs. Active handoff, staged Commit review, and other in-flight work defer finalization without destroying resumability. |
 
 Every existing-page mutation carries its expected page revision. If navigation or document replacement makes that revision stale, AgentTab rejects the operation rather than selecting a new target.
 

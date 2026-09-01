@@ -121,6 +121,13 @@ const schemas: Record<ToolMethod, unknown> = {
     }),
   ]),
   browser_commit: object({ staged_token: Type.String({ minLength: 32, maxLength: 256 }) }),
+  browser_finish: object({
+    disposition: Type.Optional(stringEnum(["auto", "close", "keep"])),
+    keep_tab_ids: Type.Optional(Type.Array(Type.Integer({ minimum: 1 }), {
+      uniqueItems: true,
+      default: [],
+    })),
+  }),
   browser_developer: object({
     action: Type.String({ minLength: 1, maxLength: 128 }),
     params: Type.Record(Type.String(), Type.Unknown()),

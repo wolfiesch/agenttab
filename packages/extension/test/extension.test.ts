@@ -148,6 +148,7 @@ class PopupTestElement {
   className = "";
   title = "";
   type = "";
+  value = "";
   disabled = false;
   checked = false;
   readonly dataset: Record<string, string> = {};
@@ -174,6 +175,7 @@ class PopupTestSpanElement extends PopupTestElement { }
 class PopupTestButtonElement extends PopupTestElement { }
 class PopupTestParagraphElement extends PopupTestElement { }
 class PopupTestInputElement extends PopupTestElement { }
+class PopupTestSelectElement extends PopupTestElement { }
 class PopupTestDivElement extends PopupTestElement { }
 class PopupTestListElement extends PopupTestElement { }
 
@@ -209,6 +211,7 @@ function installPopupDocument(): PopupTestSurface {
   add("tasks", PopupTestListElement);
   add("task-error", PopupTestParagraphElement);
   add("pointer", PopupTestInputElement);
+  add("cleanup-policy", PopupTestSelectElement);
   add("pointer-detail", PopupTestElement);
   add("settings-error", PopupTestParagraphElement);
   add("reviews", PopupTestElement);
@@ -229,6 +232,7 @@ function installPopupDocument(): PopupTestSurface {
     HTMLButtonElement: PopupTestButtonElement,
     HTMLParagraphElement: PopupTestParagraphElement,
     HTMLInputElement: PopupTestInputElement,
+    HTMLSelectElement: PopupTestSelectElement,
     HTMLDivElement: PopupTestDivElement,
     HTMLUListElement: PopupTestListElement,
   });
@@ -679,6 +683,7 @@ async function seedTask(taskId: string, tabIds: number[], groupId = 5): Promise<
       name: `Task ${taskId.slice(0, 8)}`,
       groupId,
       tabIds: [...tabIds],
+      createdTabIds: [],
       color: "purple",
       state: "working",
       createdAt: 1,
@@ -1312,6 +1317,7 @@ describe("durable extension state", () => {
         name: "Key-order-safe task",
         groupId: 9,
         tabIds: [41],
+        createdTabIds: [41],
         color: "cyan",
         state: "working",
         createdAt: 1,
@@ -2906,6 +2912,116 @@ describe("ownership and task isolation", () => {
     expect(await ownership.closeTask(TASK_A)).toEqual([21]);
     expect(removedTabIds).toEqual([21]);
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
+  });
+
+  test("explicit close preserves a tab that left its task group", async () => {
+    await seedTask(TASK_A, [21, 22]);
+    tabStore.get(22)!.groupId = -1;
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    expect(await ownership.closeTask(TASK_A)).toEqual([21]);
+    expect(removedTabIds).toEqual([21]);
+    expect(tabStore.has(22)).toBe(true);
+    expect((await readState()).tasks[TASK_A]).toBeUndefined();
+  });
+
+  test("automatic finish closes created tabs and releases adopted tabs", async () => {
+    await seedTask(TASK_A, [21, 22]);
+    await mutateState((state) => {
+      state.tasks[TASK_A].createdTabIds = [22];
+      state.cleanupPolicy = "automatic";
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    const result = await ownership.finishTask(TASK_A, "auto");
+
+    expect(result).toEqual({
+      task_id: TASK_A,
+      finished: true,
+      closed_tab_ids: [22],
+      retained_tab_ids: [21],
+    });
+    expect(removedTabIds).toEqual([22]);
+    expect(tabStore.get(21)?.groupId).toBe(-1);
+    expect((await readState()).tasks[TASK_A]).toBeUndefined();
+  });
+
+  test("automatic finish preserves a created tab that left its task group", async () => {
+    await seedTask(TASK_A, [21, 22]);
+    await mutateState((state) => {
+      state.tasks[TASK_A].createdTabIds = [21, 22];
+      state.cleanupPolicy = "automatic";
+    });
+    tabStore.get(22)!.groupId = -1;
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    const result = await ownership.finishTask(TASK_A, "auto");
+
+    expect(result).toMatchObject({
+      finished: true,
+      closed_tab_ids: [21],
+      retained_tab_ids: [22],
+    });
+    expect(removedTabIds).toEqual([21]);
+    expect(tabStore.has(22)).toBe(true);
+    expect((await readState()).tasks[TASK_A]).toBeUndefined();
+  });
+
+  test("explicit finish keep list overrides close disposition", async () => {
+    await seedTask(TASK_A, [21, 22]);
+    await mutateState((state) => {
+      state.tasks[TASK_A].createdTabIds = [21, 22];
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    const result = await ownership.finishTask(TASK_A, "close", [22]);
+
+    expect(result).toMatchObject({
+      finished: true,
+      closed_tab_ids: [21],
+      retained_tab_ids: [22],
+    });
+    expect(removedTabIds).toEqual([21]);
+    expect(tabStore.get(22)?.groupId).toBe(-1);
+  });
+
+  test("ask cleanup policy defers without releasing ownership", async () => {
+    await seedTask(TASK_A, [21]);
+    await mutateState((state) => {
+      state.tasks[TASK_A].createdTabIds = [21];
+      state.cleanupPolicy = "ask";
+    });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    const result = await ownership.finishTask(TASK_A, "auto");
+
+    expect(result).toMatchObject({
+      finished: false,
+      deferred: "user_confirmation",
+      retained_tab_ids: [21],
+    });
+    expect(removedTabIds).toEqual([]);
+    expect((await readState()).tasks[TASK_A]?.state).toBe("completed");
   });
 
   test("does not adopt a tab opened by an unowned opener even when Chrome groups it with a task", async () => {

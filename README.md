@@ -27,6 +27,7 @@ The command has no path, token, or shell-specific argument and is suitable for P
 3. If managed policy enables 1Password and an ordinary sign-in page has at most three origin-matching Login items, the agent can request a short-lived opaque token and ask the host to fill named field refs. Credential values travel only from `op` to the host and extension, never through Core RPC or the adapter. Every other human-only input uses `browser_handoff`, which focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
 4. If AgentTab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token.
 5. The task can list only its own tabs with `browser_tabs`. A separate client gets a separate task unless it proves its durable resume capability.
+6. When browser work is complete, the agent calls `browser_finish`. Automatic cleanup closes tabs created by the task, preserves tabs adopted from the user's existing browser state, ungroups retained tabs, and releases task ownership. The popup setting can instead require confirmation or retain every tab.
 
 Chrome does not expose page scripting or debugger access on browser-restricted origins such as `chrome://`, `chrome-extension://`, `devtools://`, and the Chrome Web Store. AgentTab reports these task tabs with `automation_route: "tab_only"`. Explicit navigation, reload, close, load or URL waits, and human-only `browser_handoff` remain available. History movement is also available when managed origin constraints are absent; with constraints, AgentTab rejects it because Chrome does not expose the destination for authorization before navigation. Download waits require the `full` route because exact task-tab attribution comes from tab-scoped debugger events, not browser-global download state. Page snapshots, element actions, page-content waits, and raw Developer-mode CDP fail immediately with `browser_restricted_origin` and `outcome: "not_started"` before AgentTab attempts the blocked route. Use a focus-safe OS accessibility driver bound to the exact browser window when native UI work is required.
 
@@ -41,7 +42,7 @@ Commit is a two-party, best-effort semantic barrier, not proof that a page has n
 
 ## Tool surface
 
-Standard mode exposes exactly eight MCP tools:
+Standard mode exposes exactly nine tools:
 
 | Tool | Purpose |
 |---|---|
@@ -53,6 +54,7 @@ Standard mode exposes exactly eight MCP tools:
 | `browser_handoff` | Give the user control for human-only input. |
 | `browser_commit` | Execute one staged consequential action. |
 | `browser_credentials` | Prepare and fill an origin-matching 1Password login through opaque, short-lived host tokens when managed policy explicitly enables it. |
+| `browser_finish` | Finish the task, apply its cleanup policy, return closed and retained tab receipts, and release ownership. |
 
 Developer mode adds one tool, `browser_developer`. It is absent from Standard discovery. It requires both the persistent Developer mode control in the AgentTab popup and `AGENTTAB_DEVELOPER=1` in the adapter environment. Treat it as an explicit expansion of the normal boundary.
 

@@ -107,6 +107,19 @@ export interface BrowserDeveloperParams {
   params: Record<string, unknown>;
 }
 
+export interface AgenttabFinishParams {
+  disposition?: "auto" | "close" | "keep";
+  keep_tab_ids?: number[];
+}
+
+export interface AgenttabFinishResult {
+  task_id?: string;
+  finished: boolean;
+  closed_tab_ids: number[];
+  retained_tab_ids: number[];
+  deferred?: "handoff_active" | "commit_review_active" | "user_confirmation";
+}
+
 export interface MethodParams {
   browser_open: BrowserOpenParams;
   browser_snapshot: BrowserSnapshotParams;
@@ -118,6 +131,7 @@ export interface MethodParams {
   browser_commit: BrowserCommitParams;
   browser_developer: BrowserDeveloperParams;
   "agenttab.status": Record<string, never>;
+  "agenttab.finish": AgenttabFinishParams;
   "agenttab.close": Record<string, never>;
 }
 
@@ -833,6 +847,21 @@ export class AgentTabClient {
     const response = await this.request<M, T>(method, params, options);
     if (!response.ok) throw new AgentTabError(response);
     return response.result as T;
+  }
+
+  async finishTask(params: AgenttabFinishParams = {}): Promise<AgenttabFinishResult> {
+    if (this.#closed) {
+      return { finished: false, closed_tab_ids: [], retained_tab_ids: [] };
+    }
+    const result = await this.call<"agenttab.finish", AgenttabFinishResult>(
+      "agenttab.finish",
+      params,
+    );
+    if (result.finished) {
+      await this.#capabilityStore?.clear();
+      this.close();
+    }
+    return result;
   }
 
   async closeTask(): Promise<void> {

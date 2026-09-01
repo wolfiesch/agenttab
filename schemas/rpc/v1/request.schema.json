@@ -23,6 +23,7 @@
         "browser_commit",
         "browser_developer",
         "agenttab.status",
+        "agenttab.finish",
         "agenttab.close"
       ]
     },
@@ -74,6 +75,10 @@
         "required": ["method"]
       },
       "then": { "properties": { "params": { "$ref": "status.schema.json" } } }
+    },
+    {
+      "if": { "properties": { "method": { "const": "agenttab.finish" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "agenttab-finish.schema.json" } } }
     },
     {
       "if": { "properties": { "method": { "const": "browser_developer" } }, "required": ["method"] },

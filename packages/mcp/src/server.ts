@@ -6,6 +6,7 @@ import {
   AgentTabTransportError,
   createUuidV7,
   createResumeCapabilityStore,
+  type AgenttabFinishParams,
   type MethodParams,
   type MutationMethod,
   type RpcMethod,
@@ -18,6 +19,7 @@ import tabsSchema from "../../../schemas/rpc/v1/browser-tabs.schema.json" with {
 import handoffSchema from "../../../schemas/rpc/v1/browser-handoff.schema.json" with { type: "json" };
 import credentialsSchema from "../../../schemas/rpc/v1/browser-credentials.schema.json" with { type: "json" };
 import commitSchema from "../../../schemas/rpc/v1/browser-commit.schema.json" with { type: "json" };
+import finishSchema from "../../../schemas/rpc/v1/agenttab-finish.schema.json" with { type: "json" };
 import developerSchema from "../../../schemas/rpc/v1/browser-developer.schema.json" with { type: "json" };
 import packageJson from "../package.json" with { type: "json" };
 
@@ -36,6 +38,7 @@ const MUTATIONS = new Set<RpcMethod>([
   "browser_developer",
 ]);
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+type ToolMethod = RpcMethod | "browser_finish";
 
 class InvocationIdempotencyKeys {
   readonly #keys = new Map<string, string>();
@@ -139,7 +142,7 @@ interface JsonRpcRequest {
 }
 
 interface Tool {
-  name: RpcMethod;
+  name: ToolMethod;
   description: string;
   inputSchema: Record<string, unknown>;
 }
@@ -189,6 +192,11 @@ export const STANDARD_TOOLS: readonly Tool[] = [
     name: "browser_commit",
     description: "Execute one previously staged consequential action after semantic review.",
     inputSchema: schema(commitSchema),
+  },
+  {
+    name: "browser_finish",
+    description: "Finish the current browser task, applying its cleanup policy and releasing task ownership.",
+    inputSchema: schema(finishSchema),
   },
 ] as const;
 
@@ -412,6 +420,10 @@ export class McpServer {
     let client: AgentTabClient | undefined;
     try {
       client = await this.#getClient();
+      if (params.name === "browser_finish") {
+        const result = await client.finishTask(argumentsValue as unknown as AgenttabFinishParams);
+        return toolResult(result, { outcome: result.finished ? "completed" : "needs_user", taskId: this.#taskId });
+      }
       const method = params.name as RpcMethod;
       const response = await client.request(
         method,

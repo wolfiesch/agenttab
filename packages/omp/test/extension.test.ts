@@ -56,6 +56,15 @@ function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
         result: { tabs: [] },
       };
     },
+    finishTask: async (params: Record<string, unknown>) => {
+      calls.push({ method: "agenttab.finish", params });
+      return {
+        finished: true,
+        disposition: params.disposition ?? "auto",
+        closed_tab_ids: [31],
+        retained_tab_ids: [],
+      };
+    },
   } as unknown as AgentTabClient;
   const api = {
     ...(runtime === "omp" ? { zod } : {}),
@@ -82,7 +91,7 @@ async function executeTool(
   return value as Record<string, unknown>;
 }
 
-test("Standard OMP mode registers exactly eight Core RPC tools", () => {
+test("Standard OMP mode registers the complete Core RPC tool surface", () => {
   expect(register(false).tools.map((tool) => tool.name)).toEqual([
     "browser_open",
     "browser_snapshot",
@@ -92,6 +101,7 @@ test("Standard OMP mode registers exactly eight Core RPC tools", () => {
     "browser_handoff",
     "browser_credentials",
     "browser_commit",
+    "browser_finish",
   ]);
 });
 
@@ -120,6 +130,7 @@ test("developer mode adds only browser_developer", () => {
     "browser_handoff",
     "browser_credentials",
     "browser_commit",
+    "browser_finish",
     "browser_developer",
   ]);
 });
@@ -138,6 +149,132 @@ test("registered tools call Core RPC without TCP or lease verbs", async () => {
   });
 });
 
+
+test("browser_finish finalizes the current AgentTab task", async () => {
+  const { tools, calls } = register(false);
+  const result = await executeTool(
+    tools.find((tool) => tool.name === "browser_finish"),
+    { disposition: "auto", keep_tab_ids: [41] },
+  );
+  expect(calls).toEqual([{
+    method: "agenttab.finish",
+    params: { disposition: "auto", keep_tab_ids: [41] },
+  }]);
+  expect(result.details).toMatchObject({
+    finished: true,
+    closed_tab_ids: [31],
+  });
+});
+
+test("OMP session switch finalizes the current browser task", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const handlers = new Map<string, (event: Record<string, unknown>) => void | Promise<void>>();
+  const finishes: unknown[] = [];
+  let closed = false;
+  const client = {
+    connection: { task_id: "task-session-switch" },
+    get closed() {
+      return closed;
+    },
+    request: async () => ({
+      ok: true,
+      outcome: "completed",
+      request_id: "request-session-switch",
+      result: { tabs: [] },
+    }),
+    finishTask: async (params: unknown) => {
+      finishes.push(params);
+      closed = true;
+      return {
+        finished: true,
+        disposition: "auto",
+        closed_tab_ids: [31],
+        retained_tab_ids: [41],
+      };
+    },
+    close: () => {
+      closed = true;
+    },
+  } as unknown as AgentTabClient;
+  makeExtension(async () => client)({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+    on: (
+      event: "session_before_switch" | "session_shutdown" | "agent_end",
+      handler: (event: Record<string, unknown>) => void | Promise<void>,
+    ) => handlers.set(event, handler),
+  } as unknown as AgentApi);
+  await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
+
+  await handlers.get("session_before_switch")?.({});
+
+  expect(finishes).toEqual([{ disposition: "auto", keep_tab_ids: [] }]);
+  expect(closed).toBe(true);
+});
+
+test("OMP terminal agent turn finalizes an orphaned browser task after the grace period", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const handlers = new Map<string, (event: Record<string, unknown>) => void | Promise<void>>();
+  const finishes: unknown[] = [];
+  let closed = false;
+  let resolveCleanup!: () => void;
+  const cleanupCompleted = new Promise<void>((resolve) => {
+    resolveCleanup = resolve;
+  });
+  let scheduled: (() => void) | undefined;
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((callback: () => void, delayMs?: number) => {
+    expect(delayMs).toBe(5 * 60_000);
+    scheduled = callback;
+    return { unref() { } } as NodeJS.Timeout;
+  }) as typeof setTimeout;
+  try {
+    const client = {
+      connection: { task_id: "task-orphan-cleanup" },
+      get closed() {
+        return closed;
+      },
+      request: async () => ({
+        ok: true,
+        outcome: "completed",
+        request_id: "request-orphan-cleanup",
+        result: { tabs: [] },
+      }),
+      finishTask: async (params: unknown) => {
+        finishes.push(params);
+        return {
+          finished: true,
+          disposition: "auto",
+          closed_tab_ids: [31],
+          retained_tab_ids: [],
+        };
+      },
+      close: () => {
+        closed = true;
+        resolveCleanup();
+      },
+    } as unknown as AgentTabClient;
+    makeExtension(async () => client)({
+      zod,
+      registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+      on: (
+        event: "session_before_switch" | "session_shutdown" | "agent_end",
+        handler: (event: Record<string, unknown>) => void | Promise<void>,
+      ) => handlers.set(event, handler),
+    } as unknown as AgentApi);
+    await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
+
+    await handlers.get("agent_end")?.({ willContinue: false });
+    expect(scheduled).toBeDefined();
+    scheduled?.();
+    await cleanupCompleted;
+
+    expect(finishes).toEqual([{ disposition: "auto", keep_tab_ids: [] }]);
+    expect(closed).toBe(true);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
 test("OMP forwards long-operation timeouts for SDK deadline selection", async () => {
   const { tools, calls } = register(false);
   await executeTool(tools.find((tool) => tool.name === "browser_wait"), {
@@ -686,6 +823,7 @@ test("Pi mode registers the same tools with TypeBox schemas and Pi metadata", ()
     "browser_handoff",
     "browser_credentials",
     "browser_commit",
+    "browser_finish",
   ]);
   for (const tool of tools) {
     expect(tool.parameters).toBeObject();

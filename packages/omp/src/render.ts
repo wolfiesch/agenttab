@@ -241,6 +241,11 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
     }
     case "browser_commit":
       return { title: "Commit staged action", meta: "approved one-use token" };
+    case "browser_finish":
+      return {
+        title: "Finish browser task",
+        meta: fieldString(args, "disposition") ?? "automatic cleanup",
+      };
     case "browser_developer":
       return { title: "Developer action", meta: fieldString(args, "action") };
   }
@@ -360,6 +365,14 @@ function summarizeResult(
     }
     case "browser_commit":
       return "Staged action executed";
+    case "browser_finish": {
+      if (result.finished === false) {
+        return `Task finalization deferred · ${humanize(fieldString(result, "deferred") ?? "not ready")}`;
+      }
+      const closed = Array.isArray(result.closed_tab_ids) ? result.closed_tab_ids.length : 0;
+      const retained = Array.isArray(result.retained_tab_ids) ? result.retained_tab_ids.length : 0;
+      return `Browser task finished · ${closed} closed · ${retained} retained`;
+    }
     case "browser_developer":
       return "Developer action executed";
   }

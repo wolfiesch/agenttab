@@ -13,7 +13,7 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, Mapping, Protocol
+from typing import Any, BinaryIO, Literal, Mapping, Protocol, Sequence
 
 RPC_PROTOCOL = "agenttab.rpc"
 RPC_VERSION = 1
@@ -988,6 +988,34 @@ class AgentTabClient:
         if not response.get("ok"):
             raise AgentTabError(response)
         return response.get("result")
+
+    def finish_task(
+        self,
+        *,
+        disposition: str = "auto",
+        keep_tab_ids: Sequence[int] = (),
+    ) -> JsonObject:
+        if disposition not in {"auto", "close", "keep"}:
+            raise ValueError("disposition must be auto, close, or keep")
+        result = self.call(
+            "agenttab.finish",
+            {
+                "disposition": disposition,
+                "keep_tab_ids": list(keep_tab_ids),
+            },
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("finished"), bool):
+            raise AgentTabError({
+                "error": {
+                    "code": "invalid_response",
+                    "message": "AgentTab finish response is malformed",
+                },
+            })
+        if result["finished"]:
+            if self._capability_store is not None:
+                self._capability_store.clear()
+            self.close()
+        return result
 
     def close(self) -> None:
         if self._closed:
