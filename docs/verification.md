@@ -26,9 +26,9 @@ The workspace checks TypeScript adapters, extension code, installer, OMP adapter
 
 ## Pull request routing
 
-Pull requests that change only `README.md`, `CHANGELOG.md`, `LICENSE`, documentation text under `docs/`, or a top-level GitHub Markdown file use the lightweight CI lane. The classifier still scans added public text for credentials, private paths, session identifiers, and private hosts. Source, manifest, workflow, nested GitHub, executable documentation, mixed, empty, or ambiguous changes use the full cross-platform lane.
+Pull requests that change only `README.md`, `CHANGELOG.md`, `LICENSE`, documentation files ending in `.md`, `.rst`, or `.txt` under `docs/`, or a top-level `.github/*.md` file use the lightweight CI lane. The classifier still scans added public text for credentials, private paths, session identifiers, and private hosts. Source, manifest, workflow, nested GitHub, executable documentation, mixed, empty, or ambiguous changes use the full cross-platform lane.
 
-Branch protection requires the stable `verify` check. An event-driven review gate publishes `exact-head-review` only when the automated review commit matches the current pull-request head. A new push invalidates that status and requires a fresh review; unresolved review threads remain merge blockers.
+Branch protection requires the stable `verify` check. The automatic review ruleset requests a fresh review after every push, and the repository shipping command refuses to merge unless the latest automated review commit matches the current pull-request head. Unresolved review threads remain merge blockers.
 
 ## Live browser evidence
 
