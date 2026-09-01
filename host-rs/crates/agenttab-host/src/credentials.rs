@@ -35,6 +35,7 @@ struct Attempt {
     expires_at: Instant,
 }
 
+#[derive(Clone)]
 pub struct CredentialMaterial {
     pub username: Option<String>,
     pub password: Option<String>,
@@ -618,11 +619,7 @@ mod tests {
             _host: &str,
             _include_otp: bool,
         ) -> Result<CredentialMaterial, ProviderError> {
-            Ok(CredentialMaterial {
-                username: self.material.username.clone(),
-                password: self.material.password.clone(),
-                otp: self.material.otp.clone(),
-            })
+            Ok(self.material.clone())
         }
     }
 
