@@ -27,6 +27,9 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.base.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Select comparison range
         id: range
         env:
@@ -84,6 +87,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - name: Test CI policy
         run: python3 .github/scripts/test_ci_policy.py
 
