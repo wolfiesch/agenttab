@@ -13,7 +13,7 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, Mapping, Protocol
+from typing import Any, BinaryIO, Literal, Mapping, Protocol, Sequence
 
 RPC_PROTOCOL = "agenttab.rpc"
 RPC_VERSION = 1
@@ -22,6 +22,7 @@ HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT = 30.0
 DEFAULT_BROWSER_WAIT_TIMEOUT = 30.0
 DEFAULT_BROWSER_HANDOFF_TIMEOUT = 300.0
+DEFAULT_BROWSER_CREDENTIALS_TIMEOUT = 120.0
 # Core reserves five seconds after a long operation's declared timeout. Keep a
 # second, bounded five-second margin for its response to cross the transports.
 LONG_OPERATION_TRANSPORT_GRACE = 10.0
@@ -29,6 +30,7 @@ MUTATIONS = {
     "browser_open",
     "browser_act",
     "browser_handoff",
+    "browser_credentials",
     "browser_commit",
     "browser_developer",
 }
@@ -45,6 +47,8 @@ def resolve_transport_timeout(
         default_timeout = DEFAULT_BROWSER_WAIT_TIMEOUT
     elif method == "browser_handoff":
         default_timeout = DEFAULT_BROWSER_HANDOFF_TIMEOUT
+    elif method == "browser_credentials":
+        default_timeout = DEFAULT_BROWSER_CREDENTIALS_TIMEOUT
     else:
         return request_timeout
     requested_timeout_ms = params.get("timeout_ms")
@@ -984,6 +988,34 @@ class AgentTabClient:
         if not response.get("ok"):
             raise AgentTabError(response)
         return response.get("result")
+
+    def finish_task(
+        self,
+        *,
+        disposition: str = "auto",
+        keep_tab_ids: Sequence[int] = (),
+    ) -> JsonObject:
+        if disposition not in {"auto", "close", "keep"}:
+            raise ValueError("disposition must be auto, close, or keep")
+        result = self.call(
+            "agenttab.finish",
+            {
+                "disposition": disposition,
+                "keep_tab_ids": list(keep_tab_ids),
+            },
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("finished"), bool):
+            raise AgentTabError({
+                "error": {
+                    "code": "invalid_response",
+                    "message": "AgentTab finish response is malformed",
+                },
+            })
+        if result["finished"]:
+            if self._capability_store is not None:
+                self._capability_store.clear()
+            self.close()
+        return result
 
     def close(self) -> None:
         if self._closed:

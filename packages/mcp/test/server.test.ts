@@ -19,7 +19,7 @@ import {
 } from "../src/server";
 
 describe("AgentTab MCP surface", () => {
-  test("Standard mode exposes exactly seven Core RPC tools", () => {
+  test("Standard mode exposes exactly nine Core RPC tools", () => {
     expect(STANDARD_TOOLS.map((tool) => tool.name)).toEqual([
       "browser_open",
       "browser_snapshot",
@@ -27,9 +27,11 @@ describe("AgentTab MCP surface", () => {
       "browser_wait",
       "browser_tabs",
       "browser_handoff",
+      "browser_credentials",
       "browser_commit",
+      "browser_finish",
     ]);
-    expect(listedTools(false)).toHaveLength(7);
+    expect(listedTools(false)).toHaveLength(9);
     expect(listedTools(false).some((tool) => tool.name === DEVELOPER_TOOL.name)).toBe(false);
   });
 
@@ -39,6 +41,13 @@ describe("AgentTab MCP surface", () => {
     expect(JSON.stringify(openTool.inputSchema)).toContain("\"background\":{\"const\":true}");
   });
 
+  test("browser_finish advertises provenance-aware cleanup controls", () => {
+    const finishTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_finish")!;
+    const schema = JSON.stringify(finishTool.inputSchema);
+    expect(schema).toContain('"disposition"');
+    expect(schema).toContain('"keep_tab_ids"');
+  });
+
   test("browser_snapshot advertises bounded screenshot encodings", () => {
     const snapshotTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_snapshot")!;
     const schema = JSON.stringify(snapshotTool.inputSchema);
@@ -46,6 +55,11 @@ describe("AgentTab MCP surface", () => {
     expect(schema).toContain('"max_width"');
     expect(schema).toContain('"maximum":750000');
     expect(schema).toContain('"maximum":1000000');
+  });
+
+  test("browser_credentials fills only and cannot bypass Browser Act submission review", () => {
+    const credentialTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_credentials")!;
+    expect(JSON.stringify(credentialTool.inputSchema)).not.toContain("submit_ref");
   });
 
   test("browser_act advertises no press action", () => {
@@ -386,6 +400,46 @@ describe("AgentTab MCP surface", () => {
         tabs: [],
         _agenttab: { outcome: "completed", task_id: "task-direct" },
       },
+    });
+    server.close();
+  });
+
+  test("browser_finish uses the SDK finalization path", async () => {
+    const calls: unknown[] = [];
+    let closed = false;
+    const client = {
+      connection: { task_id: "task-finish" },
+      get closed() {
+        return closed;
+      },
+      finishTask: async (params: unknown) => {
+        calls.push(params);
+        return {
+          finished: true,
+          closed_tab_ids: [7],
+          retained_tab_ids: [9],
+        };
+      },
+      close: () => {
+        closed = true;
+      },
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ clientFactory: async () => client });
+    const result = await server.handle({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "browser_finish",
+        arguments: { disposition: "auto", keep_tab_ids: [9] },
+      },
+    }) as Record<string, unknown>;
+    expect(calls).toEqual([{ disposition: "auto", keep_tab_ids: [9] }]);
+    expect(result.structuredContent).toEqual({
+      finished: true,
+      closed_tab_ids: [7],
+      retained_tab_ids: [9],
+      _agenttab: { outcome: "completed", task_id: "task-finish" },
     });
     server.close();
   });

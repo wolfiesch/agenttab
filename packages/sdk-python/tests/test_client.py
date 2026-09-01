@@ -17,6 +17,7 @@ from agenttab import (
     AgentTabClient,
     AgentTabError,
     AgentTabTransportError,
+    DEFAULT_BROWSER_CREDENTIALS_TIMEOUT,
     DEFAULT_BROWSER_HANDOFF_TIMEOUT,
     DEFAULT_BROWSER_WAIT_TIMEOUT,
     LONG_OPERATION_TRANSPORT_GRACE,
@@ -106,6 +107,13 @@ class ClientTests(unittest.TestCase):
             ),
             DEFAULT_BROWSER_HANDOFF_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
         )
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_credentials",
+                {"action": "prepare", "tab_id": 1, "expected_page_revision": 1},
+            ),
+            DEFAULT_BROWSER_CREDENTIALS_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
+        )
         self.assertEqual(resolve_transport_timeout("browser_tabs", {}, 45), 45)
         self.assertEqual(
             resolve_transport_timeout(
@@ -161,6 +169,50 @@ class ClientTests(unittest.TestCase):
             {"matched": True},
         )
         client.close()
+
+    def test_finish_task_preserves_deferred_connection_and_closes_when_finished(self) -> None:
+        class CapabilityStore:
+            def __init__(self) -> None:
+                self.clears = 0
+
+            def clear(self) -> None:
+                self.clears += 1
+
+        stream = io.BytesIO()
+        store = CapabilityStore()
+        client = AgentTabClient(stream, {}, capability_store=store)  # type: ignore[arg-type]
+        responses = [
+            {
+                "finished": False,
+                "disposition": "auto",
+                "closed_tab_ids": [],
+                "retained_tab_ids": [31],
+                "deferred": "user_confirmation",
+            },
+            {
+                "finished": True,
+                "disposition": "close",
+                "closed_tab_ids": [31],
+                "retained_tab_ids": [],
+            },
+        ]
+        with patch.object(client, "call", side_effect=responses) as call:
+            self.assertFalse(client.finish_task()["finished"])
+            self.assertFalse(client._closed)
+            self.assertFalse(stream.closed)
+            self.assertEqual(store.clears, 0)
+
+            self.assertTrue(client.finish_task(disposition="close")["finished"])
+            self.assertTrue(client._closed)
+            self.assertTrue(stream.closed)
+            self.assertEqual(store.clears, 1)
+            self.assertEqual(
+                call.call_args_list[1].args,
+                (
+                    "agenttab.finish",
+                    {"disposition": "close", "keep_tab_ids": []},
+                ),
+            )
 
     def test_connection_and_typed_request(self) -> None:
         with tempfile.TemporaryDirectory() as root:

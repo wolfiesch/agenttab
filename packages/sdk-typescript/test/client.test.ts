@@ -7,6 +7,7 @@ import {
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
+  DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS,
   DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS,
   DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
   FrameDecoder,
@@ -111,6 +112,10 @@ describe("Core RPC transport deadlines", () => {
         completion: { kind: "manual_done" },
       },
     )).toBe(DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs(
+      "browser_credentials",
+      { action: "prepare", tab_id: 1, expected_page_revision: 1 },
+    )).toBe(DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
     expect(resolveTransportTimeoutMs("browser_tabs", {}, 45_000)).toBe(45_000);
     expect(resolveTransportTimeoutMs(
       "browser_wait",
@@ -594,6 +599,96 @@ test("closeTask requests task cleanup and clears the durable capability", async 
   await client.closeTask();
 
   expect(methods).toEqual(["browser_tabs", "agenttab.close"]);
+  expect(clears).toBe(1);
+  expect(persisted).toBeUndefined();
+  expect(client.closed).toBe(true);
+});
+
+test("finishTask preserves resumability while deferred and closes after finalization", async () => {
+  const capability = "f".repeat(32);
+  const methods: unknown[] = [];
+  let persisted: string | undefined;
+  let clears = 0;
+  let finishCalls = 0;
+  const store = {
+    path: "memory",
+    load: async () => persisted,
+    loadPending: async () => undefined,
+    save: async (value: string) => { persisted = value; },
+    prepareReplacement: async () => undefined,
+    activateReplacement: async () => undefined,
+    clear: async () => {
+      clears += 1;
+      persisted = undefined;
+    },
+  };
+  const endpoint = await listen((socket) => {
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da48",
+            resumed: false,
+            state: "ready",
+          }, 1024 * 1024));
+        } else if (value.kind === "resume_confirm") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "resume_confirmed",
+            connection_id: value.connection_id,
+          }, 1024 * 1024));
+        } else {
+          methods.push(value.method);
+          const createsTask = value.method === "browser_tabs";
+          if (value.method === "agenttab.finish") finishCalls += 1;
+          const finished = finishCalls > 1;
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            request_id: value.request_id,
+            ok: true,
+            outcome: finished ? "completed" : createsTask ? "completed" : "needs_user",
+            result: createsTask
+              ? { tabs: [] }
+              : {
+                finished,
+                disposition: "auto",
+                closed_tab_ids: finished ? [31] : [],
+                retained_tab_ids: finished ? [] : [31],
+                ...(finished ? {} : { deferred: "user_confirmation" }),
+              },
+            ...(createsTask ? {
+              task: {
+                task_id: "018f22b2-4126-7c1a-8c31-3f45a783da49",
+                resume_capability: capability,
+              },
+            } : {}),
+          }, 1024 * 1024));
+        }
+      }
+    });
+  });
+
+  const client = await AgentTabClient.connect({ endpoint, capabilityStore: store });
+  await client.call("browser_tabs", {});
+
+  expect(await client.finishTask()).toMatchObject({
+    finished: false,
+    deferred: "user_confirmation",
+  });
+  expect(client.closed).toBe(false);
+  expect(persisted).toBe(capability);
+
+  expect(await client.finishTask({ disposition: "close" })).toMatchObject({
+    finished: true,
+    closed_tab_ids: [31],
+  });
+  expect(methods).toEqual(["browser_tabs", "agenttab.finish", "agenttab.finish"]);
   expect(clears).toBe(1);
   expect(persisted).toBeUndefined();
   expect(client.closed).toBe(true);

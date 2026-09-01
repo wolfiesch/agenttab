@@ -15,6 +15,7 @@ export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_WAIT_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;
+export const DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS = 120_000;
 // Core gives long-running extension operations five seconds to return after their
 // declared timeout. Keep a second, bounded five-second margin for the response to
 // cross the native and Core transports before the client classifies it as unknown.
@@ -81,6 +82,22 @@ export interface BrowserHandoffParams {
   timeout_ms?: number;
 }
 
+export type BrowserCredentialsParams =
+  | {
+    action: "prepare";
+    tab_id: number;
+    expected_page_revision: number;
+  }
+  | {
+    action: "fill" | "next";
+    tab_id: number;
+    expected_page_revision: number;
+    credential_token: string;
+    username_ref?: string;
+    password_ref?: string;
+    otp_ref?: string;
+  };
+
 export interface BrowserCommitParams {
   staged_token: string;
 }
@@ -90,6 +107,19 @@ export interface BrowserDeveloperParams {
   params: Record<string, unknown>;
 }
 
+export interface AgenttabFinishParams {
+  disposition?: "auto" | "close" | "keep";
+  keep_tab_ids?: number[];
+}
+
+export interface AgenttabFinishResult {
+  task_id?: string;
+  finished: boolean;
+  closed_tab_ids: number[];
+  retained_tab_ids: number[];
+  deferred?: "handoff_active" | "commit_review_active" | "user_confirmation";
+}
+
 export interface MethodParams {
   browser_open: BrowserOpenParams;
   browser_snapshot: BrowserSnapshotParams;
@@ -97,9 +127,11 @@ export interface MethodParams {
   browser_wait: BrowserWaitParams;
   browser_tabs: Record<string, never>;
   browser_handoff: BrowserHandoffParams;
+  browser_credentials: BrowserCredentialsParams;
   browser_commit: BrowserCommitParams;
   browser_developer: BrowserDeveloperParams;
   "agenttab.status": Record<string, never>;
+  "agenttab.finish": AgenttabFinishParams;
   "agenttab.close": Record<string, never>;
 }
 
@@ -108,6 +140,7 @@ export type MutationMethod =
   | "browser_open"
   | "browser_act"
   | "browser_handoff"
+  | "browser_credentials"
   | "browser_commit"
   | "browser_developer";
 
@@ -400,6 +433,7 @@ const MUTATIONS = new Set<RpcMethod>([
   "browser_open",
   "browser_act",
   "browser_handoff",
+  "browser_credentials",
   "browser_commit",
   "browser_developer",
 ]);
@@ -413,6 +447,8 @@ function longOperationTimeoutMs(
     defaultTimeoutMs = DEFAULT_BROWSER_WAIT_TIMEOUT_MS;
   } else if (method === "browser_handoff") {
     defaultTimeoutMs = DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS;
+  } else if (method === "browser_credentials") {
+    defaultTimeoutMs = DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS;
   } else {
     return undefined;
   }
@@ -811,6 +847,21 @@ export class AgentTabClient {
     const response = await this.request<M, T>(method, params, options);
     if (!response.ok) throw new AgentTabError(response);
     return response.result as T;
+  }
+
+  async finishTask(params: AgenttabFinishParams = {}): Promise<AgenttabFinishResult> {
+    if (this.#closed) {
+      return { finished: false, closed_tab_ids: [], retained_tab_ids: [] };
+    }
+    const result = await this.call<"agenttab.finish", AgenttabFinishResult>(
+      "agenttab.finish",
+      params,
+    );
+    if (result.finished) {
+      await this.#capabilityStore?.clear();
+      this.close();
+    }
+    return result;
   }
 
   async closeTask(): Promise<void> {

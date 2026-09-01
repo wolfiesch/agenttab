@@ -24,6 +24,7 @@ interface UiState {
   paused: boolean;
   developerMode: boolean;
   pointer: boolean | null;
+  cleanupPolicy: "automatic" | "ask" | "keep";
   handoffPrompt: string | null;
   tasks: TaskView[];
   reviews: ReviewView[];
@@ -88,6 +89,7 @@ const taskCount = element("task-count", HTMLSpanElement);
 const taskList = element("tasks", HTMLUListElement);
 const taskError = element("task-error", HTMLParagraphElement);
 const pointerToggle = element("pointer", HTMLInputElement);
+const cleanupPolicy = element("cleanup-policy", HTMLSelectElement);
 const pointerDetail = element("pointer-detail", HTMLElement);
 const settingsError = element("settings-error", HTMLParagraphElement);
 const reviews = element("reviews", HTMLElement);
@@ -179,6 +181,9 @@ async function load(): Promise<UiState> {
     paused: response.paused === true,
     developerMode: response.developer_mode === true,
     pointer: typeof response.show_agent_pointer === "boolean" ? response.show_agent_pointer : null,
+    cleanupPolicy: response.cleanup_policy === "ask" || response.cleanup_policy === "keep"
+      ? response.cleanup_policy
+      : "automatic",
     handoffPrompt: handoff === null ? null : prompt,
     tasks: Array.isArray(response.tasks)
       ? response.tasks
@@ -261,6 +266,18 @@ function renderTask(task: TaskView, developerMode: boolean): HTMLLIElement {
   }
 
 
+  const keep = document.createElement("button");
+  keep.type = "button";
+  keep.className = "link";
+  keep.textContent = "Keep";
+  keep.setAttribute("aria-label", `Keep ${task.name}'s tabs and finish the task`);
+  keep.addEventListener("click", () => {
+    void guard(taskError, async () => {
+      await send({ kind: "keep_task", task_id: task.taskId });
+      disarm();
+    });
+  });
+
   const armed = confirming === task.taskId;
   const finish = document.createElement("button");
   finish.type = "button";
@@ -285,7 +302,7 @@ function renderTask(task: TaskView, developerMode: boolean): HTMLLIElement {
     });
   });
 
-  row.append(finish);
+  row.append(keep, finish);
   return row;
 }
 
@@ -359,6 +376,7 @@ function render(state: UiState): void {
   pointerDetail.textContent = state.pointer === null
     ? "Unavailable: the runtime did not report a pointer preference."
     : "Show where an agent clicks in a visible tab.";
+  cleanupPolicy.value = state.cleanupPolicy;
 
   taskCount.textContent = String(state.tasks.length);
   if (confirming !== null && !state.tasks.some((task) => task.taskId === confirming)) disarm();
@@ -436,6 +454,14 @@ disableButton.addEventListener("click", () => {
         "Chrome kept optional scripting access. The install-time debugger grant stays installed; disable AgentTab from chrome://extensions to remove it.",
       );
     }
+  });
+});
+
+cleanupPolicy.addEventListener("change", () => {
+  const policy = cleanupPolicy.value;
+  if (policy !== "automatic" && policy !== "ask" && policy !== "keep") return;
+  void guard(settingsError, async () => {
+    await send({ kind: "set_cleanup_policy", policy });
   });
 });
 

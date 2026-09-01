@@ -1,13 +1,15 @@
 use crate::handoff::HandoffState;
 use crate::lifecycle::Lifecycle;
 use agenttab_protocol::{
-    native_close_task, native_command, native_event_ack, native_event_ack_result, native_ready,
-    read_frame, write_frame, NativeDisconnectEvent, NativeDisconnectRecovery, NativeEvent,
-    NativeEventName, NativeEventPayload, NativeHandoff, NativeHello, NativeOriginPolicy,
-    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ProtocolError, RpcError, RuntimeState,
+    native_close_task, native_command, native_event_ack, native_event_ack_result,
+    native_finish_task, native_ready, read_frame, write_frame, FinishDisposition,
+    NativeDisconnectEvent, NativeDisconnectRecovery, NativeEvent, NativeEventName,
+    NativeEventPayload, NativeHandoff, NativeHello, NativeOriginPolicy, NativeResponse,
+    NativeStagedCommit, NativeTab, Outcome, ProtocolError, RpcError, RuntimeState,
     EXTENSION_TO_HOST_MAX_BYTES, HOST_TO_EXTENSION_MAX_BYTES, NATIVE_PROTOCOL, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -37,6 +39,17 @@ pub struct NativeEventResult {
     pub outcome: Outcome,
     pub result: Option<Value>,
     pub error: Option<RpcError>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTaskFinish {
+    pub task_id: Uuid,
+    pub finished: bool,
+    pub closed_tab_ids: Vec<u64>,
+    pub retained_tab_ids: Vec<u64>,
+    #[serde(default)]
+    pub deferred: Option<String>,
 }
 impl NativeEventResult {
     pub fn completed(result: Value) -> Self {
@@ -81,6 +94,17 @@ pub trait NativeTransport: Send + Sync {
     fn close_task(&self, _task_id: Uuid, _timeout: Duration) -> Result<(), NativeError> {
         Err(NativeError::Protocol(
             "native close_task lifecycle command is unsupported".into(),
+        ))
+    }
+    fn finish_task(
+        &self,
+        _task_id: Uuid,
+        _disposition: FinishDisposition,
+        _keep_tab_ids: &[u64],
+        _timeout: Duration,
+    ) -> Result<NativeTaskFinish, NativeError> {
+        Err(NativeError::Protocol(
+            "native finish_task lifecycle command is unsupported".into(),
         ))
     }
     fn cancel_connection(&self, _connection_id: Uuid) {}
@@ -429,6 +453,59 @@ impl NativeTransport for StdioNative {
             ));
         }
         Ok(())
+    }
+
+    fn finish_task(
+        &self,
+        task_id: Uuid,
+        disposition: FinishDisposition,
+        keep_tab_ids: &[u64],
+        timeout: Duration,
+    ) -> Result<NativeTaskFinish, NativeError> {
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(NativeError::Disconnected);
+        }
+        let request_id = Uuid::new_v4();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.pending
+            .lock()
+            .insert(request_id, (Uuid::nil(), task_id, sender));
+        if let Err(error) = self.write_value(&native_finish_task(
+            request_id,
+            task_id,
+            disposition,
+            keep_tab_ids,
+        )) {
+            self.pending.lock().remove(&request_id);
+            return Err(NativeError::Transport(error.to_string()));
+        }
+        let response = match receiver.recv_timeout(timeout) {
+            Ok(result) => result?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.pending.lock().remove(&request_id);
+                return Err(NativeError::Timeout);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(NativeError::Disconnected),
+        };
+        if response.outcome != Outcome::Completed {
+            return Err(NativeError::Protocol(
+                "native finish_task cleanup was not confirmed by the extension".into(),
+            ));
+        }
+        let result: NativeTaskFinish =
+            serde_json::from_value(response.result.ok_or_else(|| {
+                NativeError::Protocol("native finish_task response omitted its result".into())
+            })?)
+            .map_err(|error| NativeError::Protocol(error.to_string()))?;
+        if result.task_id != task_id
+            || (result.finished && result.deferred.is_some())
+            || (!result.finished && result.deferred.is_none())
+        {
+            return Err(NativeError::Protocol(
+                "native finish_task result is internally inconsistent".into(),
+            ));
+        }
+        Ok(result)
     }
 
     fn cancel_connection(&self, connection_id: Uuid) {

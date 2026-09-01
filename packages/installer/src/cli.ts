@@ -25,6 +25,7 @@ const COMMAND_FLAGS: Record<string, Readonly<Record<string, FlagKind>>> = {
     version: "string",
   },
   status: {},
+  finish: { disposition: "string", "keep-tab-ids": "string" },
   doctor: { layer: "string" },
   mcp: {},
   proxy: { port: "string", "token-file": "string" },
@@ -76,6 +77,7 @@ const USAGE = [
   "  agenttab --version",
   "  agenttab install [--version X.Y.Z] [--verify-readiness] [--development --manifest-url URL --signature-url URL]",
   "  agenttab status",
+  "  agenttab finish [--disposition auto|close|keep] [--keep-tab-ids 12,34]",
   "  agenttab doctor [--layer ipc|extension]",
   "  agenttab mcp",
   "  agenttab proxy --token-file PATH [--port 9224]",
@@ -91,6 +93,31 @@ async function status(): Promise<unknown> {
   const client = await AgentTabClient.connect();
   try {
     return await client.call("agenttab.status", {});
+  } finally {
+    client.close();
+  }
+}
+
+function parseTabIds(value: string | undefined): number[] {
+  if (value === undefined || value === "") return [];
+  const tabIds = value.split(",").map((item) => Number(item));
+  if (tabIds.some((tabId) => !Number.isInteger(tabId) || tabId < 1) || new Set(tabIds).size !== tabIds.length) {
+    throw new Error("--keep-tab-ids must be a comma-separated list of unique positive integers");
+  }
+  return tabIds;
+}
+
+async function finish(args: ParsedArgs): Promise<unknown> {
+  const disposition = stringFlag(args, "disposition") ?? "auto";
+  if (disposition !== "auto" && disposition !== "close" && disposition !== "keep") {
+    throw new Error("--disposition must be auto, close, or keep");
+  }
+  const client = await AgentTabClient.connect();
+  try {
+    return await client.finishTask({
+      disposition,
+      keep_tab_ids: parseTabIds(stringFlag(args, "keep-tab-ids")),
+    });
   } finally {
     client.close();
   }
@@ -116,6 +143,10 @@ async function run(): Promise<void> {
   }
   if (command === "status") {
     console.log(JSON.stringify(await status(), null, 2));
+    return;
+  }
+  if (command === "finish") {
+    console.log(JSON.stringify(await finish(parsed), null, 2));
     return;
   }
   if (command === "doctor") {

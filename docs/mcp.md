@@ -46,7 +46,7 @@ The package coordinate for the direct stdio binary is `agenttab-mcp`; its execut
 
 The same `agenttab mcp` entry is the manual shape for Claude Desktop, Cursor, Windsurf, and another stdio-MCP client. Do not put a profile path, port, token, or `AGENTTAB_SOCKET` override in routine client configuration.
 
-For OMP and Pi, the release's public package coordinate is `@getagenttab/omp`. The package advertises both `omp.extensions` and `pi.extensions`, each pointing to the same built adapter. OMP receives native Zod schemas, approval metadata, and discoverable strict tools; Pi receives native TypeBox schemas. Both runtimes register the same seven Standard tools and render the same browser operation cards. Cards identify task and tab ownership, separate intent, policy decision, execution, and observation, surface browser effects and recovery instructions, and keep sensitive inputs out of collapsed output. Expanded results remain bounded and redact tokens, credentials, cookies, authorization, passwords, and secrets. The installer adds the local built extension path to OMP `config.extension` and Pi `packages`; the executable path remains local and does not assume a public registry install.
+For OMP and Pi, the release's public package coordinate is `@getagenttab/omp`. The package advertises both `omp.extensions` and `pi.extensions`, each pointing to the same built adapter. OMP receives native Zod schemas, approval metadata, and discoverable strict tools; Pi receives native TypeBox schemas. Both runtimes register the same nine Standard tools and render the same browser operation cards. Cards identify task and tab ownership, separate intent, policy decision, execution, and observation, surface browser effects and recovery instructions, and keep sensitive inputs out of collapsed output. Expanded results remain bounded and redact tokens, credentials, cookies, authorization, passwords, and secrets. The installer adds the local built extension path to OMP and Pi configuration without replacing unrelated extensions.
 
 ## Connection and durable resume
 
@@ -58,7 +58,7 @@ OMP and Pi automatically use the harness session ID as their stable private conv
 
 For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. Each hashes the supplied conversation scope into the owner-only filename. See [Commands](commands.md#adapter-environment) for environment variables and [Core RPC connection schema](../schemas/rpc/v1/connection.schema.json) for the connection envelope.
 
-## Seven Standard tools
+## Nine Standard tools
 
 | Tool | Required input and behavior |
 |---|---|
@@ -69,6 +69,8 @@ For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. 
 | `browser_tabs` | Takes an empty object and lists only the current task's tabs, including each tab's `automation_route`. |
 | `browser_handoff` | Requires a task tab, expected page revision, prompt, completion condition, and optional timeout. Completion can be navigation, manual completion, a URL, or a selector. It remains available on a `tab_only` route because AgentTab blocks agent observation while the human controls the tab, but selector completion requires the `full` route. |
 | `browser_commit` | Requires the staged token returned by a prior `commit_required` action and executes that one staged operation. On a `tab_only` route, only a staged close can execute; page-dependent staged actions require the `full` route. |
+| `browser_credentials` | `prepare` requires a task tab and expected page revision, then returns an opaque short-lived token only when managed policy enables 1Password and one through three Login items match the host-derived current origin. `fill` consumes that token and selected username, password, or one-time-code field refs without returning any value. `next` advances to another bounded candidate. It never submits the form. |
+| `browser_finish` | Accepts `disposition: "auto" | "close" | "keep"` and optional task-owned `keep_tab_ids`. Automatic mode follows the popup cleanup policy: close task-created tabs while retaining adopted tabs, ask for confirmation, or retain all tabs. Successful finalization ungroups retained tabs, releases ownership, closes the Core connection, and returns closed and retained tab IDs. Active handoff, staged Commit review, and other in-flight work defer finalization without destroying resumability. |
 
 Every existing-page mutation carries its expected page revision. If navigation or document replacement makes that revision stale, AgentTab rejects the operation rather than selecting a new target.
 
@@ -98,11 +100,13 @@ The stdio MCP reader dispatches requests concurrently, while its writer serializ
 
 Raw TypeScript and Python SDK clients raise `AgentTabTransportError` for an ambiguous timeout, connection close, or transport failure. The error carries the method and, for mutations, the exact generated or caller-supplied idempotency key. A caller may reconnect and explicitly retry the same method and parameters with that key; the SDK never replays the request automatically. MCP and OMP adapters likewise return the failed invocation, discard a cached client only when its transport is closed, and reconnect on the next invocation.
 
-### Your Turn handoff
+### Credentials and Your Turn handoff
 
-Call `browser_handoff` before the user enters credentials or completes another human-only step. AgentTab activates a global blackout, focuses the declared tab, opens its user-facing handoff state, and denies browser observation and capture for every task while the handoff is active. Automation resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the handoff is cleared.
+When managed policy enables 1Password, call `browser_credentials` on an ordinary sign-in page before requesting manual password entry. `prepare` derives the current origin from host-owned tab state. `fill` accepts only accessibility refs and returns filled-field booleans; credential material never crosses Core RPC. Submit separately through `browser_act`, inspect the result, and use `next` only after the site rejects the current candidate.
 
-The agent must not attempt snapshots, page reads, or mutations during this interval. It should report the handoff prompt to the user and wait for the terminal tool result or an explicit user completion.
+Call `browser_handoff` when credential preparation returns `needs_user`, the bounded candidates fail, or the site requires a passkey, security key, CAPTCHA, payment secret, account recovery, or unsupported verification. AgentTab activates a global blackout, focuses the declared tab, opens its user-facing handoff state, and denies browser observation and capture for every task while the handoff is active. Automation resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the handoff is cleared.
+
+The agent must not attempt snapshots, page reads, or mutations during a handoff. It should report the handoff prompt to the user and wait for the terminal tool result or an explicit user completion.
 
 ### Staged Commit
 
@@ -138,5 +142,6 @@ Commit reduces recognizable risk only. It requires both the popup's human approv
 - [Wait parameters](../schemas/rpc/v1/browser-wait.schema.json)
 - [Handoff parameters](../schemas/rpc/v1/browser-handoff.schema.json)
 - [Commit parameters](../schemas/rpc/v1/browser-commit.schema.json)
+- [Credential parameters](../schemas/rpc/v1/browser-credentials.schema.json)
 - [Commands](commands.md)
 - [Setup](setup.md)

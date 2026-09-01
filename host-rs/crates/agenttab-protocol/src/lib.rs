@@ -17,6 +17,7 @@ const MAX_SELECTOR_CHARS: usize = 2_048;
 const MAX_REF_CHARS: usize = 256;
 const MAX_ACTIONS: usize = 64;
 const MAX_ACTION_TEXT_CHARS: usize = 2_048;
+const MAX_KEEP_TAB_IDS: usize = 256;
 const MAX_ACTION_VALUE_CHARS: usize = 2_048;
 const MAX_UPLOAD_FILES: usize = 4;
 const MAX_UPLOAD_PATH_CHARS: usize = 512;
@@ -46,6 +47,10 @@ pub const RPC_SCHEMA_ASSETS: &[(&str, &str)] = &[
     (
         "status",
         include_str!("../../../../schemas/rpc/v1/status.schema.json"),
+    ),
+    (
+        "agenttab_finish",
+        include_str!("../../../../schemas/rpc/v1/agenttab-finish.schema.json"),
     ),
     (
         "browser_open",
@@ -175,8 +180,11 @@ pub enum RpcMethod {
     BrowserTabs,
     BrowserHandoff,
     BrowserCommit,
+    BrowserCredentials,
     #[serde(rename = "agenttab.status")]
     AgenttabStatus,
+    #[serde(rename = "agenttab.finish")]
+    AgenttabFinish,
     #[serde(rename = "agenttab.close")]
     AgenttabClose,
     BrowserDeveloper,
@@ -190,6 +198,7 @@ impl RpcMethod {
                 | Self::BrowserAct
                 | Self::BrowserHandoff
                 | Self::BrowserCommit
+                | Self::BrowserCredentials
                 | Self::BrowserDeveloper
         )
     }
@@ -285,8 +294,10 @@ pub enum MethodParams {
     Wait(BrowserWaitParams),
     Tabs(BrowserTabsParams),
     Handoff(BrowserHandoffParams),
+    Credentials(BrowserCredentialsParams),
     Commit(BrowserCommitParams),
     Status(BrowserTabsParams),
+    Finish(AgenttabFinishParams),
     Close(BrowserTabsParams),
     Developer(BrowserDeveloperParams),
 }
@@ -300,8 +311,10 @@ impl MethodParams {
             RpcMethod::BrowserWait => Self::Wait(decode_params(method, value)?),
             RpcMethod::BrowserTabs => Self::Tabs(decode_params(method, value)?),
             RpcMethod::BrowserHandoff => Self::Handoff(decode_params(method, value)?),
+            RpcMethod::BrowserCredentials => Self::Credentials(decode_params(method, value)?),
             RpcMethod::BrowserCommit => Self::Commit(decode_params(method, value)?),
             RpcMethod::AgenttabStatus => Self::Status(decode_params(method, value)?),
+            RpcMethod::AgenttabFinish => Self::Finish(decode_params(method, value)?),
             RpcMethod::AgenttabClose => Self::Close(decode_params(method, value)?),
             RpcMethod::BrowserDeveloper => Self::Developer(decode_params(method, value)?),
         };
@@ -317,8 +330,10 @@ impl MethodParams {
             Self::Wait(value) => serde_json::to_value(value),
             Self::Tabs(value) => serde_json::to_value(value),
             Self::Handoff(value) => serde_json::to_value(value),
+            Self::Credentials(value) => serde_json::to_value(value),
             Self::Commit(value) => serde_json::to_value(value),
             Self::Status(value) => serde_json::to_value(value),
+            Self::Finish(value) => serde_json::to_value(value),
             Self::Close(value) => serde_json::to_value(value),
             Self::Developer(value) => serde_json::to_value(value),
         }
@@ -515,6 +530,27 @@ pub enum WaitCondition {
 #[serde(deny_unknown_fields)]
 pub struct BrowserTabsParams {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishDisposition {
+    Auto,
+    Close,
+    Keep,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgenttabFinishParams {
+    #[serde(default = "default_finish_disposition")]
+    pub disposition: FinishDisposition,
+    #[serde(default)]
+    pub keep_tab_ids: Vec<u64>,
+}
+
+fn default_finish_disposition() -> FinishDisposition {
+    FinishDisposition::Auto
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserHandoffParams {
@@ -537,6 +573,37 @@ pub enum HandoffCompletion {
     ManualDone,
     Url { value: String },
     Selector { value: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserCredentialsParams {
+    Prepare {
+        tab_id: u64,
+        expected_page_revision: u64,
+    },
+    Fill {
+        tab_id: u64,
+        expected_page_revision: u64,
+        credential_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        otp_ref: Option<String>,
+    },
+    Next {
+        tab_id: u64,
+        expected_page_revision: u64,
+        credential_token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        otp_ref: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -730,6 +797,45 @@ impl MethodParams {
                     HandoffCompletion::Navigation | HandoffCompletion::ManualDone => {}
                 }
             }
+            Self::Credentials(BrowserCredentialsParams::Prepare { .. }) => {}
+            Self::Credentials(
+                BrowserCredentialsParams::Fill {
+                    credential_token,
+                    username_ref,
+                    password_ref,
+                    otp_ref,
+                    ..
+                }
+                | BrowserCredentialsParams::Next {
+                    credential_token,
+                    username_ref,
+                    password_ref,
+                    otp_ref,
+                    ..
+                },
+            ) => {
+                require_len(
+                    method,
+                    credential_token,
+                    32,
+                    MAX_STAGED_TOKEN_CHARS,
+                    "credential_token",
+                )?;
+                require(
+                    method,
+                    username_ref.is_some() || password_ref.is_some() || otp_ref.is_some(),
+                    "at least one credential field ref is required",
+                )?;
+                for (name, value) in [
+                    ("username_ref", username_ref),
+                    ("password_ref", password_ref),
+                    ("otp_ref", otp_ref),
+                ] {
+                    if let Some(value) = value {
+                        require_len(method, value, 1, MAX_REF_CHARS, name)?;
+                    }
+                }
+            }
             Self::Commit(params) => {
                 require_len(
                     method,
@@ -738,6 +844,25 @@ impl MethodParams {
                     MAX_STAGED_TOKEN_CHARS,
                     "staged_token",
                 )?;
+            }
+            Self::Finish(params) => {
+                require(
+                    method,
+                    params.keep_tab_ids.len() <= MAX_KEEP_TAB_IDS,
+                    format!("keep_tab_ids must contain at most {MAX_KEEP_TAB_IDS} items"),
+                )?;
+                for (index, tab_id) in params.keep_tab_ids.iter().enumerate() {
+                    require(
+                        method,
+                        *tab_id > 0,
+                        "keep_tab_ids must contain positive tab IDs",
+                    )?;
+                    require(
+                        method,
+                        !params.keep_tab_ids[..index].contains(tab_id),
+                        "keep_tab_ids must not contain duplicates",
+                    )?;
+                }
             }
             Self::Developer(params) => {
                 require_len(method, &params.action, 1, 128, "action")?;
@@ -1324,6 +1449,38 @@ pub enum NativeCloseTaskKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct NativeFinishTask {
+    pub protocol: String,
+    pub version: u16,
+    pub kind: NativeFinishTaskKind,
+    pub request_id: Uuid,
+    pub task_id: Uuid,
+    pub disposition: FinishDisposition,
+    #[serde(default)]
+    pub keep_tab_ids: Vec<u64>,
+}
+
+impl NativeFinishTask {
+    pub fn parse(value: Value) -> Result<Self, ProtocolError> {
+        let command: Self = serde_json::from_value(value)?;
+        if command.protocol != NATIVE_PROTOCOL || command.version != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedProtocol {
+                protocol: command.protocol.clone(),
+                version: command.version,
+            });
+        }
+        Ok(command)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeFinishTaskKind {
+    FinishTask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NativeResponse {
     pub protocol: String,
     pub version: u16,
@@ -1670,6 +1827,23 @@ pub fn native_close_task(request_id: Uuid, task_id: Uuid) -> Value {
         "kind": "close_task",
         "request_id": request_id,
         "task_id": task_id,
+    })
+}
+
+pub fn native_finish_task(
+    request_id: Uuid,
+    task_id: Uuid,
+    disposition: FinishDisposition,
+    keep_tab_ids: &[u64],
+) -> Value {
+    serde_json::json!({
+        "protocol": NATIVE_PROTOCOL,
+        "version": PROTOCOL_VERSION,
+        "kind": "finish_task",
+        "request_id": request_id,
+        "task_id": task_id,
+        "disposition": disposition,
+        "keep_tab_ids": keep_tab_ids,
     })
 }
 
@@ -2093,6 +2267,26 @@ mod tests {
 
         let (_, close) = RpcRequest::parse(request("agenttab.close", json!({}), false)).unwrap();
         assert!(matches!(close, MethodParams::Close(_)));
+
+        let (_, finish) = RpcRequest::parse(request(
+            "agenttab.finish",
+            json!({"disposition": "auto", "keep_tab_ids": [7, 9]}),
+            false,
+        ))
+        .unwrap();
+        assert!(matches!(
+            finish,
+            MethodParams::Finish(AgenttabFinishParams {
+                disposition: FinishDisposition::Auto,
+                keep_tab_ids,
+            }) if keep_tab_ids == vec![7, 9]
+        ));
+        assert!(RpcRequest::parse(request(
+            "agenttab.finish",
+            json!({"disposition": "auto", "keep_tab_ids": [7, 7]}),
+            false,
+        ))
+        .is_err());
     }
 
     #[test]
@@ -2279,6 +2473,22 @@ mod tests {
         let mut unknown = message;
         unknown["unexpected"] = json!(true);
         assert!(NativeCloseTask::parse(unknown).is_err());
+    }
+
+    #[test]
+    fn native_finish_task_is_strict_and_versioned() {
+        let request_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let message = native_finish_task(request_id, task_id, FinishDisposition::Auto, &[17]);
+        let parsed = NativeFinishTask::parse(message.clone()).unwrap();
+        assert_eq!(parsed.request_id, request_id);
+        assert_eq!(parsed.task_id, task_id);
+        assert_eq!(parsed.disposition, FinishDisposition::Auto);
+        assert_eq!(parsed.keep_tab_ids, vec![17]);
+
+        let mut unknown = message;
+        unknown["unexpected"] = json!(true);
+        assert!(NativeFinishTask::parse(unknown).is_err());
     }
 
     #[test]

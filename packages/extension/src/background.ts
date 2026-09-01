@@ -343,14 +343,22 @@ function errorOutcome(error: unknown, mutating: boolean, code: string): Outcome 
 }
 
 async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse> {
-  if (command.kind === "close_task") {
+  if (command.kind === "close_task" || command.kind === "finish_task") {
     try {
-      const closedTabIds = await ownership.closeTask(command.task_id);
-      await handoff.cancelForTask(command.task_id);
-      return completed(command.request_id, {
-        task_id: command.task_id,
-        closed_tab_ids: closedTabIds,
-      });
+      const result = command.kind === "close_task"
+        ? {
+          task_id: command.task_id,
+          closed_tab_ids: await ownership.closeTask(command.task_id),
+        }
+        : await ownership.finishTask(
+          command.task_id,
+          command.disposition,
+          command.keep_tab_ids,
+        );
+      if (command.kind === "close_task" || result.finished === true) {
+        await handoff.cancelForTask(command.task_id);
+      }
+      return completed(command.request_id, result);
     } catch (error) {
       return failed(
         command.request_id,
@@ -361,7 +369,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     }
   }
   const params = command.params;
-  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer";
+  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer" || command.method === "browser_credentials_fill";
   try {
     if (command.method === "commit_review_bind") {
       return completed(command.request_id, await browser.bindReview(command.task_id, params));
@@ -438,6 +446,19 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await ownership.assertOwned(command.task_id, targetTabId);
         await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.developer(targetTabId, action, cdpParams);
+      });
+      return completed(command.request_id, result);
+    }
+    if (command.method === "browser_credentials_fill") {
+      const targetTabId = tabId(params);
+      const result = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
+        await ownership.assertOwned(command.task_id, targetTabId);
+        await assertCurrentOrigin(targetTabId, command.origin_policy);
+        return browser.fillCredentials(
+          targetTabId,
+          params.expected_page_revision,
+          params.fields,
+        );
       });
       return completed(command.request_id, result);
     }
@@ -678,6 +699,7 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
       developer_mode: state.developerMode,
       handoff: state.handoff.active ? { prompt: state.handoff.prompt } : null,
       show_agent_pointer: state.showAgentPointer,
+      cleanup_policy: state.cleanupPolicy,
       tasks: Object.values(state.tasks).map((task) => ({
         task_id: task.taskId,
         name: task.name,
@@ -702,6 +724,16 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
       state.showAgentPointer = enabled;
     });
     return { enabled };
+  }
+  if (
+    message.kind === "set_cleanup_policy" &&
+    (message.policy === "automatic" || message.policy === "ask" || message.policy === "keep")
+  ) {
+    const policy = message.policy;
+    await mutateState((state) => {
+      state.cleanupPolicy = policy;
+    });
+    return { policy };
   }
   if (message.kind === "pause") {
     await handoff.pause();
@@ -747,10 +779,14 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
       throw error;
     }
   }
-  if (message.kind === "close_task" && typeof message.task_id === "string") {
-    await ownership.closeTask(message.task_id);
-    await handoff.cancelForTask(message.task_id);
-    return { closed: true };
+  if (
+    (message.kind === "close_task" || message.kind === "keep_task") &&
+    typeof message.task_id === "string"
+  ) {
+    const disposition = message.kind === "close_task" ? "close" : "keep";
+    const result = await ownership.finishTask(message.task_id, disposition);
+    if (result.finished === true) await handoff.cancelForTask(message.task_id);
+    return result;
   }
   throw new Error("Unsupported popup message");
 }

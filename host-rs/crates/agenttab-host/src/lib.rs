@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod credentials;
 pub mod guardrails;
 pub mod handoff;
 pub mod journal;

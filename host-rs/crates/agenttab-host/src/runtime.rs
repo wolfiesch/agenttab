@@ -1,4 +1,7 @@
 use crate::audit::{canonicalize, now_ms, AuditEntry, AuditLog};
+use crate::credentials::{
+    BrokerError, CredentialBroker, NeedsUserReason, PrepareResult, SelectResult,
+};
 use crate::guardrails::{GuardrailLoadError, Guardrails};
 use crate::handoff::HandoffState;
 use crate::journal::{
@@ -10,11 +13,12 @@ use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTrans
 use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
-    BrowserAction, BrowserCommitParams, BrowserHandoffParams, BrowserSnapshotParams,
-    BrowserWaitParams, ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload,
-    NativeHandoff, NativePopupCommitEvent, NativeResponse, NativeStagedCommit, NativeTab, Outcome,
-    ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest,
-    RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    AgenttabFinishParams, BrowserAction, BrowserCommitParams, BrowserCredentialsParams,
+    BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams, ConnectionAck, ConnectionInit,
+    MethodParams, NativeEventPayload, NativeHandoff, NativePopupCommitEvent, NativeResponse,
+    NativeStagedCommit, NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed,
+    RpcError, RpcMethod, RpcRequest, RpcResponse, TaskBinding, WaitCondition,
+    HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -24,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use url::Url;
 use uuid::Uuid;
 const RESPONSE_TASK_BINDING_RESERVE: usize = 512;
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -163,6 +168,7 @@ pub struct Runtime {
     audit: Arc<AuditLog>,
     native: Arc<dyn NativeTransport>,
     handoff: Arc<HandoffState>,
+    credentials: Arc<CredentialBroker>,
     task_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     global_gate: RwLock<()>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
@@ -202,12 +208,16 @@ impl Runtime {
             &paths.audit_log,
             guardrails.audit_enabled(),
         )?);
+        let credentials = Arc::new(CredentialBroker::new(
+            guardrails.one_password_policy().clone(),
+        ));
         let runtime = Arc::new(Self {
             lifecycle,
             journal,
             guardrails,
             audit,
             native,
+            credentials,
             handoff,
             task_locks: Mutex::new(HashMap::new()),
             global_gate: RwLock::new(()),
@@ -500,6 +510,69 @@ impl Runtime {
             return self.audited_value(
                 connection,
                 connection.task_id().ok().flatten(),
+                &request,
+                &params_value,
+                response,
+                started_at_ms,
+                started,
+                false,
+                false,
+            );
+        }
+        if request.method == RpcMethod::AgenttabFinish {
+            let task_id = connection.task_id().ok().flatten();
+            let response = match (task_id, params) {
+                (
+                    Some(task_id),
+                    MethodParams::Finish(AgenttabFinishParams {
+                        disposition,
+                        keep_tab_ids,
+                    }),
+                ) => self
+                    .native
+                    .finish_task(task_id, disposition, &keep_tab_ids, CLOSE_TASK_TIMEOUT)
+                    .map_err(|error| JournalError::NativeTaskCleanup(error.to_string()))
+                    .and_then(|result| {
+                        if result.finished {
+                            self.journal.close_task(task_id)?;
+                            connection.cancel();
+                            self.native.cancel_connection(connection.connection_id);
+                        }
+                        Ok(result)
+                    })
+                    .map(|result| {
+                        RpcResponse::success(
+                            request.request_id.clone(),
+                            if result.finished {
+                                Outcome::Completed
+                            } else {
+                                Outcome::NeedsUser
+                            },
+                            serde_json::to_value(result)
+                                .expect("native task finish result serializes"),
+                        )
+                    })
+                    .unwrap_or_else(|error| {
+                        RpcResponse::failure(
+                            request.request_id.clone(),
+                            Outcome::Unknown,
+                            journal_rpc_error(error),
+                        )
+                    }),
+                (None, MethodParams::Finish(_)) => RpcResponse::success(
+                    request.request_id.clone(),
+                    Outcome::Completed,
+                    json!({
+                        "finished": false,
+                        "closed_tab_ids": [],
+                        "retained_tab_ids": [],
+                    }),
+                ),
+                _ => unreachable!("protocol parser returns method-matched parameters"),
+            };
+            return self.audited_value(
+                connection,
+                task_id,
                 &request,
                 &params_value,
                 response,
@@ -1098,6 +1171,9 @@ impl Runtime {
                 return RpcResponse::failure(request_id, Outcome::NotStarted, error);
             }
         }
+        if let MethodParams::Credentials(credentials) = params {
+            return self.dispatch_credentials(connection_id, task_id, request_id, credentials);
+        }
 
         let mut committed_uploads = Vec::new();
         let mut committed_native_token = None;
@@ -1349,6 +1425,202 @@ impl Runtime {
         }
     }
 
+    fn dispatch_credentials(
+        &self,
+        connection_id: Uuid,
+        task_id: Uuid,
+        request_id: &str,
+        params: &BrowserCredentialsParams,
+    ) -> RpcResponse {
+        let (tab_id, expected_page_revision) = match params {
+            BrowserCredentialsParams::Prepare {
+                tab_id,
+                expected_page_revision,
+            }
+            | BrowserCredentialsParams::Fill {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
+            | BrowserCredentialsParams::Next {
+                tab_id,
+                expected_page_revision,
+                ..
+            } => (*tab_id, *expected_page_revision),
+        };
+        let host = match self.credential_host(tab_id) {
+            Ok(host) => host,
+            Err(error) => {
+                return RpcResponse::failure(request_id, Outcome::NotStarted, error);
+            }
+        };
+        if matches!(params, BrowserCredentialsParams::Prepare { .. }) {
+            return match self.credentials.prepare(task_id, tab_id, &host) {
+                PrepareResult::Ready {
+                    credential_token,
+                    candidate_count,
+                    expires_at_ms,
+                } => RpcResponse::success(
+                    request_id,
+                    Outcome::Completed,
+                    json!({
+                        "status": "ready",
+                        "credential_token": credential_token,
+                        "candidate_count": candidate_count,
+                        "expires_at_ms": expires_at_ms,
+                    }),
+                ),
+                PrepareResult::NeedsUser {
+                    reason,
+                    candidate_count,
+                } => credential_needs_user(request_id, reason, Some(candidate_count)),
+            };
+        }
+
+        let (credential_token, username_ref, password_ref, otp_ref, next) = match params {
+            BrowserCredentialsParams::Fill {
+                credential_token,
+                username_ref,
+                password_ref,
+                otp_ref,
+                ..
+            } => (credential_token, username_ref, password_ref, otp_ref, false),
+            BrowserCredentialsParams::Next {
+                credential_token,
+                username_ref,
+                password_ref,
+                otp_ref,
+                ..
+            } => (credential_token, username_ref, password_ref, otp_ref, true),
+            BrowserCredentialsParams::Prepare { .. } => unreachable!(),
+        };
+        let selection = match self.credentials.select(
+            credential_token,
+            task_id,
+            tab_id,
+            &host,
+            next,
+            otp_ref.is_some(),
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::NotStarted,
+                    credential_broker_error(error),
+                );
+            }
+        };
+        let SelectResult::Ready {
+            mut material,
+            attempt_number,
+            remaining_attempts,
+        } = selection
+        else {
+            let SelectResult::NeedsUser { reason } = selection else {
+                unreachable!()
+            };
+            return credential_needs_user(request_id, reason, None);
+        };
+        if (username_ref.is_some() && material.username.is_none())
+            || (password_ref.is_some() && material.password.is_none())
+            || (otp_ref.is_some() && material.otp.is_none())
+        {
+            return credential_needs_user(request_id, NeedsUserReason::UnsupportedCredential, None);
+        }
+        let mut fields = Vec::new();
+        if let (Some(r#ref), Some(value)) = (username_ref, material.username.take()) {
+            fields.push(json!({"kind": "username", "ref": r#ref, "value": value}));
+        }
+        if let (Some(r#ref), Some(value)) = (password_ref, material.password.take()) {
+            fields.push(json!({"kind": "password", "ref": r#ref, "value": value}));
+        }
+        if let (Some(r#ref), Some(value)) = (otp_ref, material.otp.take()) {
+            fields.push(json!({"kind": "otp", "ref": r#ref, "value": value}));
+        }
+        let native_params = json!({
+            "tab_id": tab_id,
+            "expected_page_revision": expected_page_revision,
+            "fields": fields,
+        });
+        let origin_policy = self.guardrails.native_origin_policy(tab_id);
+        let native = match self.native.dispatch(
+            connection_id,
+            task_id,
+            "browser_credentials_fill",
+            native_params,
+            origin_policy,
+            Duration::from_secs(30),
+        ) {
+            Ok(native) => native,
+            Err(error) => return native_failure(request_id, error),
+        };
+        match (native.outcome, native.result, native.error) {
+            (Outcome::Completed, Some(result), None) => {
+                let page_revision = result
+                    .get("page_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(expected_page_revision);
+                let field_was_filled = password_ref.is_some();
+                RpcResponse::success(
+                    request_id,
+                    Outcome::Completed,
+                    json!({
+                        "status": "filled",
+                        "attempt_number": attempt_number,
+                        "remaining_attempts": remaining_attempts,
+                        "filled_username": username_ref.is_some(),
+                        "filled_password": field_was_filled,
+                        "filled_otp": otp_ref.is_some(),
+                        "page_revision": page_revision,
+                    }),
+                )
+            }
+            (outcome, None, Some(error)) => {
+                RpcResponse::failure(request_id, outcome, self.guardrails.redact_error(error))
+            }
+            _ => RpcResponse::failure(
+                request_id,
+                Outcome::Unknown,
+                RpcError::new(
+                    "invalid_native_response",
+                    "Credential filling did not return exactly one result branch",
+                ),
+            ),
+        }
+    }
+
+    fn credential_host(&self, tab_id: u64) -> Result<String, RpcError> {
+        let tab_url = self.tab_urls.read().get(&tab_id).cloned().ok_or_else(|| {
+            RpcError::new(
+                "tab_origin_unverified",
+                "AgentTab has no verified current origin for this tab",
+            )
+        })?;
+        let url = Url::parse(&tab_url).map_err(|_| {
+            RpcError::new(
+                "credential_origin_unsupported",
+                "Credentials can only be filled on a verified HTTP or HTTPS origin",
+            )
+        })?;
+        let host = url.host_str().ok_or_else(|| {
+            RpcError::new(
+                "credential_origin_unsupported",
+                "Credentials can only be filled on a URL with a hostname",
+            )
+        })?;
+        let secure = url.scheme() == "https"
+            || (url.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1"));
+        if !secure {
+            return Err(RpcError::new(
+                "credential_origin_insecure",
+                "AgentTab will not fill credentials on an insecure remote origin",
+            )
+            .with_recovery("Use HTTPS or sign in manually after verifying the site."));
+        }
+        Ok(host.trim_end_matches('.').to_ascii_lowercase())
+    }
+
     fn attach_task_binding(
         &self,
         connection: &ConnectionContext,
@@ -1371,6 +1643,42 @@ impl Runtime {
     }
 }
 
+fn credential_needs_user(
+    request_id: &str,
+    reason: NeedsUserReason,
+    candidate_count: Option<usize>,
+) -> RpcResponse {
+    let mut result = json!({
+        "status": reason.status(),
+        "recovery": reason.recovery(),
+    });
+    if let Some(candidate_count) = candidate_count {
+        result
+            .as_object_mut()
+            .expect("credential response is an object")
+            .insert("candidate_count".into(), json!(candidate_count));
+    }
+    RpcResponse::success(request_id, Outcome::NeedsUser, result)
+}
+
+fn credential_broker_error(error: BrokerError) -> RpcError {
+    let (code, recovery) = match error {
+        BrokerError::InvalidToken => (
+            "credential_token_invalid",
+            "Prepare credentials again to obtain a fresh bound token.",
+        ),
+        BrokerError::BindingMismatch => (
+            "credential_binding_mismatch",
+            "Prepare credentials again on the current task, tab, and origin.",
+        ),
+        BrokerError::NextBeforeFill => (
+            "credential_next_before_fill",
+            "Fill the current candidate before requesting the next one.",
+        ),
+    };
+    RpcError::new(code, error.to_string()).with_recovery(recovery)
+}
+
 fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
     match params {
         MethodParams::Snapshot(
@@ -1382,10 +1690,27 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Wait(BrowserWaitParams { tab_id, .. }) => Some((*tab_id, None)),
         MethodParams::Act(params) => Some((params.tab_id, Some(params.expected_page_revision))),
         MethodParams::Handoff(params) => Some((params.tab_id, Some(params.expected_page_revision))),
+        MethodParams::Credentials(
+            BrowserCredentialsParams::Prepare {
+                tab_id,
+                expected_page_revision,
+            }
+            | BrowserCredentialsParams::Fill {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
+            | BrowserCredentialsParams::Next {
+                tab_id,
+                expected_page_revision,
+                ..
+            },
+        ) => Some((*tab_id, Some(*expected_page_revision))),
         MethodParams::Open(_)
         | MethodParams::Tabs(_)
         | MethodParams::Commit(_)
         | MethodParams::Status(_)
+        | MethodParams::Finish(_)
         | MethodParams::Close(_)
         | MethodParams::Developer(_) => None,
     }
@@ -1552,7 +1877,10 @@ pub(crate) enum RequestLockScope {
 pub(crate) fn request_lock_scope(method: RpcMethod, params: &Value) -> RequestLockScope {
     if matches!(
         method,
-        RpcMethod::BrowserSnapshot | RpcMethod::BrowserAct | RpcMethod::BrowserWait
+        RpcMethod::BrowserSnapshot
+            | RpcMethod::BrowserAct
+            | RpcMethod::BrowserWait
+            | RpcMethod::BrowserCredentials
     ) {
         if let Some(tab_id) = params.get("tab_id").and_then(Value::as_u64) {
             return RequestLockScope::Tab(tab_id);
@@ -1649,10 +1977,11 @@ fn enforce_response_limit(response: RpcResponse) -> RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::NativeTaskFinish;
     use agenttab_protocol::{
-        ConnectKind, NativeInventoryEvent, NativeOriginPolicy, NativeResponse, NativeResponseKind,
-        NativeStagedCommit, NativeTab, ResumeCapabilityConfirm, ResumeCapabilityConfirmKind,
-        RPC_PROTOCOL,
+        ConnectKind, FinishDisposition, NativeInventoryEvent, NativeOriginPolicy, NativeResponse,
+        NativeResponseKind, NativeStagedCommit, NativeTab, ResumeCapabilityConfirm,
+        ResumeCapabilityConfirmKind, RPC_PROTOCOL,
     };
     use parking_lot::Mutex;
     use serde_json::json;
@@ -1837,6 +2166,22 @@ mod tests {
                 return Err(NativeError::Disconnected);
             }
             Ok(())
+        }
+        fn finish_task(
+            &self,
+            task_id: Uuid,
+            _disposition: FinishDisposition,
+            keep_tab_ids: &[u64],
+            _timeout: Duration,
+        ) -> Result<NativeTaskFinish, NativeError> {
+            self.closed_tasks.lock().push(task_id);
+            Ok(NativeTaskFinish {
+                task_id,
+                finished: true,
+                closed_tab_ids: vec![31, 32],
+                retained_tab_ids: keep_tab_ids.to_vec(),
+                deferred: None,
+            })
         }
     }
     #[derive(Debug)]
@@ -2142,6 +2487,54 @@ mod tests {
         );
         assert_eq!(rejected["outcome"], "not_started");
         assert_eq!(rejected["error"]["code"], "connection_cancelled");
+    }
+
+    #[test]
+    fn agenttab_finish_finalizes_the_task_with_cleanup_receipts() {
+        let native = FakeNative::normal();
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let opened = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "tabs",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+        let capability = opened["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let task_id = opened["task"]["task_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap();
+        confirm_new_capability(&runtime, &connection, capability.clone());
+
+        let finished = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "finish",
+                "method": "agenttab.finish",
+                "params": {
+                    "disposition": "auto",
+                    "keep_tab_ids": [41]
+                }
+            }),
+        );
+
+        assert_eq!(finished["outcome"], "completed");
+        assert_eq!(finished["result"]["finished"], true);
+        assert_eq!(finished["result"]["closed_tab_ids"], json!([31, 32]));
+        assert_eq!(finished["result"]["retained_tab_ids"], json!([41]));
+        assert_eq!(*native.closed_tasks.lock(), vec![task_id]);
+        assert!(connection.is_cancelled());
+        assert!(runtime.journal.resume_task(&capability).unwrap().is_none());
     }
 
     fn confirm_new_capability(

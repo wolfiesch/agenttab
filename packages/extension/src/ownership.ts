@@ -93,6 +93,14 @@ export class OwnershipLedger {
     return this.serialize(() => this.closeTaskNow(taskId));
   }
 
+  finishTask(
+    taskId: string,
+    disposition: "auto" | "close" | "keep",
+    keepTabIds: readonly number[] = [],
+  ): Promise<Record<string, unknown>> {
+    return this.serialize(() => this.finishTaskNow(taskId, disposition, keepTabIds));
+  }
+
   async setTaskState(
     taskId: string,
     taskState: "working" | "needs_user" | "completed",
@@ -196,6 +204,7 @@ export class OwnershipLedger {
         if (revokedTabIds.length === 0) continue;
         for (const tabId of revokedTabIds) this.scheduler.revokeTab(tabId);
         task.tabIds = task.tabIds.filter((tabId) => !revokedTabIds.includes(tabId));
+        task.createdTabIds = task.createdTabIds.filter((tabId) => !revokedTabIds.includes(tabId));
         if (task.tabIds.length === 0) task.groupId = null;
         task.updatedAt = Date.now();
         changedTasks.push({ taskId: task.taskId, count: task.tabIds.length, revokedTabIds });
@@ -287,7 +296,7 @@ export class OwnershipLedger {
     const createdTabId = tab.id;
     if (createdTabId === undefined) throw new Error("Chrome did not return a created tab ID");
     try {
-      await this.grant(taskId, createdTabId, `Task ${taskId.slice(0, 8)}`);
+      await this.grant(taskId, createdTabId, `Task ${taskId.slice(0, 8)}`, true);
     } catch (error) {
       await chrome.tabs.remove(createdTabId).catch(() => undefined);
       throw error;
@@ -303,7 +312,7 @@ export class OwnershipLedger {
       });
     }
     const tabId = tab.id as number;
-    await this.grant(taskId, tabId, `Adopted ${taskId.slice(0, 8)}`);
+    await this.grant(taskId, tabId, `Adopted ${taskId.slice(0, 8)}`, false);
     if (chrome.action?.setBadgeText) {
       await chrome.action.setBadgeBackgroundColor({ tabId, color: "#6d5dfc" }).catch(() => undefined);
       await chrome.action.setBadgeText({ tabId, text: "✦" }).catch(() => undefined);
@@ -364,7 +373,7 @@ export class OwnershipLedger {
           await chrome.tabs.update(activeDestination.id as number, { active: true }).catch(() => undefined);
         }
       }
-      await this.grant(ownedParent.taskId, childTabId, ownedParent.name);
+      await this.grant(ownedParent.taskId, childTabId, ownedParent.name, true);
     } catch {
       // A popup or Chrome grouping race is not authority to close a user tab.
     }
@@ -390,6 +399,7 @@ export class OwnershipLedger {
       for (const task of Object.values(state.tasks)) {
         if (!task.tabIds.includes(tabId)) continue;
         task.tabIds = task.tabIds.filter((ownedTabId) => ownedTabId !== tabId);
+        task.createdTabIds = task.createdTabIds.filter((createdTabId) => createdTabId !== tabId);
         if (task.tabIds.length === 0) task.groupId = null;
         task.updatedAt = Date.now();
         return { taskId: task.taskId, count: task.tabIds.length };
@@ -404,6 +414,121 @@ export class OwnershipLedger {
     });
     await this.emitInventory();
     return true;
+  }
+
+  private async finishTaskNow(
+    taskId: string,
+    disposition: "auto" | "close" | "keep",
+    keepTabIds: readonly number[],
+  ): Promise<Record<string, unknown>> {
+    const state = await readState();
+    const task = state.tasks[taskId];
+    if (!task) {
+      return { task_id: taskId, finished: true, closed_tab_ids: [], retained_tab_ids: [] };
+    }
+    if (state.handoff.active && state.handoff.taskId === taskId) {
+      return {
+        task_id: taskId,
+        finished: false,
+        closed_tab_ids: [],
+        retained_tab_ids: [...task.tabIds],
+        deferred: "handoff_active",
+      };
+    }
+    if (Object.values(state.stagedCommits).some((staged) => staged.task_id === taskId)) {
+      return {
+        task_id: taskId,
+        finished: false,
+        closed_tab_ids: [],
+        retained_tab_ids: [...task.tabIds],
+        deferred: "commit_review_active",
+      };
+    }
+    if (disposition === "auto" && state.cleanupPolicy === "ask") {
+      await this.setTaskState(taskId, "completed");
+      return {
+        task_id: taskId,
+        finished: false,
+        closed_tab_ids: [],
+        retained_tab_ids: [...task.tabIds],
+        deferred: "user_confirmation",
+      };
+    }
+    const invalidKeepTabId = keepTabIds.find((tabId) => !task.tabIds.includes(tabId));
+    if (invalidKeepTabId !== undefined) {
+      throw Object.assign(new Error(`Tab ${invalidKeepTabId} is not owned by task ${taskId}`), {
+        code: "ownership_denied",
+      });
+    }
+    const retainAll = disposition === "keep" || (
+      disposition === "auto" && state.cleanupPolicy === "keep"
+    );
+    const requestedRetainedTabIds = new Set(
+      retainAll
+        ? task.tabIds
+        : task.tabIds.filter((tabId) => (
+          keepTabIds.includes(tabId) ||
+          (disposition === "auto" && !task.createdTabIds.includes(tabId))
+        )),
+    );
+    const retainedTabIds = new Set<number>();
+    const closedCandidates: number[] = [];
+    for (const tabId of task.tabIds) {
+      const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
+      if (!tab) continue;
+      if (
+        requestedRetainedTabIds.has(tabId) ||
+        task.groupId === null ||
+        tab.groupId !== task.groupId
+      ) {
+        retainedTabIds.add(tabId);
+      } else {
+        closedCandidates.push(tabId);
+      }
+    }
+    for (const tabId of task.tabIds) this.scheduler.revokeTab(tabId);
+    await mutateState((next) => {
+      delete next.tasks[taskId];
+      for (const [token, staged] of Object.entries(next.stagedCommits)) {
+        if (staged.task_id === taskId) delete next.stagedCommits[token];
+      }
+    });
+    for (const tabId of task.tabIds) await this.revisions.remove(tabId);
+    for (const tabId of retainedTabIds) {
+      const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
+      if (tab && task.groupId !== null && tab.groupId === task.groupId) {
+        await chrome.tabs.ungroup([tabId]).catch(() => undefined);
+      }
+      if (chrome.action?.setBadgeText) {
+        await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined);
+      }
+    }
+    const closedTabIds: number[] = [];
+    for (const tabId of closedCandidates) {
+      const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
+      if (!tab) continue;
+      if (task.groupId === null || tab.groupId !== task.groupId) {
+        retainedTabIds.add(tabId);
+        if (chrome.action?.setBadgeText) {
+          await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined);
+        }
+        continue;
+      }
+      try {
+        await chrome.tabs.remove(tabId);
+        closedTabIds.push(tabId);
+      } catch {
+        // Ownership is already durably removed; a missing/closed tab is safe.
+      }
+    }
+    this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
+    await this.emitInventory();
+    return {
+      task_id: taskId,
+      finished: true,
+      closed_tab_ids: closedTabIds,
+      retained_tab_ids: task.tabIds.filter((tabId) => retainedTabIds.has(tabId)),
+    };
   }
 
   private async closeTaskNow(taskId: string): Promise<number[]> {
@@ -423,6 +548,8 @@ export class OwnershipLedger {
     for (const tabId of tabIds) await this.revisions.remove(tabId);
     const closedTabIds: number[] = [];
     for (const tabId of tabIds) {
+      const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
+      if (!tab || existing.groupId === null || tab.groupId !== existing.groupId) continue;
       try {
         await chrome.tabs.remove(tabId);
         closedTabIds.push(tabId);
@@ -435,7 +562,7 @@ export class OwnershipLedger {
     return closedTabIds;
   }
 
-  private async grant(taskId: string, tabId: number, name: string): Promise<void> {
+  private async grant(taskId: string, tabId: number, name: string, created: boolean): Promise<void> {
     const before = (await chrome.tabs.get(tabId)) as TabLike;
     const state = await readState();
     const currentOwner = Object.values(state.tasks).find((task) => task.tabIds.includes(tabId));
@@ -445,6 +572,12 @@ export class OwnershipLedger {
       });
     }
     if (currentOwner && currentOwner.groupId === before.groupId && before.groupId !== NO_GROUP) {
+      if (created && !currentOwner.createdTabIds.includes(tabId)) {
+        await mutateState((next) => {
+          const task = next.tasks[taskId];
+          if (task && !task.createdTabIds.includes(tabId)) task.createdTabIds.push(tabId);
+        });
+      }
       await this.revisions.ensure(tabId);
       return;
     }
@@ -464,6 +597,7 @@ export class OwnershipLedger {
         name,
         groupId,
         tabIds: [],
+        createdTabIds: [],
         color: taskColor(taskId),
         state: "working",
         createdAt: Date.now(),
@@ -489,6 +623,7 @@ export class OwnershipLedger {
         const task = next.tasks[taskId] ?? previewTask;
         task.groupId = groupId;
         if (!task.tabIds.includes(tabId)) task.tabIds.push(tabId);
+        if (created && !task.createdTabIds.includes(tabId)) task.createdTabIds.push(tabId);
         task.updatedAt = Date.now();
         next.tasks[taskId] = task;
       });
