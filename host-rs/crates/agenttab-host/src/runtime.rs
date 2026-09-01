@@ -981,6 +981,8 @@ impl Runtime {
             json!({
                 "state": self.lifecycle.state(),
                 "protocol_version": PROTOCOL_VERSION,
+                "host_version": env!("CARGO_PKG_VERSION"),
+                "extension_version": self.native.extension_version(),
                 "handoff_active": self.handoff.is_active(),
                 "task_id": task_id,
             }),
@@ -2350,6 +2352,12 @@ mod tests {
             }),
         );
         assert_eq!(response["result"]["state"], "starting");
+        assert_eq!(
+            response["result"]["host_version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(response["result"]["protocol_version"], PROTOCOL_VERSION);
+        assert!(response["result"]["extension_version"].is_null());
         assert!(response["result"]["task_id"].is_null());
         let rejected = runtime.handle(
             &connection,

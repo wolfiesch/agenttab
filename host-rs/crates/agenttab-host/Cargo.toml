@@ -9,6 +9,10 @@ publish = false
 name = "agenttab-host"
 path = "src/main.rs"
 
+[[bin]]
+name = "agenttab-native"
+path = "src/bin/agenttab-native.rs"
+
 [dependencies]
 agenttab-protocol = { path = "../agenttab-protocol" }
 base64.workspace = true

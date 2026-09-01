@@ -2,6 +2,7 @@ import { execFile, execFileSync } from "node:child_process";
 import { createHash, verify as verifySignature } from "node:crypto";
 import {
   chmod,
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -14,17 +15,42 @@ import { existsSync } from "node:fs";
 import { arch as currentArch, homedir, platform as currentPlatform, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { inflateRawSync } from "node:zlib";
-import { setTimeout as delay } from "node:timers/promises";
-import { AgentTabClient, AgentTabError, type ConnectionAck } from "../../sdk-typescript/src/index";
 import identityJson from "../../../config/identity.json" with { type: "json" };
 import trustJson from "../../../config/release-trust.json" with { type: "json" };
 import migrationJson from "../../../config/migration-v1.json" with { type: "json" };
 import { planClientConfigs } from "./configs";
-import { applyTransaction, type PlannedFile, type TransactionResult } from "./transaction";
+import {
+  applyRegistryChanges,
+  activeReceiptDrift,
+  queryRegistryValue,
+  registryChangesForJournal,
+  verifyRuntimeReadiness,
+  withInstallerStateMutation,
+  windowsRegistryKeys,
+} from "./lifecycle";
+import {
+  activeStatePath,
+  canonicalJson,
+  expectationFromSnapshot,
+  loadActiveReceipt,
+  newReceiptPath,
+  ownershipForFile,
+  readOptionalBytes,
+  referenceForReceipt,
+  type InstallReceiptV2,
+  type RegistryOwnership,
+} from "./receipt";
+import {
+  activateDaemonService,
+  planDaemonService,
+  type DaemonServiceManager,
+} from "./service";
+import { applyTransaction, type FileExpectation, type PlannedFile, type TransactionResult } from "./transaction";
 import { fileURLToPath } from "node:url";
 
 const identity = identityJson as {
   product: string;
+  version: string;
   nativeHost: string;
   developmentExtension: { id: string; publicKey: string };
   webStoreExtensionId: string | null;
@@ -59,19 +85,9 @@ interface ArtifactManifest {
   assets: ArtifactEntry[];
 }
 
-interface InstallReceipt {
-  schemaVersion: 1;
-  version: string;
-  target: string;
-  manifestSha256: string;
-  assetSha256: string;
-  hostSha256: string;
-  cliSha256: string;
-  ompSha256: string;
-  extensionSha256: string;
-}
-
 export interface RuntimeAssets {
+  /** Exact version represented by these bundled CLI/OMP/extension bytes. */
+  version?: string;
   cliBundlePath: string;
   ompBundlePath: string;
   extensionDir: string;
@@ -93,6 +109,11 @@ export interface InstallOptions {
   openBrowser?: boolean;
   print?: (line: string) => void;
   transactionFailAfter?: number;
+  transactionCrashAfter?: number;
+  transactionCrashAfterExternal?: boolean;
+  registryFailAfter?: number;
+  /** Fault-injection hook for verifying plan-to-transaction compare-and-swap behavior. */
+  beforeTransaction?: () => Promise<void>;
 }
 
 export interface LegacyReport {
@@ -119,6 +140,11 @@ export interface InstallResult {
     passed: boolean;
     skipped: boolean;
     reason?: "dry_run" | "manual_extension_load";
+  };
+  service: {
+    manager: DaemonServiceManager;
+    status: "active" | "planned" | "shim_fallback";
+    reason?: string;
   };
 }
 
@@ -348,7 +374,18 @@ function zipEndOfCentralDirectory(archive: Buffer): number {
   throw zipError("is missing its end-of-central-directory record");
 }
 
-function extractWindowsZipHost(archive: Buffer, binaryName: string): Buffer {
+interface ZipExecutable {
+  name: string;
+  flags: number;
+  method: number;
+  expectedCrc: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  nameBytes: Buffer;
+  localOffset: number;
+}
+
+function extractWindowsZipExecutables(archive: Buffer, expectedNames: string[]): Map<string, Buffer> {
   const endOffset = zipEndOfCentralDirectory(archive);
   const disk = zipUInt16(archive, endOffset + 4);
   const centralDirectoryDisk = zipUInt16(archive, endOffset + 6);
@@ -359,105 +396,117 @@ function extractWindowsZipHost(archive: Buffer, binaryName: string): Buffer {
   if (
     disk !== 0 ||
     centralDirectoryDisk !== 0 ||
-    entriesOnDisk !== 1 ||
-    entries !== 1
+    entriesOnDisk !== expectedNames.length ||
+    entries !== expectedNames.length
   ) {
-    throw zipError(`must contain exactly ${binaryName}`);
+    throw zipError(`must contain exactly ${expectedNames.join(" and ")}`);
   }
   if (centralDirectoryOffset + centralDirectorySize !== endOffset) {
     throw zipError("has an invalid central directory");
   }
-  const centralOffset = centralDirectoryOffset;
-  if (zipUInt32(archive, centralOffset) !== ZIP_CENTRAL_DIRECTORY_FILE) {
-    throw zipError("has an invalid central-directory member");
+  const expected = new Set(expectedNames);
+  const members: ZipExecutable[] = [];
+  let centralOffset = centralDirectoryOffset;
+  for (let index = 0; index < entries; index += 1) {
+    if (zipUInt32(archive, centralOffset) !== ZIP_CENTRAL_DIRECTORY_FILE) {
+      throw zipError("has an invalid central-directory member");
+    }
+    const flags = zipUInt16(archive, centralOffset + 8);
+    const method = zipUInt16(archive, centralOffset + 10);
+    const expectedCrc = zipUInt32(archive, centralOffset + 16);
+    const compressedSize = zipUInt32(archive, centralOffset + 20);
+    const uncompressedSize = zipUInt32(archive, centralOffset + 24);
+    const nameLength = zipUInt16(archive, centralOffset + 28);
+    const extraLength = zipUInt16(archive, centralOffset + 30);
+    const memberCommentLength = zipUInt16(archive, centralOffset + 32);
+    const memberDisk = zipUInt16(archive, centralOffset + 34);
+    const creator = zipUInt16(archive, centralOffset + 4) >>> 8;
+    const attributes = zipUInt32(archive, centralOffset + 38);
+    const localOffset = zipUInt32(archive, centralOffset + 42);
+    const centralEnd = centralOffset + 46 + nameLength + extraLength + memberCommentLength;
+    if (centralEnd > endOffset || memberDisk !== 0) throw zipError("has an invalid central-directory member");
+    if ((flags & ~ZIP_UTF8_FLAG) !== 0 || (method !== 0 && method !== 8)) {
+      throw zipError("uses unsupported encryption, streaming, or compression");
+    }
+    if (uncompressedSize === 0 || uncompressedSize > MAX_HOST_EXECUTABLE_BYTES) {
+      throw zipError("has an invalid executable size");
+    }
+    const nameBytes = archive.subarray(centralOffset + 46, centralOffset + 46 + nameLength);
+    const name = zipMemberName(nameBytes);
+    if (!expected.delete(name)) throw zipError(`must contain exactly ${expectedNames.join(" and ")}`);
+    assertZipRegularFile(creator, attributes);
+    members.push({ name, flags, method, expectedCrc, compressedSize, uncompressedSize, nameBytes, localOffset });
+    centralOffset = centralEnd;
+  }
+  if (centralOffset !== endOffset || expected.size !== 0) {
+    throw zipError(`must contain exactly ${expectedNames.join(" and ")}`);
   }
 
-  const flags = zipUInt16(archive, centralOffset + 8);
-  const method = zipUInt16(archive, centralOffset + 10);
-  const expectedCrc = zipUInt32(archive, centralOffset + 16);
-  const compressedSize = zipUInt32(archive, centralOffset + 20);
-  const uncompressedSize = zipUInt32(archive, centralOffset + 24);
-  const nameLength = zipUInt16(archive, centralOffset + 28);
-  const extraLength = zipUInt16(archive, centralOffset + 30);
-  const memberCommentLength = zipUInt16(archive, centralOffset + 32);
-  const memberDisk = zipUInt16(archive, centralOffset + 34);
-  const creator = zipUInt16(archive, centralOffset + 4) >>> 8;
-  const attributes = zipUInt32(archive, centralOffset + 38);
-  const localOffset = zipUInt32(archive, centralOffset + 42);
-  const centralEnd = centralOffset + 46 + nameLength + extraLength + memberCommentLength;
-  if (centralEnd !== endOffset || memberDisk !== 0) throw zipError("has an invalid central-directory member");
-  if ((flags & ~ZIP_UTF8_FLAG) !== 0 || (method !== 0 && method !== 8)) {
-    throw zipError("uses unsupported encryption, streaming, or compression");
+  const executables = new Map<string, Buffer>();
+  const localMembers = [...members].sort((left, right) => left.localOffset - right.localOffset);
+  let expectedLocalOffset = 0;
+  for (const member of localMembers) {
+    const { localOffset } = member;
+    if (localOffset !== expectedLocalOffset || zipUInt32(archive, localOffset) !== ZIP_LOCAL_FILE) {
+      throw zipError("has an invalid local member");
+    }
+    const localFlags = zipUInt16(archive, localOffset + 6);
+    const localMethod = zipUInt16(archive, localOffset + 8);
+    const localCrc = zipUInt32(archive, localOffset + 14);
+    const localCompressedSize = zipUInt32(archive, localOffset + 18);
+    const localUncompressedSize = zipUInt32(archive, localOffset + 22);
+    const localNameLength = zipUInt16(archive, localOffset + 26);
+    const localExtraLength = zipUInt16(archive, localOffset + 28);
+    const localName = archive.subarray(localOffset + 30, localOffset + 30 + localNameLength);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const dataEnd = dataStart + member.compressedSize;
+    if (
+      localFlags !== member.flags ||
+      localMethod !== member.method ||
+      localCrc !== member.expectedCrc ||
+      localCompressedSize !== member.compressedSize ||
+      localUncompressedSize !== member.uncompressedSize ||
+      !localName.equals(member.nameBytes) ||
+      dataEnd > centralDirectoryOffset
+    ) {
+      throw zipError("has inconsistent local-member metadata");
+    }
+    let executable: Buffer;
+    try {
+      const data = archive.subarray(dataStart, dataEnd);
+      executable = member.method === 0
+        ? Buffer.from(data)
+        : inflateRawSync(data, { maxOutputLength: member.uncompressedSize });
+    } catch {
+      throw zipError("contains invalid compressed executable data");
+    }
+    if (executable.byteLength !== member.uncompressedSize || crc32(executable) !== member.expectedCrc) {
+      throw zipError("contains an invalid executable payload");
+    }
+    executables.set(member.name, executable);
+    expectedLocalOffset = dataEnd;
   }
-  if (uncompressedSize === 0 || uncompressedSize > MAX_HOST_EXECUTABLE_BYTES) {
-    throw zipError("has an invalid executable size");
-  }
-
-  const nameBytes = archive.subarray(centralOffset + 46, centralOffset + 46 + nameLength);
-  const name = zipMemberName(nameBytes);
-  if (name !== binaryName) throw zipError(`must contain exactly ${binaryName}`);
-  assertZipRegularFile(creator, attributes);
-  if (localOffset !== 0 || zipUInt32(archive, localOffset) !== ZIP_LOCAL_FILE) {
-    throw zipError("has an invalid local member");
-  }
-
-  const localFlags = zipUInt16(archive, localOffset + 6);
-  const localMethod = zipUInt16(archive, localOffset + 8);
-  const localCrc = zipUInt32(archive, localOffset + 14);
-  const localCompressedSize = zipUInt32(archive, localOffset + 18);
-  const localUncompressedSize = zipUInt32(archive, localOffset + 22);
-  const localNameLength = zipUInt16(archive, localOffset + 26);
-  const localExtraLength = zipUInt16(archive, localOffset + 28);
-  const localName = archive.subarray(localOffset + 30, localOffset + 30 + localNameLength);
-  const dataStart = localOffset + 30 + localNameLength + localExtraLength;
-  const dataEnd = dataStart + compressedSize;
-  if (
-    localFlags !== flags ||
-    localMethod !== method ||
-    localCrc !== expectedCrc ||
-    localCompressedSize !== compressedSize ||
-    localUncompressedSize !== uncompressedSize ||
-    !localName.equals(nameBytes) ||
-    dataEnd !== centralOffset
-  ) {
-    throw zipError("has inconsistent local-member metadata");
-  }
-
-  let executable: Buffer;
-  try {
-    const data = archive.subarray(dataStart, dataEnd);
-    executable = method === 0
-      ? Buffer.from(data)
-      : inflateRawSync(data, { maxOutputLength: uncompressedSize });
-  } catch {
-    throw zipError("contains invalid compressed executable data");
-  }
-  if (executable.byteLength !== uncompressedSize || crc32(executable) !== expectedCrc) {
-    throw zipError("contains an invalid executable payload");
-  }
-  return executable;
+  if (expectedLocalOffset !== centralDirectoryOffset) throw zipError("has unindexed local data");
+  return executables;
 }
 
-async function readJsonOptional<T>(path: string): Promise<T | null> {
-  try {
-    return JSON.parse(await readFile(path, "utf8")) as T;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    return null;
-  }
-}
-
-async function extractHost(archive: Buffer, stateDir: string, platform: NodeJS.Platform): Promise<{ bytes: Buffer; tempDir: string }> {
+async function extractHost(archive: Buffer, stateDir: string, platform: NodeJS.Platform): Promise<{ hostBytes: Buffer; shimBytes: Buffer; tempDir: string }> {
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const tempDir = await mkdtemp(join(stateDir, ".install-"));
   const binaryName = platform === "win32" ? "agenttab-host.exe" : "agenttab-host";
+  const shimName = platform === "win32" ? "agenttab-native.exe" : "agenttab-native";
   if (platform === "win32") {
     try {
       const hostPath = join(tempDir, binaryName);
-      const bytes = extractWindowsZipHost(archive, binaryName);
-      await writeFile(hostPath, bytes, { mode: 0o700 });
+      const shimPath = join(tempDir, shimName);
+      const executables = extractWindowsZipExecutables(archive, [binaryName, shimName]);
+      const hostBytes = executables.get(binaryName)!;
+      const shimBytes = executables.get(shimName)!;
+      await writeFile(hostPath, hostBytes, { mode: 0o700 });
+      await writeFile(shimPath, shimBytes, { mode: 0o700 });
       await chmod(hostPath, 0o755);
-      return { bytes, tempDir };
+      await chmod(shimPath, 0o755);
+      return { hostBytes, shimBytes, tempDir };
     } catch (error) {
       await rm(tempDir, { recursive: true, force: true });
       throw error;
@@ -470,18 +519,21 @@ async function extractHost(archive: Buffer, stateDir: string, platform: NodeJS.P
     .split(/\r?\n/)
     .filter(Boolean)
     .map((name) => name.replace(/^\.\//, ""));
-  if (listing.length !== 1 || listing[0] !== binaryName) {
-    throw new Error(`host archive must contain exactly ${binaryName}`);
+  if (listing.length !== 2 || new Set(listing).size !== 2 || !listing.includes(binaryName) || !listing.includes(shimName)) {
+    throw new Error(`host archive must contain exactly ${binaryName} and ${shimName}`);
   }
   if (listing.some((name) => name.startsWith("/") || name.split("/").includes(".."))) {
     throw new Error("host archive contains an unsafe path");
   }
   execFileSync("tar", ["-xzf", archivePath, "-C", tempDir]);
   const hostPath = join(tempDir, binaryName);
-  const metadata = await stat(hostPath);
-  if (!metadata.isFile()) throw new Error("host archive did not extract a regular file");
+  const shimPath = join(tempDir, shimName);
+  const metadata = await lstat(hostPath);
+  const shimMetadata = await lstat(shimPath);
+  if (!metadata.isFile() || !shimMetadata.isFile()) throw new Error("host archive did not extract regular executables");
   await chmod(hostPath, 0o755);
-  return { bytes: await readFile(hostPath), tempDir };
+  await chmod(shimPath, 0o755);
+  return { hostBytes: await readFile(hostPath), shimBytes: await readFile(shimPath), tempDir };
 }
 
 function quotePowerShell(value: string): string {
@@ -543,18 +595,33 @@ function extensionDigest(plans: PlannedFile[]): string {
   return hash.digest("hex");
 }
 
+function extensionVersion(plans: PlannedFile[], extensionRoot: string): string {
+  const manifest = plans.find((plan) => plan.path === join(extensionRoot, "manifest.json"));
+  if (!manifest) throw new Error("AgentTab extension bundle is missing manifest.json");
+  const parsed: unknown = JSON.parse(
+    (Buffer.isBuffer(manifest.content) ? manifest.content : Buffer.from(manifest.content)).toString("utf8"),
+  );
+  if (
+    typeof parsed !== "object"
+    || parsed === null
+    || Array.isArray(parsed)
+    || typeof (parsed as Record<string, unknown>).version !== "string"
+  ) throw new Error("AgentTab extension manifest has no version");
+  return (parsed as Record<string, unknown>).version as string;
+}
+
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function nativeManifest(hostPath: string): string {
+function nativeManifest(shimPath: string): string {
   const extensionIds = [identity.developmentExtension.id, identity.webStoreExtensionId].filter(
     (value): value is string => typeof value === "string" && value.length > 0,
   );
   return `${JSON.stringify({
     name: identity.nativeHost,
     description: "AgentTab local browser runtime",
-    path: hostPath,
+    path: shimPath,
     type: "stdio",
     allowed_origins: extensionIds.map((id) => `chrome-extension://${id}/`),
   }, null, 2)}\n`;
@@ -576,51 +643,6 @@ function nativeManifestPaths(home: string, stateDir: string, platform: NodeJS.Pl
     ];
   }
   return [join(stateDir, "native-messaging", `${identity.nativeHost}.json`)];
-}
-
-interface RegistryValue {
-  existed: boolean;
-  value: string | null;
-}
-
-function windowsRegistryKeys(): string[] {
-  return [
-    `HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\${identity.nativeHost}`,
-    `HKCU\\Software\\Chromium\\NativeMessagingHosts\\${identity.nativeHost}`,
-    `HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts\\${identity.nativeHost}`,
-  ];
-}
-
-function queryRegistryValue(key: string): RegistryValue {
-  try {
-    const output = execFileSync("reg.exe", ["query", key, "/ve"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    const match = output.match(/REG_SZ\s+([^\r\n]*)/);
-    return { existed: true, value: match?.[1]?.trim() || null };
-  } catch {
-    return { existed: false, value: null };
-  }
-}
-
-async function registerWindows(manifestPath: string): Promise<void> {
-  const snapshots = new Map<string, RegistryValue>();
-  const changed: string[] = [];
-  try {
-    for (const key of windowsRegistryKeys()) {
-      const current = queryRegistryValue(key);
-      snapshots.set(key, current);
-      if (current.value === manifestPath) continue;
-      execFileSync("reg.exe", ["add", key, "/ve", "/t", "REG_SZ", "/d", manifestPath, "/f"], { stdio: "pipe" });
-      changed.push(key);
-    }
-  } catch (error) {
-    for (const key of changed.reverse()) {
-      const previous = snapshots.get(key)!;
-      if (!previous.existed) execFileSync("reg.exe", ["delete", key, "/f"], { stdio: "pipe" });
-      else if (previous.value === null) execFileSync("reg.exe", ["delete", key, "/ve", "/f"], { stdio: "pipe" });
-      else execFileSync("reg.exe", ["add", key, "/ve", "/t", "REG_SZ", "/d", previous.value, "/f"], { stdio: "pipe" });
-    }
-    throw error;
-  }
 }
 
 function legacyManifestPaths(home: string, platform: NodeJS.Platform): string[] {
@@ -664,98 +686,43 @@ function startBrowser(platform: NodeJS.Platform): void {
   }
 }
 
-function isRetryableReadinessError(error: unknown): error is AgentTabError {
-  return error instanceof AgentTabError
-    && error.code === "runtime_not_ready"
-    && error.outcome === "not_started";
-}
-
-async function runReadiness(openBrowser: boolean, platform: NodeJS.Platform): Promise<void> {
-  if (openBrowser) startBrowser(platform);
-  const deadline = Date.now() + 20_000;
-  let client: AgentTabClient | undefined;
-  let connectError: unknown;
-  while (Date.now() < deadline) {
-    try {
-      client = await AgentTabClient.connect({ connectTimeoutMs: 500, requestTimeoutMs: 10_000 });
-      break;
-    } catch (error) {
-      connectError = error;
-      await delay(250);
-    }
-  }
-  if (!client) {
-    throw new InstallError("ipc", connectError instanceof Error ? connectError.message : "AgentTab host did not become ready", "agenttab doctor --layer ipc");
-  }
-  let lifecycleState: ConnectionAck["state"] = client.connection.state;
-  while (lifecycleState !== "ready" && Date.now() < deadline) {
-    try {
-      const status = await client.call<"agenttab.status", { state?: unknown }>("agenttab.status", {});
-      lifecycleState = typeof status.state === "string"
-        ? status.state as ConnectionAck["state"]
-        : undefined;
-      connectError = new Error(`AgentTab host is ${lifecycleState ?? "in an unknown lifecycle state"}`);
-    } catch (error) {
-      connectError = error;
-    }
-    if (lifecycleState !== "ready") await delay(250);
-  }
-  if (lifecycleState !== "ready") {
-    client.close();
-    throw new InstallError("ipc", connectError instanceof Error ? connectError.message : "AgentTab host did not become ready", "agenttab doctor --layer ipc");
-  }
-  let tabId: number | undefined;
-  let revision: number | undefined;
-  try {
-    let opened: Record<string, unknown> | undefined;
-    while (opened === undefined && Date.now() < deadline) {
-      try {
-        opened = await client.call<"browser_open", Record<string, unknown>>(
-          "browser_open",
-          { mode: "create", url: "about:blank", background: true },
-        );
-      } catch (error) {
-        if (!isRetryableReadinessError(error)) throw error;
-        const remaining = deadline - Date.now();
-        if (remaining > 0) await delay(Math.min(250, remaining));
-      }
-    }
-    if (opened === undefined) {
-      throw new Error("AgentTab extension did not become ready before the readiness deadline");
-    }
-    tabId = Number(opened.tab_id);
-    revision = Number(opened.page_revision);
-    if (!Number.isInteger(tabId) || !Number.isInteger(revision)) throw new Error("browser_open did not return tab_id and page_revision");
-    const snapshot = await client.call<"browser_snapshot", Record<string, unknown>>(
-      "browser_snapshot",
-      { tab_id: tabId, mode: "accessibility", max_nodes: 10 },
-    );
-    const latestRevision = Number(snapshot.page_revision);
-    if (Number.isInteger(latestRevision)) revision = latestRevision;
-  } catch (error) {
-    throw new InstallError("extension", error instanceof Error ? error.message : String(error), "agenttab doctor --layer extension");
-  } finally {
-    if (tabId !== undefined && revision !== undefined) {
-      await client.call("browser_act", {
-        tab_id: tabId,
-        expected_page_revision: revision,
-        actions: [{ kind: "close" }],
-      }).catch(() => undefined);
-    }
-    client.close();
-  }
-}
-
 function runtimeAssetsFromBundle(): RuntimeAssets {
   const root = dirname(fileURLToPath(import.meta.url));
   return {
+    version: identity.version,
     cliBundlePath: join(root, "cli.mjs"),
     ompBundlePath: join(root, "omp.mjs"),
     extensionDir: join(root, "extension"),
   };
 }
 
-export async function install(options: InstallOptions): Promise<InstallResult> {
+function compareVersions(left: string, right: string): number {
+  const parse = (value: string): { core: number[]; pre: string[] | null } => {
+    const [core, prerelease] = value.split("-", 2);
+    return { core: core.split(".").map(Number), pre: prerelease === undefined ? null : prerelease.split(".") };
+  };
+  const a = parse(left);
+  const b = parse(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (a.core[index] !== b.core[index]) return a.core[index] < b.core[index] ? -1 : 1;
+  }
+  if (a.pre === null || b.pre === null) return a.pre === b.pre ? 0 : a.pre === null ? 1 : -1;
+  const length = Math.max(a.pre.length, b.pre.length);
+  for (let index = 0; index < length; index += 1) {
+    const av = a.pre[index];
+    const bv = b.pre[index];
+    if (av === bv) continue;
+    if (av === undefined || bv === undefined) return av === undefined ? -1 : 1;
+    const an = /^[0-9]+$/.test(av) ? Number(av) : null;
+    const bn = /^[0-9]+$/.test(bv) ? Number(bv) : null;
+    if (an !== null && bn !== null) return an < bn ? -1 : 1;
+    if (an !== null || bn !== null) return an !== null ? -1 : 1;
+    return av < bv ? -1 : 1;
+  }
+  return 0;
+}
+
+async function installInternal(options: InstallOptions & { activation: "install" | "update" }): Promise<InstallResult> {
   const version = validVersion(options.version);
   const development = options.development === true;
   const platform = options.platform ?? currentPlatform();
@@ -763,6 +730,21 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
   const home = resolve(options.home ?? homedir());
   const stateDir = resolve(options.stateDir ?? join(home, ".agenttab"));
   const print = options.print ?? ((line: string) => console.log(line));
+  const active = await loadActiveReceipt(stateDir);
+  if (options.activation === "update") {
+    if (!active) throw new Error("agenttab update requires an existing managed AgentTab installation");
+    if (compareVersions(version, active.receipt.version) <= 0) {
+      throw new Error(`agenttab update requires a version newer than ${active.receipt.version}; use agenttab rollback for a downgrade`);
+    }
+  } else if (active && active.receipt.version !== version) {
+    throw new Error(`AgentTab ${active.receipt.version} is active; use agenttab update --version ${version} to activate a newer version`);
+  }
+  const runtime = options.runtimeAssets ?? runtimeAssetsFromBundle();
+  if (runtime.version !== undefined && runtime.version !== version) {
+    throw new Error(
+      `installer runtime ${runtime.version} cannot activate AgentTab ${version}; run the exact AgentTab ${version} installer package`,
+    );
+  }
   const manifestUrl = options.manifestUrl ?? defaultManifestUrl(version);
   if (manifestUrl.includes("/latest")) throw new Error("installer must never resolve a latest release URL");
   const signatureUrl = options.signatureUrl ?? `${manifestUrl}.sig`;
@@ -782,35 +764,39 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
 
   const versionRoot = join(stateDir, "versions", `v${version}`);
   const hostPath = join(versionRoot, target, platform === "win32" ? "agenttab-host.exe" : "agenttab-host");
-  const receiptPath = join(versionRoot, "install-receipt.json");
+  const shimPath = join(versionRoot, target, platform === "win32" ? "agenttab-native.exe" : "agenttab-native");
+  const runtimeConfigPath = join(versionRoot, target, "agenttab-runtime.json");
   const manifestSha = sha256(manifestBytes);
-  const priorReceipt = await readJsonOptional<InstallReceipt>(receiptPath);
   let hostBytes: Buffer;
+  let shimBytes: Buffer;
   if (
-    priorReceipt?.schemaVersion === 1 &&
-    priorReceipt.version === version &&
-    priorReceipt.target === target &&
-    priorReceipt.manifestSha256 === manifestSha &&
-    priorReceipt.assetSha256 === asset.sha256 &&
-    existsSync(hostPath)
+    active?.receipt.version === version &&
+    active.receipt.target === target &&
+    active.receipt.manifestSha256 === manifestSha &&
+    active.receipt.assetSha256 === asset.sha256 &&
+    existsSync(hostPath) &&
+    existsSync(shimPath)
   ) {
-    hostBytes = await readFile(hostPath);
-    if (sha256(hostBytes) !== priorReceipt.hostSha256) throw new Error("installed AgentTab host does not match its receipt");
+    [hostBytes, shimBytes] = await Promise.all([readFile(hostPath), readFile(shimPath)]);
+    if (sha256(hostBytes) !== active.receipt.hostSha256) throw new Error("installed AgentTab host does not match its receipt");
+    if (sha256(shimBytes) !== active.receipt.shimSha256) throw new Error("installed AgentTab native shim does not match its receipt");
     await verifyPlatformSignature(hostPath, asset, platform);
+    await verifyPlatformSignature(shimPath, asset, platform);
   } else {
     const archive = await fetchBytes(asset.url, development);
     if (archive.byteLength !== asset.bytes) throw new Error(`host asset byte count mismatch: expected ${asset.bytes}, got ${archive.byteLength}`);
     if (sha256(archive) !== asset.sha256) throw new Error("host asset SHA-256 mismatch");
     const extracted = await extractHost(archive, options.dryRun ? tmpdir() : stateDir, platform);
     try {
-      hostBytes = extracted.bytes;
+      hostBytes = extracted.hostBytes;
+      shimBytes = extracted.shimBytes;
       await verifyPlatformSignature(join(extracted.tempDir, basename(hostPath)), asset, platform);
+      await verifyPlatformSignature(join(extracted.tempDir, basename(shimPath)), asset, platform);
     } finally {
       await rm(extracted.tempDir, { recursive: true, force: true });
     }
   }
 
-  const runtime = options.runtimeAssets ?? runtimeAssetsFromBundle();
   const cliBytes = await readFile(runtime.cliBundlePath);
   const ompBytes = await readFile(runtime.ompBundlePath);
   const cliPath = join(versionRoot, "agenttab-cli.mjs");
@@ -821,26 +807,27 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
   const wrapper = platform === "win32"
     ? `@\"${process.execPath}\" \"${cliPath}\" %*\r\n`
     : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(cliPath)} \"$@\"\n`;
-  const receipt: InstallReceipt = {
-    schemaVersion: 1,
-    version,
-    target,
-    manifestSha256: manifestSha,
-    assetSha256: asset.sha256,
-    hostSha256: sha256(hostBytes),
-    cliSha256: sha256(cliBytes),
-    ompSha256: sha256(ompBytes),
-    extensionSha256: extensionDigest(extensionPlans),
-  };
-  const manifestContent = nativeManifest(hostPath);
+  const manifestContent = nativeManifest(shimPath);
+  const runtimeConfig = `${JSON.stringify({ schemaVersion: 1, stateDir }, null, 2)}\n`;
   const manifestPaths = nativeManifestPaths(home, stateDir, platform);
-  const configPlan = await planClientConfigs({ home, cliPath: cliCommand, ompAdapterPath: ompPath, platform });
-  const files: PlannedFile[] = [
+  const configPlan = await planClientConfigs({
+    home,
+    cliPath: cliCommand,
+    ompAdapterPath: ompPath,
+    platform,
+    previousOwnership: active?.receipt.configs,
+  });
+  const servicePlan = planDaemonService({ platform, home, hostPath, stateDir });
+  const artifactFiles: PlannedFile[] = [
     { path: hostPath, content: hostBytes, mode: 0o755, label: "AgentTab host" },
+    { path: shimPath, content: shimBytes, mode: 0o755, label: "AgentTab native shim" },
+    { path: runtimeConfigPath, content: runtimeConfig, mode: 0o600, label: "AgentTab runtime configuration" },
     { path: cliPath, content: cliBytes, mode: 0o755, label: "AgentTab CLI" },
     { path: ompPath, content: ompBytes, mode: 0o600, label: "AgentTab OMP adapter" },
-    { path: cliCommand, content: wrapper, mode: platform === "win32" ? 0o600 : 0o755, label: "AgentTab command" },
     ...extensionPlans,
+  ];
+  const activationFiles: PlannedFile[] = [
+    { path: cliCommand, content: wrapper, mode: platform === "win32" ? 0o600 : 0o755, label: "AgentTab command" },
     ...manifestPaths.map((path) => ({
       path,
       content: manifestContent,
@@ -849,20 +836,217 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
       semanticDiff: [
         `--- native host ${identity.nativeHost}`,
         `+++ native host ${identity.nativeHost}`,
-        `+path: ${hostPath}`,
+        `+path: ${shimPath}`,
         `+allowed_origins: ${[identity.developmentExtension.id, identity.webStoreExtensionId].filter(Boolean).join(", ")}`,
       ].join("\n"),
     })),
+    ...(development ? [] : servicePlan.files),
+  ];
+  const cliSha = sha256(cliBytes);
+  const ompSha = sha256(ompBytes);
+  const extensionSha = extensionDigest(extensionPlans);
+  const installedExtensionVersion = extensionVersion(extensionPlans, extensionRoot);
+  const isRepeat = active?.receipt.version === version
+    && active.receipt.target === target
+    && active.receipt.manifestSha256 === manifestSha
+    && active.receipt.assetSha256 === asset.sha256
+    && active.receipt.hostSha256 === sha256(hostBytes)
+    && active.receipt.shimSha256 === sha256(shimBytes)
+    && active.receipt.cliSha256 === cliSha
+    && active.receipt.ompSha256 === ompSha
+    && active.receipt.extensionSha256 === extensionSha
+    && active.receipt.extensionVersion === installedExtensionVersion
+    && active.receipt.daemonService.manager === servicePlan.manager
+    && active.receipt.daemonService.managed === !development;
+  if (active?.receipt.version === version && !isRepeat) {
+    throw new Error(`AgentTab ${version} runtime assets do not match its active receipt; use a new signed version`);
+  }
+  if (isRepeat) {
+    const drift = await activeReceiptDrift(active!.receipt, platform);
+    if (drift.length > 0) {
+      throw new Error(
+        `AgentTab ${version} active resources changed after installation: ${drift.join(", ")}`,
+      );
+    }
+    const plannedFiles = [
+      ...artifactFiles.map((file) => ({ file, role: "artifact" as const })),
+      ...activationFiles.map((file) => ({ file, role: "activation" as const })),
+    ];
+    if (
+      active!.receipt.files.length !== plannedFiles.length
+      || active!.receipt.files.some((owned) =>
+        !plannedFiles.some((planned) => planned.file.path === owned.path && planned.role === owned.role)
+      )
+    ) throw new Error(`AgentTab ${version} active receipt file set does not match this installer runtime`);
+    for (const { file: planned, role } of plannedFiles) {
+      const prior = active!.receipt.files.find((file) => file.role === role && file.path === planned.path);
+      if (!prior) throw new Error(`AgentTab ${version} active receipt does not own expected file: ${planned.path}`);
+      planned.expectedBefore = {
+        exists: true,
+        sha256: prior.installedSha256,
+        ...(prior.installedMode === undefined ? {} : { mode: prior.installedMode }),
+      } satisfies FileExpectation;
+    }
+  }
+
+  if (active && active.receipt.version !== version) {
+    for (const planned of activationFiles) {
+      const prior = active.receipt.files.find((file) => file.role === "activation" && file.path === planned.path);
+      if (!prior) continue;
+      planned.expectedBefore = {
+        exists: true,
+        sha256: prior.installedSha256,
+        ...(prior.installedMode === undefined ? {} : { mode: prior.installedMode }),
+      };
+      const current = await readOptionalBytes(planned.path);
+      const currentMode = current && process.platform !== "win32" ? (await stat(planned.path)).mode & 0o777 : undefined;
+      if (
+        current === null
+        || sha256(current) !== prior.installedSha256
+        || (prior.installedMode !== undefined && currentMode !== undefined && prior.installedMode !== currentMode)
+      ) {
+        throw new Error(`AgentTab activation file changed after ${active.receipt.version}: ${planned.path}`);
+      }
+    }
+  }
+
+  const registry: RegistryOwnership[] = [];
+  const registryChanges: Parameters<typeof applyRegistryChanges>[0] = [];
+  if (platform === "win32") {
+    for (const key of windowsRegistryKeys()) {
+      const current = queryRegistryValue(key);
+      const prior = active?.receipt.registry.find((entry) => entry.key === key);
+      if (active && prior && (current.existed !== true || current.value !== prior.installedValue)) {
+        throw new Error(`AgentTab registry value changed after ${active.receipt.version}: ${key}`);
+      }
+      const installedValue = manifestPaths[0];
+      const owned = current.existed !== true || current.value !== installedValue;
+      registry.push({ key, installedValue, previous: current, owned });
+      if (!isRepeat && owned) registryChanges.push({ key, expected: current, target: { existed: true, value: installedValue } });
+    }
+  }
+
+  let receiptPath: string;
+  let receiptBytes: Buffer;
+  let activeBytes: Buffer;
+  let receipt: InstallReceiptV2;
+  if (isRepeat) {
+    receiptPath = active.state.receiptPath;
+    receiptBytes = active.bytes;
+    activeBytes = canonicalJson(active.state);
+    receipt = active.receipt;
+  } else {
+    receiptPath = newReceiptPath(stateDir, version);
+    const previousActive = active?.stateSnapshot ?? { exists: false as const };
+    const ownedFiles = await Promise.all([
+      ...artifactFiles.map((file) => ownershipForFile(file, "artifact")),
+      ...activationFiles.map((file) => ownershipForFile(file, "activation")),
+    ]);
+    receipt = {
+      schemaVersion: 2,
+      activationId: basename(receiptPath, ".json"),
+      activatedAt: new Date().toISOString(),
+      version,
+      target,
+      platform,
+      stateDir,
+      home,
+      manifestSha256: manifestSha,
+      assetSha256: asset.sha256,
+      hostSha256: sha256(hostBytes),
+      shimSha256: sha256(shimBytes),
+      cliSha256: cliSha,
+      ompSha256: ompSha,
+      extensionSha256: extensionSha,
+      extensionVersion: installedExtensionVersion,
+      daemonService: { manager: servicePlan.manager, managed: !development },
+      previousActive,
+      previousReceipt: active ? {
+        version: active.state.version,
+        receiptPath: active.state.receiptPath,
+        receiptSha256: active.state.receiptSha256,
+      } : null,
+      files: ownedFiles,
+      configs: configPlan.ownership,
+      registry,
+    };
+    receiptBytes = canonicalJson(receipt);
+    activeBytes = canonicalJson({
+      schemaVersion: 1,
+      ...referenceForReceipt(version, receiptPath, receiptBytes),
+    });
+  }
+
+  const files: PlannedFile[] = [
+    ...artifactFiles,
+    ...activationFiles,
     ...configPlan.files,
-    { path: receiptPath, content: `${JSON.stringify(receipt, null, 2)}\n`, mode: 0o600, label: "AgentTab install receipt" },
+    {
+      path: receiptPath,
+      content: receiptBytes,
+      mode: 0o600,
+      label: "AgentTab activation receipt",
+      expectedBefore: isRepeat
+        ? expectationFromSnapshot(active!.receiptSnapshot)
+        : { exists: false },
+    },
+    {
+      path: activeStatePath(stateDir),
+      content: activeBytes,
+      mode: 0o600,
+      label: "AgentTab active activation",
+      expectedBefore: expectationFromSnapshot(active?.stateSnapshot ?? { exists: false }),
+      statePointer: true,
+    },
   ];
 
+  await options.beforeTransaction?.();
+  let service: InstallResult["service"] = {
+    manager: servicePlan.manager,
+    status: development ? "shim_fallback" : options.dryRun ? "planned" : "shim_fallback",
+    ...(development ? { reason: "development installs use on-demand daemon startup" } : {}),
+  };
   const transaction = await applyTransaction(files, {
     dryRun: options.dryRun,
     failAfter: options.transactionFailAfter,
+    crashAfter: options.transactionCrashAfter,
+    crashAfterExternal: options.transactionCrashAfterExternal,
     printDiff: (diff) => print(diff),
-    afterApply: platform === "win32" ? () => registerWindows(manifestPaths[0]) : undefined,
+    journal: {
+      stateDir,
+      operation: options.activation,
+      external: registryChangesForJournal(registryChanges),
+    },
+    applyExternal: registryChanges.length === 0
+      ? undefined
+      : () => applyRegistryChanges(registryChanges, options.registryFailAfter),
+    afterApply: options.dryRun ? undefined : async () => {
+      try {
+        if (options.verifyReadiness === true) {
+          if (options.openBrowser !== false) startBrowser(platform);
+          await verifyRuntimeReadiness({ stateDir, home, platform, version });
+        }
+      } catch (error) {
+        if (error instanceof InstallError) throw error;
+        const enriched = error as Error & { layer?: string; recovery?: string };
+        if (enriched.layer) {
+          throw new InstallError(enriched.layer, enriched.message, enriched.recovery ?? `agenttab doctor --layer ${enriched.layer}`);
+        }
+        throw error;
+      }
+    },
   });
+
+  if (!development && !options.dryRun) {
+    try {
+      await activateDaemonService(servicePlan);
+      service = { manager: servicePlan.manager, status: "active" };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      service = { manager: servicePlan.manager, status: "shim_fallback", reason };
+      print(`Could not activate the ${servicePlan.manager} user service; Chrome will start the daemon on demand: ${reason}`);
+    }
+  }
 
   for (const skipped of configPlan.skipped) {
     print(`Skipped ${skipped.client} config at ${skipped.path}: ${skipped.reason}`);
@@ -884,7 +1068,6 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
     readiness = { passed: false, skipped: true, reason: "dry_run" };
     extensionStatus = "planned";
   } else if (options.verifyReadiness === true) {
-    await runReadiness(options.openBrowser !== false, platform);
     readiness = { passed: true, skipped: false };
     extensionStatus = "verified";
   } else {
@@ -902,5 +1085,28 @@ export async function install(options: InstallOptions): Promise<InstallResult> {
     legacy,
     extension: { path: extensionRoot, status: extensionStatus, instructions },
     readiness,
+    service,
   };
+}
+
+export async function install(options: InstallOptions): Promise<InstallResult> {
+  const home = resolve(options.home ?? homedir());
+  const stateDir = resolve(options.stateDir ?? join(home, ".agenttab"));
+  return withInstallerStateMutation(
+    stateDir,
+    "install",
+    options.dryRun,
+    () => installInternal({ ...options, activation: "install" }),
+  );
+}
+
+export async function update(options: InstallOptions): Promise<InstallResult> {
+  const home = resolve(options.home ?? homedir());
+  const stateDir = resolve(options.stateDir ?? join(home, ".agenttab"));
+  return withInstallerStateMutation(
+    stateDir,
+    "update",
+    options.dryRun,
+    () => installInternal({ ...options, activation: "update" }),
+  );
 }

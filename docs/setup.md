@@ -67,7 +67,7 @@ The manifest keeps `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`
 
 The frozen native host identity is `dev.agenttab.host`. The extension build derives its stable development identity and the native-host allowed origins from [config/identity.json](../config/identity.json). Do not edit a generated native-host JSON, substitute an extension ID, or add an origin by hand.
 
-A successful installer registers the same native-host manifest for supported browser locations:
+A successful installer registers the same native-host manifest for supported browser locations. The manifest launches the small `agenttab-native` relay; the per-user `agenttab-host daemon` keeps Core IPC and the journal alive across Chrome service-worker or native-port churn. Stable installs attempt to activate a user-level launchd, systemd, or Windows scheduled-task entry without elevation. If that service manager is unavailable, the relay starts the daemon on demand instead:
 
 | Platform | Native Messaging registration |
 |---|---|
@@ -97,13 +97,15 @@ AgentTab v2 is side-by-side and recoverable:
 
 The installer detects the old native-host registration and known legacy state artifacts, reports them, and leaves them untouched. It never silently removes the v1 extension, registration, files, policies, or logs.
 
-## Rollback and uninstall status
+## Update, rollback, and uninstall
 
-The installer stages changed files, creates backups for replaced files, and rolls back touched files if a multi-file installation transaction fails. A second successful installation of the same verified version leaves matching files unchanged.
+The installer serializes each install, update, rollback, uninstall, or prune for a state directory with a cross-process lock. It records a recovery intent, stages changed files, creates backups for replaced or deleted files, and preflights required same-directory hard links on every target filesystem before the first target mutation. Unsupported exFAT/SMB configurations therefore fail without partially activating AgentTab. It rolls back touched files and exact Windows registry defaults if a multi-file transaction or requested readiness gate fails. A later mutating command recovers an interrupted, uncommitted intent before planning new work; it preserves and reports any resource that no longer matches either recorded transaction side. Unix uses directory durability barriers. Node exposes no equivalent Windows directory barrier, so Windows guarantees process-crash recovery but not sudden power-loss namespace atomicity; the installation doctor check reports this explicitly. A second successful installation of the same verified version leaves matching files unchanged. An update is explicit and version-aware: `agenttab update --version X.Y.Z` accepts only an exact version newer than the active managed receipt. The prior version stays staged for `agenttab rollback`.
 
 To return a test profile to the available legacy path, disable AgentTab manually in `chrome://extensions` and continue using the preserved Chrome Bridge v1.0.1 setup. Do not delete Chrome Bridge files as part of that rollback.
 
-There is **no `agenttab uninstall` command in the current CLI source**, and the current installer does not implement an automated v2 removal procedure. Keep the install receipt, native-host manifest, and any listed backups until a supported uninstall path is released. This is intentionally not replaced with an unsafe manual-deletion recipe.
+For a managed v2 test installation, `agenttab rollback`, `agenttab uninstall`, and `agenttab prune --keep N` use schema-v2 receipts. Cleanup restores or removes a file only while its hash and mode still match the receipt. Rollback aborts before any mutation if an activation file, owned client entry, or Windows registry default drifted. Prune restores a receipt's prior file when an inactive artifact displaced one, and deletes only when the prior snapshot records absence. Client and registry cleanup restores exact owned values while preserving later user edits and unrelated configuration. Registry cleanup deletes only the owned default value, never a browser/vendor key recursively. File cleanup names every exact receipt-owned file; it does not recursively delete the state directory or a version tree. Use `--dry-run` before cleanup when inspecting a test machine.
+
+Uninstall affects only AgentTab v2 receipts and values. It never removes the preserved Chrome Bridge v1 extension, registration, state, policy, token, or logs. Receipt-less or older schema-v1 test installs are intentionally not guessed at; reinstall them through the managed v2 flow before using automated lifecycle commands.
 
 ## Supported-platform state
 

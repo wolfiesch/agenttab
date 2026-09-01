@@ -98,6 +98,7 @@ jobs:
               --version "$version" \
               --target "$target" \
               --binary "$cargo_target_dir/release/agenttab-host" \
+              --shim "$cargo_target_dir/release/agenttab-native" \
               --out-dir "$release_dir"
             python3 scripts/verify_release_archives.py \
               --host-archive "$release_dir/agenttab-host-v$version-$target.tar.gz" \
