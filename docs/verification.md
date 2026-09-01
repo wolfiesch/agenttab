@@ -24,6 +24,12 @@ cargo build --release --locked --manifest-path host-rs/Cargo.toml -p agenttab-ho
 
 The workspace checks TypeScript adapters, extension code, installer, OMP adapter, and package builds. The architecture gates cover manifest identity, required and optional permission behavior, RPC schemas, forbidden legacy surface, and Rust IPC framing. They do not operate a real signed-in browser.
 
+## Pull request routing
+
+Pull requests that change only `README.md`, `CHANGELOG.md`, `LICENSE`, documentation text under `docs/`, or a top-level GitHub Markdown file use the lightweight CI lane. The classifier still scans added public text for credentials, private paths, session identifiers, and private hosts. Source, manifest, workflow, nested GitHub, executable documentation, mixed, empty, or ambiguous changes use the full cross-platform lane.
+
+Branch protection requires the stable `verify` check. An event-driven review gate publishes `exact-head-review` only when the automated review commit matches the current pull-request head. A new push invalidates that status and requires a fresh review; unresolved review threads remain merge blockers.
+
 ## Live browser evidence
 
 Use a disposable Chrome profile and a disposable test account. Reload the unpacked extension through Chrome's extension UI, then observe the actual surface after every UI action. Exercise:
