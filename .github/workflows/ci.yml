@@ -14,7 +14,88 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  classify:
+    name: classify
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      lane: ${{ steps.policy.outputs.lane }}
+      reason: ${{ steps.policy.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Select comparison range
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            printf 'base=\nhead=\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head"
+          head="$(git rev-parse "refs/remotes/pull/${PR_NUMBER}/head")"
+          if [[ "$head" != "$PR_HEAD_SHA" ]]; then
+            echo "pull-request head does not match event payload" >&2
+            exit 1
+          fi
+          base="$(git merge-base "$PR_BASE_SHA" "$head")"
+          {
+            printf 'base=%s\n' "$base"
+            printf 'head=%s\n' "$head"
+          } >> "$GITHUB_OUTPUT"
+      - name: Classify changes and scan public text
+        id: policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            printf 'lane=full\nreason=main-push\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! -f .github/scripts/ci_policy.py ]]; then
+            echo "::warning::CI policy is unavailable on the base revision; selecting the full lane without the public-text scan"
+            printf 'lane=full\nreason=policy-unavailable\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 .github/scripts/ci_policy.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --github-output "$GITHUB_OUTPUT"
+
+  ci-policy:
+    name: ci-policy
+    needs: classify
+    if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test CI policy
+        run: python3 .github/scripts/test_ci_policy.py
+
   ci:
+    needs: classify
+    if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
     runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.M1_CI_ENABLED == 'true' && '["self-hosted","macOS","ARM64","wolfie-m1","trusted"]' || '"macos-latest"') }}
     timeout-minutes: 20
     steps:
@@ -90,6 +171,8 @@ jobs:
             --root "$HOME/Library/Caches/agenttab-ci/rust-1.97"
 
   adapters-portability:
+    needs: classify
+    if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +206,8 @@ jobs:
         run: bun run --cwd packages/extension test
 
   ipc-linux:
+    needs: classify
+    if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -136,6 +221,8 @@ jobs:
         run: cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
 
   ipc-windows:
+    needs: classify
+    if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -147,3 +234,68 @@ jobs:
         run: cargo test --locked --manifest-path tests/architecture/ipc-probe/Cargo.toml
       - name: Test the AgentTab runtime core on Windows
         run: cargo test --workspace --locked --manifest-path host-rs/Cargo.toml
+
+  verify:
+    name: verify
+    if: always()
+    needs:
+      - classify
+      - ci-policy
+      - ci
+      - adapters-portability
+      - ipc-linux
+      - ipc-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      CLASSIFY_RESULT: ${{ needs.classify.result }}
+      LANE: ${{ needs.classify.outputs.lane }}
+      POLICY_RESULT: ${{ needs.ci-policy.result }}
+      CI_RESULT: ${{ needs.ci.result }}
+      ADAPTERS_RESULT: ${{ needs.adapters-portability.result }}
+      IPC_LINUX_RESULT: ${{ needs.ipc-linux.result }}
+      IPC_WINDOWS_RESULT: ${{ needs.ipc-windows.result }}
+    steps:
+      - name: Require the selected verification lane
+        run: |
+          set -euo pipefail
+          if [[ "$CLASSIFY_RESULT" != success ]]; then
+            echo "::error::CI classification did not succeed"
+            exit 1
+          fi
+          case "$LANE" in
+            fast)
+              for result in \
+                "$POLICY_RESULT" \
+                "$CI_RESULT" \
+                "$ADAPTERS_RESULT" \
+                "$IPC_LINUX_RESULT" \
+                "$IPC_WINDOWS_RESULT"
+              do
+                if [[ "$result" != skipped ]]; then
+                  echo "::error::Fast-lane job unexpectedly resolved to $result"
+                  exit 1
+                fi
+              done
+              echo "Fast-lane classification and public-text scan succeeded"
+              ;;
+            full)
+              for result in \
+                "$POLICY_RESULT" \
+                "$CI_RESULT" \
+                "$ADAPTERS_RESULT" \
+                "$IPC_LINUX_RESULT" \
+                "$IPC_WINDOWS_RESULT"
+              do
+                if [[ "$result" != success ]]; then
+                  echo "::error::Required full-lane job resolved to $result"
+                  exit 1
+                fi
+              done
+              echo "Full verification lane succeeded"
+              ;;
+            *)
+              echo "::error::Unknown CI verification lane: ${LANE:-unset}"
+              exit 1
+              ;;
+          esac
