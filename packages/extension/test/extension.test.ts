@@ -4637,7 +4637,10 @@ describe("extension entrypoint admission boundaries", () => {
         completion: { kind: "manual_done" },
       },
     );
-    expect(handoff).toMatchObject({ outcome: "needs_user", result: { task_id: TASK_A, tab_id: 100 } });
+    expect(handoff).toMatchObject({
+      outcome: "completed",
+      result: { task_id: TASK_A, tab_id: 100, handoff_started: true },
+    });
     expect((await readState()).handoff).toMatchObject({ active: true, taskId: TASK_A, tabId: 100 });
     const deniedDuringHandoff = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6226",
@@ -4844,7 +4847,10 @@ describe("extension entrypoint admission boundaries", () => {
         completion: { kind: "manual_done" },
       },
     );
-    expect(closingHandoff).toMatchObject({ outcome: "needs_user" });
+    expect(closingHandoff).toMatchObject({
+      outcome: "completed",
+      result: { handoff_started: true },
+    });
     let handoffClearPostedAfterTabRemoval = false;
     nativePostProbe = (message) => {
       if (

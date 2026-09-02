@@ -152,31 +152,32 @@ describe("AgentTab operation card rendering", () => {
     expect(rendered).not.toContain("Blocked ·");
   });
 
-  test("handoff cards distinguish waiting from completed user work", () => {
+  test("handoff cards show an asynchronous start instead of blocking", () => {
     const args = {
       tab_id: 18,
       expected_page_revision: 5,
       prompt: "Complete passkey verification",
       completion: { kind: "manual_done" },
     };
-    const waiting = createResultComponent(
+    const starting = createResultComponent(
       "browser_handoff",
       { details: {} },
       { expanded: true, isPartial: true },
       theme,
       args,
     );
-    expect(waiting.render(120)).toEqual([
-      "👤 Your turn · Waiting for user · tab 18 · rev 5 · task-owned",
-      "  Flow · ✓ Intent  ▶ Human  · Resume",
+    expect(starting.render(120)).toEqual([
+      "🔄 Working · Starting user handoff · tab 18 · rev 5 · task-owned",
     ]);
+
     const activated = createResultComponent(
       "browser_handoff",
       {
         details: {
+          handoff_started: true,
           tab_id: 18,
           page_revision: 6,
-          _agenttab: { outcome: "needs_user", task_id: "task-7" },
+          _agenttab: { outcome: "completed", task_id: "task-7" },
         },
       },
       { expanded: false },
@@ -184,20 +185,7 @@ describe("AgentTab operation card rendering", () => {
       args,
     );
     expect(activated.render(120)).toEqual([
-      "👤 Your turn · Waiting for user · task task-7 · tab 18 · rev 6 · task-owned",
-      "  Flow · ✓ Intent  ▶ Human  · Resume",
-    ]);
-
-
-    const completed = createResultComponent(
-      "browser_handoff",
-      { details: { tab_id: 18, page_revision: 6 } },
-      { expanded: false },
-      theme,
-      args,
-    );
-    expect(completed.render(120)).toEqual([
-      "🔎 Observed · User handoff completed · tab 18 · rev 6 · task-owned",
+      "🚀 Executed · User handoff started · task task-7 · tab 18 · rev 6 · task-owned",
     ]);
   });
 

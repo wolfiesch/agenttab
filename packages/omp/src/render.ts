@@ -119,7 +119,7 @@ export function createResultCard(
     method,
     status,
     title: options.isPartial === true
-      ? method === "browser_handoff" ? "Waiting for user" : "Working…"
+      ? method === "browser_handoff" ? "Starting user handoff" : "Working…"
       : result.isError === true
         ? errorSummary(result)
         : summarizeResult(method, callArgs, details, status),
@@ -353,7 +353,7 @@ function summarizeResult(
         ? countLabel(result.tabs_count, "task tab")
         : countSummary(Array.isArray(result.tabs) ? result.tabs : [], "task tab");
     case "browser_handoff":
-      return status === "awaiting_user" ? "Waiting for user" : "User handoff completed";
+      return "User handoff started";
     case "browser_credentials": {
       const credentialStatus = fieldString(result, "status");
       if (credentialStatus === "ready") {
@@ -389,15 +389,13 @@ function resultStatus(
   if (method === "browser_handoff" && outcome === "needs_user") return "awaiting_user";
   if (method === "browser_credentials" && outcome === "needs_user") return "awaiting_user";
   if (options.isPartial === true) {
-    return method === "browser_handoff" || method === "browser_credentials"
-      ? "awaiting_user"
-      : "running";
+    return method === "browser_credentials" ? "awaiting_user" : "running";
   }
   if (result.isError === true) return "blocked";
   if (typeof details.staged_token === "string" || details.awaiting_human_approval === true) {
     return "awaiting_approval";
   }
-  if (method === "browser_handoff") return "observed";
+  if (method === "browser_handoff") return "executed";
   if (method === "browser_snapshot" || method === "browser_wait" || method === "browser_tabs") {
     return "observed";
   }
@@ -447,6 +445,12 @@ function operationSteps(status: OperationCardStatus, method: ToolMethod): readon
           { label: "Resume", state: "pending" },
         ];
       case "awaiting_user":
+        return [
+          { label: "Intent", state: "done" },
+          { label: "Human", state: "active" },
+          { label: "Resume", state: "pending" },
+        ];
+      case "executed":
         return [
           { label: "Intent", state: "done" },
           { label: "Human", state: "active" },

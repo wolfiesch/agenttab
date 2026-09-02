@@ -180,7 +180,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_handoff",
-    description: "Pause all agent actions and give the user control for credentials, MFA, CAPTCHA, or other human-only input.",
+    description: "Start an asynchronous human handoff for credentials, MFA, CAPTCHA, or other human-only input. The call returns after activation; browser automation remains paused until completion.",
     inputSchema: schema(handoffSchema),
   },
   {

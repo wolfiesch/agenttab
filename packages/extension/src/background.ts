@@ -6,7 +6,6 @@ import {
   commitRequired,
   completed,
   failed,
-  needsUser,
   type NativeDispatchCommand,
   type NativeOriginPolicy,
   type NativeResponse,
@@ -409,7 +408,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       if (!scheduler.isAccepting() || (await readState()).paused) {
         throw scheduler.notStarted("AgentTab is paused");
       }
-      return needsUser(
+      return completed(
         command.request_id,
         await handoff.begin(
           command.task_id,

@@ -96,7 +96,7 @@ The Core response has `protocol: "agenttab.rpc"`, `version: 1`, matching `reques
 
 Mutation methods carry a UUIDv7 idempotency key in Core RPC. MCP, OMP, and Pi bind one key to each harness invocation ID so a retry of that invocation retains its reconciliation identity. Reusing a completed key for identical work returns the durable response; reusing it with different input is a conflict. A mutation found only as started after recovery returns `unknown` and is not replayed.
 
-The stdio MCP reader dispatches requests concurrently, while its writer serializes complete JSON-RPC lines. A long `browser_wait` or `browser_handoff` therefore does not block `ping`, discovery, or an independent tool call at the adapter layer.
+`browser_handoff` returns as soon as the durable handoff and global browser blackout are active. The stdio MCP reader also dispatches requests concurrently while its writer serializes complete JSON-RPC lines, so handoff completion never holds the initiating agent call or blocks `ping`, discovery, or independent non-browser work.
 
 Raw TypeScript and Python SDK clients raise `AgentTabTransportError` for an ambiguous timeout, connection close, or transport failure. The error carries the method and, for mutations, the exact generated or caller-supplied idempotency key. A caller may reconnect and explicitly retry the same method and parameters with that key; the SDK never replays the request automatically. MCP and OMP adapters likewise return the failed invocation, discard a cached client only when its transport is closed, and reconnect on the next invocation.
 
@@ -104,9 +104,9 @@ Raw TypeScript and Python SDK clients raise `AgentTabTransportError` for an ambi
 
 When managed policy enables 1Password, call `browser_credentials` on an ordinary sign-in page before requesting manual password entry. `prepare` derives the current origin from host-owned tab state. `fill` accepts only accessibility refs and returns filled-field booleans; credential material never crosses Core RPC. Submit separately through `browser_act`, inspect the result, and use `next` only after the site rejects the current candidate.
 
-Call `browser_handoff` when credential preparation returns `needs_user`, the bounded candidates fail, or the site requires a passkey, security key, CAPTCHA, payment secret, account recovery, or unsupported verification. AgentTab activates a global blackout, focuses the declared tab, opens its user-facing handoff state, and denies browser observation and capture for every task while the handoff is active. Automation resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the handoff is cleared.
+Call `browser_handoff` when credential preparation returns `needs_user`, the bounded candidates fail, or the site requires a passkey, security key, CAPTCHA, payment secret, account recovery, or unsupported verification. AgentTab activates a global browser blackout, focuses the declared tab, opens its user-facing handoff state, and returns a completed start result immediately. Browser automation resumes only after the declared navigation, URL, selector, or manual completion condition is satisfied and the handoff is cleared.
 
-The agent must not attempt snapshots, page reads, or mutations during a handoff. It should report the handoff prompt to the user and wait for the terminal tool result or an explicit user completion.
+The agent must not attempt snapshots, page reads, or browser mutations during a handoff. It should report the prompt to the user, continue independent non-browser work, and resume browser work after explicit user completion or a later status check confirms the handoff cleared.
 
 ### Staged Commit
 
