@@ -235,7 +235,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_handoff",
       label: "Browser Handoff",
-      description: "Give the user control for credentials, MFA, CAPTCHA, or other human-only input.",
+      description: "Start an asynchronous human handoff for credentials, MFA, CAPTCHA, or other human-only input. The call returns after activation; browser automation remains paused until completion.",
       approval: "write",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),

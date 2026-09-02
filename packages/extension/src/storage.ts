@@ -56,6 +56,7 @@ export interface ExtensionState {
   schemaVersion: typeof SCHEMA_VERSION;
   paused: boolean;
   developerMode: boolean;
+  skipCommitReview: boolean;
   showAgentPointer: boolean;
   cleanupPolicy: CleanupPolicy;
   tasks: Record<string, TaskRecord>;
@@ -74,6 +75,7 @@ function defaultState(): ExtensionState {
     schemaVersion: SCHEMA_VERSION,
     paused: false,
     developerMode: false,
+    skipCommitReview: false,
     showAgentPointer: true,
     cleanupPolicy: "automatic",
     tasks: {},
@@ -270,6 +272,7 @@ function parseState(value: unknown): ExtensionState | null {
     schemaVersion: SCHEMA_VERSION,
     paused: raw.paused,
     developerMode: raw.developerMode,
+    skipCommitReview: raw.skipCommitReview === true,
     showAgentPointer: raw.showAgentPointer,
     cleanupPolicy: cleanupPolicy as CleanupPolicy,
     tasks,

@@ -151,6 +151,7 @@ export class HandoffController {
         started_at_ms: startedAt,
       });
       return {
+        handoff_started: true,
         task_id: taskId,
         tab_id: numericTabId,
         prompt: params.prompt,

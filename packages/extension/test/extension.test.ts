@@ -211,6 +211,7 @@ function installPopupDocument(): PopupTestSurface {
   add("tasks", PopupTestListElement);
   add("task-error", PopupTestParagraphElement);
   add("pointer", PopupTestInputElement);
+  add("yolo", PopupTestInputElement);
   add("cleanup-policy", PopupTestSelectElement);
   add("pointer-detail", PopupTestElement);
   add("settings-error", PopupTestParagraphElement);
@@ -258,6 +259,7 @@ function popupUiState(paused = false): Record<string, unknown> {
     automation_enabled: true,
     paused,
     developer_mode: false,
+    skip_commit_review: false,
     show_agent_pointer: false,
     handoff: null,
     tasks: [],
@@ -799,6 +801,30 @@ describe("popup background responses", () => {
 
     expect(popup.get("status").textContent).toBe("Paused");
     expect(popup.get("runtime-error").hidden).toBe(true);
+  });
+
+  test("persists YOLO mode from the settings toggle", async () => {
+    let enabled = false;
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "get_ui_state") {
+        return { ...popupUiState(), skip_commit_review: enabled };
+      }
+      if (message.kind === "set_skip_commit_review" && typeof message.enabled === "boolean") {
+        enabled = message.enabled;
+        return { enabled };
+      }
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    const toggle = popup.get("yolo");
+    toggle.checked = true;
+    toggle.dispatch("change");
+    await flushPromiseQueue();
+
+    expect(enabled).toBe(true);
+    expect(toggle.checked).toBe(true);
+    expect(popup.get("settings-error").hidden).toBe(true);
   });
 
   test("displays background error records through the popup guard", async () => {
@@ -4637,7 +4663,10 @@ describe("extension entrypoint admission boundaries", () => {
         completion: { kind: "manual_done" },
       },
     );
-    expect(handoff).toMatchObject({ outcome: "needs_user", result: { task_id: TASK_A, tab_id: 100 } });
+    expect(handoff).toMatchObject({
+      outcome: "completed",
+      result: { task_id: TASK_A, tab_id: 100, handoff_started: true },
+    });
     expect((await readState()).handoff).toMatchObject({ active: true, taskId: TASK_A, tabId: 100 });
     const deniedDuringHandoff = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6226",
@@ -4823,6 +4852,46 @@ describe("extension entrypoint admission boundaries", () => {
       error: { code: "invalid_staged_token" },
     });
 
+    expect(await sendPopupMessage({ kind: "set_skip_commit_review", enabled: true })).toEqual({
+      enabled: true,
+    });
+    expect(await sendPopupMessage({ kind: "get_ui_state" })).toMatchObject({
+      skip_commit_review: true,
+    });
+    const deniedYoloAction = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6252",
+      TASK_A,
+      "browser_act",
+      { tab_id: 100, expected_page_revision: 1, actions: [{ kind: "click", ref: "r1-22" }] },
+      { tab_id: 100, allowed_origins: ["https://other.example"], denied_origins: [] },
+    );
+    expect(deniedYoloAction).toMatchObject({
+      outcome: "not_started",
+      error: { code: "origin_not_allowed" },
+    });
+    const yoloAction = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6251",
+      TASK_A,
+      "browser_act",
+      { tab_id: 100, expected_page_revision: 1, actions: [{ kind: "click", ref: "r1-22" }] },
+    );
+    expect(yoloAction).toMatchObject({
+      outcome: "completed",
+      result: { actions: [{ kind: "click", completed: true }] },
+    });
+    expect((await readState()).stagedCommits).toEqual({});
+    expect(
+      debuggerCommands.filter(
+        ({ method, params }) =>
+          method === "Runtime.callFunctionOn" &&
+          params.functionDeclaration === "function(){this.click()}" &&
+          params.userGesture === true,
+      ),
+    ).toHaveLength(2);
+    expect(await sendPopupMessage({ kind: "set_skip_commit_review", enabled: false })).toEqual({
+      enabled: false,
+    });
+
     const abandoned = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6232",
       TASK_A,
@@ -4844,7 +4913,10 @@ describe("extension entrypoint admission boundaries", () => {
         completion: { kind: "manual_done" },
       },
     );
-    expect(closingHandoff).toMatchObject({ outcome: "needs_user" });
+    expect(closingHandoff).toMatchObject({
+      outcome: "completed",
+      result: { handoff_started: true },
+    });
     let handoffClearPostedAfterTabRemoval = false;
     nativePostProbe = (message) => {
       if (
