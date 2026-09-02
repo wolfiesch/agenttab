@@ -23,6 +23,7 @@ interface UiState {
   automationEnabled: boolean;
   paused: boolean;
   developerMode: boolean;
+  skipCommitReview: boolean;
   pointer: boolean | null;
   cleanupPolicy: "automatic" | "ask" | "keep";
   handoffPrompt: string | null;
@@ -89,6 +90,7 @@ const taskCount = element("task-count", HTMLSpanElement);
 const taskList = element("tasks", HTMLUListElement);
 const taskError = element("task-error", HTMLParagraphElement);
 const pointerToggle = element("pointer", HTMLInputElement);
+const yoloToggle = element("yolo", HTMLInputElement);
 const cleanupPolicy = element("cleanup-policy", HTMLSelectElement);
 const pointerDetail = element("pointer-detail", HTMLElement);
 const settingsError = element("settings-error", HTMLParagraphElement);
@@ -180,6 +182,7 @@ async function load(): Promise<UiState> {
     automationEnabled: response.automation_enabled === true,
     paused: response.paused === true,
     developerMode: response.developer_mode === true,
+    skipCommitReview: response.skip_commit_review === true,
     pointer: typeof response.show_agent_pointer === "boolean" ? response.show_agent_pointer : null,
     cleanupPolicy: response.cleanup_policy === "ask" || response.cleanup_policy === "keep"
       ? response.cleanup_policy
@@ -354,6 +357,7 @@ function render(state: UiState): void {
 
   developerChip.hidden = !state.developerMode;
   developerPanel.hidden = !state.developerMode;
+  yoloToggle.checked = state.skipCommitReview;
 
   handoffPanel.hidden = state.handoffPrompt === null;
   if (state.handoffPrompt !== null) {
@@ -485,6 +489,15 @@ pointerToggle.addEventListener("change", () => {
     await send({ kind: "set_pointer", enabled });
   }).then((ran) => {
     if (!ran) pointerToggle.checked = !enabled;
+  });
+});
+
+yoloToggle.addEventListener("change", () => {
+  const enabled = yoloToggle.checked;
+  void guard(settingsError, async () => {
+    await send({ kind: "set_skip_commit_review", enabled });
+  }).then((ran) => {
+    if (!ran) yoloToggle.checked = !enabled;
   });
 });
 

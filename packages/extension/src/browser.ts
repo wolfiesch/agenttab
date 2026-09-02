@@ -456,7 +456,7 @@ export class StandardBrowserRuntime {
       }
       await this.revisions.assertExpected(tabId, pageRevision);
       const stagedConsequence = await this.consequence(tabId, pageRevision, action);
-      if (stagedConsequence) {
+      if (stagedConsequence && !(await readState()).skipCommitReview) {
         const staged: StagedCommit = {
           native_token: randomToken(),
           task_id: taskId,

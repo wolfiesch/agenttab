@@ -66,6 +66,8 @@ Before a Standard mutation, the extension prepares the target, classifies recogn
 
 Commit is a best-effort semantic barrier, not proof that an action is harmless. It requires two distinct events, human approval in the popup and the agent's later Commit request. A page can hide an external effect behind an innocent label, alter meaning through script, or use an effect AgentTab does not recognize. Harmless-looking controls may execute without review. Batches are sequential and non-atomic: work stops before a staged action and never runs later actions implicitly.
 
+YOLO mode is an explicit, disabled-by-default opt-out from Commit review. When enabled, recognized consequential controls execute during the original `browser_act` call, and pending staged actions are discarded when the setting changes on. The mode does not bypass task ownership, origin policy, expected revisions, restricted-origin routing, handoff blackout, credential isolation, or action validation.
+
 ## Your Turn blackout
 
 During a `browser_handoff`, AgentTab pauses browser work and applies a global blackout across tasks. Page observations and captures are denied while the human enters information. The extension persists the active handoff before focusing the tab; the host restores the blackout from durable state after restart. Completion requires the declared condition or explicit completion, capture scrubbing, and host acknowledgement before automation resumes.

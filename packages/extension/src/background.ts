@@ -696,6 +696,7 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
       automation_enabled: await automationEnabled(),
       paused: state.paused,
       developer_mode: state.developerMode,
+      skip_commit_review: state.skipCommitReview,
       handoff: state.handoff.active ? { prompt: state.handoff.prompt } : null,
       show_agent_pointer: state.showAgentPointer,
       cleanup_policy: state.cleanupPolicy,
@@ -721,6 +722,14 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
     const enabled = message.enabled;
     await mutateState((state) => {
       state.showAgentPointer = enabled;
+    });
+    return { enabled };
+  }
+  if (message.kind === "set_skip_commit_review" && typeof message.enabled === "boolean") {
+    const enabled = message.enabled;
+    await mutateState((state) => {
+      state.skipCommitReview = enabled;
+      if (enabled) state.stagedCommits = {};
     });
     return { enabled };
   }
