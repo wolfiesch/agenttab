@@ -180,12 +180,12 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_handoff",
-    description: "Start an asynchronous human handoff for credentials, MFA, CAPTCHA, or other human-only input. The call returns after activation; browser automation remains paused until completion.",
+    description: "Start a durable human handoff for MFA, CAPTCHA, passkeys, or other human-only input. The call returns after activation and browser automation remains available; try browser_credentials first for ordinary sign-in fields.",
     inputSchema: schema(handoffSchema),
   },
   {
     name: "browser_credentials",
-    description: "Use an origin-matching 1Password Login without exposing values; more than three matches require the user.",
+    description: "Prefer this before human handoff: use an origin-matching 1Password Login without exposing values; more than three matches require the user.",
     inputSchema: schema(credentialsSchema),
   },
   {

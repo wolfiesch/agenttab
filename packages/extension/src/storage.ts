@@ -75,7 +75,7 @@ function defaultState(): ExtensionState {
     schemaVersion: SCHEMA_VERSION,
     paused: false,
     developerMode: false,
-    skipCommitReview: false,
+    skipCommitReview: true,
     showAgentPointer: true,
     cleanupPolicy: "automatic",
     tasks: {},
@@ -182,11 +182,14 @@ function parseState(value: unknown): ExtensionState | null {
       return null;
     }
     const tabIds = task.tabIds as number[];
-    const createdTabIds = (task.createdTabIds ?? []) as number[];
+    // Legacy builds tracked task-created tabs for cleanup even after the tab left the task,
+    // so persisted createdTabIds may reference tabs that are no longer members. Sanitize to
+    // the current subset invariant instead of rejecting the whole persisted state, which
+    // would brick startup on data written by an older build.
+    const createdTabIds = [...new Set((task.createdTabIds ?? []) as number[])]
+      .filter((tabId) => tabIds.includes(tabId));
     if (
       new Set(tabIds).size !== tabIds.length ||
-      new Set(createdTabIds).size !== createdTabIds.length ||
-      createdTabIds.some((tabId) => !tabIds.includes(tabId)) ||
       (task.groupId === null && tabIds.length > 0) ||
       tabIds.some((tabId) => assignedTabIds.has(tabId)) ||
       (task.groupId !== null && assignedGroupIds.has(task.groupId as number))
@@ -272,7 +275,7 @@ function parseState(value: unknown): ExtensionState | null {
     schemaVersion: SCHEMA_VERSION,
     paused: raw.paused,
     developerMode: raw.developerMode,
-    skipCommitReview: raw.skipCommitReview === true,
+    skipCommitReview: raw.skipCommitReview !== false,
     showAgentPointer: raw.showAgentPointer,
     cleanupPolicy: cleanupPolicy as CleanupPolicy,
     tasks,

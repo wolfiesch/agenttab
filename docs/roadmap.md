@@ -7,8 +7,8 @@ AgentTab v2 is currently `2.0.0-rc.1`, a local prerelease. This page records lau
 | Gate | Current source state | Required evidence before promotion |
 | --- | --- | --- |
 | Product identity | Source identifies AgentTab, `dev.agenttab.host`, `agenttab`, and AgentTab Core RPC v1. | Exact-head identity and forbidden-surface gates. |
-| Standard boundary | Source schemas define nine Standard browser tools, including explicit provenance-aware task finalization and a disabled-by-default host-managed credential broker; Developer mode adds `browser_developer`. | Schema, adapter discovery, cleanup provenance, fake-provider credential isolation, and real-extension checks. |
-| Task safety | Source implements server-bound tasks, visible groups, revisions, Pause, handoff blackout, and staged Commit records. | Controlled browser fixtures covering restart, revocation, stale revisions, and one-use Commit. |
+| Standard boundary | Source schemas define nine Standard browser tools, including explicit provenance-aware task finalization and a default-enabled host-managed credential broker with an owner-only opt-out; Developer mode adds `browser_developer`. | Schema, adapter discovery, cleanup provenance, fake-provider credential isolation, and real-extension checks. |
+| Task safety | Source implements server-bound tasks, visible groups, revisions, explicit Pause, durable nonblocking handoff, default YOLO execution, and optional staged Commit records. | Controlled browser fixtures covering restart, revocation, stale revisions, handoff concurrency, and one-use Commit. |
 | Rust runtime | Source contains the Rust host, native bridge, same-user IPC, SQLite journal, and local audit. | Exact-head Rust, IPC, Linux, macOS, and Windows gates. |
 | Installer | Source contains a transactional Node-compatible installer and advanced loopback proxy. | Clean user-home and clean-machine install proof using the packaged signed bytes. |
 | Extension package | Source contains canonical extension build and store-package tooling. | Inspect and install the exact packaged ZIP in a clean profile. |
@@ -41,8 +41,8 @@ No stable installation call to action belongs on a public surface until the rele
 ## Non-goals and boundaries
 
 - Task groups are a coordination boundary, not profile isolation.
-- Commit reduces recognizable consequential actions but cannot prove webpage semantics.
-- Handoff protects AgentTab observation during human input, not a compromised device or browser profile.
+- Commit review is optional and reduces recognizable consequential risk but cannot prove webpage semantics.
+- Handoff is coordination, not a confidentiality boundary. Use brokered credentials or explicit Pause when user-entered page state must remain unobservable.
 - A local source test, RC artifact, draft item, or planned domain is not a public availability claim.
 
 Legacy v1.0.1 remains historical migration context until a final stable v2 launch. This roadmap intentionally contains no v1 operational path.

@@ -42,14 +42,14 @@ Pause is a barrier, not an optimistic UI toggle. It stops new admissions, lets a
 
 A host that has not completed its native handshake and reconciliation remains unavailable for browser work. The connection status can report its lifecycle, but callers must retry only after it becomes ready or the user resumes it.
 
-## Global Your Turn blackout
+## Your Turn coordination
 
-Only one handoff can be active. Starting `browser_handoff` pauses the scheduler, records the marker durably, and focuses the human's task tab. While it is active, page observations, captures, and browser work are denied across every task and connection. The host independently enforces this blackout and restores it after restart from SQLite state.
+Only one handoff can be active. Starting `browser_handoff` records the marker and completion condition durably, focuses the human's task tab, and returns without pausing the scheduler. Browser requests from the same or other tasks remain eligible. The host restores the active marker after restart from SQLite state.
 
-Automation resumes only after the declared completion condition or explicit completion, capture scrubbing, an acknowledged handoff-clear event, and a non-paused state. Handoff is the sole normal AgentTab focus transition for human input.
+The handoff clears after the declared completion condition or explicit completion and an acknowledged handoff-clear event. It is the sole normal AgentTab focus transition for human input, but it is not an observation blackout. Use `browser_credentials` for ordinary sign-in fields or explicitly pause agents when the handoff page must remain unobservable.
 
 ## Consequential work across agents
 
-Each recognizable consequential Standard action stages its own Commit. A staged token is bound to one task and tab, expires after five minutes, revalidates the page revision and target fingerprint, and executes once. A batch stops at its first staged action; another agent cannot use that stage to run later batch items.
+With default YOLO mode, recognizable consequential Standard actions execute inline after validation. Turning YOLO mode off stages each action as a Commit bound to one task and tab. The token expires after five minutes, revalidates the page revision and target fingerprint, and executes once. In review mode a batch stops at its first staged action; another agent cannot use that stage to run later batch items.
 
-There are no agent-facing global lease tools. Coordinating intent is still the responsibility of the agents and the user. Use distinct tasks for independent work, observe task counts in the extension, and have the human review staged effects before Commit.
+There are no agent-facing global lease tools. Coordinating intent is still the responsibility of the agents and the user. Use distinct tasks for independent work and observe task counts in the extension. Turn YOLO mode off when human review of staged effects is desired.

@@ -26,19 +26,19 @@ A task workspace is visible in Chrome. Task-owned tabs are grouped for display, 
 
 ### Your Turn
 
-**Your Turn** is the human-only input boundary. AgentTab MUST hand control to the user for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential workflow that returns `needs_user`. A disabled-by-default managed 1Password broker MAY fill an origin-matching Login item through the private host-to-extension path, but MUST NOT expose the value to an agent or submit the form.
+**Your Turn** is the human-only input boundary. AgentTab MUST hand control to the user for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential workflow that returns `needs_user`. The managed 1Password broker is available by default and MAY fill an origin-matching Login item through the private host-to-extension path, but MUST NOT expose the value to an agent or submit the form. Owner-only policy MAY disable or constrain the broker.
 
-While any Your Turn handoff is active, AgentTab MUST enforce a global observation blackout across every task and client. The extension and host each fail closed. AgentTab MUST NOT capture human keystrokes. Handoff clears only after its declared completion condition or explicit Done, capture scrubbing, and host acknowledgement.
+An active handoff MUST be a durable coordination marker, not an implicit automation pause. AgentTab MUST persist the handoff and completion condition before focusing the declared tab, then keep browser requests eligible. Product and security copy MUST state that handoff does not guarantee an observation blackout and MUST direct ordinary username, password, and one-time-code entry through `browser_credentials`. Explicit **Pause agents** remains the owner-controlled confidentiality boundary.
 
 ### Commit
 
 **Commit** is a best-effort semantic review barrier for recognizable consequential controls, including send, publish, purchase, delete, upload, authorization, and permission grants.
 
-Every Standard-mode mutation MUST pass through one extension-side `prepare -> classify -> revalidate -> execute` choke point. A recognizable consequential action is staged before any side effect. Its token is bound to the task, tab, effect class, exact element fingerprint, document revision, event, preview, and a five-minute expiry. The extension popup MUST send only an opaque review handle. Human approval MUST durably mark the corresponding stage approved without consuming it or dispatching the browser action. Only a later agent `browser_commit` carrying the private staged token may consume and execute the approved stage. Execution MUST reject an unapproved, changed, expired, foreign, or used stage, revalidate the target, and dispatch at most once.
+Every Standard-mode mutation MUST pass through one extension-side `prepare -> classify -> revalidate -> execute` choke point. YOLO mode is enabled by default, so recognizable consequential actions execute in the original mutation. When the user turns YOLO mode off, a recognizable consequential action is staged before any side effect. Its token is bound to the task, tab, effect class, exact element fingerprint, document revision, event, preview, and a five-minute expiry. The extension popup MUST send only an opaque review handle. Human approval MUST durably mark the corresponding stage approved without consuming it or dispatching the browser action. Only a later agent `browser_commit` carrying the private staged token may consume and execute the approved stage. Execution MUST reject an unapproved, changed, expired, foreign, or used stage, revalidate the target, and dispatch at most once.
 
 Commit does not guarantee recognition of every page-triggered external effect. A page can attach a consequential effect to an innocently labelled control. Product and security copy MUST describe Commit as risk reduction, not proof of semantic safety.
 
-Action batches are sequential and non-atomic. A batch stops before its first staged operation and returns the completed prefix plus staged index. Committing that staged operation MUST NOT execute later operations implicitly.
+Action batches are sequential and non-atomic. With YOLO mode off, a batch stops before its first staged operation and returns the completed prefix plus staged index. Committing that staged operation MUST NOT execute later operations implicitly. With YOLO mode on, the recognized action executes inline and the batch continues.
 
 ## Security boundary
 

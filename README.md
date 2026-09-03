@@ -6,7 +6,7 @@
 
 > Give an agent a tab, not the keys to your browser.
 
-AgentTab lets an agent work in your existing signed-in Chrome profile without giving it unrestricted control of the profile. Each connection receives a task-owned browser workspace. The agent can create tabs, inspect and act in those tabs, wait for page state, and ask for help. A disabled-by-default 1Password broker can fill a matching login or one-time code without exposing its value to the agent; passkeys, security keys, CAPTCHA, payment secrets, account recovery, and unsupported verification remain **Your Turn**. Recognizable consequential actions are staged for **Commit** instead of being performed immediately.
+AgentTab lets an agent work in your existing signed-in Chrome profile without giving it unrestricted control of the profile. Each connection receives a task-owned browser workspace. The agent can create tabs, inspect and act in those tabs, wait for page state, and ask for help. The built-in 1Password broker is available by default and can fill a matching login or one-time code without exposing its value to the agent; passkeys, security keys, CAPTCHA, payment secrets, account recovery, and unsupported verification remain **Your Turn**. Recognizable consequential actions execute directly by default, while the popup can enable a staged **Commit** review when desired.
 
 ## Release status
 
@@ -24,8 +24,8 @@ The command has no path, token, or shell-specific argument and is suitable for P
 
 1. An agent calls `browser_open` with `mode: "create"`. AgentTab creates a background tab for that task and returns its task, tab, window, page-revision, and automation-route identifiers. `placement: "new_window"` may create the task's first tab in a separate unfocused normal window.
 2. On a normal web origin, the agent calls `browser_snapshot`, works from revisioned accessibility references, then calls `browser_act` with the expected page revision. It cannot act on unrelated tabs.
-3. If managed policy enables 1Password and an ordinary sign-in page has at most three origin-matching Login items, the agent can request a short-lived opaque token and ask the host to fill named field refs. Credential values travel only from `op` to the host and extension, never through Core RPC or the adapter. Every other human-only input uses `browser_handoff`, which focuses that tab, pauses automation, and blocks browser observation until the declared completion condition or **I'm done**.
-4. If AgentTab recognizes a send, publish, purchase, delete, upload, authorization, or permission-grant control, `browser_act` can return `commit_required`. The extension shows the staged effect in its popup. A human must approve it there before the agent can call `browser_commit` with the one-use staged token. The disabled-by-default YOLO mode setting skips this Commit review and executes recognized consequential controls in the original `browser_act` call.
+3. On an ordinary sign-in page with at most three origin-matching Login items, the agent can request a short-lived opaque token and ask the host to fill named field refs through the local `op` command. Credential values travel only from `op` to the host and extension, never through Core RPC or the adapter. Owner-only policy can disable or constrain this broker. Every other human-only input uses `browser_handoff`, which focuses that tab and records a durable completion condition while browser automation remains available.
+4. Recognized send, publish, purchase, delete, upload, authorization, and permission-grant controls execute in the original `browser_act` call by default. Turn off YOLO mode in the popup to require Commit review instead. In review mode, AgentTab stages the control, shows its effect in the popup, requires human approval, and then accepts the one-use token through `browser_commit`.
 5. The task can list only its own tabs with `browser_tabs`. A separate client gets a separate task unless it proves its durable resume capability.
 6. When browser work is complete, the agent calls `browser_finish`. Automatic cleanup closes tabs created by the task, preserves tabs adopted from the user's existing browser state, ungroups retained tabs, and releases task ownership. The popup setting can instead require confirmation or retain every tab.
 
@@ -36,8 +36,8 @@ Commit is a two-party, best-effort semantic barrier, not proof that a page has n
 ## Trust contract
 
 - **Task ownership is an execution and coordination boundary, not profile isolation.** AgentTab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or a generic browser-global mutation API. Its one window-level operation creates an unfocused normal window for the first tab of an otherwise empty task.
-- **Your Turn is the only routine focus transition.** Routine task work stays in task-owned tabs. During handoff, all agent observation and capture are denied so human credentials are not captured.
-- **Commit requires human approval and agent intent unless YOLO mode is enabled.** By default, a staged action is bound to its task, tab, page revision, element fingerprint, effect, and short expiry. Popup approval records consent but does not execute it. The agent must then call `browser_commit`; a changed page, expired stage, used token, or unapproved stage cannot execute. YOLO mode is an explicit local opt-out from Commit review, not from ownership, origin policy, revisions, handoff blackout, or credential boundaries.
+- **Your Turn is the only routine focus transition.** Routine task work stays in task-owned tabs. Handoff focuses the declared tab and records a durable completion condition without globally pausing browser work. This permissive default does not guarantee an observation blackout while the user types; prefer `browser_credentials` for ordinary sign-in fields because its values never enter AgentTab RPC or audit data.
+- **Consequential actions run directly by default; Commit review is available.** YOLO mode skips the staging step but not task ownership, origin policy, expected page revisions, restricted-origin routing, credential isolation, or action validation. Turning YOLO mode off binds each staged action to its task, tab, page revision, element fingerprint, effect, and short expiry. Popup approval records consent but does not execute it; the agent must call `browser_commit`.
 - **Local by default.** Policy, task state, audit records, and IPC stay on the machine. AgentTab has no telemetry. See [Telemetry](docs/telemetry.md) and [Security](docs/security.md).
 
 ## Tool surface
@@ -53,7 +53,7 @@ Standard mode exposes exactly nine tools:
 | `browser_tabs` | List only tabs owned by the current task, including each tab's automation route. |
 | `browser_handoff` | Give the user control for human-only input. |
 | `browser_commit` | Execute one staged consequential action. |
-| `browser_credentials` | Prepare and fill an origin-matching 1Password login through opaque, short-lived host tokens when managed policy explicitly enables it. |
+| `browser_credentials` | Prepare and fill an origin-matching 1Password login through opaque, short-lived host tokens. Available by default when the local `op` CLI is usable; owner-only policy can disable or constrain it. |
 | `browser_finish` | Finish the task, apply its cleanup policy, return closed and retained tab receipts, and release ownership. |
 
 Developer mode adds one tool, `browser_developer`. It is absent from Standard discovery. It requires both the persistent Developer mode control in the AgentTab popup and `AGENTTAB_DEVELOPER=1` in the adapter environment. Treat it as an explicit expansion of the normal boundary.

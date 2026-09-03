@@ -1315,6 +1315,15 @@ describe("durable extension state", () => {
     expect(storageRemoveCount).toBe(1);
   });
 
+  test("enables direct consequential actions by default and preserves an explicit opt-out", async () => {
+    expect((await readState()).skipCommitReview).toBe(true);
+    await mutateState((state) => {
+      state.skipCommitReview = false;
+    });
+    resetStateForTest();
+    expect((await readState()).skipCommitReview).toBe(false);
+  });
+
   test("skips no-op persistence and avoids hot-path write verification reads", async () => {
     await readState();
     const initialGets = storageGetCount;
@@ -1357,6 +1366,26 @@ describe("durable extension state", () => {
       groupId: 9,
       tabIds: [41],
     });
+  });
+
+  test("sanitizes legacy createdTabIds that outlived task membership instead of failing startup", async () => {
+    const base = await readState();
+    base.tasks[TASK_A] = {
+      taskId: TASK_A,
+      name: "Legacy ledger task",
+      groupId: null,
+      tabIds: [],
+      createdTabIds: [77, 77],
+      color: "pink",
+      state: "working",
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    persisted[STATE_KEY] = JSON.parse(JSON.stringify(base));
+    resetStateForTest();
+
+    const restored = await readState();
+    expect(restored.tasks[TASK_A]).toMatchObject({ tabIds: [], createdTabIds: [] });
   });
 
   test("still rejects malformed persisted state during startup", async () => {
@@ -1443,6 +1472,9 @@ describe("page revision monotonicity", () => {
       () => undefined,
       async () => undefined,
     );
+    await mutateState((state) => {
+      state.skipCommitReview = false;
+    });
 
     const execution = await runtime.act(TASK_A, 65, 1, [{
       kind: "upload_file",
@@ -3160,7 +3192,7 @@ describe("ownership and task isolation", () => {
 });
 
 describe("handoff and pause barriers", () => {
-  test("keeps the global pause active until the completion condition matches", async () => {
+  test("keeps the handoff durable without pausing browser work", async () => {
     await seedTask(TASK_A, [31]);
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
@@ -3182,19 +3214,19 @@ describe("handoff and pause barriers", () => {
       timeout_ms: 60_000,
     });
 
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
     expect((await readState()).handoff.active).toBe(true);
     expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
     expect(await handoff.finish(true)).toMatchObject({
       completed: false,
       reason: "The handoff completion condition has not been met",
     });
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
     expect((await readState()).handoff.active).toBe(true);
 
     scriptResult = true;
     expect(await handoff.finish(true)).toEqual({ completed: true });
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
     const pendingHandoff = (await readState()).handoff;
     if (!pendingHandoff.active || !pendingHandoff.pendingClearEventId || !clearEventId) {
       throw new Error("handoff completion must await a native acknowledgment");
@@ -3233,7 +3265,7 @@ describe("handoff and pause barriers", () => {
     expect(await handoff.cancelForTab(33)).toBe(true);
     const firstPending = (await readState()).handoff;
     expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
     const firstClearEventId = events.at(-1)?.eventId;
     if (!firstPending.active || !firstPending.pendingClearEventId || !firstClearEventId) {
       throw new Error("tab cancellation did not create a pending handoff event");
@@ -3257,7 +3289,7 @@ describe("handoff and pause barriers", () => {
     expect(await handoff.cancelForTask(TASK_B)).toBe(true);
     const secondPending = (await readState()).handoff;
     expect((await readState()).tasks[TASK_B]?.state).toBe("needs_user");
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
     const secondClearEventId = events.at(-1)?.eventId;
     if (!secondPending.active || !secondPending.pendingClearEventId || !secondClearEventId) {
       throw new Error("task cancellation did not create a pending handoff event");
@@ -3303,7 +3335,7 @@ describe("handoff and pause barriers", () => {
 
     expect(revokedTabIds).toEqual([35]);
     const pending = (await readState()).handoff;
-    expect(scheduler.isAccepting()).toBe(false);
+    expect(scheduler.isAccepting()).toBe(true);
     const clearEventId = clearEventIds.at(-1);
     if (!pending.active || !pending.pendingClearEventId || !clearEventId) {
       throw new Error("startup reconciliation did not create a pending handoff event");
@@ -3952,6 +3984,12 @@ describe("startup lifecycle", () => {
 });
 
 describe("consequential action staging", () => {
+  beforeEach(async () => {
+    await mutateState((state) => {
+      state.skipCommitReview = false;
+    });
+  });
+
   test("stages a purchase-like click, commits it once, and consumes the token", async () => {
     tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
@@ -4668,17 +4706,27 @@ describe("extension entrypoint admission boundaries", () => {
       result: { task_id: TASK_A, tab_id: 100, handoff_started: true },
     });
     expect((await readState()).handoff).toMatchObject({ active: true, taskId: TASK_A, tabId: 100 });
-    const deniedDuringHandoff = await sendNativeCommand(
-      "018f47b8-2f80-7c20-9c77-f8a38c9e6226",
+    const tabsDuringHandoff = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6500",
+      TASK_A,
+      "browser_tabs",
+      {},
+    );
+    expect(tabsDuringHandoff).toMatchObject({
+      outcome: "completed",
+      result: { tabs: [{ tab_id: 100, task_id: TASK_A }] },
+    });
+    const snapshotDuringHandoff = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6501",
       TASK_A,
       "browser_snapshot",
       { tab_id: 100, mode: "accessibility" },
     );
-    expect(deniedDuringHandoff).toMatchObject({
-      outcome: "not_started",
-      error: { code: "handoff_blackout" },
+    expect(snapshotDuringHandoff).toMatchObject({
+      outcome: "completed",
+      result: { tab_id: 100 },
     });
-    expect(debuggerCommands).toHaveLength(deniedBeforePermission);
+    const commandsAfterHandoffSnapshot = debuggerCommands.length;
     expect(await sendPopupMessage({ kind: "handoff_finish", completed: true })).toEqual({ completed: true });
     const pendingHandoff = (await readState()).handoff;
     if (!pendingHandoff.active || !pendingHandoff.pendingClearEventId) {
@@ -4707,7 +4755,7 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: { code: "developer_mode_required" },
     });
-    expect(debuggerCommands).toHaveLength(deniedBeforePermission);
+    expect(debuggerCommands).toHaveLength(commandsAfterHandoffSnapshot);
     expect(await sendPopupMessage({ kind: "developer_mode", enabled: true })).toEqual({ enabled: true });
     const developerEnabled = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6228",
@@ -4721,6 +4769,9 @@ describe("extension entrypoint admission boundaries", () => {
         ({ method, params }) => method === "Runtime.evaluate" && params.expression === "document.title",
       ),
     ).toBe(true);
+    expect(await sendPopupMessage({ kind: "set_skip_commit_review", enabled: false })).toEqual({
+      enabled: false,
+    });
 
 
     const staged = await sendNativeCommand(

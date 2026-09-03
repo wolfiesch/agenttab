@@ -170,7 +170,6 @@ pub struct Runtime {
     handoff: Arc<HandoffState>,
     credentials: Arc<CredentialBroker>,
     task_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
-    global_gate: RwLock<()>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
     upload_staging_dir: PathBuf,
 }
@@ -220,7 +219,6 @@ impl Runtime {
             credentials,
             handoff,
             task_locks: Mutex::new(HashMap::new()),
-            global_gate: RwLock::new(()),
             tab_urls,
             upload_staging_dir: paths.upload_staging_dir.clone(),
         });
@@ -799,7 +797,6 @@ impl Runtime {
             .lifecycle
             .gate(request.method)
             .err()
-            .or_else(|| self.handoff_blackout_error())
             .or_else(|| self.guardrails.authorize(request.method, &params).err());
         if let Some(error) = early_error {
             let response =
@@ -853,11 +850,6 @@ impl Runtime {
                 true,
             );
         }
-        let (_global_read, _global_write) = if request.method == RpcMethod::BrowserHandoff {
-            (None, Some(self.global_gate.write()))
-        } else {
-            (Some(self.global_gate.read()), None)
-        };
         let lock_key = request_lock_key(task_id, request.method, &params_value);
         let task_lock = {
             let mut locks = self.task_locks.lock();
@@ -903,21 +895,6 @@ impl Runtime {
                 );
             }
         };
-        if let Some(error) = self.handoff_blackout_error() {
-            let response =
-                RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
-            return self.audited_value(
-                connection,
-                Some(task_id),
-                &request,
-                &params_value,
-                response,
-                started_at_ms,
-                started,
-                false,
-                true,
-            );
-        }
         if let Err(error) = self.validate_task_scope(task_id, &params) {
             let response =
                 RpcResponse::failure(request.request_id.clone(), Outcome::NotStarted, error);
@@ -1143,16 +1120,6 @@ impl Runtime {
             )
             .with_recovery("Repair ~/.agenttab ownership or free disk space before retrying."),
         )
-    }
-
-    fn handoff_blackout_error(&self) -> Option<RpcError> {
-        self.handoff.is_active().then(|| {
-            RpcError::new(
-                "handoff_blackout",
-                "Automation is disabled while credential handoff is active",
-            )
-            .with_recovery("Wait for the human to finish or cancel the active handoff.")
-        })
     }
 
     fn dispatch(
@@ -1880,6 +1847,7 @@ pub(crate) fn request_lock_scope(method: RpcMethod, params: &Value) -> RequestLo
         RpcMethod::BrowserSnapshot
             | RpcMethod::BrowserAct
             | RpcMethod::BrowserWait
+            | RpcMethod::BrowserHandoff
             | RpcMethod::BrowserCredentials
     ) {
         if let Some(tab_id) = params.get("tab_id").and_then(Value::as_u64) {
@@ -2185,19 +2153,31 @@ mod tests {
         }
     }
     #[derive(Debug)]
-    struct TimeoutNative;
+    struct HandoffTimeoutNative;
 
-    impl NativeTransport for TimeoutNative {
+    impl NativeTransport for HandoffTimeoutNative {
         fn dispatch(
             &self,
             _connection_id: Uuid,
             _task_id: Uuid,
-            _method: &str,
+            method: &str,
             _params: Value,
             _origin_policy: Option<NativeOriginPolicy>,
             _timeout: Duration,
         ) -> Result<NativeResponse, NativeError> {
-            Err(NativeError::Timeout)
+            if method == "browser_handoff" {
+                return Err(NativeError::Timeout);
+            }
+            Ok(NativeResponse {
+                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: NativeResponseKind::Response,
+                request_id: Uuid::new_v4(),
+                outcome: Outcome::Completed,
+                result: Some(json!({"ok": true})),
+                error: None,
+                staged: None,
+            })
         }
     }
 
@@ -2971,8 +2951,8 @@ mod tests {
     }
 
     #[test]
-    fn handoff_timeout_keeps_global_blackout_active() {
-        let (_temp, runtime, connection) = connected_runtime(Arc::new(TimeoutNative));
+    fn timed_out_handoff_state_does_not_block_browser_work() {
+        let (_temp, runtime, connection) = connected_runtime(Arc::new(HandoffTimeoutNative));
         own_tab(&runtime, &connection, 7);
         let response = runtime.handle(
             &connection,
@@ -2994,7 +2974,7 @@ mod tests {
         assert_eq!(response["error"]["code"], "extension_timeout");
         assert!(runtime.handoff.is_active());
 
-        let blocked = runtime.handle(
+        let snapshot = runtime.handle(
             &connection,
             json!({
                 "protocol": RPC_PROTOCOL,
@@ -3004,11 +2984,11 @@ mod tests {
                 "params": {"mode": "text", "tab_id": 3}
             }),
         );
-        assert_eq!(blocked["error"]["code"], "handoff_blackout");
+        assert_eq!(snapshot["outcome"], "completed");
         runtime.handoff.restore(false);
     }
     #[test]
-    fn rejected_handoff_releases_global_blackout() {
+    fn rejected_handoff_releases_active_marker() {
         let (_temp, runtime, connection) = connected_runtime(Arc::new(RejectedHandoffNative));
         own_tab(&runtime, &connection, 7);
         let response = runtime.handle(

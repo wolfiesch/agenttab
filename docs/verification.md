@@ -40,8 +40,8 @@ Use a disposable Chrome profile and a disposable test account. Reload the unpack
 4. accessibility, text, HTML, and screenshot snapshots; stale revision/ref rejection; wait conditions; and debugger detach/restart;
 5. ready, working, needs-you, resumed, and finished popup states;
 6. Pause, restart while paused, reconciliation, and Resume;
-7. global blackout during `browser_handoff`, including host and extension restart during the handoff;
-8. recognizable consequential controls staged without side effect, a changed target rejected, one unchanged Commit execution, and harmless controls executed without review.
+7. nonblocking `browser_handoff`, including concurrent snapshots and mutations plus host and extension restart during the handoff;
+8. default inline execution for recognizable consequential controls, then YOLO opt-out with staging, changed-target rejection, and one unchanged Commit execution.
 
 Never Commit a real send, purchase, delete, permission grant, or upload against a live account merely to prove the barrier. Use controlled fixtures and stop at the staged preview for live authenticated checks.
 
