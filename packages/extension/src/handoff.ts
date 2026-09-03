@@ -61,10 +61,6 @@ export class HandoffController {
   }
 
   private async restoreNow(): Promise<void> {
-    const state = await readState();
-    if (!state.handoff.active) return;
-    const barrier = this.scheduler.pause();
-    await barrier;
     const restored = await readState();
     if (!restored.handoff.active) return;
     if (restored.handoff.pendingClearEventId) {
@@ -122,7 +118,6 @@ export class HandoffController {
       timeoutMs: Number(timeoutMs),
     };
 
-    const barrier = this.scheduler.pause();
     let recorded = false;
     try {
       await mutateState((state) => {
@@ -135,7 +130,6 @@ export class HandoffController {
         state.handoff = next;
       });
       recorded = true;
-      await barrier;
       await this.ownership.assertOwned(taskId, numericTabId);
       await this.revisions.assertExpected(numericTabId, next.expectedRevision);
       if (originGuard) await originGuard();
@@ -158,7 +152,6 @@ export class HandoffController {
         started_at_ms: startedAt,
       };
     } catch (error) {
-      await barrier;
       if (recorded) {
         await mutateState((state) => {
           const handoff = state.handoff;
@@ -178,8 +171,6 @@ export class HandoffController {
         });
         await chrome.alarms.clear(HANDOFF_ALARM);
       }
-      const recovered = await readState();
-      if (!recovered.paused && !recovered.handoff.active) this.scheduler.resume();
       throw error;
     }
   }
@@ -226,8 +217,6 @@ export class HandoffController {
     });
     await chrome.alarms.clear(HANDOFF_ALARM);
     await this.ownership.setTaskState(handoff.taskId, "working");
-    const current = await readState();
-    if (!current.paused && !current.handoff.active) this.scheduler.resume();
   }
 
   private async cancelMatchingNow(
@@ -260,19 +249,8 @@ export class HandoffController {
   }
 
   private async resumeNow(): Promise<void> {
-    const state = await readState();
-    if (state.handoff.active) {
-      throw Object.assign(new Error("Finish or cancel credential handoff before resuming"), {
-        code: "handoff_in_progress",
-      });
-    }
     await this.ownership.reconcile();
     await mutateState((next) => {
-      if (next.handoff.active) {
-        throw Object.assign(new Error("Finish or cancel credential handoff before resuming"), {
-          code: "handoff_in_progress",
-        });
-      }
       next.paused = false;
     });
     this.scheduler.resume();

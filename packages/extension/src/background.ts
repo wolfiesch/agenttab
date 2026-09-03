@@ -49,7 +49,6 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   staged_commit_expired: true,
   staged_commit_mismatch: true,
   handoff_in_progress: true,
-  handoff_blackout: true,
   origin_denied: true,
   origin_not_allowed: true,
   origin_unavailable: true,
@@ -379,12 +378,6 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await browser.abandonNativeStage(command.task_id, params.native_token, params.tab_id),
       );
     }
-    if ((await readState()).handoff.active) {
-      throw Object.assign(new Error("Automation is disabled while credential handoff is active"), {
-        code: "handoff_blackout",
-        recovery: "Wait for the human to finish or cancel the active handoff.",
-      });
-    }
     if (
       command.method !== "browser_open" &&
       command.method !== "browser_tabs" &&
@@ -405,17 +398,15 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       });
     }
     if (command.method === "browser_handoff") {
-      if (!scheduler.isAccepting() || (await readState()).paused) {
-        throw scheduler.notStarted("AgentTab is paused");
-      }
-      return completed(
-        command.request_id,
-        await handoff.begin(
+      const targetTabId = tabId(params);
+      const result = await scheduler.enqueueTab(command.task_id, targetTabId, () =>
+        handoff.begin(
           command.task_id,
           params,
-          () => assertHandoffRoute(tabId(params), params, command.origin_policy),
-        ),
+          () => assertHandoffRoute(targetTabId, params, command.origin_policy),
+        )
       );
+      return completed(command.request_id, result);
     }
     if (command.method === "browser_commit") {
       const targetTabId = await browser.stagedTabId(command.task_id, params.native_token);
@@ -544,7 +535,7 @@ async function initializeRuntime(): Promise<void> {
     automationRevocationGeneration,
     state.automationCleanup.generation,
   );
-  scheduler.setInitialPaused(state.paused || state.handoff.active);
+  scheduler.setInitialPaused(state.paused);
   if (await automationEnabled()) {
     scheduler.restorePermissions();
   } else {

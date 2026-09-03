@@ -7,7 +7,7 @@
 | Component | Responsibility |
 | --- | --- |
 | Core RPC | Validates versioned `agenttab.rpc` v1 requests, attaches connection identity and task scope server-side, and returns a structured outcome. |
-| Runtime | Applies lifecycle, task scope, handoff blackout, origin and upload guardrails, idempotency, audit, and request locks. |
+| Runtime | Applies lifecycle, task scope, durable handoff state, origin and upload guardrails, idempotency, audit, and request locks. |
 | Journal | Maintains durable task, ownership, revision-floor, handoff, staged Commit, event receipt, and idempotency state in SQLite. |
 | Native transport | Exchanges versioned `agenttab.native` v1 messages with the Chrome extension over Native Messaging. |
 | Local IPC server | Accepts authenticated same-user Core clients over a Unix socket or Windows named pipe. |
@@ -35,7 +35,7 @@ Standard mode has no TCP listener or bearer token. The advanced `agenttab proxy 
 
 The implemented lifecycle states are `starting`, `reconciling`, `ready`, `paused`, and terminal. Browser work is admitted only in `ready`. In `starting` or `reconciling` it returns `runtime_not_ready`; in `paused` it returns `automation_paused`; in terminal state it returns a protocol-recovery error.
 
-Pause admission is also enforced by the extension scheduler. It closes new admission, waits for in-flight work, persists pause state, and rejects queued work before dispatch. Handoff is a global write barrier and causes a host-side blackout check both before and after request admission.
+Pause admission is also enforced by the extension scheduler. It closes new admission, waits for in-flight work, persists pause state, and rejects queued work before dispatch. Handoff records durable coordination state but does not alter request admission or locking.
 
 ## Durable state
 

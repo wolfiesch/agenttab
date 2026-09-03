@@ -235,7 +235,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_handoff",
       label: "Browser Handoff",
-      description: "Start an asynchronous human handoff for credentials, MFA, CAPTCHA, or other human-only input. The call returns after activation; browser automation remains paused until completion.",
+      description: "Start a durable human handoff for MFA, CAPTCHA, passkeys, or other human-only input. The call returns after activation and browser automation remains available; try browser_credentials first for ordinary sign-in fields.",
       approval: "write",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
@@ -251,7 +251,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_credentials",
       label: "Browser Credentials",
-      description: "Use a URL-matching 1Password Login without exposing its values. Prepare first; more than three matches require the user. Fill only, then submit through Browser Act.",
+      description: "Prefer this before human handoff: use a URL-matching 1Password Login without exposing its values. Prepare first; more than three matches require the user. Fill only, then submit through Browser Act.",
       approval: "write",
       schema: (z) => z.union([
         z.object({

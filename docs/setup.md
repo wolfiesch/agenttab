@@ -8,8 +8,8 @@ This guide distinguishes the contributor source path from the future signed RC a
 
 - Chrome must be version 127 or later for the current extension manifest.
 - AgentTab runs in the existing signed-in Chrome profile. It is task-scoped browser control, not a separate profile, cookie jar, or identity boundary.
-- Keep page content untrusted. A managed, disabled-by-default 1Password broker may fill an origin-matching Login item without exposing its value to the agent. Use **Your Turn** for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential result that requests the user. Review a staged **Commit** before performing it.
-- A future installation needs an AgentTab extension and the `dev.agenttab.host` native host. Standard mode does not require a TCP listener, a bearer token, or a Python process. Credential filling additionally requires 1Password CLI with desktop-app integration and biometric unlock available to the current OS user.
+- Keep page content untrusted. The built-in 1Password broker is available by default and may fill an origin-matching Login item without exposing its value to the agent. Use **Your Turn** for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential result that requests the user. Recognized consequential actions execute directly unless YOLO mode is turned off in the popup.
+- A future installation needs an AgentTab extension and the `dev.agenttab.host` native host. Standard mode does not require a TCP listener, a bearer token, or a Python process. Credential filling additionally requires the `op` command, 1Password desktop-app integration, and biometric unlock available to the current OS user.
 
 The product boundary and residual Commit risk are described in the [runtime ADR](adr/0001-agenttab-runtime.md) and [Security](security.md).
 
@@ -86,16 +86,17 @@ Normal local adapter traffic uses one of these OS-native endpoints:
 
 On Unix, AgentTab requires its state and runtime directories to be current-user owned and mode `0700`; its socket and host lock are mode `0600`. The host authenticates local peers with OS credentials. On Windows, the named-pipe DACL is limited to the current user SID and `SYSTEM`. `AGENTTAB_SOCKET` and `AGENTTAB_PIPE_NAME` are adapter overrides for configured local endpoints, not normal setup switches.
 
-## Optional 1Password credential broker
+## 1Password credential broker
 
-Credential filling is off by default. Enable it only in the host's owner-only
-`~/.agenttab/policy.json`:
+Credential filling is available by default. AgentTab resolves `op` from the
+native host's process `PATH`, then checks standard installation locations for
+the current platform. Owner-only `~/.agenttab/policy.json` can disable the
+broker or constrain its executable, account, and limits:
 
 ```json
 {
   "one_password": {
     "enabled": true,
-    "executable": "/opt/homebrew/bin/op",
     "max_candidates": 3,
     "max_attempts": 3,
     "auth_timeout_ms": 45000
@@ -107,13 +108,15 @@ The limits must be integers from one through three. `auth_timeout_ms` must be
 between 5000 and 120000. An optional `account` selects one configured
 1Password account without putting a secret in policy. Set `executable` to the
 absolute `op` path when a GUI-launched browser does not inherit the shell
-`PATH`; relative paths are rejected. Policy changes apply when the native host
-next starts, so reload the extension after editing this file.
+`PATH`; relative paths are rejected. Set `enabled` to `false` to disable
+credential access. Policy changes apply when the native host next starts, so
+reload the extension after editing this file.
 
 Install and sign in to 1Password CLI separately, enable its desktop-app
-integration, and keep biometric unlock available. AgentTab never stores a
-1Password session token. If 1Password needs approval, its Touch ID or Apple
-Watch prompt is the only expected human interaction. More than the configured
+integration, and keep the platform's supported biometric or desktop approval
+available. AgentTab never stores a 1Password session token. If 1Password needs
+approval, its native 1Password prompt is the only expected human interaction.
+More than the configured
 number of origin-matching Login items, unavailable CLI state, or an unsupported
 verification step returns control to the user instead of trying additional
 credentials.

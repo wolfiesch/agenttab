@@ -27,7 +27,7 @@ When comparing another surface, run the same scenario, user-visible success crit
 
 Do not convert security barriers into speed-only scores. If measuring Commit, record classification result, stage creation, human review delay as a separate interval, revalidation outcome, and execution or refusal. Never Commit a real consequential action only to collect a timing number.
 
-If measuring handoff, record only safe lifecycle timestamps such as request accepted, blackout active, completion acknowledged, and resume ready. Do not record keys, secrets, page contents, screenshots, or human input.
+If measuring handoff, record only safe lifecycle timestamps such as request accepted, marker active, completion acknowledged, and marker cleared. Do not record keys, secrets, page contents, screenshots, or human input.
 
 ## Publishing a result
 

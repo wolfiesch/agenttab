@@ -26,18 +26,6 @@ impl HandoffState {
                 )
             })
     }
-
-    pub fn observation_gate(&self) -> Result<(), RpcError> {
-        if self.is_active() {
-            Err(RpcError::new(
-                "handoff_blackout",
-                "Browser observations are disabled during credential handoff",
-            )
-            .with_recovery("Wait for the human to finish or cancel the active handoff."))
-        } else {
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -45,12 +33,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blackout_remains_until_native_completion_is_reconciled() {
+    fn active_state_rejects_only_another_handoff() {
         let state = HandoffState::default();
         state.begin().unwrap();
-        assert!(state.observation_gate().is_err());
         assert!(state.begin().is_err());
         state.restore(false);
-        assert!(state.observation_gate().is_ok());
+        assert!(!state.is_active());
     }
 }

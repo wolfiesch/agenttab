@@ -45,7 +45,7 @@ pub struct OnePasswordPolicy {
 impl Default for OnePasswordPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             account: None,
             executable: None,
             max_candidates: 3,
@@ -634,6 +634,22 @@ mod tests {
                 .code,
             "upload_file_not_allowed"
         );
+    }
+
+    #[test]
+    fn one_password_is_available_by_default_but_can_be_disabled() {
+        let defaults = Guardrails::defaults();
+        assert!(defaults.one_password_policy().enabled);
+
+        let disabled = Guardrails::from_policy(Policy {
+            one_password: OnePasswordPolicy {
+                enabled: false,
+                ..OnePasswordPolicy::default()
+            },
+            ..Policy::default()
+        })
+        .unwrap();
+        assert!(!disabled.one_password_policy().enabled);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -309,10 +310,82 @@ struct OnePasswordProvider {
     timeout: Duration,
 }
 
+fn default_one_password_executable() -> PathBuf {
+    let executable_name = if cfg!(windows) { "op.exe" } else { "op" };
+    let search_path = std::env::var_os("PATH");
+    let fallbacks = standard_one_password_executable_paths();
+    resolve_one_password_executable(executable_name, search_path.as_deref(), &fallbacks)
+}
+
+fn resolve_one_password_executable(
+    executable_name: &str,
+    search_path: Option<&OsStr>,
+    fallbacks: &[PathBuf],
+) -> PathBuf {
+    if let Some(search_path) = search_path {
+        for directory in std::env::split_paths(search_path) {
+            let candidate = directory.join(executable_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    fallbacks
+        .iter()
+        .find(|candidate| candidate.is_file())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(executable_name))
+}
+
+fn standard_one_password_executable_paths() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return ["/opt/homebrew/bin/op", "/usr/local/bin/op", "/usr/bin/op"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return ["/usr/local/bin/op", "/usr/bin/op", "/snap/bin/op"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    #[cfg(windows)]
+    {
+        let mut paths = Vec::new();
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            paths.push(
+                PathBuf::from(local_app_data)
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links")
+                    .join("op.exe"),
+            );
+        }
+        if let Some(program_files) = std::env::var_os("PROGRAMFILES") {
+            paths.push(
+                PathBuf::from(program_files)
+                    .join("1Password CLI")
+                    .join("op.exe"),
+            );
+        }
+        return paths;
+    }
+
+    #[allow(unreachable_code)]
+    Vec::new()
+}
+
 impl OnePasswordProvider {
     fn new(policy: OnePasswordPolicy) -> Self {
         Self {
-            executable: policy.executable.unwrap_or_else(|| PathBuf::from("op")),
+            executable: policy
+                .executable
+                .unwrap_or_else(default_one_password_executable),
             account: policy.account,
             timeout: Duration::from_millis(policy.auth_timeout_ms),
         }
@@ -647,6 +720,35 @@ mod tests {
         });
 
         assert!(provider.candidates("example.com").unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_executable_discovery_prefers_the_process_path_then_standard_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let path_candidate = temp
+            .path()
+            .join(if cfg!(windows) { "op.exe" } else { "op" });
+        std::fs::write(&path_candidate, b"fixture").unwrap();
+        let search_path = std::env::join_paths([temp.path()]).unwrap();
+        let fallback = temp.path().join("fallback-op");
+        std::fs::write(&fallback, b"fixture").unwrap();
+
+        assert_eq!(
+            resolve_one_password_executable(
+                if cfg!(windows) { "op.exe" } else { "op" },
+                Some(&search_path),
+                std::slice::from_ref(&fallback),
+            ),
+            path_candidate
+        );
+        assert_eq!(
+            resolve_one_password_executable("missing-op", None, std::slice::from_ref(&fallback)),
+            fallback
+        );
+        assert_eq!(
+            resolve_one_password_executable("missing-op", None, &[]),
+            PathBuf::from("missing-op")
+        );
     }
 
     #[test]

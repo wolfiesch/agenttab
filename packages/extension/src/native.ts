@@ -333,7 +333,7 @@ export class NativeBridge {
     }
     const state = await readState();
     if (this.port !== port) return;
-    if (!state.paused && !state.handoff.active) this.scheduler.resume();
+    if (!state.paused) this.scheduler.resume();
     await this.onReady();
   }
 
