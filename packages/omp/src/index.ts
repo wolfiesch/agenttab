@@ -235,18 +235,25 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_handoff",
       label: "Browser Handoff",
-      description: "Start a durable human handoff for MFA, CAPTCHA, passkeys, or other human-only input. The call returns after activation and browser automation remains available; try browser_credentials first for ordinary sign-in fields.",
+      description: "Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id.",
       approval: "write",
-      schema: (z) => z.object({
-        tab_id: z.number().int().min(0),
-        expected_page_revision: z.number().int().min(0),
-        prompt: z.string().min(1).max(2000),
-        completion: z.union([
-          z.object({ kind: z.enum(["navigation", "manual_done"]) }).strict(),
-          z.object({ kind: z.enum(["url", "selector"]), value: z.string().min(1).max(65_536) }).strict(),
-        ]),
-        timeout_ms: z.number().int().min(1000).max(900_000).optional(),
-      }).strict(),
+      schema: (z) => z.union([
+        z.object({
+          operation: z.literal("request"),
+          tab_id: z.number().int().min(0),
+          expected_page_revision: z.number().int().min(0),
+          prompt: z.string().min(1).max(2000),
+          completion: z.object({
+            kind: z.enum(["url", "selector"]),
+            value: z.string().min(1).max(65_536),
+          }).strict().optional(),
+          timeout_ms: z.number().int().min(1000).max(900_000).optional(),
+        }).strict(),
+        z.object({
+          operation: z.enum(["status", "resolve", "dismiss"]),
+          notice_id: z.string().min(1).max(256),
+        }).strict(),
+      ]),
     },
     {
       name: "browser_credentials",

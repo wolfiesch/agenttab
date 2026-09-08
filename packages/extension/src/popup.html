@@ -17,13 +17,9 @@
   </header>
   <main>
     <section id="handoff" class="panel handoff" aria-labelledby="handoff-title" tabindex="-1" hidden>
-      <h2 id="handoff-title" class="eyebrow">Your turn</h2>
-      <p id="handoff-prompt" class="lead"></p>
-      <p class="note">AgentTab is not watching this tab. Nothing is captured until you finish.</p>
-      <div class="actions">
-        <button id="handoff-cancel" type="button" class="quiet">Cancel</button>
-        <button id="handoff-done" type="button">I'm done</button>
-      </div>
+      <h2 id="handoff-title" class="eyebrow">Needs your attention</h2>
+      <p class="note">Finish a requested step in a task tab, then tell the agent. It checks the page itself before continuing. Dismissing only hides the reminder.</p>
+      <ul id="handoff-list" class="handoff-list"></ul>
       <p id="handoff-error" class="error" role="alert" hidden></p>
     </section>
 
@@ -111,6 +107,13 @@
           <small id="pointer-detail">Show where an agent clicks in a visible tab.</small>
         </span>
         <input id="pointer" type="checkbox">
+      </label>
+      <label class="toggle-row" for="yolo">
+        <span class="row-copy">
+          <strong>YOLO mode</strong>
+          <small>Execute recognized consequential actions without Commit review. Task ownership, origin policy, and credential isolation stay enforced.</small>
+        </span>
+        <input id="yolo" type="checkbox">
       </label>
       <p id="settings-error" class="error" role="alert" hidden></p>
     </details>

@@ -22,13 +22,13 @@ The local policy can disable audit writing. Disabling it changes local accountab
 
 ## SQLite state and receipts
 
-`state.sqlite3` is local runtime state, not telemetry. It contains task/ownership state, page-revision floors, hashes of resume capabilities and staged Commit tokens, idempotency records, handoff state, and native-event receipts. It supports crash recovery and one-use operations. It is not a proof that a remote website accepted an action.
+`state.sqlite3` is local runtime state, not telemetry. It contains task/ownership state, page-revision floors, hashes of resume capabilities and staged Commit tokens, idempotency records, and native-event receipts. It supports crash recovery and one-use operations. It is not a proof that a remote website accepted an action.
 
 A user-visible website confirmation, transaction receipt, or download is independent evidence. The host's audit entry and journal receipt record only AgentTab's local processing.
 
 ## Extension local state
 
-The extension keeps task state, paused state, active handoff marker, staged Commit records, and revision information in Chrome extension storage. This lets it restore safety barriers after service-worker restart. Chrome may sync or back up browser-profile data according to the user's browser/account configuration; AgentTab does not initiate a telemetry upload.
+The extension keeps task state, paused state, open attention notices, staged Commit records, and revision information in Chrome extension storage. This lets it restore safety barriers after service-worker restart. Chrome may sync or back up browser-profile data according to the user's browser/account configuration; AgentTab does not initiate a telemetry upload.
 
 ## Explicit network paths
 

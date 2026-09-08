@@ -68,11 +68,11 @@ Commit is an optional, best-effort semantic barrier, not proof that an action is
 
 YOLO mode is enabled by default. It bypasses only Commit review. Task ownership, origin policy, expected revisions, restricted-origin routing, credential isolation, and action validation remain enforced. Turning YOLO mode on discards pending staged actions; turning it off restores the two-party Commit flow.
 
-## Your Turn handoff
+## Attention notices
 
-`browser_handoff` persists the active handoff and completion condition before focusing the declared tab, then returns immediately. It does not pause the scheduler or block browser observations and mutations. Explicit **Pause agents** remains a separate owner control.
+A `browser_handoff` request records an advisory attention notice for one task tab. Notices never gate command admission, scheduling, Pause, or finalization, and a request never focuses a tab, activates a window, or opens the popup by itself. The human completes the step in Chrome and tells the agent; the agent then verifies the page itself before resolving or dismissing the notice. The popup can explicitly focus the exact noticed tab when the user clicks Open tab, and Dismiss only hides the reminder.
 
-This permissive behavior keeps unrelated browser work moving, but handoff is not a confidentiality boundary: an agent that continues observing the handoff tab may capture user-entered page state. Prefer `browser_credentials` for ordinary username, password, and one-time-code fields because brokered values never enter Core RPC, adapter responses, or audit output. Use handoff for interactions the broker cannot complete, and explicitly pause agents first when the page state itself must remain unobservable.
+This keeps human-only input out of agent requests. It cannot protect secrets from a compromised device, a malicious webpage, or browser extensions with their own access.
 
 ## Upload guardrails
 
@@ -86,7 +86,7 @@ A Core connection receives a task lazily on first browser work. A resume capabil
 
 Adapters must store a capability in owner-only private state and must not log, display, or share it. Losing it does not expose a task, but reconnecting without it creates a new task. Treat a capability like a local session secret.
 
-The host stores task state, ownership, revision floors, handoff state, staged Commit records, event receipts, and idempotency records in local SQLite with WAL and full synchronous writes. Mutations use UUIDv7 idempotency keys. A completed record returns its cached result; a durable started record after a crash returns `unknown` and is never replayed.
+The host stores task state, ownership, revision floors, staged Commit records, event receipts, and idempotency records in local SQLite with WAL and full synchronous writes. Attention notices live in extension storage, not host admission state. Mutations use UUIDv7 idempotency keys. A completed record returns its cached result; a durable started record after a crash returns `unknown` and is never replayed.
 
 ## Local audit data and operational records
 

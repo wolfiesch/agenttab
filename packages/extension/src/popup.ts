@@ -19,6 +19,16 @@ interface ReviewView {
   expiresAtMs: number;
 }
 
+interface NoticeView {
+  noticeId: string;
+  taskId: string;
+  tabId: number;
+  prompt: string;
+  status: string;
+  startedAtMs: number;
+  expiresAtMs: number;
+}
+
 interface UiState {
   automationEnabled: boolean;
   paused: boolean;
@@ -26,7 +36,7 @@ interface UiState {
   skipCommitReview: boolean;
   pointer: boolean | null;
   cleanupPolicy: "automatic" | "ask" | "keep";
-  handoffPrompt: string | null;
+  notices: NoticeView[];
   tasks: TaskView[];
   reviews: ReviewView[];
 }
@@ -51,7 +61,6 @@ interface TaskGlyph {
 
 const TASK_STATES: Record<string, TaskGlyph> = {
   working: { label: "Working", symbol: "✦" },
-  needs_user: { label: "Needs you", symbol: "↗" },
   completed: { label: "Finished", symbol: "✓" },
 };
 
@@ -59,7 +68,7 @@ const STATUS_TEXT: Record<Lifecycle, string> = {
   disabled: "Setup needed",
   ready: "Ready",
   paused: "Paused",
-  "your-turn": "Your turn",
+  "your-turn": "Needs your attention",
   error: "Unavailable",
 };
 
@@ -82,21 +91,20 @@ const disableButton = element("disable", HTMLButtonElement);
 const developerPanel = element("developer", HTMLElement);
 const developerOff = element("developer-off", HTMLButtonElement);
 const handoffPanel = element("handoff", HTMLElement);
-const handoffPrompt = element("handoff-prompt", HTMLParagraphElement);
-const handoffCancel = element("handoff-cancel", HTMLButtonElement);
-const handoffDone = element("handoff-done", HTMLButtonElement);
+const handoffList = element("handoff-list", HTMLUListElement);
 const handoffError = element("handoff-error", HTMLParagraphElement);
 const taskCount = element("task-count", HTMLSpanElement);
 const taskList = element("tasks", HTMLUListElement);
 const taskError = element("task-error", HTMLParagraphElement);
 const pointerToggle = element("pointer", HTMLInputElement);
 const yoloToggle = element("yolo", HTMLInputElement);
-const cleanupPolicy = element("cleanup-policy", HTMLSelectElement);
+
 const pointerDetail = element("pointer-detail", HTMLElement);
-const settingsError = element("settings-error", HTMLParagraphElement);
+const cleanupPolicy = element("cleanup-policy", HTMLSelectElement);
 const reviews = element("reviews", HTMLElement);
 const reviewList = element("review-list", HTMLUListElement);
 const reviewError = element("review-error", HTMLParagraphElement);
+const settingsError = element("settings-error", HTMLParagraphElement);
 
 let current: UiState | null = null;
 let pending = false;
@@ -172,12 +180,37 @@ function parseReview(value: Record<string, unknown>): ReviewView | null {
   };
 }
 
+function parseNotice(value: Record<string, unknown>): NoticeView | null {
+  if (
+    typeof value.notice_id !== "string" ||
+    typeof value.task_id !== "string" ||
+    typeof value.tab_id !== "number" ||
+    typeof value.status !== "string" ||
+    typeof value.started_at_ms !== "number" ||
+    typeof value.expires_at_ms !== "number"
+  ) {
+    return null;
+  }
+  return {
+    noticeId: value.notice_id,
+    taskId: value.task_id,
+    tabId: value.tab_id,
+    prompt: typeof value.prompt === "string" && value.prompt.trim() !== ""
+      ? value.prompt
+      : "Finish the requested step in the task tab, then tell the agent.",
+    status: value.status,
+    startedAtMs: value.started_at_ms,
+    expiresAtMs: value.expires_at_ms,
+  };
+}
+
 async function load(): Promise<UiState> {
   const response = await send({ kind: "get_ui_state" });
-  const handoff = isRecord(response.handoff) ? response.handoff : null;
-  const prompt = handoff && typeof handoff.prompt === "string" && handoff.prompt.trim() !== ""
-    ? handoff.prompt
-    : "Finish the requested step in the focused tab, then choose I'm done.";
+  const noticeValues = Array.isArray(response.notices)
+    ? response.notices
+    : isRecord(response.notices)
+      ? Object.values(response.notices)
+      : [];
   return {
     automationEnabled: response.automation_enabled === true,
     paused: response.paused === true,
@@ -187,7 +220,10 @@ async function load(): Promise<UiState> {
     cleanupPolicy: response.cleanup_policy === "ask" || response.cleanup_policy === "keep"
       ? response.cleanup_policy
       : "automatic",
-    handoffPrompt: handoff === null ? null : prompt,
+    notices: noticeValues
+      .filter(isRecord)
+      .map(parseNotice)
+      .filter((notice): notice is NoticeView => notice !== null && notice.status === "open"),
     tasks: Array.isArray(response.tasks)
       ? response.tasks
         .filter(isRecord)
@@ -204,13 +240,13 @@ async function load(): Promise<UiState> {
 }
 
 function lifecycle(state: UiState): Lifecycle {
-  if (state.handoffPrompt !== null) return "your-turn";
   if (!state.automationEnabled) return "disabled";
-  return state.paused ? "paused" : "ready";
+  if (state.paused) return "paused";
+  return state.notices.length > 0 ? "your-turn" : "ready";
 }
 
 function admissionDetail(phase: Lifecycle, paused: boolean): string {
-  if (phase === "your-turn") return "Held until you finish or cancel the step above.";
+  if (phase === "your-turn") return "Agents keep working while you finish the step above.";
   if (paused) return "Queued agent work is refused. Work already dispatched still finishes.";
   if (phase === "disabled") return "Agents can open task tabs, but page reads and actions stay blocked.";
   return "Agents can open task tabs and act inside them.";
@@ -341,6 +377,39 @@ function renderReview(review: ReviewView): HTMLLIElement {
   return row;
 }
 
+function renderNotice(notice: NoticeView): HTMLLIElement {
+  const row = document.createElement("li");
+  row.className = "notice";
+  const prompt = document.createElement("strong");
+  prompt.textContent = notice.prompt;
+  const expiry = document.createElement("small");
+  const seconds = Math.max(0, Math.ceil((notice.expiresAtMs - Date.now()) / 1_000));
+  const countdown = seconds === 1 ? "1 second" : `${seconds} seconds`;
+  expiry.textContent = `Tab ${notice.tabId} · Reminder expires in ${countdown}`;
+  const actions = document.createElement("div");
+  actions.className = "notice-actions";
+  const dismiss = document.createElement("button");
+  dismiss.type = "button";
+  dismiss.className = "quiet";
+  dismiss.textContent = "Dismiss";
+  dismiss.addEventListener("click", () => {
+    void guard(handoffError, async () => {
+      await send({ kind: "handoff_dismiss", notice_id: notice.noticeId });
+    });
+  });
+  const openTab = document.createElement("button");
+  openTab.type = "button";
+  openTab.textContent = "Open tab";
+  openTab.addEventListener("click", () => {
+    void guard(handoffError, async () => {
+      await send({ kind: "handoff_open", notice_id: notice.noticeId });
+    });
+  });
+  actions.append(dismiss, openTab);
+  row.append(prompt, expiry, actions);
+  return row;
+}
+
 function render(state: UiState): void {
   const phase = lifecycle(state);
   document.body.dataset.state = phase;
@@ -353,15 +422,15 @@ function render(state: UiState): void {
   automationDetail.textContent = admissionDetail(phase, state.paused);
   pauseButton.textContent = state.paused ? "Resume agents" : "Pause agents";
   pauseButton.dataset.mode = state.paused ? "resume" : "pause";
-  pauseButton.disabled = phase === "your-turn";
+  pauseButton.disabled = false;
 
   developerChip.hidden = !state.developerMode;
   developerPanel.hidden = !state.developerMode;
   yoloToggle.checked = state.skipCommitReview;
 
-  handoffPanel.hidden = state.handoffPrompt === null;
-  if (state.handoffPrompt !== null) {
-    handoffPrompt.textContent = state.handoffPrompt;
+  handoffPanel.hidden = state.notices.length === 0;
+  if (state.notices.length > 0) {
+    handoffList.replaceChildren(...state.notices.map(renderNotice));
     if (!handoffShown) {
       handoffShown = true;
       handoffPanel.focus();
@@ -498,25 +567,7 @@ yoloToggle.addEventListener("change", () => {
     await send({ kind: "set_skip_commit_review", enabled });
   }).then((ran) => {
     if (!ran) yoloToggle.checked = !enabled;
-  });
-});
 
-handoffCancel.addEventListener("click", () => {
-  void guard(handoffError, async () => {
-    await send({ kind: "handoff_finish", completed: false });
-  });
-});
-
-handoffDone.addEventListener("click", () => {
-  void guard(handoffError, async () => {
-    const result = await send({ kind: "handoff_finish", completed: true });
-    if (result.completed !== true) {
-      throw new Error(
-        typeof result.reason === "string" && result.reason !== ""
-          ? result.reason
-          : "AgentTab could not confirm that the step finished.",
-      );
-    }
   });
 });
 

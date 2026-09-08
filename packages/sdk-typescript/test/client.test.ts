@@ -106,12 +106,17 @@ describe("Core RPC transport deadlines", () => {
     expect(resolveTransportTimeoutMs(
       "browser_handoff",
       {
+        operation: "request",
         tab_id: 1,
         expected_page_revision: 1,
         prompt: "Complete MFA",
-        completion: { kind: "manual_done" },
+        completion: { kind: "selector", value: "body" },
       },
     )).toBe(DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs(
+      "browser_handoff",
+      { operation: "status", notice_id: "notice-1" },
+    )).toBe(30_000);
     expect(resolveTransportTimeoutMs(
       "browser_credentials",
       { action: "prepare", tab_id: 1, expected_page_revision: 1 },

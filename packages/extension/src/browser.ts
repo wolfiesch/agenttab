@@ -286,6 +286,12 @@ export class StandardBrowserRuntime {
     if (failed) throw failed.reason;
   }
 
+  async discardHumanInteractionCapture(tabId: number): Promise<void> {
+    // A browser_handoff notice applies only to its owned tab. Detach any CDP
+    // session there before human input without disrupting unrelated tasks.
+    await this.detach(tabId);
+  }
+
   private async detachRecovered(tabId: number): Promise<void> {
     if (this.sessions.has(tabId)) {
       await this.detach(tabId);

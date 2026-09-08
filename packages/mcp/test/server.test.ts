@@ -480,10 +480,11 @@ describe("AgentTab MCP surface", () => {
       params: {
         name: "browser_handoff",
         arguments: {
+          operation: "request",
           tab_id: 7,
           expected_page_revision: 3,
           prompt: "Complete MFA",
-          completion: { kind: "manual_done" },
+          completion: { kind: "url", value: "https://example.test/done" },
           timeout_ms: 900_000,
         },
       },
@@ -500,10 +501,11 @@ describe("AgentTab MCP surface", () => {
       {
         method: "browser_handoff",
         params: {
+          operation: "request",
           tab_id: 7,
           expected_page_revision: 3,
           prompt: "Complete MFA",
-          completion: { kind: "manual_done" },
+          completion: { kind: "url", value: "https://example.test/done" },
           timeout_ms: 900_000,
         },
       },

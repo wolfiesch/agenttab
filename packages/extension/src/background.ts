@@ -48,7 +48,7 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   invalid_staged_token: true,
   staged_commit_expired: true,
   staged_commit_mismatch: true,
-  handoff_in_progress: true,
+
   origin_denied: true,
   origin_not_allowed: true,
   origin_unavailable: true,
@@ -100,7 +100,7 @@ browser = new StandardBrowserRuntime(
   },
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
-handoff.setScrubber(() => browser.scrubForHandoff());
+handoff.setScrubber((tabId) => browser.discardHumanInteractionCapture(tabId));
 
 async function automationEnabled(): Promise<boolean> {
   if (automationCleanupPending) return false;
@@ -354,7 +354,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
           command.keep_tab_ids,
         );
       if (command.kind === "close_task" || result.finished === true) {
-        await handoff.cancelForTask(command.task_id);
+        await handoff.clearForTask(command.task_id);
       }
       return completed(command.request_id, result);
     } catch (error) {
@@ -398,15 +398,30 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       });
     }
     if (command.method === "browser_handoff") {
-      const targetTabId = tabId(params);
-      const result = await scheduler.enqueueTab(command.task_id, targetTabId, () =>
-        handoff.begin(
-          command.task_id,
-          params,
-          () => assertHandoffRoute(targetTabId, params, command.origin_policy),
-        )
-      );
-      return completed(command.request_id, result);
+      if (!scheduler.isAccepting() || (await readState()).paused) {
+        throw scheduler.notStarted("AgentTab is paused");
+      }
+      const operation = params.operation;
+      if (operation === "request") {
+        return completed(
+          command.request_id,
+          await handoff.request(
+            command.task_id,
+            params,
+            () => assertHandoffRoute(tabId(params), params, command.origin_policy),
+          ),
+        );
+      }
+      if (operation === "status") {
+        return completed(command.request_id, await handoff.status(command.task_id, String(params.notice_id)));
+      }
+      if (operation === "resolve") {
+        return completed(command.request_id, await handoff.resolve(command.task_id, String(params.notice_id)));
+      }
+      if (operation === "dismiss") {
+        return completed(command.request_id, await handoff.dismiss(command.task_id, String(params.notice_id)));
+      }
+      throw Object.assign(new Error("Unsupported browser_handoff operation"), { code: "invalid_request" });
     }
     if (command.method === "browser_commit") {
       const targetTabId = await browser.stagedTabId(command.task_id, params.native_token);
@@ -509,7 +524,6 @@ nativeBridge = new NativeBridge(
   scheduler,
   ownership,
   dispatch,
-  (event, eventId) => void handoff.acknowledgeEvent(event, eventId),
   () => handoff.restore(),
   async (nativeTokens) => {
     if (nativeTokens.length > 0) {
@@ -665,7 +679,7 @@ chrome.permissions.onAdded.addListener((permissions) => {
 chrome.alarms.onAlarm.addListener((alarm: { name: string }) => {
   runAfterStart(async () => {
     if (alarm.name === RECONNECT_ALARM) await nativeBridge?.reconnectFromAlarm(alarm.name);
-    if (alarm.name === HANDOFF_ALARM) await handoff.finish(false);
+    if (alarm.name === HANDOFF_ALARM) await handoff.expire();
     if (alarm.name === AUTOMATION_CLEANUP_ALARM) {
       if (automationCleanupTimer) clearTimeout(automationCleanupTimer);
       automationCleanupTimer = undefined;
@@ -685,10 +699,19 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
     const state = await readState();
     return {
       automation_enabled: await automationEnabled(),
+      notices: Object.values(state.notices).map((notice) => ({
+        notice_id: notice.noticeId,
+        task_id: notice.taskId,
+        tab_id: notice.tabId,
+        prompt: notice.prompt,
+        status: notice.status,
+        started_at_ms: notice.startedAtMs,
+        expires_at_ms: notice.expiresAtMs,
+      })),
       paused: state.paused,
       developer_mode: state.developerMode,
       skip_commit_review: state.skipCommitReview,
-      handoff: state.handoff.active ? { prompt: state.handoff.prompt } : null,
+
       show_agent_pointer: state.showAgentPointer,
       cleanup_policy: state.cleanupPolicy,
       tasks: Object.values(state.tasks).map((task) => ({
@@ -746,8 +769,11 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
     await ownership.setDeveloperMode(message.enabled);
     return { enabled: message.enabled };
   }
-  if (message.kind === "handoff_finish" && typeof message.completed === "boolean") {
-    return handoff.finish(message.completed);
+  if (message.kind === "handoff_open" && typeof message.notice_id === "string") {
+    return handoff.openFromPopup(message.notice_id);
+  }
+  if (message.kind === "handoff_dismiss" && typeof message.notice_id === "string") {
+    return handoff.dismissFromPopup(message.notice_id);
   }
   if (
     (message.kind === "approve_popup_commit" || message.kind === "abandon_popup_commit") &&
@@ -784,7 +810,7 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
   ) {
     const disposition = message.kind === "close_task" ? "close" : "keep";
     const result = await ownership.finishTask(message.task_id, disposition);
-    if (result.finished === true) await handoff.cancelForTask(message.task_id);
+    if (result.finished === true) await handoff.clearForTask(message.task_id);
     return result;
   }
   throw new Error("Unsupported popup message");

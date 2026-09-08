@@ -72,15 +72,18 @@ export interface BrowserWaitParams {
   timeout_ms?: number;
 }
 
-export interface BrowserHandoffParams {
-  tab_id: number;
-  expected_page_revision: number;
-  prompt: string;
-  completion:
-  | { kind: "navigation" | "manual_done" }
-  | { kind: "url" | "selector"; value: string };
-  timeout_ms?: number;
-}
+export type BrowserHandoffCompletion = { kind: "url" | "selector"; value: string };
+
+export type BrowserHandoffParams =
+  | {
+    operation: "request";
+    tab_id: number;
+    expected_page_revision: number;
+    prompt: string;
+    completion?: BrowserHandoffCompletion;
+    timeout_ms?: number;
+  }
+  | { operation: "status" | "resolve" | "dismiss"; notice_id: string };
 
 export type BrowserCredentialsParams =
   | {
@@ -117,7 +120,7 @@ export interface AgenttabFinishResult {
   finished: boolean;
   closed_tab_ids: number[];
   retained_tab_ids: number[];
-  deferred?: "handoff_active" | "commit_review_active" | "user_confirmation";
+  deferred?: "commit_review_active" | "user_confirmation";
 }
 
 export interface MethodParams {
@@ -445,7 +448,11 @@ function longOperationTimeoutMs(
   let defaultTimeoutMs: number;
   if (method === "browser_wait") {
     defaultTimeoutMs = DEFAULT_BROWSER_WAIT_TIMEOUT_MS;
-  } else if (method === "browser_handoff") {
+  } else if (
+    method === "browser_handoff"
+    && "operation" in params
+    && params.operation === "request"
+  ) {
     defaultTimeoutMs = DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS;
   } else if (method === "browser_credentials") {
     defaultTimeoutMs = DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS;

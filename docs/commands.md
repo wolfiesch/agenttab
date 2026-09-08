@@ -55,7 +55,7 @@ The current source contains the stable Ed25519 verification public key, but no m
 agenttab status
 ```
 
-Connects to local AgentTab IPC and prints the Core `agenttab.status` result as JSON. The status response reports the host lifecycle state, protocol version, whether a handoff is active, and the current connection's task identifier when one exists.
+Connects to local AgentTab IPC and prints the Core `agenttab.status` result as JSON. The status response reports the host lifecycle state, protocol version, and the current connection's task identifier when one exists.
 
 Use this only after the extension and native host are installed. It does not start a browser, create a task, use a port, or authenticate with a token.
 

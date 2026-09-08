@@ -32,15 +32,15 @@ Standard MCP access exposes exactly nine tools: `browser_open`, `browser_snapsho
 
 ### Human controls
 
-The local 1Password broker can fill one of at most three origin-matching Login items directly into a selected field without revealing the value to the agent. **Your Turn** remains the path for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, or a broker result that needs the user. Handoff records the completion condition and focuses the declared tab without globally pausing browser work. It is not an observation blackout; users can explicitly pause agents first when the page state must remain unobservable.
+The local 1Password broker can fill one of at most three origin-matching Login items directly into a selected field without revealing the value to the agent. **Needs your attention** notices remain the path for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, or a broker result that needs the user. A notice is advisory: it never pauses agent work, focuses a tab, or opens a popup by itself, and the user's explicit Open tab click is the only focus transition. The agent verifies the page itself before resolving a notice. AgentTab does not capture human keystrokes.
 
-Recognizable sends, publishes, purchases, deletes, uploads, authorizations, and permission grants execute directly by default. Users can turn YOLO mode off to enable the best-effort **Commit** review barrier. In that mode, AgentTab stages a preview and requires approval in a human popup plus the requesting agent's one-use token. Commit reduces recognizable risk; it cannot prove that a page has no hidden external effect.
+Recognizable sends, publishes, purchases, deletes, uploads, authorizations, and permission grants execute directly by default. Users can turn YOLO mode off to enable the best-effort **Commit** review barrier. In that mode, AgentTab prepares, classifies, and revalidates the target, stages the action with a preview, and requires approval in a human popup plus the requesting agent's one-use token. The record expires after a short interval, cannot be replayed, and is invalidated if the page or target changes. Commit reduces recognizable risk; it cannot prove that a page has no hidden external effect.
 
 ### Trust boundary
 
 AgentTab can operate in the signed-in Chrome profile the user already uses. Task ownership is an execution and coordination boundary, not cookie, account, password, or profile isolation. A trusted local agent can act within an owned tab through the same signed-in web session available to the person at the keyboard. Users should connect only agents and local software they trust.
 
-Browser automation also remains exposed to hostile or misleading page content. A page can attempt prompt injection, a control can have consequences that are not apparent from its label, and an agent can make a poor decision from ordinary page content. Your Turn and Commit address bounded parts of that risk. They are not guarantees against every external side effect.
+Browser automation also remains exposed to hostile or misleading page content. A page can attempt prompt injection, a control can have consequences that are not apparent from its label, and an agent can make a poor decision from ordinary page content. Attention notices and Commit address bounded parts of that risk. They are not guarantees against every external side effect.
 
 ## Manifest permissions and host permissions
 
@@ -48,11 +48,11 @@ This section is draft review copy for the v2 contract. It must be reconciled aga
 
 | Manifest entry | Type | Review justification |
 |---|---:|---|
-| `nativeMessaging` | Required permission | Connects the MV3 extension to the user-installed local AgentTab host. It is the extension-to-host link for task ownership, lifecycle reconciliation, handoff state, Commit staging, and command results. It does not connect the extension to a cloud service. |
+| `nativeMessaging` | Required permission | Connects the MV3 extension to the user-installed local AgentTab host. It is the extension-to-host link for task ownership, lifecycle reconciliation, Commit staging, and command results. It does not connect the extension to a cloud service. |
 | `debugger` | Required permission | Supports the task-scoped browser capabilities required for accessibility snapshots, precise click, type, fill, select, scroll, key press, inactive screenshots, network-idle observation, and exact download completion attribution. AgentTab attaches lazily only to task-owned tabs, reuses the task connection while needed, and exposes no generic CDP method in Standard mode. |
-| `tabs` | Required permission | Lets AgentTab create and visibly adopt task tabs, track their lifecycle and document revision, focus a handoff tab when the user asks, and clean up a closed task. It is not used to make unrelated tabs owned by an agent. |
+| `tabs` | Required permission | Lets AgentTab create and visibly adopt task tabs, track their lifecycle and document revision, focus an attention notice's tab only when the user clicks Open tab, and clean up a closed task. It is not used to make unrelated tabs owned by an agent. |
 | `tabGroups` | Required permission | Shows task-owned tabs as a visible workspace with working, needs-you, or finished status. Group membership is display-only and never authorizes an operation. Removing or moving a tab out of its task group revokes its ownership. |
-| `storage` | Required permission | Persists the minimum extension state needed to recover task status, pause state, handoff state, revision floors, and user interface preferences across MV3 service-worker restarts. It is not an analytics store and is not used to collect browsing history. |
+| `storage` | Required permission | Persists the minimum extension state needed to recover task status, pause state, attention notices, revision floors, and user interface preferences across MV3 service-worker restarts. It is not an analytics store and is not used to collect browsing history. |
 | `alarms` | Required permission | Schedules bounded MV3 lifecycle work such as reconnect, expiry, and recovery checks after service-worker suspension. It is not used for tracking, advertising, or remote scheduling. |
 | `scripting` | Optional permission | Requested only after the user explicitly clicks **Enable AgentTab automation** in the AgentTab popup. It is not a required install-time permission, denial leaves the extension visibly disabled, and it does not add a Standard raw-script API. |
 | `<all_urls>` | Required host permission | Required so the `chrome.scripting` text, HTML, selector, wait, and scroll paths can run on the task-owned page the user directs AgentTab to use, regardless of its site. It does not let an agent claim tabs or expose raw cookies, browser storage, arbitrary JavaScript, CDP, or network APIs in Standard mode. |
@@ -65,8 +65,8 @@ These notes are for a controlled reviewer package only. They are not public inst
 2. Provide the exact `v2.0.0-rc.1` extension package together with the matching separately installed local AgentTab host. The extension should report that it is disconnected until the compatible local host is ready.
 3. Reconcile the package identity and native-host allowed origins with `config/identity.json` before review. Do not infer an identity from this document or treat it as store publication evidence.
 4. Demonstrate a local MCP client opening a task workspace, taking an accessibility snapshot, performing a harmless action, waiting for a defined condition, and listing only that task's tabs.
-5. Demonstrate Your Turn with a harmless test page. Verify that the handoff marker persists while other browser work remains available and clears after Done or the declared completion condition.
-6. Demonstrate default inline execution with a harmless controlled effect. Then turn YOLO mode off and verify that a controlled recognizable action does not execute before popup approval and the requesting agent's one-use Commit token. Do not use a real message, purchase, upload, deletion, or authorization.
+5. Demonstrate an attention notice with a harmless test page. Verify that requesting `browser_handoff` does not pause work, focus a tab, or open the popup; that reads, actions, waits, and finalization remain available while the notice is open; that the user's Open tab focuses only the noticed tab; and that the agent resolves the notice only after verifying the page, with dismiss and expiry never reported as success.
+6. Demonstrate default inline execution with a harmless controlled effect. Then turn YOLO mode off and verify that a controlled recognizable action does not execute before the human popup approves the staged action with the requesting agent's one-use Commit token. Do not use a real message, purchase, upload, deletion, or authorization.
 7. Demonstrate Pause and Resume, including that queued work does not start after Pause and that task status remains visible after recovery.
 8. Verify that Standard discovery exposes exactly the nine Standard tools, that `browser_finish` retains an adopted tab while releasing its task ownership, that `browser_credentials` reaches a fake provider by default and returns a disabled-policy result after explicit opt-out, and that the Developer-only tool is absent until the reviewer explicitly enables Developer mode.
 
@@ -85,7 +85,7 @@ None of these items is represented as complete by this draft. Verify each item a
 - [ ] Final store package built from the frozen `v2.0.0-rc.1` source and package identity.
 - [ ] Required 16, 32, 48, and 128 pixel icons verified in the final package.
 - [ ] Store promotional image in the required current dimensions.
-- [ ] Screenshots that show a task workspace, Your Turn, Commit staged but not approved, and the local-only status without exposing identity, URLs, secrets, or local paths.
+- [ ] Screenshots that show a task workspace, an attention notice, Commit staged but not approved, and the local-only status without exposing identity, URLs, secrets, or local paths.
 - [ ] Scrubbed reviewer demonstration using a dedicated test profile and accounts.
 - [ ] Public privacy-policy destination verified under controlled hosting.
 - [ ] Public support destination verified under controlled hosting.

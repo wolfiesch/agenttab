@@ -5,7 +5,7 @@ const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
 const SCHEMA_VERSION = 1;
 
-export type TaskState = "working" | "needs_user" | "completed";
+export type TaskState = "working" | "completed";
 
 export type TaskColor = "purple" | "cyan" | "green" | "yellow" | "orange" | "red" | "pink" | "blue";
 
@@ -31,19 +31,24 @@ export interface RevisionRecord {
   loaderId?: string;
 }
 
-export type HandoffRecord =
-  | { active: false }
-  | {
-    active: true;
-    taskId: string;
-    tabId: number;
-    expectedRevision: number;
-    prompt: string;
-    completion: Record<string, unknown>;
-    startedAtMs: number;
-    timeoutMs: number;
-    pendingClearEventId?: string;
-  };
+export type NoticeStatus = "open" | "resolved" | "dismissed" | "expired";
+
+export interface NoticeCompletion {
+  kind: "url" | "selector";
+  value: string;
+}
+
+export interface HandoffNotice {
+  noticeId: string;
+  taskId: string;
+  tabId: number;
+  expectedRevision: number;
+  prompt: string;
+  completion?: NoticeCompletion;
+  status: NoticeStatus;
+  startedAtMs: number;
+  expiresAtMs: number;
+}
 
 export interface AutomationCleanupRecord {
   pending: boolean;
@@ -61,7 +66,7 @@ export interface ExtensionState {
   cleanupPolicy: CleanupPolicy;
   tasks: Record<string, TaskRecord>;
   revisions: Record<string, RevisionRecord>;
-  handoff: HandoffRecord;
+  notices: Record<string, HandoffNotice>;
   stagedCommits: Record<string, StagedCommit>;
   automationCleanup: AutomationCleanupRecord;
 }
@@ -80,7 +85,7 @@ function defaultState(): ExtensionState {
     cleanupPolicy: "automatic",
     tasks: {},
     revisions: {},
-    handoff: { active: false },
+    notices: {},
     stagedCommits: {},
     automationCleanup: {
       pending: false,
@@ -124,6 +129,63 @@ function jsonEquivalent(left: unknown, right: unknown): boolean {
 }
 const taskColors: readonly TaskColor[] = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
 
+function parseNotice(value: unknown, noticeId: string): HandoffNotice | null {
+  const notice = objectValue(value);
+  const completion = notice?.completion === undefined ? undefined : objectValue(notice.completion);
+  if (
+    !notice ||
+    notice.noticeId !== noticeId ||
+    typeof notice.taskId !== "string" ||
+    !finiteInteger(notice.tabId) ||
+    !finiteInteger(notice.expectedRevision, 1) ||
+    typeof notice.prompt !== "string" ||
+    !["open", "resolved", "dismissed", "expired"].includes(String(notice.status)) ||
+    !finiteInteger(notice.startedAtMs) ||
+    !finiteInteger(notice.expiresAtMs, notice.startedAtMs as number) ||
+    (completion !== undefined &&
+      completion !== null &&
+      ((completion.kind !== "url" && completion.kind !== "selector") ||
+        typeof completion.value !== "string"))
+  ) {
+    return null;
+  }
+  return notice as unknown as HandoffNotice;
+}
+
+function migratedLegacyNotice(value: unknown): HandoffNotice | null {
+  const handoff = objectValue(value);
+  if (!handoff || handoff.active !== true) return null;
+  if (
+    typeof handoff.taskId !== "string" ||
+    !finiteInteger(handoff.tabId) ||
+    !finiteInteger(handoff.expectedRevision, 1) ||
+    typeof handoff.prompt !== "string" ||
+    !finiteInteger(handoff.startedAtMs) ||
+    !finiteInteger(handoff.timeoutMs, 1) ||
+    (handoff.pendingClearEventId !== undefined && typeof handoff.pendingClearEventId !== "string")
+  ) {
+    return null;
+  }
+  const completion = objectValue(handoff.completion);
+  const noticeId = crypto.randomUUID();
+  return {
+    noticeId,
+    taskId: handoff.taskId,
+    tabId: handoff.tabId,
+    expectedRevision: handoff.expectedRevision,
+    prompt: handoff.prompt,
+    ...(completion !== undefined &&
+      completion !== null &&
+      (completion.kind === "url" || completion.kind === "selector") &&
+      typeof completion.value === "string"
+      ? { completion: { kind: completion.kind, value: completion.value } }
+      : {}),
+    status: handoff.pendingClearEventId ? "dismissed" : "open",
+    startedAtMs: handoff.startedAtMs,
+    expiresAtMs: handoff.startedAtMs + handoff.timeoutMs,
+  };
+}
+
 function parseState(value: unknown): ExtensionState | null {
   const raw = objectValue(value);
   if (!raw || raw.schemaVersion !== SCHEMA_VERSION) return null;
@@ -136,7 +198,8 @@ function parseState(value: unknown): ExtensionState | null {
   }
   const tasksValue = objectValue(raw.tasks);
   const revisionsValue = objectValue(raw.revisions);
-  const handoffValue = objectValue(raw.handoff);
+  const noticesValue = raw.notices === undefined ? undefined : objectValue(raw.notices);
+  const handoffValue = raw.handoff === undefined ? undefined : objectValue(raw.handoff);
   const commitsValue = objectValue(raw.stagedCommits);
   const cleanupValue = raw.automationCleanup === undefined
     ? {
@@ -146,7 +209,7 @@ function parseState(value: unknown): ExtensionState | null {
       epoch: 0,
     }
     : objectValue(raw.automationCleanup);
-  if (!tasksValue || !revisionsValue || !handoffValue || !commitsValue || !cleanupValue) return null;
+  if (!tasksValue || !revisionsValue || (!noticesValue && !handoffValue) || !commitsValue || !cleanupValue) return null;
   if (
     typeof cleanupValue.pending !== "boolean" ||
     !Array.isArray(cleanupValue.tabIds) ||
@@ -200,6 +263,7 @@ function parseState(value: unknown): ExtensionState | null {
     if (task.groupId !== null) assignedGroupIds.set(task.groupId as number, taskId);
     tasks[taskId] = {
       ...(task as unknown as TaskRecord),
+      state: task.state === "needs_user" ? "working" : task.state as TaskState,
       createdTabIds,
     };
   }
@@ -219,20 +283,17 @@ function parseState(value: unknown): ExtensionState | null {
     revisions[tabId] = revision as unknown as RevisionRecord;
   }
 
-  if (typeof handoffValue.active !== "boolean") return null;
-  if (
-    handoffValue.active &&
-    (typeof handoffValue.taskId !== "string" ||
-      !finiteInteger(handoffValue.tabId) ||
-      !finiteInteger(handoffValue.expectedRevision, 1) ||
-      typeof handoffValue.prompt !== "string" ||
-      !objectValue(handoffValue.completion) ||
-      !finiteInteger(handoffValue.startedAtMs) ||
-      !finiteInteger(handoffValue.timeoutMs, 1) ||
-      (handoffValue.pendingClearEventId !== undefined &&
-        typeof handoffValue.pendingClearEventId !== "string"))
-  ) {
-    return null;
+  const notices: Record<string, HandoffNotice> = {};
+  if (noticesValue) {
+    for (const [noticeId, candidate] of Object.entries(noticesValue)) {
+      const notice = parseNotice(candidate, noticeId);
+      if (!notice) return null;
+      notices[noticeId] = notice;
+    }
+  } else {
+    const migrated = migratedLegacyNotice(handoffValue);
+    if (handoffValue?.active === true && !migrated) return null;
+    if (migrated) notices[migrated.noticeId] = migrated;
   }
 
   const stagedCommits: Record<string, StagedCommit> = {};
@@ -280,7 +341,7 @@ function parseState(value: unknown): ExtensionState | null {
     cleanupPolicy: cleanupPolicy as CleanupPolicy,
     tasks,
     revisions,
-    handoff: handoffValue as unknown as HandoffRecord,
+    notices,
     stagedCommits,
     automationCleanup: cleanupValue as unknown as AutomationCleanupRecord,
   };
@@ -322,9 +383,7 @@ function legacyTasks(value: unknown): Record<string, TaskRecord> {
       tabIds,
       createdTabIds: [],
       color: taskColors.includes(session.color as TaskColor) ? (session.color as TaskColor) : "purple",
-      state: ["working", "needs_user", "completed"].includes(String(session.state))
-        ? (session.state as TaskState)
-        : "working",
+      state: session.state === "completed" ? "completed" : "working",
       createdAt: finiteInteger(session.createdAt) ? session.createdAt : now,
       updatedAt: finiteInteger(session.updatedAt) ? session.updatedAt : now,
       legacyImported: true,
@@ -352,6 +411,9 @@ async function loadInitialState(): Promise<ExtensionState> {
   if (Object.hasOwn(stored, STATE_KEY)) {
     const existing = parseState(stored[STATE_KEY]);
     if (!existing) throw new Error("Persisted AgentTab state is malformed");
+    if (!jsonEquivalent(stored[STATE_KEY], existing)) {
+      await chrome.storage.local.set({ [STATE_KEY]: existing });
+    }
     initializedState = existing;
     await removeLegacyState(
       [LEGACY_TASKS_KEY, LEGACY_PREFERENCES_KEY].filter((key) => Object.hasOwn(stored, key)),

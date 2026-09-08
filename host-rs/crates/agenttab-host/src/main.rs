@@ -1,4 +1,4 @@
-use agenttab_host::{AgentTabPaths, HandoffState, Lifecycle, Runtime, StdioNative};
+use agenttab_host::{AgentTabPaths, Lifecycle, Runtime, StdioNative};
 use std::io;
 use std::sync::Arc;
 
@@ -7,9 +7,8 @@ use std::sync::Arc;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = AgentTabPaths::discover()?;
     let lifecycle = Arc::new(Lifecycle::default());
-    let handoff = Arc::new(HandoffState::default());
-    let native = StdioNative::new(io::stdout(), lifecycle.clone(), handoff.clone());
-    let runtime = Runtime::open(&paths, lifecycle.clone(), native.clone(), handoff)?;
+    let native = StdioNative::new(io::stdout(), lifecycle.clone());
+    let runtime = Runtime::open(&paths, lifecycle.clone(), native.clone())?;
 
     let (native_done_sender, native_done) = tokio::sync::oneshot::channel();
     let reader_native = native.clone();
@@ -35,9 +34,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = AgentTabPaths::discover()?;
     let lifecycle = Arc::new(Lifecycle::default());
-    let handoff = Arc::new(HandoffState::default());
-    let native = StdioNative::new(io::stdout(), lifecycle.clone(), handoff.clone());
-    let runtime = Runtime::open(&paths, lifecycle.clone(), native.clone(), handoff)?;
+    let native = StdioNative::new(io::stdout(), lifecycle.clone());
+    let runtime = Runtime::open(&paths, lifecycle.clone(), native.clone())?;
 
     let (native_done_sender, native_done) = tokio::sync::oneshot::channel();
     let reader_native = native.clone();

@@ -203,9 +203,7 @@ function installPopupDocument(): PopupTestSurface {
   add("developer", PopupTestElement);
   add("developer-off", PopupTestButtonElement);
   add("handoff", PopupTestElement);
-  add("handoff-prompt", PopupTestParagraphElement);
-  add("handoff-cancel", PopupTestButtonElement);
-  add("handoff-done", PopupTestButtonElement);
+  add("handoff-list", PopupTestListElement);
   add("handoff-error", PopupTestParagraphElement);
   add("task-count", PopupTestSpanElement);
   add("tasks", PopupTestListElement);
@@ -261,7 +259,7 @@ function popupUiState(paused = false): Record<string, unknown> {
     developer_mode: false,
     skip_commit_review: false,
     show_agent_pointer: false,
-    handoff: null,
+    notices: [],
     tasks: [],
     reviews: [],
   };
@@ -796,6 +794,7 @@ describe("popup background responses", () => {
     };
 
     const popup = await loadPopup();
+    expect(popup.get("automation-detail").textContent).toBe("Agents can open task tabs and act inside them.");
     popup.get("pause").dispatch("click");
     await flushPromiseQueue();
 
@@ -826,6 +825,34 @@ describe("popup background responses", () => {
     expect(toggle.checked).toBe(true);
     expect(popup.get("settings-error").hidden).toBe(true);
   });
+  test("an attention notice keeps admission available without acknowledgement", async () => {
+    let paused = false;
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "pause") {
+        paused = true;
+        return { paused };
+      }
+      if (message.kind !== "get_ui_state") throw new Error("Unexpected popup mutation");
+      return {
+        ...popupUiState(),
+        paused,
+        notices: [{
+          notice_id: "notice-fixture", task_id: TASK_A, tab_id: 100,
+          prompt: "Complete the step, then tell the agent in chat.", status: "open",
+          started_at_ms: Date.now(), expires_at_ms: Date.now() + 300_000,
+        }],
+      };
+    };
+    const popup = await loadPopup();
+    expect(popup.get("status").textContent).toBe("Needs your attention");
+    expect(popup.get("automation-detail").textContent).toBe("Agents keep working while you finish the step above.");
+    expect(popup.get("pause").disabled).toBe(false);
+    popup.get("pause").dispatch("click");
+    await flushPromiseQueue();
+    expect(popup.get("status").textContent).toBe("Paused");
+    expect(popup.get("automation-detail").textContent).toBe("Queued agent work is refused. Work already dispatched still finishes.");
+    expect(popup.get("handoff").hidden).toBe(false);
+  });
 
   test("displays background error records through the popup guard", async () => {
     popupRuntimeHandler = (message) => {
@@ -840,6 +867,78 @@ describe("popup background responses", () => {
 
     expect(popup.get("runtime-error").hidden).toBe(false);
     expect(popup.get("runtime-error").textContent).toBe("Native host disconnected.");
+  });
+
+  test("developer-off sends the developer-mode disable message", async () => {
+    const messages: Array<Record<string, unknown>> = [];
+    popupRuntimeHandler = (message) => {
+      messages.push(message);
+      if (message.kind === "get_ui_state") return { ...popupUiState(), developer_mode: true };
+      if (message.kind === "developer_mode") return { enabled: false };
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    expect(popup.get("developer").hidden).toBe(false);
+    popup.get("developer-off").dispatch("click");
+    await flushPromiseQueue();
+
+    expect(messages).toContainEqual({ kind: "developer_mode", enabled: false });
+    expect(popup.get("runtime-error").hidden).toBe(true);
+  });
+
+  test("rejects a pointer change while a popup action is in flight", async () => {
+    const messages: Array<Record<string, unknown>> = [];
+    let stateCalls = 0;
+    const gate = Promise.withResolvers<void>();
+    popupRuntimeHandler = (message) => {
+      messages.push(message);
+      if (message.kind !== "get_ui_state") return { enabled: true };
+      stateCalls += 1;
+      return stateCalls === 1 ? popupUiState() : gate.promise.then(() => popupUiState());
+    };
+
+    const popup = await loadPopup();
+    const pointer = popup.get("pointer");
+    pointer.checked = true;
+    pointer.dispatch("change");
+    await flushPromiseQueue();
+    expect(messages).toContainEqual({ kind: "set_pointer", enabled: true });
+
+    pointer.checked = false;
+    pointer.dispatch("change");
+    await flushPromiseQueue();
+    expect(pointer.checked).toBe(true);
+    expect(messages.filter((message) => message.kind === "set_pointer")).toHaveLength(1);
+    expect(popup.get("settings-error").hidden).toBe(true);
+
+    gate.resolve();
+    await flushPromiseQueue();
+    expect(pointer.checked).toBe(false);
+  });
+
+  test("turning YOLO mode off sends the setting and reflects reloaded state", async () => {
+    let skip = true;
+    const messages: Array<Record<string, unknown>> = [];
+    popupRuntimeHandler = (message) => {
+      if (message.kind === "set_skip_commit_review") {
+        messages.push(message);
+        skip = message.enabled === true;
+        return { enabled: skip };
+      }
+      if (message.kind === "get_ui_state") return { ...popupUiState(), skip_commit_review: skip };
+      throw new Error(`unexpected popup message ${String(message.kind)}`);
+    };
+
+    const popup = await loadPopup();
+    expect(popup.get("yolo").checked).toBe(true);
+    popup.get("yolo").checked = false;
+    popup.get("yolo").dispatch("change");
+    await flushPromiseQueue();
+
+    expect(messages).toContainEqual({ kind: "set_skip_commit_review", enabled: false });
+    expect(popup.get("yolo").checked).toBe(false);
+    expect(popup.get("settings-error").hidden).toBe(true);
   });
 });
 
@@ -1454,6 +1553,7 @@ describe("page revision monotonicity", () => {
   });
 
   test("re-resolves selector-addressed uploads before Commit", async () => {
+    await mutateState((state) => { state.skipCommitReview = false; });
     tabStore.set(65, {
       id: 65,
       windowId: 1,
@@ -3191,207 +3291,195 @@ describe("ownership and task isolation", () => {
   });
 });
 
-describe("handoff and pause barriers", () => {
-  test("keeps the handoff durable without pausing browser work", async () => {
+describe("advisory handoff notices", () => {
+  test("creates a task-scoped notice without pausing, task-state changes, or focus", async () => {
     await seedTask(TASK_A, [31]);
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
-    const events: string[] = [];
-    let clearEventId: string | undefined;
-    const ownership = new OwnershipLedger(scheduler, revisions, (event) => events.push(event));
-    const handoff = new HandoffController(scheduler, revisions, ownership, (event, _payload, eventId) => {
-      events.push(event);
-      if (event === "handoff_changed" && eventId) clearEventId = eventId;
-    });
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
     const pageRevision = await revisions.ensure(31);
-    scriptResult = false;
+    const scrubbed: number[] = [];
+    handoff.setScrubber(async (tabId) => {
+      scrubbed.push(tabId);
+    });
 
-    await handoff.begin(TASK_A, {
+    const notice = await handoff.request(TASK_A, {
+      operation: "request",
       tab_id: 31,
       expected_page_revision: pageRevision,
       prompt: "Complete authentication",
-      completion: { kind: "selector", value: "#signed-in" },
       timeout_ms: 60_000,
     });
 
-    expect(scheduler.isAccepting()).toBe(true);
-    expect((await readState()).handoff.active).toBe(true);
-    expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
-    expect(await handoff.finish(true)).toMatchObject({
-      completed: false,
-      reason: "The handoff completion condition has not been met",
+    expect(notice).toMatchObject({
+      task_id: TASK_A,
+      tab_id: 31,
+      status: "open",
+      prompt: "Complete authentication",
     });
+    expect(typeof notice.notice_id).toBe("string");
     expect(scheduler.isAccepting()).toBe(true);
-    expect((await readState()).handoff.active).toBe(true);
-
-    scriptResult = true;
-    expect(await handoff.finish(true)).toEqual({ completed: true });
-    expect(scheduler.isAccepting()).toBe(true);
-    const pendingHandoff = (await readState()).handoff;
-    if (!pendingHandoff.active || !pendingHandoff.pendingClearEventId || !clearEventId) {
-      throw new Error("handoff completion must await a native acknowledgment");
-    }
-    expect(clearEventId).toBe(pendingHandoff.pendingClearEventId);
-    await handoff.acknowledgeEvent("handoff_changed", clearEventId);
-    expect(scheduler.isAccepting()).toBe(true);
-    expect((await readState()).handoff).toEqual({ active: false });
     expect((await readState()).tasks[TASK_A]?.state).toBe("working");
-    expect(events.filter((event) => event === "handoff_changed")).toHaveLength(2);
+    expect(scrubbed).toEqual([31]);
   });
 
-  test("requires acknowledgment when an owned handoff tab or task disappears", async () => {
+  test("waits for admitted same-tab work before detaching for human interaction", async () => {
+    await seedTask(TASK_A, [37]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+    const pageRevision = await revisions.ensure(37);
+    const activeGate = Promise.withResolvers<void>();
+    const activeStarted = Promise.withResolvers<void>();
+    const active = scheduler.enqueueTab(TASK_A, 37, async () => {
+      activeStarted.resolve();
+      await activeGate.promise;
+    });
+    const scrubbed: number[] = [];
+    handoff.setScrubber(async (tabId) => {
+      scrubbed.push(tabId);
+    });
+
+    await activeStarted.promise;
+    const requested = handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 37,
+      expected_page_revision: pageRevision,
+      prompt: "Wait",
+    });
+    await Promise.resolve();
+    expect(scrubbed).toEqual([]);
+    activeGate.resolve();
+    await active;
+    await requested;
+    expect(scrubbed).toEqual([37]);
+  });
+
+  test("publishes independent pause transitions without notice events", async () => {
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const events: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload) => {
+      events.push({ event, payload });
+    });
+
+    await handoff.pause();
+    await handoff.resume();
+
+    expect(events).toEqual([
+      { event: "pause_changed", payload: { paused: true } },
+      { event: "pause_changed", payload: { paused: false } },
+    ]);
+  });
+
+  test("does not record a notice when ownership is revoked during privacy cleanup", async () => {
+    await seedTask(TASK_A, [36]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+    const pageRevision = await revisions.ensure(36);
+    handoff.setScrubber(async () => {
+      await ownership.revoke(36, "tab_removed");
+    });
+
+    await expect(handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 36,
+      expected_page_revision: pageRevision,
+      prompt: "Race",
+    })).rejects.toMatchObject({ code: "ownership_denied" });
+    expect(Object.values((await readState()).notices)).toEqual([]);
+  });
+
+  test("keeps delayed IDs terminal, enforces task isolation, and resolves only after inspection", async () => {
     await seedTask(TASK_A, [33]);
     await seedTask(TASK_B, [34], 6);
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
-    const events: Array<{ event: string; payload: Record<string, unknown>; eventId?: string }> = [];
     const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
-    const handoff = new HandoffController(scheduler, revisions, ownership, (event, payload, eventId) => {
-      events.push({ event, payload, eventId });
-    });
-    let scrubCalls = 0;
-    handoff.setScrubber(async () => {
-      scrubCalls += 1;
-    });
-    const firstRevision = await revisions.ensure(33);
-    await handoff.begin(TASK_A, {
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+    const pageRevision = await revisions.ensure(33);
+    scriptResult = false;
+
+    const first = await handoff.request(TASK_A, {
+      operation: "request",
       tab_id: 33,
-      expected_page_revision: firstRevision,
-      prompt: "Complete authentication",
-      completion: { kind: "manual_done" },
-    });
 
-    expect(await handoff.cancelForTab(999)).toBe(false);
-    expect(await handoff.cancelForTab(33)).toBe(true);
-    const firstPending = (await readState()).handoff;
-    expect((await readState()).tasks[TASK_A]?.state).toBe("needs_user");
-    expect(scheduler.isAccepting()).toBe(true);
-    const firstClearEventId = events.at(-1)?.eventId;
-    if (!firstPending.active || !firstPending.pendingClearEventId || !firstClearEventId) {
-      throw new Error("tab cancellation did not create a pending handoff event");
-    }
-    expect(typeof firstPending.pendingClearEventId).toBe("string");
-    expect(firstClearEventId).toBe(firstPending.pendingClearEventId);
-    await handoff.acknowledgeEvent("handoff_changed", firstClearEventId);
-    expect((await readState()).handoff).toEqual({ active: false });
-    expect((await readState()).tasks[TASK_A]?.state).toBe("working");
-    expect(scheduler.isAccepting()).toBe(true);
-
-    const secondRevision = await revisions.ensure(34);
-    await handoff.begin(TASK_B, {
-      tab_id: 34,
-      expected_page_revision: secondRevision,
-      prompt: "Complete payment",
-      completion: { kind: "manual_done" },
-    });
-
-    expect(await handoff.cancelForTask(TASK_A)).toBe(false);
-    expect(await handoff.cancelForTask(TASK_B)).toBe(true);
-    const secondPending = (await readState()).handoff;
-    expect((await readState()).tasks[TASK_B]?.state).toBe("needs_user");
-    expect(scheduler.isAccepting()).toBe(true);
-    const secondClearEventId = events.at(-1)?.eventId;
-    if (!secondPending.active || !secondPending.pendingClearEventId || !secondClearEventId) {
-      throw new Error("task cancellation did not create a pending handoff event");
-    }
-    expect(typeof secondPending.pendingClearEventId).toBe("string");
-    expect(secondClearEventId).toBe(secondPending.pendingClearEventId);
-    await handoff.acknowledgeEvent("handoff_changed", secondClearEventId);
-    expect((await readState()).handoff).toEqual({ active: false });
-    expect((await readState()).tasks[TASK_B]?.state).toBe("working");
-    expect(scheduler.isAccepting()).toBe(true);
-    expect(events.filter(({ event, payload, eventId }) =>
-      event === "handoff_changed" && payload.active === false && typeof eventId === "string"
-    )).toHaveLength(2);
-    expect(alarmClears.filter((name) => name === HANDOFF_ALARM)).toHaveLength(4);
-    expect(scrubCalls).toBe(2);
-  });
-
-  test("clears a restored handoff for a tab revoked during initial reconciliation", async () => {
-    await seedTask(TASK_A, [35]);
-    const scheduler = new MutationScheduler();
-    const revisions = new RevisionTracker();
-    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
-    const clearEventIds: string[] = [];
-    const handoff = new HandoffController(scheduler, revisions, ownership, (event, _payload, eventId) => {
-      if (event === "handoff_changed" && eventId) clearEventIds.push(eventId);
-    });
-    let scrubCalls = 0;
-    handoff.setScrubber(async () => {
-      scrubCalls += 1;
-    });
-    const pageRevision = await revisions.ensure(35);
-    await handoff.begin(TASK_A, {
-      tab_id: 35,
       expected_page_revision: pageRevision,
-      prompt: "Complete authentication",
-      completion: { kind: "manual_done" },
+      prompt: "First",
+      completion: { kind: "selector", value: "#signed-in" },
     });
-    tabStore.delete(35);
+    const second = await handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 33,
+      expected_page_revision: pageRevision,
+      prompt: "Replacement",
+      completion: { kind: "selector", value: "#signed-in" },
+    });
+    const firstId = String(first.notice_id);
+    const secondId = String(second.notice_id);
 
-    const revokedTabIds = await ownership.reconcile();
-    await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
-    await handoff.restore();
+    expect((await handoff.status(TASK_A, firstId)).status).toBe("dismissed");
+    await expect(handoff.status(TASK_B, secondId)).rejects.toMatchObject({ code: "ownership_denied" });
+    await expect(handoff.resolve(TASK_A, secondId)).rejects.toMatchObject({ code: "completion_not_met" });
+    expect((await handoff.status(TASK_A, secondId)).status).toBe("open");
 
-    expect(revokedTabIds).toEqual([35]);
-    const pending = (await readState()).handoff;
+    scriptResult = true;
+    expect((await handoff.resolve(TASK_A, secondId)).status).toBe("resolved");
+    expect((await handoff.resolve(TASK_A, secondId)).status).toBe("resolved");
     expect(scheduler.isAccepting()).toBe(true);
-    const clearEventId = clearEventIds.at(-1);
-    if (!pending.active || !pending.pendingClearEventId || !clearEventId) {
-      throw new Error("startup reconciliation did not create a pending handoff event");
-    }
-    expect(typeof pending.pendingClearEventId).toBe("string");
-    expect(clearEventIds).toEqual([pending.pendingClearEventId, pending.pendingClearEventId]);
-    expect(clearEventId).toBe(pending.pendingClearEventId);
-    await handoff.acknowledgeEvent("handoff_changed", clearEventId);
-    expect((await readState()).handoff).toEqual({ active: false });
-    expect(scheduler.isAccepting()).toBe(true);
-    expect(scrubCalls).toBe(1);
-    expect(alarmClears).toContain(HANDOFF_ALARM);
   });
 
-  test("requires acknowledgment to clear an expired handoff without resuming manual Pause", async () => {
+  test("expires notices without unpausing, cancelling tasks, or reporting success", async () => {
     await seedTask(TASK_A, [32]);
     const scheduler = new MutationScheduler();
     const revisions = new RevisionTracker();
     const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
-    let clearEventId: string | undefined;
-    const handoff = new HandoffController(scheduler, revisions, ownership, (event, _payload, eventId) => {
-      if (event === "handoff_changed" && eventId) clearEventId = eventId;
-    });
+    const handoff = new HandoffController(scheduler, revisions, ownership);
     const pageRevision = await revisions.ensure(32);
     await mutateState((state) => {
       state.paused = true;
-      state.tasks[TASK_A].state = "needs_user";
-      state.handoff = {
-        active: true,
+      state.notices.expired = {
+        noticeId: "expired",
         taskId: TASK_A,
         tabId: 32,
         expectedRevision: pageRevision,
         prompt: "Expired",
-        completion: { kind: "manual_done" },
+        status: "open",
         startedAtMs: 1,
-        timeoutMs: 1,
+        expiresAtMs: 2,
       };
     });
     scheduler.setInitialPaused(true);
 
     await handoff.restore();
 
-    const pendingState = await readState();
-    if (!pendingState.handoff.active || !pendingState.handoff.pendingClearEventId || !clearEventId) {
-      throw new Error("expired handoff must await a native acknowledgment");
-    }
-    expect(clearEventId).toBe(pendingState.handoff.pendingClearEventId);
-    expect(pendingState.paused).toBe(true);
+    expect((await handoff.status(TASK_A, "expired")).status).toBe("expired");
+    expect((await readState()).paused).toBe(true);
+    expect((await readState()).tasks[TASK_A]?.state).toBe("working");
     expect(scheduler.isAccepting()).toBe(false);
-    await handoff.acknowledgeEvent("handoff_changed", clearEventId);
-    const state = await readState();
-    expect(state.handoff).toEqual({ active: false });
-    expect(state.paused).toBe(true);
-    expect(state.tasks[TASK_A]?.state).toBe("working");
-    expect(scheduler.isAccepting()).toBe(false);
-    expect(alarmClears).toContain(HANDOFF_ALARM);
+  });
+
+  test("clears all notices only when the owning task finishes", async () => {
+    await seedTask(TASK_A, [35]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+    const pageRevision = await revisions.ensure(35);
+    await handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 35,
+      expected_page_revision: pageRevision,
+      prompt: "Complete payment",
+    });
+
+    expect(await handoff.clearForTask(TASK_A)).toBe(true);
+    expect(Object.values((await readState()).notices)).toEqual([]);
   });
 });
 
@@ -3465,7 +3553,6 @@ describe("native bridge transport", () => {
         task_id: TASK_A,
       }],
       paused: false,
-      handoff: { active: false },
       staged_commits: [],
     });
     expect(scheduler.isAccepting()).toBe(false);
@@ -3521,7 +3608,6 @@ describe("native bridge transport", () => {
       async () => {
         throw new Error("command handler must not run");
       },
-      undefined,
       undefined,
       undefined,
       {
@@ -3583,7 +3669,6 @@ describe("native bridge transport", () => {
       },
       undefined,
       undefined,
-      undefined,
       {
         now: () => now,
         schedule: (callback, delayMs) => {
@@ -3643,7 +3728,6 @@ describe("native bridge transport", () => {
           result: {},
         };
       },
-      undefined,
       undefined,
       async () => {
         reconciliationStarted.resolve();
@@ -4540,7 +4624,7 @@ describe("extension entrypoint admission boundaries", () => {
       automation_enabled: true,
       paused: false,
       developer_mode: false,
-      handoff: null,
+      notices: [],
       tasks: [{ task_id: TASK_A, state: "working", tab_count: 1 }],
     });
 
@@ -4695,55 +4779,37 @@ describe("extension entrypoint admission boundaries", () => {
       TASK_A,
       "browser_handoff",
       {
+        operation: "request",
         tab_id: 100,
         expected_page_revision: 1,
         prompt: "Complete the sign-in yourself",
-        completion: { kind: "manual_done" },
       },
     );
     expect(handoff).toMatchObject({
       outcome: "completed",
-      result: { task_id: TASK_A, tab_id: 100, handoff_started: true },
+      result: { task_id: TASK_A, tab_id: 100, status: "open" },
     });
-    expect((await readState()).handoff).toMatchObject({ active: true, taskId: TASK_A, tabId: 100 });
-    const tabsDuringHandoff = await sendNativeCommand(
-      "018f47b8-2f80-7c20-9c77-f8a38c9e6500",
-      TASK_A,
-      "browser_tabs",
-      {},
+    const noticeId = (handoff.result as Record<string, unknown>).notice_id;
+    if (typeof noticeId !== "string") throw new Error("handoff request did not return a notice id");
+    expect(Object.values((await readState()).notices)).toContainEqual(
+      expect.objectContaining({ noticeId, taskId: TASK_A, tabId: 100, status: "open" }),
     );
-    expect(tabsDuringHandoff).toMatchObject({
-      outcome: "completed",
-      result: { tabs: [{ tab_id: 100, task_id: TASK_A }] },
-    });
-    const snapshotDuringHandoff = await sendNativeCommand(
-      "018f47b8-2f80-7c20-9c77-f8a38c9e6501",
+    const allowedDuringHandoff = await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6226",
       TASK_A,
       "browser_snapshot",
       { tab_id: 100, mode: "accessibility" },
     );
-    expect(snapshotDuringHandoff).toMatchObject({
-      outcome: "completed",
-      result: { tab_id: 100 },
-    });
-    const commandsAfterHandoffSnapshot = debuggerCommands.length;
-    expect(await sendPopupMessage({ kind: "handoff_finish", completed: true })).toEqual({ completed: true });
-    const pendingHandoff = (await readState()).handoff;
-    if (!pendingHandoff.active || !pendingHandoff.pendingClearEventId) {
-      throw new Error("handoff completion must await a native acknowledgment");
-    }
-    expect((await readState()).paused).toBe(false);
-    port.receive({
-      protocol: "agenttab.native",
-      version: 1,
-      kind: "event_ack",
-      event: "handoff_changed",
-      event_id: pendingHandoff.pendingClearEventId,
-    });
-    for (let attempt = 0; attempt < 20 && (await readState()).handoff.active; attempt += 1) {
-      await Promise.resolve();
-    }
-    expect((await readState()).handoff).toEqual({ active: false });
+    expect(allowedDuringHandoff).toMatchObject({ outcome: "completed" });
+    expect(
+      await sendNativeCommand(
+        "018f47b8-2f80-7c20-9c77-f8a38c9e6327",
+        TASK_A,
+        "browser_handoff",
+        { operation: "resolve", notice_id: noticeId },
+      ),
+    ).toMatchObject({ outcome: "completed", result: { notice_id: noticeId, status: "resolved" } });
+    const commandsBeforeDeveloperDenied = debuggerCommands.length;
 
     const developerDenied = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6227",
@@ -4755,7 +4821,7 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: { code: "developer_mode_required" },
     });
-    expect(debuggerCommands).toHaveLength(commandsAfterHandoffSnapshot);
+    expect(debuggerCommands).toHaveLength(commandsBeforeDeveloperDenied);
     expect(await sendPopupMessage({ kind: "developer_mode", enabled: true })).toEqual({ enabled: true });
     const developerEnabled = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6228",
@@ -4769,10 +4835,15 @@ describe("extension entrypoint admission boundaries", () => {
         ({ method, params }) => method === "Runtime.evaluate" && params.expression === "document.title",
       ),
     ).toBe(true);
+
+
+    expect(await sendPopupMessage({ kind: "get_ui_state" })).toMatchObject({
+      skip_commit_review: true,
+    });
     expect(await sendPopupMessage({ kind: "set_skip_commit_review", enabled: false })).toEqual({
       enabled: false,
     });
-
+    expect((await readState()).skipCommitReview).toBe(false);
 
     const staged = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6229",
@@ -4958,36 +5029,13 @@ describe("extension entrypoint admission boundaries", () => {
       TASK_A,
       "browser_handoff",
       {
+        operation: "request",
         tab_id: 100,
         expected_page_revision: 1,
         prompt: "Finish before closing",
-        completion: { kind: "manual_done" },
       },
     );
-    expect(closingHandoff).toMatchObject({
-      outcome: "completed",
-      result: { handoff_started: true },
-    });
-    let handoffClearPostedAfterTabRemoval = false;
-    nativePostProbe = (message) => {
-      if (
-        isRecord(message) &&
-        message.kind === "event" &&
-        message.event === "handoff_changed" &&
-        typeof message.event_id === "string" &&
-        isRecord(message.payload) &&
-        message.payload.active === false
-      ) {
-        handoffClearPostedAfterTabRemoval = removedTabIds.includes(100);
-        port.receive({
-          protocol: "agenttab.native",
-          version: 1,
-          kind: "event_ack",
-          event: "handoff_changed",
-          event_id: message.event_id,
-        });
-      }
-    };
+    expect(closingHandoff).toMatchObject({ outcome: "completed", result: { status: "open" } });
     let taskDeletedBeforeRemove = false;
     tabRemovalProbe = async () => {
       taskDeletedBeforeRemove = (await readState()).tasks[TASK_A] === undefined;
@@ -5001,11 +5049,7 @@ describe("extension entrypoint admission boundaries", () => {
       result: { task_id: TASK_A, closed_tab_ids: [100] },
     });
     expect(removedTabIds).toContain(100);
-    expect(handoffClearPostedAfterTabRemoval).toBe(true);
-    for (let attempt = 0; attempt < 20 && (await readState()).handoff.active; attempt += 1) {
-      await Promise.resolve();
-    }
-    expect((await readState()).handoff).toEqual({ active: false });
+    expect(Object.values((await readState()).notices)).toEqual([]);
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
     expect(Object.values((await readState()).stagedCommits)).not.toContainEqual(
       expect.objectContaining({ task_id: TASK_A }),
@@ -5163,6 +5207,7 @@ describe("extension entrypoint admission boundaries", () => {
       TASK_C,
       "browser_handoff",
       {
+        operation: "request",
         tab_id: 102,
         expected_page_revision: restrictedPageRevision,
         prompt: "Complete the browser-owned form",
@@ -5173,7 +5218,7 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "not_started",
       error: { code: "browser_restricted_origin" },
     });
-    expect((await readState()).handoff).toEqual({ active: false });
+    expect(Object.values((await readState()).notices)).toEqual([]);
     expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
     const restrictedTab = tabStore.get(102);
     if (!restrictedTab) throw new Error("restricted task tab is unavailable");

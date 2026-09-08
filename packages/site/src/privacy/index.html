@@ -75,7 +75,7 @@
         <section aria-labelledby="boundaries-title">
           <h2 id="boundaries-title">Security boundaries and limits</h2>
           <p>Task ownership limits agent execution and coordination to visible task workspaces. It is not cookie, identity, or browser-profile isolation. Standard mode does not provide raw cookies, storage, passwords, arbitrary JavaScript, raw Chrome DevTools Protocol access, or coordinate actions.</p>
-          <p>For passwords, passkeys, 2FA, CAPTCHAs, payment secrets, and other human-only input, AgentTab uses Your Turn handoff. During handoff, the agent is not allowed to observe or capture that interaction.</p>
+          <p>For passwords, passkeys, 2FA, CAPTCHAs, payment secrets, and other human-only input, AgentTab shows a Needs your attention notice. The person completes that input directly in Chrome; the agent asks for it in chat and verifies the page itself afterward, and AgentTab does not capture the person's keystrokes.</p>
           <p>Commit stages recognizable sends, publishing, purchases, deletion, uploads, authorization, and permission grants for review. This is a best-effort safety measure. Prompt injection and page behavior can still create risks, and Commit cannot guarantee recognition of every external effect.</p>
         </section>
 

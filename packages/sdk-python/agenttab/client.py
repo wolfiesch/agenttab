@@ -45,7 +45,7 @@ def resolve_transport_timeout(
 ) -> float:
     if method == "browser_wait":
         default_timeout = DEFAULT_BROWSER_WAIT_TIMEOUT
-    elif method == "browser_handoff":
+    elif method == "browser_handoff" and params.get("operation") == "request":
         default_timeout = DEFAULT_BROWSER_HANDOFF_TIMEOUT
     elif method == "browser_credentials":
         default_timeout = DEFAULT_BROWSER_CREDENTIALS_TIMEOUT

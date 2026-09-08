@@ -30,7 +30,7 @@ function taskColor(taskId: string): TaskColor {
 }
 
 function groupTitle(task: TaskRecord, developerMode: boolean): string {
-  const symbol = task.state === "completed" ? "✓" : task.state === "needs_user" ? "↗" : "✦";
+  const symbol = task.state === "completed" ? "✓" : "✦";
   const mode = developerMode ? "DEV " : "";
   return `${symbol} ${mode}${task.name}`.slice(0, 40);
 }
@@ -103,7 +103,7 @@ export class OwnershipLedger {
 
   async setTaskState(
     taskId: string,
-    taskState: "working" | "needs_user" | "completed",
+    taskState: "working" | "completed",
   ): Promise<void> {
     const updated = await mutateState((state) => {
       const task = state.tasks[taskId];
@@ -425,15 +425,6 @@ export class OwnershipLedger {
     const task = state.tasks[taskId];
     if (!task) {
       return { task_id: taskId, finished: true, closed_tab_ids: [], retained_tab_ids: [] };
-    }
-    if (state.handoff.active && state.handoff.taskId === taskId) {
-      return {
-        task_id: taskId,
-        finished: false,
-        closed_tab_ids: [],
-        retained_tab_ids: [...task.tabIds],
-        deferred: "handoff_active",
-      };
     }
     if (Object.values(state.stagedCommits).some((staged) => staged.task_id === taskId)) {
       return {

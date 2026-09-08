@@ -7,17 +7,17 @@
 | Component | Responsibility |
 | --- | --- |
 | Core RPC | Validates versioned `agenttab.rpc` v1 requests, attaches connection identity and task scope server-side, and returns a structured outcome. |
-| Runtime | Applies lifecycle, task scope, durable handoff state, origin and upload guardrails, idempotency, audit, and request locks. |
-| Journal | Maintains durable task, ownership, revision-floor, handoff, staged Commit, event receipt, and idempotency state in SQLite. |
+| Runtime | Applies lifecycle, task scope, origin and upload guardrails, idempotency, audit, and request locks. |
+| Journal | Maintains durable task, ownership, revision-floor, staged Commit, event receipt, and idempotency state in SQLite. |
 | Native transport | Exchanges versioned `agenttab.native` v1 messages with the Chrome extension over Native Messaging. |
 | Local IPC server | Accepts authenticated same-user Core clients over a Unix socket or Windows named pipe. |
-| Extension | Owns Chrome tabs, groups, revisions, debugger attachment, handoff UI, and Commit classification/execution. |
+| Extension | Owns Chrome tabs, groups, revisions, debugger attachment, attention notices, and Commit classification/execution. |
 
 Core RPC and the native bridge are separate protocols. Both reject unsupported versions and unknown fields rather than silently downgrading.
 
 ## Native bridge
 
-Chrome launches the native host named `dev.agenttab.host`; the extension maintains the Native Messaging connection. Native frames are an unsigned 32-bit little-endian length followed by UTF-8 JSON. Host-to-extension messages are capped at 1 MiB and extension-to-host messages at 64 MiB. The extension sends `hello` inventory, paused state, handoff state, and staged Commit state. The host becomes ready only after compatible hello and reconciliation, then returns `ready` with `ready` or `paused` state.
+Chrome launches the native host named `dev.agenttab.host`; the extension maintains the Native Messaging connection. Native frames are an unsigned 32-bit little-endian length followed by UTF-8 JSON. Host-to-extension messages are capped at 1 MiB and extension-to-host messages at 64 MiB. The extension sends `hello` inventory, paused state, and staged Commit state; attention notices live in the extension and never gate host admission. The host becomes ready only after compatible hello and reconciliation, then returns `ready` with `ready` or `paused` state.
 
 A native disconnect returns the host to reconciliation. A protocol mismatch is terminal rather than a compatibility fallback.
 
@@ -35,13 +35,13 @@ Standard mode has no TCP listener or bearer token. The advanced `agenttab proxy 
 
 The implemented lifecycle states are `starting`, `reconciling`, `ready`, `paused`, and terminal. Browser work is admitted only in `ready`. In `starting` or `reconciling` it returns `runtime_not_ready`; in `paused` it returns `automation_paused`; in terminal state it returns a protocol-recovery error.
 
-Pause admission is also enforced by the extension scheduler. It closes new admission, waits for in-flight work, persists pause state, and rejects queued work before dispatch. Handoff records durable coordination state but does not alter request admission or locking.
+Pause admission is also enforced by the extension scheduler. It closes new admission, waits for in-flight work, persists pause state, and rejects queued work before dispatch. Attention notices are advisory extension state; the host applies no handoff admission barrier.
 
 ## Durable state
 
 By default, Unix state lives under `$HOME/.agenttab`; Windows uses `%LOCALAPPDATA%\AgentTab`. `AGENTTAB_STATE_DIR` can select a different root. The host creates a user-owned private root, run directory, and upload staging directory.
 
-`state.sqlite3` uses WAL, full synchronous writes, foreign keys, and a busy timeout. It stores only hashes of resume capabilities and staged tokens. It also stores task ownership, monotonic page-revision floors, active handoff state, native-event receipts, staged Commit bindings, and idempotency entries.
+`state.sqlite3` uses WAL, full synchronous writes, foreign keys, and a busy timeout. It stores only hashes of resume capabilities and staged tokens. It also stores task ownership, monotonic page-revision floors, native-event receipts, staged Commit bindings, and idempotency entries.
 
 Mutation idempotency is keyed by task and UUIDv7 key with a canonical method/parameter hash. The host records `started` before native dispatch and a terminal response after completion. A matching completed record replays the cached response. A durable started record after a crash returns `unknown` and is never re-executed. Terminal records are retained for seven days, with at most 10,000 records per task.
 

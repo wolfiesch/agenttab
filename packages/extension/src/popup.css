@@ -176,6 +176,21 @@ input[type="checkbox"] { flex: none; width: 17px; height: 17px; margin: 0; accen
 /* your turn */
 .handoff { border-left: 3px solid var(--teal); padding-left: calc(var(--gutter) - 3px); }
 .handoff:focus { outline: none; }
+.handoff-list {
+  display: grid;
+  gap: var(--step-2);
+  margin: var(--step-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+.notice {
+  display: grid;
+  gap: var(--step-1);
+  padding-top: var(--step-2);
+  border-top: 1px solid var(--line-soft);
+}
+.notice:first-child { padding-top: 0; border-top: 0; }
+.notice-actions { display: flex; justify-content: flex-end; gap: var(--step-1); }
 
 /* developer */
 .developer { border-left: 3px solid var(--violet); padding-left: calc(var(--gutter) - 3px); }

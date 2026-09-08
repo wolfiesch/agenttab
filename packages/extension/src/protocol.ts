@@ -41,7 +41,6 @@ const NATIVE_EVENTS: Record<NativeEventName, true> = {
   tab_removed: true,
   group_membership_changed: true,
   pause_changed: true,
-  handoff_changed: true,
   commit_expired: true,
   commit_abandoned: true,
   popup_commit_approved: true,
@@ -55,7 +54,6 @@ export type NativeEventName =
   | "tab_removed"
   | "group_membership_changed"
   | "pause_changed"
-  | "handoff_changed"
   | "commit_expired"
   | "commit_abandoned"
   | "popup_commit_approved"
@@ -66,7 +64,6 @@ export type Outcome =
   | "completed"
   | "not_started"
   | "unknown"
-  | "needs_user"
   | "commit_required";
 
 export interface NativeOriginPolicy {
@@ -111,9 +108,9 @@ export interface NativeEventAck {
   protocol: typeof NATIVE_PROTOCOL;
   version: typeof PROTOCOL_VERSION;
   kind: "event_ack";
-  event: "handoff_changed" | "popup_commit_approved" | "popup_commit_abandoned";
+  event: "popup_commit_approved" | "popup_commit_abandoned";
   event_id: string;
-  outcome?: Outcome;
+  outcome: Outcome;
   result?: Record<string, unknown>;
   error?: RpcError;
 }
@@ -177,9 +174,6 @@ export interface NativeTab {
   task_id?: string | null;
 }
 
-export type NativeHandoff =
-  | { active: false }
-  | { active: true; task_id: string; tab_id: number; started_at_ms: number };
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const URL_PATTERN = /^(https?:\/\/|about:)[^\s]+$/;
@@ -431,25 +425,37 @@ function assertWaitParams(value: unknown): Record<string, unknown> {
 }
 
 function assertHandoffParams(value: unknown): Record<string, unknown> {
-  const params = assertExactObject(value, ["tab_id", "expected_page_revision", "prompt", "completion"], ["timeout_ms"], "browser_handoff parameters");
-  assertTabId(params.tab_id);
-  assertRevision(params.expected_page_revision);
-  assertBoundedString(params.prompt, "prompt", 1, 2_000);
-  if (params.timeout_ms !== undefined && !isIntegerInRange(params.timeout_ms, 1_000, 900_000)) {
-    commandError("timeout_ms must be between 1000 and 900000");
+  if (!isRecord(value) || typeof value.operation !== "string") {
+    commandError("browser_handoff requires an operation");
   }
-  if (!isRecord(params.completion) || typeof params.completion.kind !== "string") {
-    commandError("browser_handoff requires a completion condition");
+  if (value.operation === "request") {
+    const params = assertExactObject(
+      value,
+      ["operation", "tab_id", "expected_page_revision", "prompt"],
+      ["completion", "timeout_ms"],
+      "browser_handoff request parameters",
+    );
+    assertTabId(params.tab_id);
+    assertRevision(params.expected_page_revision);
+    assertBoundedString(params.prompt, "prompt", 1, 2_000);
+    if (params.timeout_ms !== undefined && !isIntegerInRange(params.timeout_ms, 1_000, 900_000)) {
+      commandError("timeout_ms must be between 1000 and 900000");
+    }
+    if (params.completion !== undefined) {
+      const completion = assertExactObject(params.completion, ["kind", "value"], [], "handoff completion");
+      if (completion.kind !== "url" && completion.kind !== "selector") {
+        commandError(`Unsupported handoff completion: ${String(completion.kind)}`);
+      }
+      assertBoundedString(completion.value, "completion.value", 1, 65_536);
+    }
+    return params;
   }
-  if (params.completion.kind === "navigation" || params.completion.kind === "manual_done") {
-    assertExactObject(params.completion, ["kind"], [], "handoff completion");
-  } else if (params.completion.kind === "url" || params.completion.kind === "selector") {
-    assertExactObject(params.completion, ["kind", "value"], [], "handoff completion");
-    assertBoundedString(params.completion.value, "completion.value", 1, 65_536);
-  } else {
-    commandError(`Unsupported handoff completion: ${params.completion.kind}`);
+  if (value.operation === "status" || value.operation === "resolve" || value.operation === "dismiss") {
+    const params = assertExactObject(value, ["operation", "notice_id"], [], "browser_handoff parameters");
+    assertBoundedString(params.notice_id, "notice_id", 1, 128);
+    return params;
   }
-  return params;
+  commandError(`Unsupported browser_handoff operation: ${value.operation}`);
 }
 
 function assertDeveloperParams(value: unknown): Record<string, unknown> {
@@ -660,24 +666,10 @@ export function parseInboundNativeMessage(value: unknown): NativeInboundMessage 
         ["protocol", "version", "kind", "event", "event_id"],
         ["outcome", "result", "error"],
       ) ||
-      (value.event !== "handoff_changed" &&
-        value.event !== "popup_commit_approved" &&
-        value.event !== "popup_commit_abandoned") ||
+      (value.event !== "popup_commit_approved" && value.event !== "popup_commit_abandoned") ||
       !isBoundedString(value.event_id, 16, 256)
     ) {
       throw new Error("native event acknowledgement is invalid");
-    }
-    if (value.event === "handoff_changed") {
-      if (value.outcome !== undefined || value.result !== undefined || value.error !== undefined) {
-        throw new Error("handoff acknowledgement must not contain a result");
-      }
-      return {
-        protocol: NATIVE_PROTOCOL,
-        version: PROTOCOL_VERSION,
-        kind: "event_ack",
-        event: "handoff_changed",
-        event_id: value.event_id,
-      };
     }
     if (
       (value.outcome !== "completed" && value.outcome !== "not_started" && value.outcome !== "unknown") ||
@@ -742,16 +734,6 @@ export function completed(requestId: string, result: unknown): NativeResponse {
   };
 }
 
-export function needsUser(requestId: string, result: unknown): NativeResponse {
-  return {
-    protocol: NATIVE_PROTOCOL,
-    version: PROTOCOL_VERSION,
-    kind: "response",
-    request_id: requestId,
-    outcome: "needs_user",
-    result,
-  };
-}
 
 export function commitRequired(
   requestId: string,
@@ -792,7 +774,6 @@ export function nativeHello(
   extensionVersion: string,
   inventory: NativeTab[],
   paused: boolean,
-  handoff: NativeHandoff,
   stagedCommits: PublicStagedCommit[],
 ) {
   return {
@@ -802,7 +783,6 @@ export function nativeHello(
     extension_version: extensionVersion,
     inventory,
     paused,
-    handoff,
     staged_commits: stagedCommits,
   };
 }
@@ -829,9 +809,6 @@ export function nativeEvent(event: string, payload: Record<string, unknown>, eve
       if (typeof eventPayload.paused !== "boolean") commandError("pause event paused must be a boolean");
       break;
     }
-    case "handoff_changed":
-      assertNativeHandoff(payload);
-      break;
     case "commit_expired":
     case "commit_abandoned": {
       const eventPayload = assertExactObject(payload, ["native_token"], [], "commit event payload");
@@ -892,17 +869,6 @@ function assertNativeTab(value: unknown): asserts value is NativeTab {
   }
 }
 
-function assertNativeHandoff(value: unknown): asserts value is NativeHandoff {
-  if (!isRecord(value) || typeof value.active !== "boolean") commandError("handoff event must specify active");
-  if (!value.active) {
-    assertExactObject(value, ["active"], [], "inactive handoff payload");
-    return;
-  }
-  const handoff = assertExactObject(value, ["active", "task_id", "tab_id", "started_at_ms"], [], "active handoff payload");
-  assertUuid(handoff.task_id, "task_id");
-  assertTabId(handoff.tab_id);
-  if (!isIntegerInRange(handoff.started_at_ms, 0)) commandError("started_at_ms must be a non-negative integer");
-}
 
 export function randomToken(byteLength = 32): string {
   const bytes = crypto.getRandomValues(new Uint8Array(byteLength));

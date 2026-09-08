@@ -306,10 +306,11 @@ test("OMP forwards long-operation timeouts for SDK deadline selection", async ()
     timeout_ms: 120_000,
   });
   await executeTool(tools.find((tool) => tool.name === "browser_handoff"), {
+    operation: "request",
     tab_id: 7,
     expected_page_revision: 3,
     prompt: "Complete MFA",
-    completion: { kind: "manual_done" },
+    completion: { kind: "url", value: "https://example.test/done" },
     timeout_ms: 900_000,
   });
   expect(calls).toEqual([
@@ -324,13 +325,27 @@ test("OMP forwards long-operation timeouts for SDK deadline selection", async ()
     {
       method: "browser_handoff",
       params: {
+        operation: "request",
         tab_id: 7,
         expected_page_revision: 3,
         prompt: "Complete MFA",
-        completion: { kind: "manual_done" },
+        completion: { kind: "url", value: "https://example.test/done" },
         timeout_ms: 900_000,
       },
     },
+  ]);
+});
+
+test("OMP forwards handoff notice status, resolve, and dismiss operations", async () => {
+  const { tools, calls } = register(false);
+  const handoff = tools.find((tool) => tool.name === "browser_handoff");
+  await executeTool(handoff, { operation: "status", notice_id: "notice-1" });
+  await executeTool(handoff, { operation: "resolve", notice_id: "notice-1" });
+  await executeTool(handoff, { operation: "dismiss", notice_id: "notice-1" });
+  expect(calls).toEqual([
+    { method: "browser_handoff", params: { operation: "status", notice_id: "notice-1" } },
+    { method: "browser_handoff", params: { operation: "resolve", notice_id: "notice-1" } },
+    { method: "browser_handoff", params: { operation: "dismiss", notice_id: "notice-1" } },
   ]);
 });
 

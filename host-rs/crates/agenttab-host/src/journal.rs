@@ -1,6 +1,4 @@
-use agenttab_protocol::{
-    NativeHandoff, NativeStagedCommit, NativeTab, Outcome, RpcError, RpcMethod, RpcResponse,
-};
+use agenttab_protocol::{NativeStagedCommit, NativeTab, Outcome, RpcError, RpcMethod, RpcResponse};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use parking_lot::Mutex;
@@ -59,10 +57,6 @@ pub enum JournalError {
     InvalidPageRevision,
     #[error("invalid native inventory: {0}")]
     InvalidInventory(String),
-    #[error("handoff event id was reused with different state")]
-    HandoffEventConflict,
-    #[error("handoff clear event is missing its acknowledgement id")]
-    MissingHandoffEventId,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("native task cleanup failed: {0}")]
@@ -211,13 +205,6 @@ impl Journal {
                  tab_id INTEGER PRIMARY KEY,
                  page_revision INTEGER NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS handoff_state (
-                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                 active INTEGER NOT NULL CHECK (active IN (0, 1)),
-                 task_id TEXT,
-                 tab_id INTEGER,
-                 started_at_ms INTEGER
-             );
              CREATE TABLE IF NOT EXISTS native_event_receipts (
                  event_id TEXT PRIMARY KEY,
                  event_name TEXT NOT NULL,
@@ -275,6 +262,10 @@ impl Journal {
             "staged_commits",
             "consumed_idempotency_key",
             "TEXT",
+        )?;
+        connection.execute_batch(
+            "DROP TABLE IF EXISTS handoff_state;
+             DELETE FROM native_event_receipts WHERE event_name = 'handoff_changed';",
         )?;
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_staged_commits_review_handle
@@ -1238,84 +1229,6 @@ impl Journal {
         transaction.commit()?;
         Ok(serde_json::from_str(&upload_paths_json)?)
     }
-    pub fn reconcile_handoff(&self, handoff: &NativeHandoff) -> Result<(), JournalError> {
-        self.store_handoff(handoff, None, false)
-    }
-
-    pub fn apply_handoff_event(
-        &self,
-        handoff: &NativeHandoff,
-        event_id: Option<&str>,
-    ) -> Result<(), JournalError> {
-        self.store_handoff(handoff, event_id, true)
-    }
-
-    fn store_handoff(
-        &self,
-        handoff: &NativeHandoff,
-        event_id: Option<&str>,
-        receipt_required: bool,
-    ) -> Result<(), JournalError> {
-        if receipt_required && !handoff.active && event_id.is_none() {
-            return Err(JournalError::MissingHandoffEventId);
-        }
-        let payload_hash = handoff_payload_hash(handoff);
-        let mut connection = self.connection.lock();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(event_id) = event_id {
-            let previous: Option<Vec<u8>> = transaction
-                .query_row(
-                    "SELECT payload_hash FROM native_event_receipts
-                     WHERE event_id = ?1 AND event_name = 'handoff_changed'",
-                    params![event_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(previous) = previous {
-                if previous.as_slice() != payload_hash.as_slice() {
-                    return Err(JournalError::HandoffEventConflict);
-                }
-                transaction.commit()?;
-                return Ok(());
-            }
-        }
-        transaction.execute(
-            "INSERT INTO handoff_state(singleton, active, task_id, tab_id, started_at_ms)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(singleton) DO UPDATE SET
-                 active = excluded.active,
-                 task_id = excluded.task_id,
-                 tab_id = excluded.tab_id,
-                 started_at_ms = excluded.started_at_ms",
-            params![
-                if handoff.active { 1_i64 } else { 0_i64 },
-                handoff.task_id.map(|task_id| task_id.to_string()),
-                handoff.tab_id.map(sqlite_u64).transpose()?,
-                handoff.started_at_ms,
-            ],
-        )?;
-        if let Some(event_id) = event_id {
-            transaction.execute(
-                "INSERT INTO native_event_receipts(event_id, event_name, payload_hash, applied_at_ms)
-                 VALUES (?1, 'handoff_changed', ?2, ?3)",
-                params![event_id, payload_hash.as_slice(), now_ms()],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn handoff_active(&self) -> Result<bool, JournalError> {
-        let connection = self.connection.lock();
-        let active: Option<i64> = connection
-            .query_row(
-                "SELECT active FROM handoff_state WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(active == Some(1))
-    }
 }
 
 fn mutation_decision(
@@ -1387,21 +1300,6 @@ fn capability_hash(capability: &str) -> [u8; 32] {
     Sha256::digest(capability.as_bytes()).into()
 }
 
-fn handoff_payload_hash(handoff: &NativeHandoff) -> [u8; 32] {
-    let task_id = handoff.task_id.map(|task_id| task_id.to_string());
-    let tab_id = handoff.tab_id.map(|tab_id| tab_id.to_string());
-    Sha256::digest(
-        format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-            handoff.active,
-            task_id.as_deref().unwrap_or_default(),
-            tab_id.as_deref().unwrap_or_default(),
-            handoff.started_at_ms.unwrap_or_default(),
-        )
-        .as_bytes(),
-    )
-    .into()
-}
 fn sqlite_u64(value: u64) -> Result<i64, JournalError> {
     i64::try_from(value).map_err(|_| JournalError::InvalidPageRevision)
 }
@@ -1442,7 +1340,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agenttab_protocol::{NativeHandoff, NativeStagedCommit, NativeTab, RpcMethod};
+    use agenttab_protocol::{NativeStagedCommit, NativeTab, RpcMethod};
     use serde_json::json;
 
     fn open_journal(temp: &tempfile::TempDir) -> Journal {
@@ -2076,43 +1974,48 @@ mod tests {
     }
 
     #[test]
-    fn handoff_clear_is_durable_before_idempotent_acknowledgement() {
+    fn opening_a_legacy_active_handoff_state_drops_it() {
         let temp = tempfile::tempdir().unwrap();
-        let journal = open_journal(&temp);
-        let active = NativeHandoff {
-            active: true,
-            task_id: Some(Uuid::now_v7()),
-            tab_id: Some(7),
-            started_at_ms: Some(now_ms()),
-        };
-        journal.reconcile_handoff(&active).unwrap();
-        assert!(journal.handoff_active().unwrap());
+        let path = temp.path().join("state.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE handoff_state (
+                     singleton INTEGER PRIMARY KEY,
+                     active INTEGER NOT NULL,
+                     task_id TEXT,
+                     tab_id INTEGER,
+                     started_at_ms INTEGER
+                 );
+                 INSERT INTO handoff_state VALUES (1, 1, 'legacy-task', 7, 1);
+                 CREATE TABLE native_event_receipts (
+                     event_id TEXT PRIMARY KEY,
+                     event_name TEXT NOT NULL,
+                     payload_hash BLOB NOT NULL,
+                     applied_at_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO native_event_receipts
+                     VALUES ('legacy-handoff-event', 'handoff_changed', x'00', 1);",
+            )
+            .unwrap();
 
-        let clear = NativeHandoff {
-            active: false,
-            task_id: None,
-            tab_id: None,
-            started_at_ms: None,
-        };
-        assert!(matches!(
-            journal.apply_handoff_event(&clear, None),
-            Err(JournalError::MissingHandoffEventId)
-        ));
-        journal
-            .apply_handoff_event(&clear, Some("handoff-clear-0001"))
+        let _journal = Journal::open(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'handoff_state')",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert!(!journal.handoff_active().unwrap());
-        journal
-            .apply_handoff_event(&clear, Some("handoff-clear-0001"))
+        assert!(!exists);
+        let legacy_receipts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_event_receipts WHERE event_name = 'handoff_changed'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert!(matches!(
-            journal.apply_handoff_event(&active, Some("handoff-clear-0001")),
-            Err(JournalError::HandoffEventConflict)
-        ));
-        let reopened = open_journal(&temp);
-        assert!(!reopened.handoff_active().unwrap());
-        reopened
-            .apply_handoff_event(&clear, Some("handoff-clear-0001"))
-            .unwrap();
+        assert_eq!(legacy_receipts, 0);
     }
 }
