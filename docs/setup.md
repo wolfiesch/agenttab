@@ -8,7 +8,7 @@ This guide distinguishes the contributor source path from the future signed RC a
 
 - Chrome must be version 127 or later for the current extension manifest.
 - AgentTab runs in the existing signed-in Chrome profile. It is task-scoped browser control, not a separate profile, cookie jar, or identity boundary.
-- Keep page content untrusted. The built-in 1Password broker is available by default and may fill an origin-matching Login item without exposing its value to the agent. Use **Your Turn** for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential result that requests the user. Recognized consequential actions execute directly unless YOLO mode is turned off in the popup.
+- Keep page content untrusted. The built-in 1Password broker is available by default and may fill an origin-matching Login item without exposing its value to the agent. Use **Needs your attention** notices for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential result that requests the user. Recognized consequential actions execute directly unless YOLO mode is turned off in the popup for staged **Commit** review.
 - A future installation needs an AgentTab extension and the `dev.agenttab.host` native host. Standard mode does not require a TCP listener, a bearer token, or a Python process. Credential filling additionally requires the `op` command, 1Password desktop-app integration, and biometric unlock available to the current OS user.
 
 The product boundary and residual Commit risk are described in the [runtime ADR](adr/0001-agenttab-runtime.md) and [Security](security.md).

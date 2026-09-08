@@ -3,7 +3,6 @@ use crate::credentials::{
     BrokerError, CredentialBroker, NeedsUserReason, PrepareResult, SelectResult,
 };
 use crate::guardrails::{GuardrailLoadError, Guardrails};
-use crate::handoff::HandoffState;
 use crate::journal::{
     BeginDecision, InventoryReconciliation, Journal, JournalError, StagedCommitApproval,
     StagedCommitConsumption, StagedReplayResolution,
@@ -15,10 +14,10 @@ use crate::task::ConnectionContext;
 use agenttab_protocol::{
     AgenttabFinishParams, BrowserAction, BrowserCommitParams, BrowserCredentialsParams,
     BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams, ConnectionAck, ConnectionInit,
-    MethodParams, NativeEventPayload, NativeHandoff, NativePopupCommitEvent, NativeResponse,
-    NativeStagedCommit, NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed,
-    RpcError, RpcMethod, RpcRequest, RpcResponse, TaskBinding, WaitCondition,
-    HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
+    MethodParams, NativeEventPayload, NativePopupCommitEvent, NativeResponse, NativeStagedCommit,
+    NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod,
+    RpcRequest, RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES,
+    PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -62,7 +61,6 @@ impl NativeEventSink for JournalNativeEventSink {
         &self,
         inventory: &[NativeTab],
         staged_commits: &[NativeStagedCommit],
-        handoff: &NativeHandoff,
     ) -> Result<(), String> {
         let inventory_reconciliation = self
             .journal
@@ -75,10 +73,7 @@ impl NativeEventSink for JournalNativeEventSink {
             .journal
             .reconcile_staged_commits(staged_commits)
             .map_err(|error| error.to_string())?;
-        Self::cleanup_uploads(removed_uploads)?;
-        self.journal
-            .reconcile_handoff(handoff)
-            .map_err(|error| error.to_string())
+        Self::cleanup_uploads(removed_uploads)
     }
 
     fn handle(
@@ -136,12 +131,6 @@ impl NativeEventSink for JournalNativeEventSink {
                     .map_err(|error| error.to_string())?;
                 Ok(NativeEventResult::completed(json!({})))
             }
-            NativeEventPayload::Handoff(handoff) => {
-                self.journal
-                    .apply_handoff_event(handoff, event_id)
-                    .map_err(|error| error.to_string())?;
-                Ok(NativeEventResult::completed(json!({})))
-            }
             NativeEventPayload::Pause(_) => Ok(NativeEventResult::completed(json!({}))),
             NativeEventPayload::ExtensionDisconnected(_) => {
                 let paths = self
@@ -167,7 +156,6 @@ pub struct Runtime {
     guardrails: Arc<Guardrails>,
     audit: Arc<AuditLog>,
     native: Arc<dyn NativeTransport>,
-    handoff: Arc<HandoffState>,
     credentials: Arc<CredentialBroker>,
     task_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
@@ -188,13 +176,9 @@ impl Runtime {
         paths: &AgentTabPaths,
         lifecycle: Arc<Lifecycle>,
         native: Arc<dyn NativeTransport>,
-        handoff: Arc<HandoffState>,
     ) -> Result<Arc<Self>, RuntimeBuildError> {
         paths.prepare()?;
         let journal = Arc::new(Journal::open(&paths.state_db)?);
-        if journal.handoff_active()? {
-            handoff.restore(true);
-        }
         let tab_urls = Arc::new(RwLock::new(HashMap::new()));
         let sink = Arc::new(JournalNativeEventSink {
             journal: journal.clone(),
@@ -217,23 +201,12 @@ impl Runtime {
             audit,
             native,
             credentials,
-            handoff,
             task_locks: Mutex::new(HashMap::new()),
             tab_urls,
             upload_staging_dir: paths.upload_staging_dir.clone(),
         });
         *sink.runtime.lock() = Arc::downgrade(&runtime);
         Ok(runtime)
-    }
-
-    #[cfg(test)]
-    fn for_test(
-        paths: &AgentTabPaths,
-        lifecycle: Arc<Lifecycle>,
-        native: Arc<dyn NativeTransport>,
-        handoff: Arc<HandoffState>,
-    ) -> Arc<Self> {
-        Self::open(paths, lifecycle, native, handoff).unwrap()
     }
 
     pub fn connect(
@@ -1031,7 +1004,6 @@ impl Runtime {
             json!({
                 "state": self.lifecycle.state(),
                 "protocol_version": PROTOCOL_VERSION,
-                "handoff_active": self.handoff.is_active(),
                 "task_id": task_id,
             }),
         )
@@ -1133,11 +1105,6 @@ impl Runtime {
         mut params_value: Value,
     ) -> RpcResponse {
         let timeout = dispatch_timeout(params);
-        if method == RpcMethod::BrowserHandoff {
-            if let Err(error) = self.handoff.begin() {
-                return RpcResponse::failure(request_id, Outcome::NotStarted, error);
-            }
-        }
         if let MethodParams::Credentials(credentials) = params {
             return self.dispatch_credentials(connection_id, task_id, request_id, credentials);
         }
@@ -1260,9 +1227,6 @@ impl Runtime {
                 return native_failure(request_id, error);
             }
         };
-        if method == RpcMethod::BrowserHandoff && native.outcome == Outcome::NotStarted {
-            self.handoff.restore(false);
-        }
         if native.outcome == Outcome::CommitRequired {
             let stage_error = match native.staged.as_ref() {
                 None => Some(RpcError::new(
@@ -1656,7 +1620,11 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         )
         | MethodParams::Wait(BrowserWaitParams { tab_id, .. }) => Some((*tab_id, None)),
         MethodParams::Act(params) => Some((params.tab_id, Some(params.expected_page_revision))),
-        MethodParams::Handoff(params) => Some((params.tab_id, Some(params.expected_page_revision))),
+        MethodParams::Handoff(BrowserHandoffParams::Request {
+            tab_id,
+            expected_page_revision,
+            ..
+        }) => Some((*tab_id, Some(*expected_page_revision))),
         MethodParams::Credentials(
             BrowserCredentialsParams::Prepare {
                 tab_id,
@@ -1673,7 +1641,12 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
                 ..
             },
         ) => Some((*tab_id, Some(*expected_page_revision))),
-        MethodParams::Open(_)
+        MethodParams::Handoff(
+            BrowserHandoffParams::Status { .. }
+            | BrowserHandoffParams::Resolve { .. }
+            | BrowserHandoffParams::Dismiss { .. },
+        )
+        | MethodParams::Open(_)
         | MethodParams::Tabs(_)
         | MethodParams::Commit(_)
         | MethodParams::Status(_)
@@ -1698,7 +1671,7 @@ fn is_tab_only_request(params: &MethodParams) -> bool {
             &params.condition,
             WaitCondition::Load | WaitCondition::Url { .. } | WaitCondition::Download
         ),
-        MethodParams::Handoff(_) => true,
+        MethodParams::Handoff(BrowserHandoffParams::Request { .. }) => true,
         _ => false,
     }
 }
@@ -1720,7 +1693,7 @@ fn dispatch_timeout(params: &MethodParams) -> Duration {
         MethodParams::Wait(BrowserWaitParams { timeout_ms, .. }) => {
             Duration::from_millis(timeout_ms.saturating_add(5_000))
         }
-        MethodParams::Handoff(BrowserHandoffParams { timeout_ms, .. }) => {
+        MethodParams::Handoff(BrowserHandoffParams::Request { timeout_ms, .. }) => {
             Duration::from_millis(timeout_ms.saturating_add(5_000))
         }
         _ => Duration::from_secs(30),
@@ -2152,34 +2125,6 @@ mod tests {
             })
         }
     }
-    #[derive(Debug)]
-    struct HandoffTimeoutNative;
-
-    impl NativeTransport for HandoffTimeoutNative {
-        fn dispatch(
-            &self,
-            _connection_id: Uuid,
-            _task_id: Uuid,
-            method: &str,
-            _params: Value,
-            _origin_policy: Option<NativeOriginPolicy>,
-            _timeout: Duration,
-        ) -> Result<NativeResponse, NativeError> {
-            if method == "browser_handoff" {
-                return Err(NativeError::Timeout);
-            }
-            Ok(NativeResponse {
-                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
-                version: PROTOCOL_VERSION,
-                kind: NativeResponseKind::Response,
-                request_id: Uuid::new_v4(),
-                outcome: Outcome::Completed,
-                result: Some(json!({"ok": true})),
-                error: None,
-                staged: None,
-            })
-        }
-    }
 
     #[derive(Debug)]
     struct OversizedNative;
@@ -2206,34 +2151,6 @@ mod tests {
             })
         }
     }
-    #[derive(Debug)]
-    struct RejectedHandoffNative;
-
-    impl NativeTransport for RejectedHandoffNative {
-        fn dispatch(
-            &self,
-            _connection_id: Uuid,
-            _task_id: Uuid,
-            _method: &str,
-            _params: Value,
-            _origin_policy: Option<NativeOriginPolicy>,
-            _timeout: Duration,
-        ) -> Result<NativeResponse, NativeError> {
-            Ok(NativeResponse {
-                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
-                version: PROTOCOL_VERSION,
-                kind: NativeResponseKind::Response,
-                request_id: Uuid::new_v4(),
-                outcome: Outcome::NotStarted,
-                result: None,
-                error: Some(RpcError::new(
-                    "handoff_declined",
-                    "The handoff did not start",
-                )),
-                staged: None,
-            })
-        }
-    }
 
     fn connected_runtime(
         native: Arc<dyn NativeTransport>,
@@ -2243,8 +2160,7 @@ mod tests {
         let lifecycle = Arc::new(Lifecycle::default());
         lifecycle.begin_reconciliation();
         lifecycle.complete_reconciliation(false);
-        let runtime =
-            Runtime::for_test(&paths, lifecycle, native, Arc::new(HandoffState::default()));
+        let runtime = Runtime::open(&paths, lifecycle, native).unwrap();
         let (connection, _) = runtime
             .connect(ConnectionInit {
                 protocol: RPC_PROTOCOL.into(),
@@ -2268,8 +2184,7 @@ mod tests {
         let lifecycle = Arc::new(Lifecycle::default());
         lifecycle.begin_reconciliation();
         lifecycle.complete_reconciliation(false);
-        let runtime =
-            Runtime::for_test(&paths, lifecycle, native, Arc::new(HandoffState::default()));
+        let runtime = Runtime::open(&paths, lifecycle, native).unwrap();
         let (connection, _) = runtime
             .connect(ConnectionInit {
                 protocol: RPC_PROTOCOL.into(),
@@ -2306,8 +2221,7 @@ mod tests {
         let lifecycle = Arc::new(Lifecycle::default());
         lifecycle.begin_reconciliation();
         lifecycle.complete_reconciliation(false);
-        let runtime =
-            Runtime::for_test(&paths, lifecycle, native, Arc::new(HandoffState::default()));
+        let runtime = Runtime::open(&paths, lifecycle, native).unwrap();
         let (connection, _) = runtime
             .connect(ConnectionInit {
                 protocol: RPC_PROTOCOL.into(),
@@ -2672,6 +2586,37 @@ mod tests {
     }
 
     #[test]
+    fn handoff_request_locks_by_tab_but_notice_operations_remain_global() {
+        let task_id = Uuid::new_v4();
+        assert_eq!(
+            request_lock_scope(
+                RpcMethod::BrowserHandoff,
+                &json!({"operation": "request", "tab_id": 7}),
+            ),
+            RequestLockScope::Tab(7),
+        );
+        assert_eq!(
+            request_lock_scope(
+                RpcMethod::BrowserHandoff,
+                &json!({"operation": "status", "notice_id": "notice-1"}),
+            ),
+            RequestLockScope::Global,
+        );
+        assert_ne!(
+            request_lock_key(
+                task_id,
+                RpcMethod::BrowserHandoff,
+                &json!({"operation": "request", "tab_id": 7}),
+            ),
+            request_lock_key(
+                Uuid::new_v4(),
+                RpcMethod::BrowserHandoff,
+                &json!({"operation": "request", "tab_id": 7}),
+            ),
+        );
+    }
+
+    #[test]
     fn native_error_fields_are_redacted_before_rpc_return() {
         let (_temp, runtime, connection) = connected_runtime(FakeNative::failing());
         let response = runtime.handle(
@@ -2697,12 +2642,7 @@ mod tests {
         let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
         let lifecycle = Arc::new(Lifecycle::default());
         let native = FakeNative::normal();
-        let runtime = Runtime::for_test(
-            &paths,
-            lifecycle,
-            native.clone(),
-            Arc::new(HandoffState::default()),
-        );
+        let runtime = Runtime::open(&paths, lifecycle, native.clone()).unwrap();
         let (connection, _) = runtime
             .connect(ConnectionInit {
                 protocol: RPC_PROTOCOL.into(),
@@ -2755,12 +2695,7 @@ mod tests {
         lifecycle.begin_reconciliation();
         lifecycle.complete_reconciliation(false);
         let native = FakeNative::normal();
-        let runtime = Runtime::for_test(
-            &paths,
-            lifecycle,
-            native.clone(),
-            Arc::new(HandoffState::default()),
-        );
+        let runtime = Runtime::open(&paths, lifecycle, native.clone()).unwrap();
         let (connection, _) = runtime
             .connect(ConnectionInit {
                 protocol: RPC_PROTOCOL.into(),
@@ -2874,16 +2809,61 @@ mod tests {
                 "idempotency_key": Uuid::now_v7(),
                 "method": "browser_handoff",
                 "params": {
+                    "operation": "request",
                     "tab_id": 3,
                     "expected_page_revision": 7,
                     "prompt": "Inspect browser settings",
-                    "completion": {"kind": "manual_done"},
+                    "completion": {"kind": "selector", "value": "body"},
                     "timeout_ms": 1000
                 }
             }),
         );
         assert_eq!(system_handoff["outcome"], "completed", "{system_handoff}");
     }
+    #[test]
+    fn handoff_notice_operations_are_forwarded_without_host_admission_state() {
+        let native = FakeNative::normal();
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        own_tab(&runtime, &connection, 7);
+        let handoff = |request_id: &str, params: Value| {
+            runtime.handle(
+                &connection,
+                json!({
+                    "protocol": RPC_PROTOCOL,
+                    "version": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "idempotency_key": Uuid::now_v7(),
+                    "method": "browser_handoff",
+                    "params": params,
+                }),
+            )
+        };
+
+        let request_params = json!({
+            "operation": "request",
+            "tab_id": 3,
+            "expected_page_revision": 7,
+            "prompt": "Complete the browser step",
+            "completion": {"kind": "selector", "value": "body"},
+        });
+        let mut expected_request_params = request_params.clone();
+        expected_request_params["timeout_ms"] = json!(300_000);
+        assert_eq!(
+            handoff("request-notice", request_params.clone())["outcome"],
+            "completed"
+        );
+        assert_eq!(
+            native.last_params.lock().as_ref(),
+            Some(&expected_request_params),
+        );
+
+        for operation in ["status", "resolve", "dismiss"] {
+            let params = json!({"operation": operation, "notice_id": "notice-1"});
+            assert_eq!(handoff(operation, params.clone())["outcome"], "completed");
+            assert_eq!(native.last_params.lock().as_ref(), Some(&params));
+        }
+    }
+
     #[test]
     fn commit_rechecks_staged_tab_policy_after_navigation() {
         let native = FakeNative::staging();
@@ -2948,69 +2928,6 @@ mod tests {
             &[expected_policy.clone(), None, expected_policy],
         );
         assert_eq!(native.executed_commits.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn timed_out_handoff_state_does_not_block_browser_work() {
-        let (_temp, runtime, connection) = connected_runtime(Arc::new(HandoffTimeoutNative));
-        own_tab(&runtime, &connection, 7);
-        let response = runtime.handle(
-            &connection,
-            json!({
-                "protocol": RPC_PROTOCOL,
-                "version": PROTOCOL_VERSION,
-                "request_id": "handoff",
-                "idempotency_key": Uuid::now_v7(),
-                "method": "browser_handoff",
-                "params": {
-                    "tab_id": 3,
-                    "expected_page_revision": 7,
-                    "prompt": "Complete sign-in",
-                    "completion": {"kind": "manual_done"},
-                    "timeout_ms": 1000
-                }
-            }),
-        );
-        assert_eq!(response["error"]["code"], "extension_timeout");
-        assert!(runtime.handoff.is_active());
-
-        let snapshot = runtime.handle(
-            &connection,
-            json!({
-                "protocol": RPC_PROTOCOL,
-                "version": PROTOCOL_VERSION,
-                "request_id": "snapshot",
-                "method": "browser_snapshot",
-                "params": {"mode": "text", "tab_id": 3}
-            }),
-        );
-        assert_eq!(snapshot["outcome"], "completed");
-        runtime.handoff.restore(false);
-    }
-    #[test]
-    fn rejected_handoff_releases_active_marker() {
-        let (_temp, runtime, connection) = connected_runtime(Arc::new(RejectedHandoffNative));
-        own_tab(&runtime, &connection, 7);
-        let response = runtime.handle(
-            &connection,
-            json!({
-                "protocol": RPC_PROTOCOL,
-                "version": PROTOCOL_VERSION,
-                "request_id": "handoff-rejected",
-                "idempotency_key": Uuid::now_v7(),
-                "method": "browser_handoff",
-                "params": {
-                    "tab_id": 3,
-                    "expected_page_revision": 7,
-                    "prompt": "Complete sign-in",
-                    "completion": {"kind": "manual_done"},
-                    "timeout_ms": 1000
-                }
-            }),
-        );
-        assert_eq!(response["outcome"], "not_started");
-        assert_eq!(response["error"]["code"], "handoff_declined");
-        assert!(!runtime.handoff.is_active());
     }
 
     #[test]

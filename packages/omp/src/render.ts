@@ -60,7 +60,7 @@ const MAX_EXPANDED_LINES = 160;
 const STATUS_LABEL: Readonly<Record<OperationCardStatus, string>> = {
   planned: "🧭 Plan",
   running: "🔄 Working",
-  awaiting_user: "👤 Your turn",
+  awaiting_user: "👤 Needs you",
   awaiting_approval: "🔒 Review",
   executed: "🚀 Executed",
   observed: "🔎 Observed",
@@ -112,14 +112,14 @@ export function createResultCard(
   const status = resultStatus(method, result, options, values);
   const notices = [
     ...sensitiveInputNotices(callArgs),
-    ...resultNotices(status, values),
+    ...resultNotices(method, status, values),
   ];
   return {
     version: 1,
     method,
     status,
     title: options.isPartial === true
-      ? method === "browser_handoff" ? "Starting user handoff" : "Working…"
+      ? "Working…"
       : result.isError === true
         ? errorSummary(result)
         : summarizeResult(method, callArgs, details, status),
@@ -222,10 +222,23 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
     case "browser_tabs":
       return { title: "List task tabs", meta: "current connection" };
     case "browser_handoff": {
-      const completion = toRecord(args.completion);
+      const operation = fieldString(args, "operation") ?? "request";
+      if (operation === "request") {
+        const completion = toRecord(args.completion);
+        return {
+          title: "Request user attention",
+          meta: fieldString(completion, "kind") === undefined
+            ? "agent verifies completion"
+            : humanize(fieldString(completion, "kind") ?? "completion"),
+        };
+      }
       return {
-        title: "Hand off to user",
-        meta: humanize(fieldString(completion, "kind") ?? "manual completion"),
+        title: operation === "resolve"
+          ? "Resolve attention notice"
+          : operation === "dismiss"
+            ? "Dismiss attention notice"
+            : "Check attention notice",
+        meta: `notice ${shortId(fieldString(args, "notice_id")) ?? ""}`,
       };
     }
     case "browser_credentials": {
@@ -352,8 +365,13 @@ function summarizeResult(
       return typeof result.tabs_count === "number"
         ? countLabel(result.tabs_count, "task tab")
         : countSummary(Array.isArray(result.tabs) ? result.tabs : [], "task tab");
-    case "browser_handoff":
-      return "User handoff started";
+    case "browser_handoff": {
+      const noticeStatus = fieldString(result, "status") ?? "open";
+      if (noticeStatus === "resolved") return "Assistance resolved";
+      if (noticeStatus === "dismissed") return "Reminder dismissed";
+      if (noticeStatus === "expired") return "Reminder expired";
+      return "Attention requested";
+    }
     case "browser_credentials": {
       const credentialStatus = fieldString(result, "status");
       if (credentialStatus === "ready") {
@@ -386,7 +404,6 @@ function resultStatus(
 ): OperationCardStatus {
   const outcome = fieldString(toRecord(details._agenttab), "outcome") ?? fieldString(details, "outcome");
   if (outcome === "unknown") return "uncertain";
-  if (method === "browser_handoff" && outcome === "needs_user") return "awaiting_user";
   if (method === "browser_credentials" && outcome === "needs_user") return "awaiting_user";
   if (options.isPartial === true) {
     return method === "browser_credentials" ? "awaiting_user" : "running";
@@ -395,7 +412,9 @@ function resultStatus(
   if (typeof details.staged_token === "string" || details.awaiting_human_approval === true) {
     return "awaiting_approval";
   }
-  if (method === "browser_handoff") return "executed";
+  if (method === "browser_handoff") {
+    return fieldString(details, "status") === "open" ? "awaiting_user" : "observed";
+  }
   if (method === "browser_snapshot" || method === "browser_wait" || method === "browser_tabs") {
     return "observed";
   }
@@ -440,33 +459,31 @@ function operationSteps(status: OperationCardStatus, method: ToolMethod): readon
     switch (status) {
       case "planned":
         return [
-          { label: "Intent", state: "active" },
+          { label: "Ask", state: "active" },
           { label: "Human", state: "pending" },
-          { label: "Resume", state: "pending" },
+          { label: "Verify", state: "pending" },
+          { label: "Resolve", state: "pending" },
         ];
       case "awaiting_user":
         return [
-          { label: "Intent", state: "done" },
+          { label: "Ask", state: "done" },
           { label: "Human", state: "active" },
-          { label: "Resume", state: "pending" },
-        ];
-      case "executed":
-        return [
-          { label: "Intent", state: "done" },
-          { label: "Human", state: "active" },
-          { label: "Resume", state: "pending" },
+          { label: "Verify", state: "pending" },
+          { label: "Resolve", state: "pending" },
         ];
       case "observed":
         return [
-          { label: "Intent", state: "done" },
+          { label: "Ask", state: "done" },
           { label: "Human", state: "done" },
-          { label: "Resume", state: "done" },
+          { label: "Verify", state: "done" },
+          { label: "Resolve", state: "done" },
         ];
       case "blocked":
         return [
-          { label: "Intent", state: "done" },
-          { label: "Handoff", state: "blocked" },
-          { label: "Resume", state: "pending" },
+          { label: "Ask", state: "done" },
+          { label: "Human", state: "blocked" },
+          { label: "Verify", state: "pending" },
+          { label: "Resolve", state: "pending" },
         ];
       default:
         break;
@@ -558,8 +575,11 @@ function sensitiveInputNotices(args: Record<string, unknown>): string[] {
     : [`Privacy · ${hidden} sensitive input${hidden === 1 ? "" : "s"} hidden`];
 }
 
-function resultNotices(status: OperationCardStatus, details: Record<string, unknown>): string[] {
+function resultNotices(method: ToolMethod, status: OperationCardStatus, details: Record<string, unknown>): string[] {
   const notices: string[] = [];
+  if (method === "browser_handoff" && status === "awaiting_user") {
+    notices.push("Non-blocking · Agent work continues; verify the page yourself before resolving");
+  }
   if (status === "awaiting_approval") {
     notices.push("Policy · Consequential action paused before execution");
   }

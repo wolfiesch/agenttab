@@ -139,13 +139,16 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         core_request(
             "browser_handoff",
             {
+                "operation": "request",
                 "tab_id": 1,
                 "expected_page_revision": 2,
-                "prompt": "Complete sign-in, then choose Done.",
-                "completion": {"kind": "manual_done"},
+                "prompt": "Complete sign-in, then tell the agent in chat.",
             },
             mutation=True,
         ),
+        core_request("browser_handoff", {"operation": "status", "notice_id": "notice-1"}, mutation=True),
+        core_request("browser_handoff", {"operation": "resolve", "notice_id": "notice-1"}, mutation=True),
+        core_request("browser_handoff", {"operation": "dismiss", "notice_id": "notice-1"}, mutation=True),
         core_request(
             "browser_commit",
             {"staged_token": "t" * 32},

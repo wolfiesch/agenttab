@@ -152,41 +152,101 @@ describe("AgentTab operation card rendering", () => {
     expect(rendered).not.toContain("Blocked ·");
   });
 
-  test("handoff cards show an asynchronous start instead of blocking", () => {
+  test("handoff cards never treat notice creation as completed human work", () => {
     const args = {
+      operation: "request",
       tab_id: 18,
       expected_page_revision: 5,
       prompt: "Complete passkey verification",
-      completion: { kind: "manual_done" },
     };
-    const starting = createResultComponent(
-      "browser_handoff",
-      { details: {} },
-      { expanded: true, isPartial: true },
-      theme,
-      args,
-    );
-    expect(starting.render(120)).toEqual([
-      "🔄 Working · Starting user handoff · tab 18 · rev 5 · task-owned",
-    ]);
-
-    const activated = createResultComponent(
+    const requested = createResultComponent(
       "browser_handoff",
       {
         details: {
-          handoff_started: true,
+          notice_id: "018f22b2-4126-7c1a-8c31-3f45a783da45",
+          task_id: "task-7",
           tab_id: 18,
-          page_revision: 6,
-          _agenttab: { outcome: "completed", task_id: "task-7" },
+          status: "open",
+          started_at_ms: 1_000,
+          expires_at_ms: 301_000,
         },
       },
       { expanded: false },
       theme,
       args,
     );
-    expect(activated.render(120)).toEqual([
-      "🚀 Executed · User handoff started · task task-7 · tab 18 · rev 6 · task-owned",
+    expect(requested.render(120)).toEqual([
+      "👤 Needs you · Attention requested · task task-7 · tab 18 · rev 5 · task-owned",
+      "  Flow · ✓ Ask  ▶ Human  · Verify  · Resolve",
+      "  Non-blocking · Agent work continues; verify the page yourself before resolving",
     ]);
+
+    const partial = createResultComponent(
+      "browser_handoff",
+      { details: {} },
+      { expanded: true, isPartial: true },
+      theme,
+      args,
+    );
+    expect(partial.render(120)).toEqual([
+      "🔄 Working · Working… · tab 18 · rev 5 · task-owned",
+    ]);
+
+    const resolved = createResultComponent(
+      "browser_handoff",
+      {
+        details: {
+          notice_id: "018f22b2-4126-7c1a-8c31-3f45a783da45",
+          task_id: "task-7",
+          tab_id: 18,
+          status: "resolved",
+        },
+      },
+      { expanded: false },
+      theme,
+      { operation: "resolve", notice_id: "018f22b2-4126-7c1a-8c31-3f45a783da45" },
+    );
+    expect(resolved.render(120)).toEqual([
+      "🔎 Observed · Assistance resolved · task task-7 · tab 18 · task-owned",
+    ]);
+
+    const dismissed = createResultComponent(
+      "browser_handoff",
+      { details: { notice_id: "n-1", tab_id: 18, status: "dismissed" } },
+      { expanded: false },
+      theme,
+      { operation: "dismiss", notice_id: "n-1" },
+    );
+    expect(dismissed.render(120)).toEqual([
+      "🔎 Observed · Reminder dismissed · tab 18 · task-owned",
+    ]);
+  });
+
+  test("handoff call cards identify request and notice operations", () => {
+    const request = createCallComponent("browser_handoff", {
+      operation: "request",
+      tab_id: 18,
+      expected_page_revision: 5,
+      prompt: "Complete passkey verification",
+      completion: { kind: "url", value: "https://example.test/done" },
+    }, theme);
+    expect(request.render(120)).toEqual([
+      "🧭 Plan · Request user attention · Url · tab 18 · rev 5 · task-owned",
+      "  Flow · ▶ Ask  · Human  · Verify  · Resolve",
+    ]);
+    const withoutCompletion = createCallComponent("browser_handoff", {
+      operation: "request",
+      tab_id: 18,
+      expected_page_revision: 5,
+      prompt: "Approve the payment",
+    }, theme);
+    expect(withoutCompletion.render(120)[0]).toContain("agent verifies completion");
+    const resolve = createCallComponent("browser_handoff", {
+      operation: "resolve",
+      notice_id: "018f22b2-4126-7c1a-8c31-3f45a783da45",
+    }, theme);
+    expect(resolve.render(120)[0]).toContain("Resolve attention notice");
+    expect(resolve.render(120)[0]).toContain("notice 018f22b2…da45");
   });
 
   test("partial results stay compact even when expanded", () => {

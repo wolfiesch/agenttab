@@ -99,13 +99,21 @@ class ClientTests(unittest.TestCase):
             resolve_transport_timeout(
                 "browser_handoff",
                 {
+                    "operation": "request",
                     "tab_id": 1,
                     "expected_page_revision": 1,
                     "prompt": "Complete MFA",
-                    "completion": {"kind": "manual_done"},
+                    "completion": {"kind": "selector", "value": "body"},
                 },
             ),
             DEFAULT_BROWSER_HANDOFF_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
+        )
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_handoff",
+                {"operation": "status", "notice_id": "notice-1"},
+            ),
+            30.0,
         )
         self.assertEqual(
             resolve_transport_timeout(

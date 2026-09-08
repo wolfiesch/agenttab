@@ -1262,7 +1262,7 @@ class LiveLifecycleProbe:
                 self.connect(resume=resume)
                 status, _ = self.client.call("agenttab.status", {})
                 result = require_completed(f"{operation} agenttab.status", status)
-                if result.get("state") == "ready" and result.get("handoff_active") is False:
+                if result.get("state") == "ready":
                     return
                 last_error = GateFailure(f"{operation} agenttab.status did not reach ready")
             except GateFailure as error:
@@ -1500,42 +1500,41 @@ class LiveLifecycleProbe:
         response, _ = self.client.call(
             "browser_handoff",
             {
+                "operation": "request",
                 "tab_id": handoff_tab,
                 "expected_page_revision": revision,
-                "prompt": "Complete the local AgentTab handoff fixture.",
+                "prompt": "Complete the local fixture, then tell the agent in chat.",
                 "completion": {"kind": "url", "value": f"{fixture.base_url}/handoff-complete"},
                 "timeout_ms": int(self.args.timeout_seconds * 1000),
             },
             mutation=True,
         )
-        if response.get("ok") is not True or response_outcome(response) != "needs_user":
-            raise GateFailure(
-                "browser_handoff: expected immediate needs_user admission state; "
-                f"received {response_outcome(response)} ({scrubbed_error_code(response)})"
-            )
-        _selected_window, selected_tab = self.inspector.selection()
-        if selected_tab != handoff_tab:
-            raise ChromeOperationFailure(
-                "browser_handoff did not select its admitted handoff tab in the focused Chrome window"
-            )
-        status = self.status("browser_handoff blackout", expected_state="ready")
-        if status.get("handoff_active") is not True:
-            raise GateFailure("agenttab.status did not persist active handoff")
-        response, _ = self.client.call("browser_snapshot", {"tab_id": handoff_tab, "mode": "accessibility"})
-        require_denied("browser_snapshot global handoff blackout", response, {"handoff_blackout"})
-        self.prompt(
-            f"run {run_number}: handoff completion",
-            "Wait for the focused local fixture to show Handoff complete, then choose I'm done in the "
-            "AgentTab popup.",
+        notice = require_completed("browser_handoff request", response)
+        notice_id = notice.get("notice_id")
+        if not isinstance(notice_id, str) or notice.get("status") != "open":
+            raise GateFailure("browser_handoff did not return an open notice")
+        self.inspector.assert_selection_unchanged(selection_before, "browser_handoff request")
+        self.status("browser_handoff advisory state", expected_state="ready")
+        self.snapshot(handoff_tab, "accessibility", "browser_snapshot during open notice")
+        response, _ = self.client.call(
+            "browser_wait",
+            {
+                "tab_id": handoff_tab,
+                "condition": {"kind": "url", "value": f"{fixture.base_url}/handoff-complete"},
+                "timeout_ms": int(self.args.timeout_seconds * 1000),
+            },
         )
-        deadline = time.monotonic() + self.args.timeout_seconds
-        while time.monotonic() < deadline:
-            status_response, _ = self.client.call("agenttab.status", {})
-            status_result = require_completed("agenttab.status handoff completion", status_response)
-            if status_result.get("handoff_active") is False:
-                return
-            time.sleep(0.1)
-        raise GateFailure("browser_handoff local completion did not clear blackout")
+        require_completed("browser_wait during open notice", response)
+        text, _ = self.snapshot(handoff_tab, "text", "browser_snapshot assistance verification")
+        if not contains_text(text, "Handoff complete"):
+            raise GateFailure("Human assistance fixture completion was not observable")
+        response, _ = self.client.call(
+            "browser_handoff", {"operation": "resolve", "notice_id": notice_id}, mutation=True
+        )
+        resolved = require_completed("browser_handoff agent resolution", response)
+        if resolved.get("status") != "resolved":
+            raise GateFailure("browser_handoff agent resolution did not resolve the notice")
+        self.inspector.assert_selection_unchanged(selection_before, "browser_handoff resolution")
 
     def close_owned_tabs(self) -> None:
         task_id = self.client.task_id

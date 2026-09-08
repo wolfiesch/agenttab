@@ -94,16 +94,23 @@ const schemas: Record<ToolMethod, unknown> = {
     timeout_ms: Type.Optional(Type.Integer({ minimum: 1, maximum: 120_000 })),
   }),
   browser_tabs: object({}),
-  browser_handoff: object({
-    tab_id: Type.Integer({ minimum: 0 }),
-    expected_page_revision: Type.Integer({ minimum: 0 }),
-    prompt: Type.String({ minLength: 1, maxLength: 2000 }),
-    completion: Type.Union([
-      object({ kind: stringEnum(["navigation", "manual_done"]) }),
-      object({ kind: stringEnum(["url", "selector"]), value: Type.String({ minLength: 1, maxLength: 65_536 }) }),
-    ]),
-    timeout_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 900_000 })),
-  }),
+  browser_handoff: Type.Union([
+    object({
+      operation: Type.Literal("request"),
+      tab_id: Type.Integer({ minimum: 0 }),
+      expected_page_revision: Type.Integer({ minimum: 0 }),
+      prompt: Type.String({ minLength: 1, maxLength: 2000 }),
+      completion: Type.Optional(object({
+        kind: stringEnum(["url", "selector"]),
+        value: Type.String({ minLength: 1, maxLength: 65_536 }),
+      })),
+      timeout_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 900_000 })),
+    }),
+    object({
+      operation: stringEnum(["status", "resolve", "dismiss"]),
+      notice_id: Type.String({ minLength: 1, maxLength: 256 }),
+    }),
+  ]),
   browser_credentials: Type.Union([
     object({
       action: Type.Literal("prepare"),

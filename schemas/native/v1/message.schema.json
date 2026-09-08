@@ -25,17 +25,6 @@
       },
       "additionalProperties": false
     },
-    "handoff": {
-      "type": "object",
-      "required": ["active"],
-      "properties": {
-        "active": { "type": "boolean" },
-        "task_id": { "type": "string", "format": "uuid" },
-        "tab_id": { "type": "integer", "minimum": 0 },
-        "started_at_ms": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
     "staged": {
       "type": "object",
       "required": ["native_token", "task_id", "tab_id", "page_revision", "effect", "fingerprint", "expires_at_ms"],
@@ -129,13 +118,12 @@
         { "$ref": "#/$defs/base" },
         {
           "type": "object",
-          "required": ["kind", "extension_version", "inventory", "paused", "handoff", "staged_commits"],
+          "required": ["kind", "extension_version", "inventory", "paused", "staged_commits"],
           "properties": {
             "protocol": {}, "version": {}, "kind": { "const": "hello" },
             "extension_version": { "type": "string", "minLength": 1 },
             "inventory": { "type": "array", "items": { "$ref": "#/$defs/tab" } },
             "paused": { "type": "boolean" },
-            "handoff": { "$ref": "#/$defs/handoff" },
             "staged_commits": { "type": "array", "items": { "$ref": "#/$defs/staged" } }
           },
           "additionalProperties": false
@@ -241,38 +229,22 @@
           "required": ["kind", "event", "event_id"],
           "properties": {
             "protocol": {}, "version": {}, "kind": { "const": "event_ack" },
-            "event": { "enum": ["handoff_changed", "popup_commit_approved", "popup_commit_abandoned"] },
+            "event": { "enum": ["popup_commit_approved", "popup_commit_abandoned"] },
             "event_id": { "type": "string", "minLength": 1, "maxLength": 256 },
             "outcome": { "enum": ["completed", "not_started", "unknown"] },
             "result": { "type": "object" },
             "error": { "$ref": "#/$defs/rpc_error" }
           },
-          "allOf": [
+          "oneOf": [
             {
-              "if": { "properties": { "event": { "const": "handoff_changed" } } },
-              "then": {
-                "not": {
-                  "anyOf": [
-                    { "required": ["outcome"] },
-                    { "required": ["result"] },
-                    { "required": ["error"] }
-                  ]
-                }
-              },
-              "else": {
-                "oneOf": [
-                  {
-                    "required": ["outcome", "result"],
-                    "properties": { "outcome": { "const": "completed" } },
-                    "not": { "required": ["error"] }
-                  },
-                  {
-                    "required": ["outcome", "error"],
-                    "properties": { "outcome": { "enum": ["not_started", "unknown"] } },
-                    "not": { "required": ["result"] }
-                  }
-                ]
-              }
+              "required": ["outcome", "result"],
+              "properties": { "outcome": { "const": "completed" } },
+              "not": { "required": ["error"] }
+            },
+            {
+              "required": ["outcome", "error"],
+              "properties": { "outcome": { "enum": ["not_started", "unknown"] } },
+              "not": { "required": ["result"] }
             }
           ],
           "additionalProperties": false
@@ -294,7 +266,6 @@
                 "tab_removed",
                 "group_membership_changed",
                 "pause_changed",
-                "handoff_changed",
                 "commit_expired",
                 "commit_abandoned",
                 "popup_commit_approved",
@@ -319,25 +290,6 @@
               "then": { "properties": { "payload": { "$ref": "#/$defs/pause_payload" } } }
             },
             {
-              "if": { "properties": { "event": { "const": "handoff_changed" } } },
-              "then": {
-                "properties": { "payload": { "$ref": "#/$defs/handoff" } },
-                "allOf": [
-                  {
-                    "if": {
-                      "properties": {
-                        "payload": {
-                          "properties": { "active": { "const": false } },
-                          "required": ["active"]
-                        }
-                      }
-                    },
-                    "then": { "required": ["event_id"] }
-                  }
-                ]
-              }
-            },
-            {
               "if": { "properties": { "event": { "const": "commit_expired" } } },
               "then": { "properties": { "payload": { "$ref": "#/$defs/commit_expired_payload" } } }
             },
@@ -360,7 +312,7 @@
               "if": { "required": ["event_id"] },
               "then": {
                 "properties": {
-                  "event": { "enum": ["handoff_changed", "popup_commit_approved", "popup_commit_abandoned"] }
+                  "event": { "enum": ["popup_commit_approved", "popup_commit_abandoned"] }
                 }
               }
             }

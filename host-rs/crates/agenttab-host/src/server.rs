@@ -896,7 +896,6 @@ fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::handoff::HandoffState;
     use crate::lifecycle::Lifecycle;
     use crate::native::{NativeError, NativeTransport};
     use crate::paths::AgentTabPaths;
@@ -990,8 +989,7 @@ mod tests {
         let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
         let lifecycle = Arc::new(Lifecycle::default());
         lifecycle.complete_reconciliation(false);
-        let runtime =
-            Runtime::open(&paths, lifecycle, native, Arc::new(HandoffState::default())).unwrap();
+        let runtime = Runtime::open(&paths, lifecycle, native).unwrap();
         (runtime, paths)
     }
 
@@ -1348,13 +1346,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
         let lifecycle = Arc::new(Lifecycle::default());
-        let runtime = Runtime::open(
-            &paths,
-            lifecycle,
-            Arc::new(UnusedNative),
-            Arc::new(HandoffState::default()),
-        )
-        .unwrap();
+        let runtime = Runtime::open(&paths, lifecycle, Arc::new(UnusedNative)).unwrap();
         let socket = temp.path().join("run/agenttab.sock");
         let server_runtime = runtime.clone();
         let server_socket = socket.clone();

@@ -79,7 +79,6 @@ export class NativeBridge {
     private readonly scheduler: MutationScheduler,
     private readonly ownership: OwnershipLedger,
     private readonly handleCommand: CommandHandler,
-    private readonly onEventAcknowledged: (event: string, eventId: string) => void = () => undefined,
     private readonly onReady: () => Promise<void> = async () => undefined,
     private readonly discardStages: StageDiscarder = async () => undefined,
     private readonly reconnectTiming: ReconnectTiming = DEFAULT_RECONNECT_TIMING,
@@ -115,14 +114,6 @@ export class NativeBridge {
         chrome.runtime.getManifest().version,
         nativeInventory(await this.ownership.inventory()),
         state.paused,
-        state.handoff.active
-          ? {
-            active: true,
-            task_id: state.handoff.taskId,
-            tab_id: state.handoff.tabId,
-            started_at_ms: state.handoff.startedAtMs,
-          }
-          : { active: false },
         Object.values(state.stagedCommits).map(({
           action: _action,
           preview: _preview,
@@ -256,8 +247,6 @@ export class NativeBridge {
         clearTimeout(pending.timeout);
         this.pendingEventAcks.delete(parsed.event_id);
         pending.resolve(parsed);
-      } else if (this.ready) {
-        this.onEventAcknowledged(parsed.event, parsed.event_id);
       }
       return;
     }

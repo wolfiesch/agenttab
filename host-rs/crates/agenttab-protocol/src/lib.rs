@@ -552,14 +552,26 @@ fn default_finish_disposition() -> FinishDisposition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BrowserHandoffParams {
-    pub tab_id: u64,
-    pub expected_page_revision: u64,
-    pub prompt: String,
-    pub completion: HandoffCompletion,
-    #[serde(default = "default_handoff_timeout")]
-    pub timeout_ms: u64,
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserHandoffParams {
+    Request {
+        tab_id: u64,
+        expected_page_revision: u64,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion: Option<HandoffCompletion>,
+        #[serde(default = "default_handoff_timeout")]
+        timeout_ms: u64,
+    },
+    Status {
+        notice_id: String,
+    },
+    Resolve {
+        notice_id: String,
+    },
+    Dismiss {
+        notice_id: String,
+    },
 }
 
 fn default_handoff_timeout() -> u64 {
@@ -569,8 +581,6 @@ fn default_handoff_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HandoffCompletion {
-    Navigation,
-    ManualDone,
     Url { value: String },
     Selector { value: String },
 }
@@ -771,32 +781,36 @@ impl MethodParams {
                     WaitCondition::Load | WaitCondition::NetworkIdle | WaitCondition::Download => {}
                 }
             }
-            Self::Handoff(params) => {
-                require_len(
-                    method,
-                    &params.prompt,
-                    1,
-                    MAX_HANDOFF_PROMPT_CHARS,
-                    "prompt",
-                )?;
+            Self::Handoff(BrowserHandoffParams::Request {
+                prompt,
+                completion,
+                timeout_ms,
+                ..
+            }) => {
+                require_len(method, prompt, 1, MAX_HANDOFF_PROMPT_CHARS, "prompt")?;
                 require(
                     method,
-                    (1_000..=900_000).contains(&params.timeout_ms),
+                    (1_000..=900_000).contains(timeout_ms),
                     "timeout_ms must be between 1000 and 900000",
                 )?;
-                match &params.completion {
-                    HandoffCompletion::Url { value } | HandoffCompletion::Selector { value } => {
-                        require_len(
-                            method,
-                            value,
-                            1,
-                            MAX_HANDOFF_COMPLETION_CHARS,
-                            "completion.value",
-                        )?;
-                    }
-                    HandoffCompletion::Navigation | HandoffCompletion::ManualDone => {}
+                if let Some(
+                    HandoffCompletion::Url { value } | HandoffCompletion::Selector { value },
+                ) = completion
+                {
+                    require_len(
+                        method,
+                        value,
+                        1,
+                        MAX_HANDOFF_COMPLETION_CHARS,
+                        "completion.value",
+                    )?;
                 }
             }
+            Self::Handoff(
+                BrowserHandoffParams::Status { notice_id }
+                | BrowserHandoffParams::Resolve { notice_id }
+                | BrowserHandoffParams::Dismiss { notice_id },
+            ) => require_len(method, notice_id, 1, usize::MAX, "notice_id")?,
             Self::Credentials(BrowserCredentialsParams::Prepare { .. }) => {}
             Self::Credentials(
                 BrowserCredentialsParams::Fill {
@@ -1328,18 +1342,6 @@ fn validate_native_inventory(inventory: &[NativeTab]) -> Result<(), ProtocolErro
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NativeHandoff {
-    pub active: bool,
-    #[serde(default)]
-    pub task_id: Option<Uuid>,
-    #[serde(default)]
-    pub tab_id: Option<u64>,
-    #[serde(default)]
-    pub started_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NativeHello {
     pub protocol: String,
     pub version: u16,
@@ -1347,7 +1349,6 @@ pub struct NativeHello {
     pub extension_version: String,
     pub inventory: Vec<NativeTab>,
     pub paused: bool,
-    pub handoff: NativeHandoff,
     pub staged_commits: Vec<NativeStagedCommit>,
 }
 impl NativeHello {
@@ -1365,7 +1366,6 @@ impl NativeHello {
             ));
         }
         validate_native_inventory(&hello.inventory)?;
-        validate_native_handoff(&hello.handoff)?;
         for staged in &hello.staged_commits {
             staged.validate()?;
         }
@@ -1570,27 +1570,6 @@ impl NativeStagedCommit {
     }
 }
 
-fn validate_native_handoff(handoff: &NativeHandoff) -> Result<(), ProtocolError> {
-    let complete_binding = handoff.task_id.is_some()
-        && handoff.tab_id.is_some_and(|tab_id| tab_id != 0)
-        && handoff.started_at_ms.is_some_and(|value| value >= 0);
-    if handoff.active && !complete_binding {
-        return Err(ProtocolError::InvalidNativeMessage(
-            "active handoff must bind a task, tab, and non-negative start time".into(),
-        ));
-    }
-    if !handoff.active
-        && (handoff.task_id.is_some()
-            || handoff.tab_id.is_some()
-            || handoff.started_at_ms.is_some())
-    {
-        return Err(ProtocolError::InvalidNativeMessage(
-            "inactive handoff must not retain task, tab, or start-time data".into(),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeEvent {
@@ -1608,7 +1587,6 @@ pub enum NativeEventPayload {
     Inventory(NativeInventoryEvent),
     TaskTabs(NativeTaskTabsEvent),
     Pause(NativePauseEvent),
-    Handoff(NativeHandoff),
     CommitExpired(NativeCommitExpiredEvent),
     CommitAbandoned(NativeCommitExpiredEvent),
     PopupCommitApproved(NativePopupCommitEvent),
@@ -1667,9 +1645,7 @@ impl NativeEvent {
         if event.event_id.is_some()
             && !matches!(
                 event.event,
-                NativeEventName::HandoffChanged
-                    | NativeEventName::PopupCommitApproved
-                    | NativeEventName::PopupCommitAbandoned
+                NativeEventName::PopupCommitApproved | NativeEventName::PopupCommitAbandoned
             )
         {
             return Err(ProtocolError::InvalidNativeMessage(
@@ -1688,9 +1664,6 @@ impl NativeEvent {
             NativeEventName::PauseChanged => {
                 NativeEventPayload::Pause(decode_native_event_payload(event.payload.clone())?)
             }
-            NativeEventName::HandoffChanged => {
-                NativeEventPayload::Handoff(decode_native_event_payload(event.payload.clone())?)
-            }
             NativeEventName::CommitExpired => NativeEventPayload::CommitExpired(
                 decode_native_event_payload(event.payload.clone())?,
             ),
@@ -1708,22 +1681,6 @@ impl NativeEvent {
             ),
         };
         match &payload {
-            NativeEventPayload::Handoff(handoff) => {
-                validate_native_handoff(handoff)?;
-                if !handoff.active && event.event_id.is_none() {
-                    return Err(ProtocolError::InvalidNativeMessage(
-                        "inactive handoff event must carry an event_id for durable acknowledgement"
-                            .into(),
-                    ));
-                }
-                if let Some(event_id) = &event.event_id {
-                    if !(1..=128).contains(&event_id.chars().count()) {
-                        return Err(ProtocolError::InvalidNativeMessage(
-                            "event_id must contain 1 to 128 characters".into(),
-                        ));
-                    }
-                }
-            }
             NativeEventPayload::CommitExpired(event)
             | NativeEventPayload::CommitAbandoned(event)
                 if !(16..=256).contains(&event.native_token.chars().count()) =>
@@ -1780,7 +1737,6 @@ pub enum NativeEventName {
     TabRemoved,
     GroupMembershipChanged,
     PauseChanged,
-    HandoffChanged,
     CommitExpired,
     CommitAbandoned,
     PopupCommitApproved,
@@ -2124,10 +2080,11 @@ mod tests {
             (
                 "browser_handoff",
                 json!({
+                    "operation": "request",
                     "tab_id": 1,
                     "expected_page_revision": 1,
                     "prompt": "",
-                    "completion": {"kind": "manual_done"}
+                    "completion": {"kind": "url", "value": "https://example.test/"}
                 }),
                 true,
             ),
@@ -2140,6 +2097,50 @@ mod tests {
         ] {
             assert!(matches!(
                 RpcRequest::parse(request(method, params, mutation)),
+                Err(ProtocolError::InvalidParamConstraint { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn handoff_notice_operations_use_the_discriminated_request_union() {
+        let (_, request_params) = RpcRequest::parse(request(
+            "browser_handoff",
+            json!({
+                "operation": "request",
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "prompt": "Complete the browser step",
+                "completion": {"kind": "selector", "value": "body"},
+            }),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(
+            request_params,
+            MethodParams::Handoff(BrowserHandoffParams::Request {
+                timeout_ms: 300_000,
+                completion: Some(HandoffCompletion::Selector { value }),
+                ..
+            }) if value == "body"
+        ));
+
+        for operation in ["status", "resolve", "dismiss"] {
+            let (_, params) = RpcRequest::parse(request(
+                "browser_handoff",
+                json!({"operation": operation, "notice_id": "notice-1"}),
+                true,
+            ))
+            .unwrap();
+            assert!(matches!(params, MethodParams::Handoff(_)));
+        }
+        for operation in ["status", "resolve", "dismiss"] {
+            assert!(matches!(
+                RpcRequest::parse(request(
+                    "browser_handoff",
+                    json!({"operation": operation, "notice_id": ""}),
+                    true,
+                )),
                 Err(ProtocolError::InvalidParamConstraint { .. })
             ));
         }
@@ -2531,44 +2532,15 @@ mod tests {
         assert!(failure.error.is_some());
     }
     #[test]
-    fn handoff_clear_event_requires_acknowledgement_id_and_preserves_it() {
-        let clear = json!({
+    fn legacy_handoff_native_events_are_rejected() {
+        assert!(NativeEvent::parse(json!({
             "protocol": NATIVE_PROTOCOL,
             "version": PROTOCOL_VERSION,
             "kind": "event",
             "event": "handoff_changed",
-            "payload": {"active": false}
-        });
-        assert!(matches!(
-            NativeEvent::parse(clear),
-            Err(ProtocolError::InvalidNativeMessage(_))
-        ));
-
-        let event_id = "handoff-clear-0001";
-        let (event, payload) = NativeEvent::parse(json!({
-            "protocol": NATIVE_PROTOCOL,
-            "version": PROTOCOL_VERSION,
-            "kind": "event",
-            "event": "handoff_changed",
-            "event_id": event_id,
             "payload": {"active": false}
         }))
-        .unwrap();
-        assert_eq!(event.event_id.as_deref(), Some(event_id));
-        assert!(matches!(
-            payload,
-            NativeEventPayload::Handoff(NativeHandoff { active: false, .. })
-        ));
-        assert_eq!(
-            native_event_ack(NativeEventName::HandoffChanged, event_id),
-            json!({
-                "protocol": NATIVE_PROTOCOL,
-                "version": PROTOCOL_VERSION,
-                "kind": "event_ack",
-                "event": "handoff_changed",
-                "event_id": event_id,
-            })
-        );
+        .is_err());
     }
 
     #[test]

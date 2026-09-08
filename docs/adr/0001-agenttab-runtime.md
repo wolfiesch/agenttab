@@ -24,15 +24,15 @@ The default experience uses the user's existing Chrome profile and creates a tas
 
 A task workspace is visible in Chrome. Task-owned tabs are grouped for display, but the group is not an authorization boundary.
 
-### Your Turn
+### Attention notices
 
-**Your Turn** is the human-only input boundary. AgentTab MUST hand control to the user for passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential workflow that returns `needs_user`. The managed 1Password broker is available by default and MAY fill an origin-matching Login item through the private host-to-extension path, but MUST NOT expose the value to an agent or submit the form. Owner-only policy MAY disable or constrain the broker.
+**Needs your attention** is the human-only input boundary. AgentTab MUST route passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential workflow that returns `needs_user` to an advisory attention notice. The managed 1Password broker is available by default and MAY fill an origin-matching Login item through the private host-to-extension path, but MUST NOT expose the value to an agent or submit the form. Owner-only policy MAY disable or constrain the broker.
 
-An active handoff MUST be a durable coordination marker, not an implicit automation pause. AgentTab MUST persist the handoff and completion condition before focusing the declared tab, then keep browser requests eligible. Product and security copy MUST state that handoff does not guarantee an observation blackout and MUST direct ordinary username, password, and one-time-code entry through `browser_credentials`. Explicit **Pause agents** remains the owner-controlled confidentiality boundary.
+*Amended 2026-09-07:* Notices are non-blocking display metadata. A request MUST NOT pause the scheduler, gate command admission, focus a tab, activate a window, or open the popup; no global observation blackout or host handoff admission state exists. The agent asks the user in chat, the user reports back, and the agent MUST verify the page itself before resolving or dismissing the notice by ID. AgentTab MUST NOT capture human keystrokes, and no tool result may report the user's work as completed on creation. Only the user's explicit popup Open tab action may focus the noticed tab.
 
 ### Commit
 
-**Commit** is a best-effort semantic review barrier for recognizable consequential controls, including send, publish, purchase, delete, upload, authorization, and permission grants.
+**Commit** is an optional, best-effort semantic review barrier for recognizable consequential controls, including send, publish, purchase, delete, upload, authorization, and permission grants.
 
 Every Standard-mode mutation MUST pass through one extension-side `prepare -> classify -> revalidate -> execute` choke point. YOLO mode is enabled by default, so recognizable consequential actions execute in the original mutation. When the user turns YOLO mode off, a recognizable consequential action is staged before any side effect. Its token is bound to the task, tab, effect class, exact element fingerprint, document revision, event, preview, and a five-minute expiry. The extension popup MUST send only an opaque review handle. Human approval MUST durably mark the corresponding stage approved without consuming it or dispatching the browser action. Only a later agent `browser_commit` carrying the private staged token may consume and execute the approved stage. Execution MUST reject an unapproved, changed, expired, foreign, or used stage, revalidate the target, and dispatch at most once.
 
@@ -92,9 +92,9 @@ MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not a
 8. `browser_credentials`
 9. `browser_finish`
 
-`browser_credentials` is disabled by managed policy unless explicitly enabled. It MUST derive the page origin and task ownership in the host, enforce a candidate and attempt limit no greater than three, use one-use short-lived tokens, and keep credential values out of Core RPC, adapters, responses, and audit output.
+`browser_credentials` is enabled by default. Managed policy MAY disable or constrain it. It MUST derive the page origin and task ownership in the host, enforce a candidate and attempt limit no greater than three, use one-use short-lived tokens, and keep credential values out of Core RPC, adapters, responses, and audit output.
 
-`browser_finish` applies the task's cleanup policy, closes task-created tabs unless retained, preserves adopted tabs by default, ungroups retained tabs, and releases task ownership. Active handoff, staged Commit review, or another in-flight task operation MUST defer finalization rather than destroy resumability.
+`browser_finish` applies the task's cleanup policy, closes task-created tabs unless retained, preserves adopted tabs by default, ungroups retained tabs, and releases task ownership while clearing that task's open notices. Staged Commit review or another in-flight task operation MUST defer finalization rather than destroy resumability; an open attention notice MUST NOT defer it.
 
 `browser_developer` is the tenth tool and is absent unless Developer mode is enabled.
 
@@ -116,7 +116,7 @@ Ownership can be granted only by:
 
 Adoption MUST be visible. It groups the active tab and shows a brief non-blocking indicator. If grouping fails, creation or adoption rolls back with `outcome: "not_started"`. AgentTab MUST NOT retain invisible ownership with `groupId: null`.
 
-Dedicated-window eligibility MUST be derived from the persisted task record, never from a caller-supplied ownership claim. `placement: "new_window"` MUST fail after the task owns a tab, MUST reject foreground creation, and MUST roll back the created tab if visible grouping fails. Standard mode MUST NOT expose generic focus, resize, move, state-change, or close-window operations. `browser_handoff` remains the sole normal focus transition.
+Dedicated-window eligibility MUST be derived from the persisted task record, never from a caller-supplied ownership claim. `placement: "new_window"` MUST fail after the task owns a tab, MUST reject foreground creation, and MUST roll back the created tab if visible grouping fails. Standard mode MUST NOT expose generic focus, resize, move, state-change, or close-window operations. No routine operation focuses a tab; the popup's explicit Open tab action on an attention notice is the sole normal focus transition.
 
 Tab groups are display-only. Manual grouping never grants ownership. Ungrouping or moving a tab out of its task group immediately revokes ownership, cancels queued mutations, and notifies the host.
 
