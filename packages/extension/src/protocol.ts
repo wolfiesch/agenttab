@@ -254,13 +254,23 @@ function assertAction(value: unknown): Record<string, unknown> {
   const action = value;
   switch (action.kind) {
     case "click":
-      assertExactObject(action, ["kind", "ref"], [], "click action");
-      assertBoundedString(action.ref, "click.ref", 1, 256);
+      assertExactObject(action, ["kind"], ["ref", "selector"], "click action");
+      if ((action.ref === undefined) === (action.selector === undefined)) {
+        commandError("click requires exactly one of ref or selector");
+      }
+      if (action.ref !== undefined) assertBoundedString(action.ref, "click.ref", 1, 256);
+      if (action.selector !== undefined) assertBoundedString(action.selector, "click.selector", 1, 2_048);
       return action;
     case "type":
     case "fill":
-      assertExactObject(action, ["kind", "ref", "text"], [], `${action.kind} action`);
-      assertBoundedString(action.ref, `${action.kind}.ref`, 1, 256);
+      assertExactObject(action, ["kind", "text"], ["ref", "selector"], `${action.kind} action`);
+      if ((action.ref === undefined) === (action.selector === undefined)) {
+        commandError(`${action.kind} requires exactly one of ref or selector`);
+      }
+      if (action.ref !== undefined) assertBoundedString(action.ref, `${action.kind}.ref`, 1, 256);
+      if (action.selector !== undefined) {
+        assertBoundedString(action.selector, `${action.kind}.selector`, 1, 2_048);
+      }
       assertBoundedString(action.text, `${action.kind}.text`, 0, 1_048_576);
       return action;
     case "select":
