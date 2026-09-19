@@ -45,8 +45,8 @@ export type BrowserSnapshotParams =
   };
 
 export type BrowserAction =
-  | { kind: "click"; ref: string }
-  | { kind: "type" | "fill"; ref: string; text: string }
+  | ({ kind: "click" } & ({ ref: string; selector?: never } | { ref?: never; selector: string }))
+  | ({ kind: "type" | "fill"; text: string } & ({ ref: string; selector?: never } | { ref?: never; selector: string }))
   | { kind: "select"; ref: string; value: string }
   | { kind: "scroll"; delta_x: number; delta_y: number; ref?: string }
   | { kind: "drag"; ref: string; target_ref: string }

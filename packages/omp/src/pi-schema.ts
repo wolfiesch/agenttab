@@ -14,6 +14,7 @@ const object = (properties: Record<string, unknown>) => {
   return Type.Object(typedProperties, { additionalProperties: false });
 };
 const ref = () => Type.String({ minLength: 1, maxLength: 256 });
+const selector = () => Type.String({ minLength: 1, maxLength: 2048 });
 
 const schemas: Record<ToolMethod, unknown> = {
   browser_open: Type.Union([
@@ -62,8 +63,11 @@ const schemas: Record<ToolMethod, unknown> = {
     expected_page_revision: Type.Integer({ minimum: 0 }),
     actions: Type.Array(Type.Union([
       object({ kind: Type.Literal("click"), ref: ref() }),
+      object({ kind: Type.Literal("click"), selector: selector() }),
       object({ kind: Type.Literal("type"), ref: ref(), text: Type.String({ maxLength: STANDARD_ACTION_VALUE_MAX_CHARS }) }),
+      object({ kind: Type.Literal("type"), selector: selector(), text: Type.String({ maxLength: STANDARD_ACTION_VALUE_MAX_CHARS }) }),
       object({ kind: Type.Literal("fill"), ref: ref(), text: Type.String({ maxLength: STANDARD_ACTION_VALUE_MAX_CHARS }) }),
+      object({ kind: Type.Literal("fill"), selector: selector(), text: Type.String({ maxLength: STANDARD_ACTION_VALUE_MAX_CHARS }) }),
       object({ kind: Type.Literal("select"), ref: ref(), value: Type.String({ maxLength: STANDARD_ACTION_VALUE_MAX_CHARS }) }),
       object({
         kind: Type.Literal("scroll"),
@@ -81,6 +85,11 @@ const schemas: Record<ToolMethod, unknown> = {
       object({
         kind: Type.Literal("upload_file"),
         ref: ref(),
+        files: Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { minItems: 1, maxItems: 4 }),
+      }),
+      object({
+        kind: Type.Literal("upload_file"),
+        selector: selector(),
         files: Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { minItems: 1, maxItems: 4 }),
       }),
     ]), { minItems: 1, maxItems: 64 }),
