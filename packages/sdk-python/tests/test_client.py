@@ -1071,5 +1071,89 @@ class ClientTests(unittest.TestCase):
             worker.join(timeout=2)
             server.close()
 
+    def test_connect_retries_transient_connection_refusal_within_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+
+            def delayed_serve() -> None:
+                time.sleep(0.08)
+                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                server.settimeout(1)
+                server.bind(endpoint)
+                server.listen(1)
+                try:
+                    connection, _ = server.accept()
+                    connection.settimeout(1)
+                    try:
+                        _ = read_frame(connection)
+                        connection.sendall(encode_frame({
+                            "protocol": "agenttab.rpc",
+                            "version": 1,
+                            "kind": "connected",
+                            "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                            "resumed": False,
+                            "state": "ready",
+                        }, 1024 * 1024))
+                    finally:
+                        connection.close()
+                finally:
+                    server.close()
+
+            worker = threading.Thread(target=delayed_serve)
+            worker.start()
+            client = None
+            try:
+                client = AgentTabClient.connect(endpoint=endpoint, connect_timeout=1.5)
+                self.assertEqual(client.connection.get("kind"), "connected")
+                self.assertEqual(client.connection.get("state"), "ready")
+                self.assertFalse(client.connection.get("resumed"))
+            finally:
+                if client is not None:
+                    client.close()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive(), "connect retry worker did not stop")
+
+    def test_does_not_replay_connect_after_reset_or_close_once_handshake_dispatched(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.settimeout(0.05)
+            server.bind(endpoint)
+            server.listen(5)
+            connect_attempts = 0
+            stop = threading.Event()
+
+            def serve() -> None:
+                nonlocal connect_attempts
+                try:
+                    while not stop.is_set():
+                        try:
+                            connection, _ = server.accept()
+                        except socket.timeout:
+                            continue
+                        with connection:
+                            connection.settimeout(0.5)
+                            _ = read_frame(connection)
+                            connect_attempts += 1
+                            # Close without ACK; a dispatched handshake must not replay.
+                finally:
+                    server.close()
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            try:
+                with self.assertRaises(Exception):
+                    AgentTabClient.connect(
+                        endpoint=endpoint,
+                        resume_capability="a" * 32,
+                        connect_timeout=0.5,
+                    )
+            finally:
+                stop.set()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive(), "no-replay worker did not stop")
+            self.assertEqual(connect_attempts, 1)
 if __name__ == "__main__":
     unittest.main()
