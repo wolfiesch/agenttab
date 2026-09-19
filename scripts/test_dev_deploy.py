@@ -11,9 +11,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.dev_deploy import (
     DeployError,
+    check_platform_reload_support,
     clean_version,
     compute_bundle_digest,
     deploy,
@@ -23,10 +25,12 @@ from scripts.dev_deploy import (
     repo_root,
     resolve_target_dir,
     rollback,
+    validate_sibling_paths,
     validate_target,
     validate_timeout,
     verify_bundle,
     verify_installed_bytes,
+    write_receipt_atomic,
 )
 
 IDENTITY_KEY = (
@@ -485,6 +489,299 @@ class DevDeployTests(unittest.TestCase):
             self.assertEqual(receipt_obj["receiptType"], "development-deploy")
             self.assertTrue(receipt_obj["signedInstallReceiptPreserved"])
 
+    def test_receipt_symlink_overwrite_rejected_victim_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            src = tmp / "src"
+            create_mock_extension_bundle(src)
+
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+            target_dir = version_root / "extension"
+            create_mock_extension_bundle(target_dir)
+
+            # Victim file outside target
+            victim = tmp / "victim.txt"
+            victim.write_text("VICTIM RECEIPT SECRET", encoding="utf-8")
+
+            # Receipt is a hostile symlink to victim
+            receipt_symlink = version_root / "dev-deploy-receipt.json"
+            os.symlink(victim, receipt_symlink)
+
+            # 1. validate_sibling_paths rejects receipt symlink
+            with self.assertRaises(DeployError) as ctx:
+                validate_sibling_paths(version_root)
+            self.assertIn("cannot be a symbolic link", str(ctx.exception))
+
+            # 2. write_receipt_atomic rejects receipt symlink and does not clobber victim
+            with self.assertRaises(DeployError) as ctx:
+                write_receipt_atomic(receipt_symlink, '{"hostile": true}')
+            self.assertIn("cannot be a symbolic link", str(ctx.exception))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM RECEIPT SECRET")
+
+            # 3. deploy rejects receipt symlink pre-mutation and does not clobber victim
+            args = parse_args([
+                "--skip-build",
+                "--source-dir", str(src),
+                "--target-dir", str(target_dir),
+                "--reload-command", f"{sys.executable} -c \"print('reload')\"",
+                "--doctor-command", f"{sys.executable} -c \"import sys; sys.exit(0)\"",
+            ])
+            with self.assertRaises(DeployError) as ctx:
+                deploy(args)
+            self.assertIn("cannot be a symbolic link", str(ctx.exception))
+            self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM RECEIPT SECRET")
+
+    def test_receipt_symlink_during_rollback_victim_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+            target_dir = version_root / "extension"
+            create_mock_extension_bundle(target_dir)
+
+            backup_dir = version_root / "backup_real"
+            create_mock_extension_bundle(backup_dir)
+
+            victim = tmp / "victim_rollback.txt"
+            victim.write_text("VICTIM ROLLBACK SECRET", encoding="utf-8")
+
+            receipt_symlink = version_root / "dev-deploy-receipt.json"
+            os.symlink(victim, receipt_symlink)
+
+            # Rollback with prior receipt content replaces link safely, leaving victim untouched
+            report = rollback(
+                target_dir=target_dir,
+                backup_dir=backup_dir,
+                prior_receipt_content='{"restored": true}',
+                receipt_path=receipt_symlink,
+                reload_fn=None,
+            )
+            self.assertTrue(report["onDiskRestored"])
+            self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM ROLLBACK SECRET")
+            self.assertFalse(receipt_symlink.is_symlink())
+            self.assertTrue(receipt_symlink.is_file())
+            self.assertEqual(receipt_symlink.read_text(encoding="utf-8"), '{"restored": true}')
+
+            # Rollback with prior_receipt_content=None unlinks symlink, leaving victim untouched
+            os.unlink(receipt_symlink)
+            os.symlink(victim, receipt_symlink)
+            report2 = rollback(
+                target_dir=target_dir,
+                backup_dir=backup_dir,
+                prior_receipt_content=None,
+                receipt_path=receipt_symlink,
+                reload_fn=None,
+            )
+            self.assertTrue(report2["onDiskRestored"])
+            self.assertEqual(victim.read_text(encoding="utf-8"), "VICTIM ROLLBACK SECRET")
+            self.assertFalse(receipt_symlink.exists())
+            self.assertFalse(receipt_symlink.is_symlink())
+
+    def test_backups_sibling_symlink_traversal_rejected_victim_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            src = tmp / "src"
+            create_mock_extension_bundle(src)
+
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+            target_dir = version_root / "extension"
+            create_mock_extension_bundle(target_dir)
+
+            # Victim directory outside target
+            victim_dir = tmp / "victim_dir"
+            victim_dir.mkdir()
+            (victim_dir / "sensitive.txt").write_text("SENSITIVE DATA", encoding="utf-8")
+
+            # backups is a hostile symlink to victim_dir
+            backup_symlink = version_root / "backups"
+            os.symlink(victim_dir, backup_symlink)
+
+            # 1. validate_sibling_paths rejects backups symlink
+            with self.assertRaises(DeployError) as ctx:
+                validate_sibling_paths(version_root)
+            self.assertIn("cannot be a symbolic link", str(ctx.exception))
+
+            # 2. deploy rejects backups symlink pre-mutation and does not clobber victim dir
+            args = parse_args([
+                "--skip-build",
+                "--source-dir", str(src),
+                "--target-dir", str(target_dir),
+                "--reload-command", f"{sys.executable} -c \"print('reload')\"",
+                "--doctor-command", f"{sys.executable} -c \"import sys; sys.exit(0)\"",
+            ])
+            with self.assertRaises(DeployError) as ctx:
+                deploy(args)
+            self.assertIn("cannot be a symbolic link", str(ctx.exception))
+
+            # Victim directory is untouched
+            self.assertEqual((victim_dir / "sensitive.txt").read_text(encoding="utf-8"), "SENSITIVE DATA")
+            self.assertEqual(len(list(victim_dir.iterdir())), 1)
+
+    def test_validate_sibling_paths_allows_readonly_or_unrelated_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+
+            external = tmp / "external.txt"
+            external.write_text("external", encoding="utf-8")
+
+            # install-receipt.json as symlink is read-only / unrelated, must not be rejected by validate_sibling_paths
+            os.symlink(external, version_root / "install-receipt.json")
+            # Unrelated symlink in version_root must not be rejected
+            os.symlink(external, version_root / "unrelated.txt")
+
+            # validate_sibling_paths must succeed without error
+            validate_sibling_paths(version_root)
+
+    def test_rollback_validates_backups_parent_no_follow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+            target_dir = version_root / "extension"
+            create_mock_extension_bundle(target_dir)
+
+            victim_dir = tmp / "victim_backups_parent"
+            victim_dir.mkdir()
+            real_backup = victim_dir / "backup_real"
+            create_mock_extension_bundle(real_backup)
+
+            # backups parent is a hostile symlink to victim_dir
+            backups_symlink = version_root / "backups"
+            os.symlink(victim_dir, backups_symlink)
+
+            backup_dir_through_symlink = backups_symlink / "backup_real"
+            receipt_path = version_root / "dev-deploy-receipt.json"
+
+            with self.assertRaises(DeployError) as ctx:
+                rollback(
+                    target_dir=target_dir,
+                    backup_dir=backup_dir_through_symlink,
+                    prior_receipt_content=None,
+                    receipt_path=receipt_path,
+                    reload_fn=None,
+                )
+            self.assertIn("Backups parent directory cannot be a symbolic link", str(ctx.exception))
+
+    def test_backup_internal_symlink_during_rollback_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+            target_dir = version_root / "extension"
+            create_mock_extension_bundle(target_dir)
+
+            backups_dir = version_root / "backups"
+            backups_dir.mkdir()
+            backup_dir = backups_dir / "backup_1"
+            create_mock_extension_bundle(backup_dir)
+
+            external_file = tmp / "external.txt"
+            external_file.write_text("external", encoding="utf-8")
+
+            # Symlink inside backup directory is rejected during rollback
+            link_in_backup = backup_dir / "traversal_link.txt"
+            os.symlink(external_file, link_in_backup)
+
+            receipt_path = version_root / "dev-deploy-receipt.json"
+
+            with self.assertRaises(DeployError) as ctx:
+                rollback(
+                    target_dir=target_dir,
+                    backup_dir=backup_dir,
+                    prior_receipt_content=None,
+                    receipt_path=receipt_path,
+                    reload_fn=None,
+                )
+            self.assertIn("Backup directory contains symbolic link file", str(ctx.exception))
+
+    def test_backup_symlink_during_rollback_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+            target_dir = version_root / "extension"
+            create_mock_extension_bundle(target_dir)
+
+            victim_dir = tmp / "victim_backup"
+            create_mock_extension_bundle(victim_dir)
+
+            backup_symlink = version_root / "sym_backup"
+            os.symlink(victim_dir, backup_symlink)
+
+            receipt_path = version_root / "dev-deploy-receipt.json"
+
+            with self.assertRaises(DeployError) as ctx:
+                rollback(
+                    target_dir=target_dir,
+                    backup_dir=backup_symlink,
+                    prior_receipt_content=None,
+                    receipt_path=receipt_path,
+                    reload_fn=None,
+                )
+            self.assertIn("no prior backup existed", str(ctx.exception))
+
+    def test_linux_default_reload_fails_pre_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir).resolve()
+            src = tmp / "src"
+            create_mock_extension_bundle(src)
+
+            version_root = tmp / "v2.0.0-rc.1"
+            version_root.mkdir()
+            target_dir = version_root / "extension"
+            create_mock_extension_bundle(target_dir)
+
+            prior_marker = target_dir / "prior_marker.txt"
+            prior_marker.write_text("UNTOUCHED PRE-MUTATION", encoding="utf-8")
+
+            args = parse_args([
+                "--skip-build",
+                "--source-dir", str(src),
+                "--target-dir", str(target_dir),
+            ])
+
+            with patch("sys.platform", "linux"):
+                with self.assertRaises(DeployError) as ctx:
+                    deploy(args)
+                self.assertIn("unsupported on platform 'linux'", str(ctx.exception))
+                self.assertIn("--debugging-url", str(ctx.exception))
+                self.assertIn("--reload-command", str(ctx.exception))
+
+            # Verify pre-mutation: target untouched, no backup, no receipt
+            self.assertTrue(prior_marker.exists())
+            self.assertEqual(prior_marker.read_text(encoding="utf-8"), "UNTOUCHED PRE-MUTATION")
+            self.assertFalse((version_root / "backups").exists())
+            self.assertFalse((version_root / "dev-deploy-receipt.json").exists())
+
+    def test_linux_reload_with_overrides_allowed(self) -> None:
+        with patch("sys.platform", "linux"):
+            # 1. With --debugging-url
+            args_cdp = parse_args(["--debugging-url", "http://127.0.0.1:9222"])
+            check_platform_reload_support(args_cdp)
+
+            # 2. With --reload-command
+            args_cmd = parse_args(["--reload-command", "echo reload"])
+            check_platform_reload_support(args_cmd)
+
+            # 3. With custom --reload-script
+            args_script = parse_args(["--reload-script", "/custom/reload.sh"])
+            check_platform_reload_support(args_script)
+
+            # 4. Without override fails
+            args_default = parse_args([])
+            with self.assertRaises(DeployError) as ctx:
+                check_platform_reload_support(args_default)
+            self.assertIn("unsupported on platform 'linux'", str(ctx.exception))
+
+    def test_macos_platform_allows_default_reload(self) -> None:
+        with patch("sys.platform", "darwin"):
+            args_default = parse_args([])
+            # Succeeds without error
+            check_platform_reload_support(args_default)
 
 if __name__ == "__main__":
     unittest.main()

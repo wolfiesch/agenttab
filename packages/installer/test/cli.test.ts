@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
@@ -129,7 +128,7 @@ describe("agenttab doctor", () => {
           protocol: "agenttab.rpc",
           version: 1,
           kind: "connected",
-          connection_id: randomUUID(),
+          connection_id: crypto.randomUUID(),
           resumed: false,
           state: "reconciling",
         }),
@@ -185,7 +184,7 @@ describe("agenttab doctor", () => {
           protocol: "agenttab.rpc",
           version: 1,
           kind: "connected",
-          connection_id: randomUUID(),
+          connection_id: crypto.randomUUID(),
           resumed: false,
           state: "ready",
         }),

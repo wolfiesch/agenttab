@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 from hashlib import sha256
@@ -221,6 +222,75 @@ def validate_target(target: Path, root: Path, source_dir: Path, expected_key: st
     return res_target
 
 
+def validate_sibling_paths(version_root: Path) -> None:
+    """Validate all writable sibling paths in the version directory using no-follow semantics."""
+    if version_root.is_symlink():
+        raise DeployError(f"Version root directory cannot be a symbolic link: {version_root}")
+
+    # 1. Reject receipt path if it is a symbolic link (whether valid or dangling)
+    receipt_path = version_root / "dev-deploy-receipt.json"
+    if receipt_path.is_symlink():
+        raise DeployError(f"Receipt path cannot be a symbolic link: {receipt_path}")
+
+    # 2. Reject backups directory if it is a symbolic link
+    backup_root = version_root / "backups"
+    if backup_root.is_symlink():
+        raise DeployError(f"Backups directory cannot be a symbolic link: {backup_root}")
+    if backup_root.exists() and not backup_root.is_dir():
+        raise DeployError(f"Backups path must be a directory: {backup_root}")
+
+    # 3. Reject writable temporary staging and swap paths if they are symbolic links
+    if version_root.is_dir():
+        for item in version_root.iterdir():
+            if item.name.startswith((".tmp_deploy_", ".old_deploy_", ".tmp_receipt_")) and item.is_symlink():
+                raise DeployError(f"Temporary deployment path cannot be a symbolic link: {item}")
+
+
+def write_receipt_atomic(receipt_path: Path, content: str) -> None:
+    """Atomically write receipt content without following symbolic links."""
+    if receipt_path.is_symlink():
+        raise DeployError(f"Receipt path cannot be a symbolic link: {receipt_path}")
+    version_root = receipt_path.parent
+    if version_root.is_symlink():
+        raise DeployError(f"Receipt parent directory cannot be a symbolic link: {version_root}")
+
+    fd, tmp_path_str = tempfile.mkstemp(prefix=".tmp_receipt_", dir=str(version_root))
+    tmp_path = Path(tmp_path_str)
+    try:
+        with open(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(fd)
+
+        if receipt_path.is_symlink():
+            raise DeployError(f"Receipt path cannot be a symbolic link: {receipt_path}")
+
+        os.replace(tmp_path_str, str(receipt_path))
+    finally:
+        if tmp_path.is_symlink() or tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+def check_platform_reload_support(args: argparse.Namespace, root: Path | None = None) -> None:
+    """Validate platform reload support before mutating system or swapping files."""
+    if sys.platform != "darwin":
+        has_debugging_url = bool(getattr(args, "debugging_url", None) and str(args.debugging_url).strip())
+        has_reload_command = bool(getattr(args, "reload_command", None) and str(args.reload_command).strip())
+        has_custom_reload_script = False
+        reload_script = getattr(args, "reload_script", None)
+        if reload_script:
+            default_script = ((root or repo_root()) / "scripts" / "reload_unpacked_extension.sh").resolve()
+            has_custom_reload_script = Path(reload_script).resolve() != default_script
+
+        if not (has_debugging_url or has_reload_command or has_custom_reload_script):
+            raise DeployError(
+                f"Default extension reload via macOS 'open' is unsupported on platform '{sys.platform}'. "
+                "Specify an explicit --debugging-url (e.g. http://127.0.0.1:9222) or --reload-command to deploy on this platform."
+            )
+
+
 def verify_bundle(
     source_dir: Path,
     expected_key: str,
@@ -321,24 +391,51 @@ def rollback(
     receipt_path: Path,
     reload_fn: Callable[[], None] | None,
 ) -> dict[str, Any]:
-    if backup_dir is None or not backup_dir.is_dir():
+    if target_dir.is_symlink():
+        raise DeployError(f"Target directory cannot be a symbolic link: {target_dir}")
+
+    if backup_dir is None or not backup_dir.is_dir() or backup_dir.is_symlink():
         raise DeployError("Deployment failed; on-disk target could not be rolled back because no prior backup existed.")
 
+    # Validate backups parent directory using no-follow semantics before reading it
+    backups_parent = backup_dir.parent
+    if backups_parent.is_symlink():
+        raise DeployError(f"Backups parent directory cannot be a symbolic link: {backups_parent}")
+    if not backups_parent.is_dir():
+        raise DeployError(f"Backups parent path must be a directory: {backups_parent}")
+    for dirpath, dirnames, filenames in os.walk(backup_dir):
+        dp = Path(dirpath)
+        if dp.is_symlink():
+            raise DeployError(f"Backup directory contains symbolic link directory: {dp}")
+        for d in dirnames:
+            if (dp / d).is_symlink():
+                raise DeployError(f"Backup directory contains symbolic link subdirectory: {dp / d}")
+        for f in filenames:
+            if (dp / f).is_symlink():
+                raise DeployError(f"Backup directory contains symbolic link file: {dp / f}")
+
     for entry in list(target_dir.iterdir()):
-        if entry.is_dir():
+        if entry.is_symlink():
+            entry.unlink()
+        elif entry.is_dir():
             shutil.rmtree(entry)
         else:
             entry.unlink()
 
     for entry in backup_dir.iterdir():
+        if entry.is_symlink():
+            raise DeployError(f"Backup directory contains symbolic link: {entry}")
         if entry.is_dir():
-            shutil.copytree(entry, target_dir / entry.name)
+            shutil.copytree(entry, target_dir / entry.name, symlinks=False)
         else:
-            shutil.copy2(entry, target_dir / entry.name)
+            shutil.copy2(entry, target_dir / entry.name, follow_symlinks=False)
+
+    if receipt_path.is_symlink():
+        receipt_path.unlink()
 
     if prior_receipt_content is not None:
-        receipt_path.write_text(prior_receipt_content, encoding="utf-8")
-    elif receipt_path.exists():
+        write_receipt_atomic(receipt_path, prior_receipt_content)
+    elif receipt_path.is_symlink() or receipt_path.exists():
         receipt_path.unlink()
 
     reload_status = "not_attempted"
@@ -354,7 +451,6 @@ def rollback(
         "backupDir": str(backup_dir),
         "reloadStatus": reload_status,
     }
-
 def poll_readiness(doctor_argv: list[str], timeout_seconds: float, env: dict[str, str] | None = None) -> dict[str, Any]:
     start_time = time.monotonic()
     deadline = start_time + timeout_seconds
@@ -455,8 +551,8 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
     target_dir = validate_target(raw_target, root=root, source_dir=source_dir, expected_key=expected_key)
 
     version_root = target_dir.parent
+    validate_sibling_paths(version_root)
     receipt_path = version_root / "dev-deploy-receipt.json"
-
     # Step 3: Dry-run check (handles missing dist gracefully)
     if args.dry_run:
         dist_exists = source_dir.is_dir()
@@ -479,6 +575,9 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
             "signedInstallReceiptPreserved": (version_root / "install-receipt.json").exists(),
         }
 
+    # Guard default reload on unsupported platforms before mutation or swapping
+    check_platform_reload_support(args, root)
+
     # Step 4: Build before bundle verification (unless build is skipped)
     if not args.skip_build:
         build_cmd = shlex.split(args.build_command) if args.build_command else ["bun", "run", "--cwd", "packages/extension", "build"]
@@ -487,6 +586,7 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
             raise DeployError(f"Extension build failed (exit {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}")
         # Re-validate target boundary after build
         target_dir = validate_target(raw_target, root=root, source_dir=source_dir, expected_key=expected_key)
+        validate_sibling_paths(version_root)
 
     # Step 5: Verify bundle after build
     files, bundle_digest = verify_bundle(source_dir, expected_key, expected_manifest_version, expected_version)
@@ -495,13 +595,26 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
     git_info = get_git_metadata(root)
 
     # Step 6: Safe backup
+    validate_sibling_paths(version_root)
     backup_root = version_root / "backups"
+    if backup_root.is_symlink():
+        raise DeployError(f"Backups directory cannot be a symbolic link: {backup_root}")
+    if backup_root.exists() and not backup_root.is_dir():
+        raise DeployError(f"Backups path must be a directory: {backup_root}")
     backup_root.mkdir(parents=True, exist_ok=True)
+    if backup_root.is_symlink():
+        raise DeployError(f"Backups directory cannot be a symbolic link: {backup_root}")
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     backup_dir = backup_root / f"extension_backup_{timestamp}"
-    shutil.copytree(target_dir, backup_dir)
+    if backup_dir.is_symlink():
+        raise DeployError(f"Backup directory cannot be a symbolic link: {backup_dir}")
+    shutil.copytree(target_dir, backup_dir, symlinks=False)
 
-    prior_receipt_content = receipt_path.read_text(encoding="utf-8") if receipt_path.is_file() else None
+    prior_receipt_content = None
+    if receipt_path.is_symlink():
+        raise DeployError(f"Receipt path cannot be a symbolic link: {receipt_path}")
+    if receipt_path.is_file():
+        prior_receipt_content = receipt_path.read_text(encoding="utf-8")
 
     # Reload helper (uses validated expected_id from identity)
     def do_reload(timeout: float = 10.0) -> None:
@@ -521,9 +634,12 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
     # Step 7: Deploy files with rename staging swap and rollback on failure
     staging_dir = version_root / f".tmp_deploy_{os.getpid()}_{int(time.time() * 1000)}"
     old_target_swap = version_root / f".old_deploy_{os.getpid()}_{int(time.time() * 1000)}"
+    if staging_dir.is_symlink():
+        raise DeployError(f"Staging directory cannot be a symbolic link: {staging_dir}")
+    if old_target_swap.is_symlink():
+        raise DeployError(f"Swap directory cannot be a symbolic link: {old_target_swap}")
     try:
-        shutil.copytree(source_dir, staging_dir)
-        # Atomic directory swap via staging rename
+        shutil.copytree(source_dir, staging_dir, symlinks=False)
         target_dir.rename(old_target_swap)
         staging_dir.rename(target_dir)
         shutil.rmtree(old_target_swap, ignore_errors=True)
@@ -546,7 +662,7 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
             "signedInstallReceiptPreserved": (version_root / "install-receipt.json").exists(),
             "files": files,
         }
-        receipt_path.write_text(json.dumps(receipt_data, indent=2) + "\n", encoding="utf-8")
+        write_receipt_atomic(receipt_path, json.dumps(receipt_data, indent=2) + "\n")
 
         # Reload
         do_reload(timeout=10.0)
@@ -571,7 +687,9 @@ def deploy(args: argparse.Namespace) -> dict[str, Any]:
         # Clean up transient swap directories if left behind
         if old_target_swap.exists() and not target_dir.exists():
             old_target_swap.rename(target_dir)
-        if staging_dir.exists():
+        if staging_dir.is_symlink():
+            staging_dir.unlink()
+        elif staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
         report = rollback(target_dir, backup_dir, prior_receipt_content, receipt_path, lambda: do_reload(timeout=5.0))
         raise DeployError(

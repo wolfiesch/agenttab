@@ -2038,7 +2038,9 @@ mod tests {
 
         // Active task tab is retained and owned
         assert_eq!(
-            journal.verify_task_tab(active_task.task_id, 7, Some(1)).unwrap(),
+            journal
+                .verify_task_tab(active_task.task_id, 7, Some(1))
+                .unwrap(),
             1
         );
         // Missing task tab was skipped, not adopted

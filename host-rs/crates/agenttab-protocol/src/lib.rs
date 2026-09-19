@@ -905,7 +905,11 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
         BrowserAction::Click { r#ref, selector } => match (r#ref, selector) {
             (Some(value), None) => require_ref(method, value),
             (None, Some(value)) => require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector"),
-            _ => require(method, false, "click requires exactly one of ref or selector"),
+            _ => require(
+                method,
+                false,
+                "click requires exactly one of ref or selector",
+            ),
         },
         BrowserAction::Type {
             r#ref,
@@ -917,7 +921,13 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
                 (None, Some(value)) => {
                     require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
                 }
-                _ => return require(method, false, "type requires exactly one of ref or selector"),
+                _ => {
+                    return require(
+                        method,
+                        false,
+                        "type requires exactly one of ref or selector",
+                    )
+                }
             }
             require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
         }
@@ -931,7 +941,13 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
                 (None, Some(value)) => {
                     require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
                 }
-                _ => return require(method, false, "fill requires exactly one of ref or selector"),
+                _ => {
+                    return require(
+                        method,
+                        false,
+                        "fill requires exactly one of ref or selector",
+                    )
+                }
             }
             require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
         }

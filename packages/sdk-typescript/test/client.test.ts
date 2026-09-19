@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, Socket, type Server } from "node:net";
 import {
   AgentTabClient,
   AgentTabError,
@@ -900,12 +900,14 @@ test("retries transient connection errors during host reload and resumes task", 
     clear: async () => undefined,
   };
 
+  const events: string[] = [];
   const server = createServer((socket) => {
     socket.on("error", () => {});
     const decoder = new FrameDecoder();
     socket.on("data", (chunk) => {
       for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
         if (value.kind === "connect") {
+          events.push("handshake");
           socket.write(encodeFrame({
             protocol: "agenttab.rpc",
             version: 1,
@@ -929,21 +931,69 @@ test("retries transient connection errors during host reload and resumes task", 
   });
   servers.push(server);
 
-  // Start server on the next tick so the initial connection attempt encounters ENOENT/ECONNREFUSED
-  setImmediate(() => {
-    server.listen(endpoint);
-  });
+  let firstFailure: (Error & { code?: string }) | undefined;
+  let connectionAttempts = 0;
+  const originalConnect = Socket.prototype.connect;
+  let client: AgentTabClient | undefined;
 
-  const client = await AgentTabClient.connect({
-    endpoint,
-    connectTimeoutMs: 1500,
-    capabilityStore: store,
-  });
+  try {
+    Socket.prototype.connect = function (this: Socket, ...args: unknown[]) {
+      let first: unknown = args[0];
+      if (Array.isArray(first)) {
+        first = first[0];
+      }
+      let targetPath: string | undefined;
+      if (typeof first === "string") {
+        targetPath = first;
+      } else if (first && typeof first === "object" && "path" in first) {
+        const candidate = first.path;
+        if (typeof candidate === "string") {
+          targetPath = candidate;
+        }
+      }
 
-  expect(client.connection.resumed).toBe(true);
-  expect(client.connection.task_id).toBe("018f22b2-4126-7c1a-8c31-3f45a783da44");
-  expect(client.closed).toBe(false);
-  client.close();
+      if (targetPath === endpoint) {
+        connectionAttempts += 1;
+        if (connectionAttempts === 1) {
+          this.once("error", (err: Error & { code?: string }) => {
+            firstFailure = err;
+            const code = "code" in err && typeof err.code === "string" ? err.code : undefined;
+            events.push(`failed:${code ?? err.message}`);
+            server.listen(endpoint);
+          });
+        }
+      }
+      // Re-invoke original connect with preserved arguments
+      const connectMethod = originalConnect as (this: Socket, ...connectArgs: unknown[]) => Socket;
+      return connectMethod.apply(this, args);
+    };
+
+    client = await AgentTabClient.connect({
+      endpoint,
+      connectTimeoutMs: 1500,
+      capabilityStore: store,
+    });
+
+    let firstFailureCode: string | undefined;
+    if (firstFailure && typeof firstFailure === "object" && "code" in firstFailure) {
+      const candidate = firstFailure.code;
+      if (typeof candidate === "string") {
+        firstFailureCode = candidate;
+      }
+    }
+
+    expect(firstFailure).toBeDefined();
+    expect(["ENOENT", "ECONNREFUSED"]).toContain(firstFailureCode ?? "");
+    expect(connectionAttempts).toBeGreaterThanOrEqual(2);
+    expect(events[0]).toMatch(/^failed:(ENOENT|ECONNREFUSED)$/);
+    expect(events).toEqual([`failed:${firstFailureCode}`, "handshake"]);
+    expect(client.connection.resumed).toBe(true);
+    expect(client.connection.task_id).toBe("018f22b2-4126-7c1a-8c31-3f45a783da44");
+    expect(client.closed).toBe(false);
+  } finally {
+    Socket.prototype.connect = originalConnect;
+    client?.close();
+  }
 });
 
 test("refuses unauthenticated fallback when stored resume capability is rejected by host", async () => {
