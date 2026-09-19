@@ -1598,6 +1598,241 @@ describe("page revision monotonicity", () => {
     await runtime.detach(65);
   });
 
+  test("appends DOM fallback refs for editables missing from the accessibility tree", async () => {
+    tabStore.set(66, {
+      id: 66,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getFullAXTree") {
+        return {
+          nodes: [{
+            nodeId: "1",
+            backendDOMNodeId: 1,
+            role: { value: "WebArea" },
+            name: { value: "Example" },
+          }],
+        };
+      }
+      if (method === "DOM.querySelectorAll") {
+        expect(params.selector).toBe("textarea,input,[contenteditable]");
+        return { nodeIds: [11, 12, 13] };
+      }
+      if (method === "DOM.describeNode") {
+        if (params.nodeId === 11) {
+          return {
+            node: {
+              backendNodeId: 110,
+              localName: "textarea",
+              attributes: ["placeholder", "Message Composer"],
+              value: "",
+            },
+          };
+        }
+        if (params.nodeId === 12) {
+          return { node: { backendNodeId: 1, localName: "input", attributes: ["type", "text"] } };
+        }
+        if (params.nodeId === 13) {
+          return { node: { backendNodeId: 130, localName: "input", attributes: ["type", "checkbox"] } };
+        }
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(66, { mode: "accessibility" });
+
+    expect(result.nodes).toEqual([
+      expect.objectContaining({
+        ref: "r1-110",
+        role: "textbox",
+        name: "Message Composer",
+        dom_fallback: true,
+      }),
+      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+    ]);
+    expect(result.dom_fallback_nodes).toBe(1);
+    await runtime.detach(66);
+  });
+
+  test("keeps scanning DOM matches for eligible editables beyond filtered ones", async () => {
+    tabStore.set(68, {
+      id: 68,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    const filteredMatches = Array.from({ length: 45 }, (_unused, index) => 1000 + index);
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getFullAXTree") {
+        return {
+          nodes: [{
+            nodeId: "1",
+            backendDOMNodeId: 1,
+            role: { value: "WebArea" },
+            name: { value: "Example" },
+          }],
+        };
+      }
+      if (method === "DOM.querySelectorAll") {
+        return { nodeIds: [...filteredMatches, 21] };
+      }
+      if (method === "DOM.describeNode") {
+        if (typeof params.nodeId === "number" && params.nodeId >= 1000) {
+          return { node: { backendNodeId: params.nodeId, localName: "input", attributes: ["type", "checkbox"] } };
+        }
+        if (params.nodeId === 21) {
+          return {
+            node: { backendNodeId: 210, localName: "textarea", attributes: ["placeholder", "Message"] },
+          };
+        }
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(68, { mode: "accessibility" });
+
+    expect(result.nodes).toEqual([
+      expect.objectContaining({ ref: "r1-210", role: "textbox", name: "Message", dom_fallback: true }),
+      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+    ]);
+    expect(result.truncated).toBe(false);
+    await runtime.detach(68);
+  });
+
+  test("applies the node budget to fallback and accessibility nodes together", async () => {
+    tabStore.set(69, {
+      id: 69,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getFullAXTree") {
+        return {
+          nodes: [
+            {
+              nodeId: "1",
+              backendDOMNodeId: 1,
+              role: { value: "WebArea" },
+              name: { value: "Example" },
+            },
+            {
+              nodeId: "2",
+              backendDOMNodeId: 2,
+              role: { value: "button" },
+              name: { value: "Send" },
+            },
+          ],
+        };
+      }
+      if (method === "DOM.querySelectorAll") return { nodeIds: [31] };
+      if (method === "DOM.describeNode" && params.nodeId === 31) {
+        return {
+          node: { backendNodeId: 310, localName: "textarea", attributes: ["placeholder", "Message"] },
+        };
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(69, { mode: "accessibility", max_nodes: 2 });
+
+    expect(result.nodes).toEqual([
+      expect.objectContaining({ ref: "r1-310", dom_fallback: true }),
+      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+    ]);
+    expect(result.truncated).toBe(true);
+    expect(result.dom_fallback_nodes).toBe(1);
+    await runtime.detach(69);
+  });
+
+  test("fills a DOM fallback ref through the standard fill path", async () => {
+    tabStore.set(67, {
+      id: 67,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    let fillValue: unknown;
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getFullAXTree") {
+        return {
+          nodes: [{
+            nodeId: "1",
+            backendDOMNodeId: 1,
+            role: { value: "WebArea" },
+            name: { value: "Example" },
+          }],
+        };
+      }
+      if (method === "DOM.querySelectorAll") return { nodeIds: [21] };
+      if (method === "DOM.describeNode" && params.nodeId === 21) {
+        return {
+          node: {
+            backendNodeId: 210,
+            localName: "textarea",
+            attributes: ["placeholder", "Message"],
+          },
+        };
+      }
+      if (method === "DOM.resolveNode" && params.backendNodeId === 210) {
+        return { object: { objectId: "composer-node" } };
+      }
+      if (method === "Runtime.callFunctionOn" && params.objectId === "composer-node") {
+        const declaration = String(params.functionDeclaration);
+        if (declaration.includes("const f=this.form")) {
+          return { result: { value: { tag: "TEXTAREA", aria_label: "Message" } } };
+        }
+        const args = params.arguments as Array<{ value?: unknown }> | undefined;
+        fillValue = args?.[0]?.value;
+        return { result: { value: null } };
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    const snapshot = await runtime.snapshot(67, { mode: "accessibility" });
+    const composerRef = (snapshot.nodes as Array<Record<string, unknown>>)
+      .find((node) => node.dom_fallback === true)?.ref;
+    expect(composerRef).toBe("r1-210");
+
+    await runtime.act(TASK_A, 67, snapshot.page_revision, [{
+      kind: "fill",
+      ref: composerRef,
+      text: "hello composer",
+    }]);
+
+    expect(fillValue).toBe("hello composer");
+    await runtime.detach(67);
+  });
+
   test("retries a content match when navigation replaces the probed document", async () => {
     tabStore.set(61, {
       id: 61,
