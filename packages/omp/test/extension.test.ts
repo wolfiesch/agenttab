@@ -843,6 +843,65 @@ test("OMP shares one in-flight Core connection across concurrent first calls", a
   expect(connections).toBe(1);
 });
 
+test("OMP reconnects and resumes task after transport failure on subsequent tool call", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  let client1Closed = false;
+  const client1 = {
+    connection: { task_id: "task-resumed-42" },
+    get closed() {
+      return client1Closed;
+    },
+    request: async () => ({
+      ok: true,
+      outcome: "completed",
+      request_id: "req-1",
+      result: { tabs: [{ tab_id: 1, url: "https://example.com" }] },
+    }),
+  } as unknown as AgentTabClient;
+
+  const client2 = {
+    connection: { task_id: "task-resumed-42" },
+    get closed() {
+      return false;
+    },
+    request: async () => ({
+      ok: true,
+      outcome: "completed",
+      request_id: "req-2",
+      result: { mode: "text", content: "hello resumed", page_revision: 1 },
+    }),
+  } as unknown as AgentTabClient;
+
+  let connectCount = 0;
+  makeExtension(async () => {
+    connectCount += 1;
+    return connectCount === 1 ? client1 : client2;
+  })({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  } as unknown as AgentApi);
+
+  const tabsTool = tools.find((t) => t.name === "browser_tabs");
+  const snapshotTool = tools.find((t) => t.name === "browser_snapshot");
+
+  const res1 = await executeTool(tabsTool, {}, "call-1");
+  expect(res1.details).toMatchObject({
+    _agenttab: { outcome: "completed", task_id: "task-resumed-42" },
+  });
+  expect(connectCount).toBe(1);
+
+  // Simulate transport failure on client1
+  client1Closed = true;
+
+  // Next tool call detects closed client, triggers reconnect, resumes task
+  const res2 = await executeTool(snapshotTool, { tab_id: 1, mode: "text" }, "call-2");
+  expect(res2.details).toMatchObject({
+    mode: "text",
+    _agenttab: { outcome: "completed", task_id: "task-resumed-42" },
+  });
+  expect(connectCount).toBe(2);
+});
+
 test("OMP tools expose compact and expanded custom renderers", () => {
   for (const tool of register(false).tools) {
     expect(typeof tool.renderCall).toBe("function");

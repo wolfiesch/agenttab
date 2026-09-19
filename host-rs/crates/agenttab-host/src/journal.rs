@@ -446,7 +446,7 @@ impl Journal {
                 )
                 .optional()?;
             if active.is_none() {
-                return Err(JournalError::MissingTask);
+                continue;
             }
             let floor: Option<i64> = transaction
                 .query_row(
@@ -2017,5 +2017,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(legacy_receipts, 0);
+    }
+
+    #[test]
+    fn reconcile_inventory_skips_tabs_for_closed_or_missing_tasks_without_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let active_task = journal.create_task(Some("conversation")).unwrap();
+        let missing_task_id = Uuid::now_v7();
+
+        let mut tab_active = owned_tab(active_task.task_id, 1);
+        tab_active.tab_id = 7;
+        let mut tab_missing = owned_tab(missing_task_id, 1);
+        tab_missing.tab_id = 8;
+
+        let inventory = vec![tab_active, tab_missing];
+
+        let result = journal.reconcile_inventory(&inventory).unwrap();
+        assert_eq!(result, InventoryReconciliation::Applied);
+
+        // Active task tab is retained and owned
+        assert_eq!(
+            journal
+                .verify_task_tab(active_task.task_id, 7, Some(1))
+                .unwrap(),
+            1
+        );
+        // Missing task tab was skipped, not adopted
+        assert!(matches!(
+            journal.verify_task_tab(active_task.task_id, 8, None),
+            Err(JournalError::TabNotOwned { tab_id: 8 })
+        ));
+    }
+
+    #[test]
+    fn closed_task_refuses_resume_and_retains_tab_denial() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let task = journal.create_task(Some("conversation")).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(task.task_id, 1)])
+            .unwrap();
+        assert_eq!(
+            journal.verify_task_tab(task.task_id, 7, Some(1)).unwrap(),
+            1
+        );
+
+        journal.close_task(task.task_id).unwrap();
+
+        // Resume is denied on closed task
+        let resume_result = journal.resume_task(&task.resume_capability).unwrap();
+        assert!(resume_result.is_none());
+
+        // Tab is denied
+        assert!(matches!(
+            journal.verify_task_tab(task.task_id, 7, None),
+            Err(JournalError::TabNotOwned { tab_id: 7 })
+        ));
     }
 }
