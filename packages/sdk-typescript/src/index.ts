@@ -45,8 +45,8 @@ export type BrowserSnapshotParams =
   };
 
 export type BrowserAction =
-  | ({ kind: "click" } & ({ ref: string; selector?: never } | { ref?: never; selector: string }))
-  | ({ kind: "type" | "fill"; text: string } & ({ ref: string; selector?: never } | { ref?: never; selector: string }))
+  | { kind: "click"; ref: string }
+  | { kind: "type" | "fill"; ref: string; text: string }
   | { kind: "select"; ref: string; value: string }
   | { kind: "scroll"; delta_x: number; delta_y: number; ref?: string }
   | { kind: "drag"; ref: string; target_ref: string }
@@ -581,87 +581,52 @@ async function negotiateConnection(
   conversationId: string | undefined,
   resumeCapability: string | undefined,
 ): Promise<NegotiatedConnection> {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      throw new Error(`Timed out after ${timeoutMs} ms connecting to AgentTab at ${endpoint}`);
-    }
-    let handshakeWritten = false;
-    let activeSocket: Socket | undefined;
-    try {
-      return await new Promise<NegotiatedConnection>((resolve, reject) => {
-        const socket = createConnection(endpoint);
-        activeSocket = socket;
-        const decoder = new FrameDecoder();
-        const timer = setTimeout(() => {
-          cleanup();
-          socket.destroy();
-          reject(new Error(`Timed out after ${timeoutMs} ms connecting to AgentTab at ${endpoint}`));
-        }, remainingMs);
-        const cleanup = () => {
-          clearTimeout(timer);
-          socket.off("error", onError);
-          socket.off("close", onClose);
-          socket.off("data", onData);
-          socket.off("connect", onConnect);
-        };
-        const fail = (error: Error) => {
-          cleanup();
-          socket.destroy();
-          reject(error);
-        };
-        const onError = (error: Error) => fail(error);
-        const onClose = () => fail(new Error("AgentTab closed during connection negotiation"));
-        const onData = (chunk: Buffer) => {
-          try {
-            for (const value of decoder.push(chunk)) {
-              if (!isConnectionAck(value)) throw new Error("AgentTab sent a response before connection negotiation completed");
-              cleanup();
-              resolve({ socket, decoder, connected: value });
-              return;
-            }
-          } catch (error) {
-            fail(error instanceof Error ? error : new Error(String(error)));
-          }
-        };
-        const onConnect = () => {
-          handshakeWritten = true;
-          socket.write(encodeFrame({
-            protocol: RPC_PROTOCOL,
-            version: RPC_VERSION,
-            kind: "connect",
-            ...(conversationId ? { conversation_id: conversationId } : {}),
-            ...(resumeCapability ? { resume_capability: resumeCapability } : {}),
-          }));
-        };
-        socket.once("error", onError);
-        socket.once("close", onClose);
-        socket.on("data", onData);
-        socket.once("connect", onConnect);
-      });
-    } catch (error) {
-      if (activeSocket) {
-        activeSocket.destroy();
-      }
-      // Retry ONLY pre-connect transport failure before the handshake payload is written.
-      // Once handshake write is dispatched, an ambiguous server ACK must never replay.
-      const isTransient = !handshakeWritten && isRecord(error) && (
-        error.code === "ECONNREFUSED" ||
-        error.code === "ENOENT"
-      );
-      if (isTransient && deadline - Date.now() > 0) {
-        const delay = Math.min(50, Math.max(0, deadline - Date.now()));
-        if (delay > 0) {
-          await new Promise((resolve) => setTimeout(resolve, delay));
+  const socket = createConnection(endpoint);
+  const decoder = new FrameDecoder();
+  const connected = await new Promise<ConnectionAck>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Timed out after ${timeoutMs} ms connecting to AgentTab at ${endpoint}`));
+    }, timeoutMs);
+    const closed = () => fail(new Error("AgentTab closed during connection negotiation"));
+    const fail = (error: Error) => {
+      clearTimeout(timer);
+      socket.off("error", fail);
+      socket.off("close", closed);
+      reject(error);
+    };
+    const accept = (value: ConnectionAck) => {
+      clearTimeout(timer);
+      socket.off("error", fail);
+      socket.off("close", closed);
+      socket.removeAllListeners("data");
+      resolve(value);
+    };
+    socket.once("error", fail);
+    socket.once("close", closed);
+    socket.on("data", (chunk) => {
+      try {
+        for (const value of decoder.push(chunk)) {
+          if (!isConnectionAck(value)) throw new Error("AgentTab sent a response before connection negotiation completed");
+          accept(value);
+          return;
         }
-        if (deadline - Date.now() > 0) {
-          continue;
-        }
+      } catch (error) {
+        socket.destroy();
+        fail(error instanceof Error ? error : new Error(String(error)));
       }
-      throw error;
-    }
-  }
+    });
+    socket.once("connect", () => {
+      socket.write(encodeFrame({
+        protocol: RPC_PROTOCOL,
+        version: RPC_VERSION,
+        kind: "connect",
+        ...(conversationId ? { conversation_id: conversationId } : {}),
+        ...(resumeCapability ? { resume_capability: resumeCapability } : {}),
+      }));
+    });
+  });
+  return { socket, decoder, connected };
 }
 
 async function confirmResumeCapability(

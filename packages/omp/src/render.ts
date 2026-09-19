@@ -57,7 +57,6 @@ export interface OperationCard {
 
 const SENSITIVE_KEY = /(authorization|cookie|credential|password|secret|token)/i;
 const MAX_EXPANDED_LINES = 160;
-export const MAX_SELECTOR_LENGTH = 72;
 const STATUS_LABEL: Readonly<Record<OperationCardStatus, string>> = {
   planned: "🧭 Plan",
   running: "🔄 Working",
@@ -292,33 +291,25 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
       upload_file: "Upload file",
     };
     let target: string | undefined;
-    const targetRefOrSelector = fieldString(action, "ref") ?? fieldString(action, "selector");
     if (kind === "type" || kind === "fill") {
-      target = joinMeta(selectorMeta(targetRefOrSelector), charCount(fieldString(action, "text")));
+      target = joinMeta(selectorMeta(fieldString(action, "ref")), charCount(fieldString(action, "text")));
     } else if (kind === "select") {
-      target = joinMeta(selectorMeta(targetRefOrSelector), "value hidden");
+      target = joinMeta(selectorMeta(fieldString(action, "ref")), "value hidden");
     } else if (kind === "drag") {
-      target = joinMeta(
-        selectorMeta(targetRefOrSelector),
-        "→",
-        selectorMeta(fieldString(action, "target_ref") ?? fieldString(action, "target_selector")),
-      );
+      target = joinMeta(selectorMeta(fieldString(action, "ref")), "→", selectorMeta(fieldString(action, "target_ref")));
     } else if (kind === "navigate") {
       target = safeUrl(fieldString(action, "url"));
     } else if (kind === "scroll") {
       target = joinMeta(
-        selectorMeta(targetRefOrSelector),
+        selectorMeta(fieldString(action, "ref")),
         `${fieldNumber(action, "delta_x") ?? 0},${fieldNumber(action, "delta_y") ?? 0}`,
       );
     } else if (kind === "dialog") {
       target = fieldString(action, "decision");
     } else if (kind === "upload_file") {
-      target = joinMeta(
-        selectorMeta(targetRefOrSelector),
-        countSummary(Array.isArray(action.files) ? action.files : [], "file"),
-      );
+      target = countSummary(Array.isArray(action.files) ? action.files : [], "file");
     } else {
-      target = selectorMeta(targetRefOrSelector);
+      target = selectorMeta(fieldString(action, "ref"));
     }
     return joinMeta(titles[kind] ?? humanize(kind), target) ?? humanize(kind);
   });
@@ -714,13 +705,9 @@ function tabMeta(tabId: number | undefined): string | undefined {
   return tabId === undefined ? undefined : `tab ${tabId}`;
 }
 
-export function selectorMeta(selector: string | undefined): string | undefined {
+function selectorMeta(selector: string | undefined): string | undefined {
   if (!selector) return undefined;
-  const cleaned = selector.replace(/[\s\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ").trim();
-  if (!cleaned) return undefined;
-  const target = cleaned.startsWith("ref=") ? cleaned.slice(4).trim() : cleaned;
-  if (!target) return undefined;
-  return truncate(target, MAX_SELECTOR_LENGTH);
+  return selector.startsWith("ref=") ? selector.slice(4) : selector;
 }
 
 function safeUrl(value: string | undefined): string | undefined {
@@ -771,7 +758,7 @@ function renderHeader(
 }
 
 function truncate(value: string, width: number): string {
-  const text = value.replace(/[\r\n\t\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, " ");
+  const text = value.replace(/[\r\n\t]+/g, " ");
   if (text.length <= width) return text;
   return width <= 1 ? "…" : `${text.slice(0, width - 1)}…`;
 }
