@@ -131,6 +131,10 @@ function assertDeliverableSnapshot(result: Record<string, unknown>): Record<stri
 // backend node id, so full-tree snapshots append DOM fallback nodes for them.
 const DOM_EDITABLE_FALLBACK_SELECTOR = "textarea,input,[contenteditable]";
 const DOM_EDITABLE_FALLBACK_LIMIT = 40;
+// Work bound for pathological pages: scanning stops after this many DOM
+// inspections even if fewer than DOM_EDITABLE_FALLBACK_LIMIT nodes were
+// accepted, so snapshot latency stays bounded on input-heavy documents.
+const DOM_EDITABLE_FALLBACK_INSPECT_LIMIT = 400;
 const DOM_EDITABLE_INPUT_TYPES: Record<string, true> = {
   "": true,
   text: true,
@@ -451,7 +455,7 @@ export class StandardBrowserRuntime {
     }
     const domFallbackNodes = typeof params.root_ref === "string"
       ? []
-      : await this.domEditableFallbackNodes(tabId, pageRevision, axBackendIds);
+      : await this.#domEditableFallbackNodes(tabId, pageRevision, axBackendIds);
     const after = await this.pageIdentity(tabId);
     if (before.documentId !== after.documentId || before.loaderId !== after.loaderId) {
       const currentPageRevision = await this.revisions.observeDocument(
@@ -464,7 +468,7 @@ export class StandardBrowserRuntime {
         currentPageRevision,
       });
     }
-    const encoded = nodes.slice(0, maxNodes).map((node) => ({
+    const encoded = nodes.map((node) => ({
       ...(node.backendDOMNodeId
         ? { ref: `r${pageRevision}-${node.backendDOMNodeId}` }
         : {}),
@@ -474,17 +478,20 @@ export class StandardBrowserRuntime {
       ...(node.description?.value !== undefined ? { description: node.description.value } : {}),
       ...(node.ignored ? { ignored: true } : {}),
     }));
+    // Fallback editables lead the combined list so they survive the
+    // max_nodes budget even when the accessibility tree alone fills it.
+    const combined = [...domFallbackNodes, ...encoded];
     return assertDeliverableSnapshot({
       tab_id: tabId,
       page_revision: pageRevision,
       mode,
-      nodes: domFallbackNodes.length > 0 ? [...encoded, ...domFallbackNodes] : encoded,
-      truncated: nodes.length > maxNodes,
+      nodes: combined.slice(0, maxNodes),
+      truncated: combined.length > maxNodes,
       ...(domFallbackNodes.length > 0 ? { dom_fallback_nodes: domFallbackNodes.length } : {}),
     });
   }
 
-  private async domEditableFallbackNodes(
+  async #domEditableFallbackNodes(
     tabId: number,
     pageRevision: number,
     axBackendIds: ReadonlySet<number>,
@@ -503,7 +510,11 @@ export class StandardBrowserRuntime {
         )
         : [];
       const fallback: Array<Record<string, unknown>> = [];
-      for (const nodeId of nodeIds.slice(0, DOM_EDITABLE_FALLBACK_LIMIT)) {
+      let inspected = 0;
+      for (const nodeId of nodeIds) {
+        if (fallback.length >= DOM_EDITABLE_FALLBACK_LIMIT) break;
+        if (inspected >= DOM_EDITABLE_FALLBACK_INSPECT_LIMIT) break;
+        inspected += 1;
         const described = await this.send(tabId, "DOM.describeNode", { nodeId, depth: 0 });
         const node = isRecord(described.node) ? described.node : null;
         if (!node || typeof node.backendNodeId !== "number") continue;
@@ -516,6 +527,7 @@ export class StandardBrowserRuntime {
       return [];
     }
   }
+
 
   async act(
     taskId: string,

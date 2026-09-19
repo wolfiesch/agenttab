@@ -1651,16 +1651,121 @@ describe("page revision monotonicity", () => {
     const result = await runtime.snapshot(66, { mode: "accessibility" });
 
     expect(result.nodes).toEqual([
-      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
       expect.objectContaining({
         ref: "r1-110",
         role: "textbox",
         name: "Message Composer",
         dom_fallback: true,
       }),
+      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
     ]);
     expect(result.dom_fallback_nodes).toBe(1);
     await runtime.detach(66);
+  });
+
+  test("keeps scanning DOM matches for eligible editables beyond filtered ones", async () => {
+    tabStore.set(68, {
+      id: 68,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    const filteredMatches = Array.from({ length: 45 }, (_unused, index) => 1000 + index);
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getFullAXTree") {
+        return {
+          nodes: [{
+            nodeId: "1",
+            backendDOMNodeId: 1,
+            role: { value: "WebArea" },
+            name: { value: "Example" },
+          }],
+        };
+      }
+      if (method === "DOM.querySelectorAll") {
+        return { nodeIds: [...filteredMatches, 21] };
+      }
+      if (method === "DOM.describeNode") {
+        if (typeof params.nodeId === "number" && params.nodeId >= 1000) {
+          return { node: { backendNodeId: params.nodeId, localName: "input", attributes: ["type", "checkbox"] } };
+        }
+        if (params.nodeId === 21) {
+          return {
+            node: { backendNodeId: 210, localName: "textarea", attributes: ["placeholder", "Message"] },
+          };
+        }
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(68, { mode: "accessibility" });
+
+    expect(result.nodes).toEqual([
+      expect.objectContaining({ ref: "r1-210", role: "textbox", name: "Message", dom_fallback: true }),
+      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+    ]);
+    expect(result.truncated).toBe(false);
+    await runtime.detach(68);
+  });
+
+  test("applies the node budget to fallback and accessibility nodes together", async () => {
+    tabStore.set(69, {
+      id: 69,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getFullAXTree") {
+        return {
+          nodes: [
+            {
+              nodeId: "1",
+              backendDOMNodeId: 1,
+              role: { value: "WebArea" },
+              name: { value: "Example" },
+            },
+            {
+              nodeId: "2",
+              backendDOMNodeId: 2,
+              role: { value: "button" },
+              name: { value: "Send" },
+            },
+          ],
+        };
+      }
+      if (method === "DOM.querySelectorAll") return { nodeIds: [31] };
+      if (method === "DOM.describeNode" && params.nodeId === 31) {
+        return {
+          node: { backendNodeId: 310, localName: "textarea", attributes: ["placeholder", "Message"] },
+        };
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(69, { mode: "accessibility", max_nodes: 2 });
+
+    expect(result.nodes).toEqual([
+      expect.objectContaining({ ref: "r1-310", dom_fallback: true }),
+      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+    ]);
+    expect(result.truncated).toBe(true);
+    expect(result.dom_fallback_nodes).toBe(1);
+    await runtime.detach(69);
   });
 
   test("fills a DOM fallback ref through the standard fill path", async () => {
