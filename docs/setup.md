@@ -28,6 +28,54 @@ cargo build --locked --manifest-path host-rs/Cargo.toml
 
 These commands do **not** create a public release, verify a signed artifact, register a complete consumer installation, or make the extension available through the Chrome Web Store. This repository does not publish a manual source host-registration recipe. The supported consumer path must be the artifact-verifying installer once an RC is available.
 
+## Local extension iteration
+
+For an existing unpacked development installation, run from the repository root
+in a POSIX shell (bash/zsh):
+
+```sh
+bun run dev:deploy --dry-run --version 2.0.0-rc.1
+bun run dev:deploy --version 2.0.0-rc.1
+```
+
+Use `--target-dir '/path/to/installed/extension'` when the installation is outside
+the default state directory. The destination must already contain an AgentTab
+development extension with the expected key. Multiple installed versions require
+an explicit selection. The target path and its writable sibling entries (including
+the `backups` directory, `dev-deploy-receipt.json`, and staging paths) are validated
+with no-follow semantics; symbolic links and paths overlapping the source checkout
+are rejected before any mutation.
+
+The command builds the extension, preserves a backup, verifies the installed
+files, requests an extension reload, and waits up to 90 seconds for successful IPC
+and extension health checks. Use `--timeout` for a different finite deadline. On
+failure, the command restores the prior bundle and development receipt and attempts
+to reload the restored bundle. Inspect the reported runtime status before treating
+recovery as complete.
+
+Default extension reload uses `scripts/reload_unpacked_extension.sh` (via macOS
+`open -g -a "$CHROME_APP"`), which is supported by default only on macOS. On Linux
+and other non-macOS platforms, the default reload mechanism is unsupported and the
+deployment fails pre-mutation before building, creating backups, or swapping files.
+To iterate on Linux or other platforms, provide an explicit reload override:
+- `--debugging-url <url>` (e.g. `--debugging-url http://127.0.0.1:9222`) to reload
+  via Chrome DevTools Protocol over a loopback endpoint.
+- `--reload-command '<cmd>'` to execute a custom platform-specific reload command.
+
+Local build evidence is recorded separately in `dev-deploy-receipt.json` beside
+the extension directory via link-safe atomic replacement; it will not follow
+symbolic links or clobber external files during success or rollback. The signed
+`install-receipt.json` remains unchanged; this workflow does not create a signed
+release. Health checks establish runtime reachability, not the loaded Chrome
+bundle's build identity. Confirm Chrome's unpacked path matches the selected
+destination. Start a fresh adapter session after changing tool schemas;
+extension-only behavior changes need only a reload.
+
+`--dry-run` makes no filesystem or browser changes and works before the first
+build. For an already built bundle, use `--skip-build`. Run
+`bun run dev:deploy --help` for the bounded command overrides used by fixture
+tests and non-default browser installations.
+
 ## Future signed RC path
 
 When, and only when, an explicitly signed `2.0.0-rc.1` package and immutable RC artifact manifest are made available to approved testers, the intended command is:

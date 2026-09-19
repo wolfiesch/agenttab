@@ -123,6 +123,119 @@ async function finish(args: ParsedArgs): Promise<unknown> {
   }
 }
 
+async function doctor(layer: "ipc" | "extension"): Promise<void> {
+  let client: AgentTabClient | undefined;
+  try {
+    client = await AgentTabClient.connect({ connectTimeoutMs: 1_000 });
+    const statusResult = (await client.call("agenttab.status", {})) as {
+      state?: string;
+      protocol_version?: number;
+      task_id?: string | null;
+      [key: string]: unknown;
+    };
+
+    if (layer === "ipc") {
+      if (statusResult?.state !== "ready") {
+        console.log(
+          JSON.stringify(
+            {
+              success: false,
+              layer: "ipc",
+              result: statusResult,
+              error: `AgentTab IPC runtime state is not ready (state: ${statusResult?.state ?? "unknown"})`,
+              recovery:
+                "Open Chrome with the AgentTab extension enabled, then rerun agenttab doctor --layer ipc.",
+            },
+            null,
+            2,
+          ),
+        );
+        process.exitCode = 1;
+        return;
+      }
+      console.log(
+        JSON.stringify(
+          {
+            success: true,
+            layer: "ipc",
+            result: statusResult,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    // layer === "extension"
+    if (statusResult?.state !== "ready") {
+      console.log(
+        JSON.stringify(
+          {
+            success: false,
+            layer: "extension",
+            result: statusResult,
+            error: `AgentTab runtime state is not ready for extension probe (state: ${statusResult?.state ?? "unknown"})`,
+            recovery:
+              "Reload AgentTab in chrome://extensions, then rerun agenttab doctor --layer extension.",
+          },
+          null,
+          2,
+        ),
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    try {
+      const tabsResult = (await client.call("browser_tabs", {})) as {
+        tabs?: Array<{ tab_id: number; url: string; title: string }>;
+        [key: string]: unknown;
+      };
+      if (!tabsResult || !Array.isArray(tabsResult.tabs)) {
+        throw new Error("Extension probe returned invalid browser_tabs result");
+      }
+      console.log(
+        JSON.stringify(
+          {
+            success: true,
+            layer: "extension",
+            result: {
+              state: statusResult.state,
+              probe: "browser_tabs",
+              tabs_count: tabsResult.tabs.length,
+              status: statusResult,
+            },
+          },
+          null,
+          2,
+        ),
+      );
+    } finally {
+      await client.closeTask().catch(() => {});
+    }
+  } catch (error) {
+    console.log(
+      JSON.stringify(
+        {
+          success: false,
+          layer,
+          error: error instanceof Error ? error.message : String(error),
+          recovery:
+            layer === "ipc"
+              ? "Open Chrome with the AgentTab extension enabled, then rerun agenttab doctor --layer ipc."
+              : "Reload AgentTab in chrome://extensions, then rerun agenttab doctor --layer extension.",
+        },
+        null,
+        2,
+      ),
+    );
+    process.exitCode = 1;
+  } finally {
+    client?.close();
+  }
+}
+
 async function run(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.length === 1 && argv[0] === "--help") usage(0);
@@ -152,20 +265,7 @@ async function run(): Promise<void> {
   if (command === "doctor") {
     const layer = stringFlag(parsed, "layer") ?? "ipc";
     if (layer !== "ipc" && layer !== "extension") throw new Error("--layer must be ipc or extension");
-    try {
-      const result = await status();
-      console.log(JSON.stringify({ success: true, layer, result }, null, 2));
-    } catch (error) {
-      console.log(JSON.stringify({
-        success: false,
-        layer,
-        error: error instanceof Error ? error.message : String(error),
-        recovery: layer === "ipc"
-          ? "Open Chrome with the AgentTab extension enabled, then rerun agenttab doctor --layer ipc."
-          : "Reload AgentTab in chrome://extensions, then rerun agenttab doctor --layer extension.",
-      }, null, 2));
-      process.exitCode = 1;
-    }
+    await doctor(layer);
     return;
   }
   if (command === "proxy") {
