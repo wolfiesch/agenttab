@@ -177,10 +177,14 @@ const DEFINITIONS: ReadonlyArray<{
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);
+        const selector = z.string().min(1).max(2048);
         const action = z.union([
           z.object({ kind: z.literal("click"), ref }).strict(),
+          z.object({ kind: z.literal("click"), selector }).strict(),
           z.object({ kind: z.literal("type"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
+          z.object({ kind: z.literal("type"), selector, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
           z.object({ kind: z.literal("fill"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
+          z.object({ kind: z.literal("fill"), selector, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
           z.object({ kind: z.literal("select"), ref, value: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
           z.object({
             kind: z.literal("scroll"),
@@ -201,6 +205,11 @@ const DEFINITIONS: ReadonlyArray<{
           z.object({
             kind: z.literal("upload_file"),
             ref,
+            files: z.array(z.string().min(1).max(512)).min(1).max(4),
+          }).strict(),
+          z.object({
+            kind: z.literal("upload_file"),
+            selector,
             files: z.array(z.string().min(1).max(512)).min(1).max(4),
           }).strict(),
         ]);

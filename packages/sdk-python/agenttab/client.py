@@ -680,13 +680,31 @@ class AgentTabClient:
         connect_timeout: float,
         request_timeout: float,
     ) -> tuple[BinaryIO | socket.socket, JsonObject]:
-        if os.name == "nt":
-            stream: BinaryIO | socket.socket = _open_windows_named_pipe(address)
-        else:
-            unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            unix_socket.settimeout(connect_timeout)
-            unix_socket.connect(address)
-            stream = unix_socket
+        connect_deadline = time.monotonic() + connect_timeout
+        while True:
+            remaining_connect = connect_deadline - time.monotonic()
+            if remaining_connect <= 0:
+                raise TimeoutError(f"Timed out connecting to AgentTab at {address}")
+            unix_socket: socket.socket | None = None
+            try:
+                if os.name == "nt":
+                    stream: BinaryIO | socket.socket = _open_windows_named_pipe(address)
+                else:
+                    unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    unix_socket.settimeout(remaining_connect)
+                    unix_socket.connect(address)
+                    stream = unix_socket
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                if unix_socket is not None:
+                    unix_socket.close()
+                if time.monotonic() >= connect_deadline:
+                    raise
+                delay = min(0.05, max(0.0, connect_deadline - time.monotonic()))
+                if delay > 0:
+                    time.sleep(delay)
+                if time.monotonic() >= connect_deadline:
+                    raise
         request: JsonObject = {
             "protocol": RPC_PROTOCOL,
             "version": RPC_VERSION,

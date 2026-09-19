@@ -885,3 +885,127 @@ test("does not confirm a replacement when durable staging fails", async () => {
   await expect(AgentTabClient.connect({ endpoint, capabilityStore: store })).rejects.toThrow("fsync failed");
   expect(confirmations).toBe(0);
 });
+
+test("retries transient connection errors during host reload and resumes task", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agenttab-sdk-"));
+  roots.push(root);
+  const endpoint = join(root, "agenttab.sock");
+  const store = {
+    path: "memory",
+    load: async () => "a".repeat(32),
+    loadPending: async () => undefined,
+    save: async () => undefined,
+    prepareReplacement: async () => undefined,
+    activateReplacement: async () => undefined,
+    clear: async () => undefined,
+  };
+
+  const server = createServer((socket) => {
+    socket.on("error", () => {});
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da99",
+            resumed: true,
+            task_id: "018f22b2-4126-7c1a-8c31-3f45a783da44",
+            resume_capability: "b".repeat(32),
+            state: "ready",
+          }, 1024 * 1024));
+        } else if (value.kind === "resume_confirm") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "resume_confirmed",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da99",
+          }, 1024 * 1024));
+        }
+      }
+    });
+  });
+  servers.push(server);
+
+  // Start server on the next tick so the initial connection attempt encounters ENOENT/ECONNREFUSED
+  setImmediate(() => {
+    server.listen(endpoint);
+  });
+
+  const client = await AgentTabClient.connect({
+    endpoint,
+    connectTimeoutMs: 1500,
+    capabilityStore: store,
+  });
+
+  expect(client.connection.resumed).toBe(true);
+  expect(client.connection.task_id).toBe("018f22b2-4126-7c1a-8c31-3f45a783da44");
+  expect(client.closed).toBe(false);
+  client.close();
+});
+
+test("refuses unauthenticated fallback when stored resume capability is rejected by host", async () => {
+  const endpoint = await listen((socket) => {
+    socket.on("error", () => {});
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          socket.end(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da99",
+            resumed: false,
+            state: "ready",
+          }, 1024 * 1024));
+        }
+      }
+    });
+  });
+  const store = {
+    path: "memory",
+    load: async () => "a".repeat(32),
+    loadPending: async () => undefined,
+    save: async () => undefined,
+    prepareReplacement: async () => undefined,
+    activateReplacement: async () => undefined,
+    clear: async () => undefined,
+  };
+  await expect(AgentTabClient.connect({ endpoint, capabilityStore: store })).rejects.toThrow(
+    "AgentTab rejected the stored resume capability",
+  );
+});
+
+test("does not replay connect after reset or close once handshake write is dispatched", async () => {
+  let connectAttempts = 0;
+  const endpoint = await listen((socket) => {
+    socket.on("error", () => {});
+    const decoder = new FrameDecoder();
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          connectAttempts += 1;
+          socket.destroy();
+        }
+      }
+    });
+  });
+  const store = {
+    path: "memory",
+    load: async () => "a".repeat(32),
+    loadPending: async () => undefined,
+    save: async () => undefined,
+    prepareReplacement: async () => undefined,
+    activateReplacement: async () => undefined,
+    clear: async () => undefined,
+  };
+  await expect(AgentTabClient.connect({
+    endpoint,
+    connectTimeoutMs: 500,
+    capabilityStore: store,
+  })).rejects.toThrow();
+  expect(connectAttempts).toBe(1);
+});

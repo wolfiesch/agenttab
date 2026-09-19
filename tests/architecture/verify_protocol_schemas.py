@@ -121,6 +121,19 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
                 "tab_id": 1,
                 "expected_page_revision": 2,
                 "actions": [
+                    {"kind": "click", "selector": "button.submit"},
+                    {"kind": "type", "selector": "input.search", "text": "agenttab"},
+                    {"kind": "fill", "selector": "input.email", "text": "test@example.com"},
+                ],
+            },
+            mutation=True,
+        ),
+        core_request(
+            "browser_act",
+            {
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "actions": [
                     {
                         "kind": "upload_file",
                         "selector": "input[type='file']",
@@ -222,6 +235,24 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         mutation=True,
     )
     expect_invalid(request_validator, ambiguous_upload_target, "ambiguous upload target")
+    for invalid_action, label in [
+        ({"kind": "click"}, "missing click target"),
+        ({"kind": "click", "ref": "e1", "selector": "button"}, "ambiguous click target"),
+        ({"kind": "type", "text": "hello"}, "missing type target"),
+        ({"kind": "type", "ref": "e1", "selector": "input", "text": "hello"}, "ambiguous type target"),
+        ({"kind": "fill", "text": "hello"}, "missing fill target"),
+        ({"kind": "fill", "ref": "e1", "selector": "input", "text": "hello"}, "ambiguous fill target"),
+    ]:
+        invalid_req = core_request(
+            "browser_act",
+            {
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "actions": [invalid_action],
+            },
+            mutation=True,
+        )
+        expect_invalid(request_validator, invalid_req, label)
     unknown = dict(requests[0], unexpected=True)
     expect_invalid(request_validator, unknown, "unknown request field")
 
