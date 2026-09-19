@@ -291,8 +291,9 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
       upload_file: "Upload file",
     };
     let target: string | undefined;
+    const targetRefOrSelector = fieldString(action, "ref") ?? fieldString(action, "selector");
     if (kind === "type" || kind === "fill") {
-      target = joinMeta(selectorMeta(fieldString(action, "ref")), charCount(fieldString(action, "text")));
+      target = joinMeta(selectorMeta(targetRefOrSelector), charCount(fieldString(action, "text")));
     } else if (kind === "select") {
       target = joinMeta(selectorMeta(fieldString(action, "ref")), "value hidden");
     } else if (kind === "drag") {
@@ -307,9 +308,12 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
     } else if (kind === "dialog") {
       target = fieldString(action, "decision");
     } else if (kind === "upload_file") {
-      target = countSummary(Array.isArray(action.files) ? action.files : [], "file");
+      target = joinMeta(
+        selectorMeta(targetRefOrSelector),
+        countSummary(Array.isArray(action.files) ? action.files : [], "file"),
+      );
     } else {
-      target = selectorMeta(fieldString(action, "ref"));
+      target = selectorMeta(targetRefOrSelector);
     }
     return joinMeta(titles[kind] ?? humanize(kind), target) ?? humanize(kind);
   });

@@ -24,28 +24,46 @@
     },
     "click": {
       "type": "object",
-      "required": ["kind", "ref"],
-      "properties": { "kind": { "const": "click" }, "ref": { "$ref": "#/$defs/ref" } },
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "click" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" }
+      },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
       "additionalProperties": false
     },
     "type": {
       "type": "object",
-      "required": ["kind", "ref", "text"],
+      "required": ["kind", "text"],
       "properties": {
         "kind": { "const": "type" },
         "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" },
         "text": { "type": "string", "maxLength": 2048 }
       },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
       "additionalProperties": false
     },
     "fill": {
       "type": "object",
-      "required": ["kind", "ref", "text"],
+      "required": ["kind", "text"],
       "properties": {
         "kind": { "const": "fill" },
         "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" },
         "text": { "type": "string", "maxLength": 2048 }
       },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
       "additionalProperties": false
     },
     "select": {
