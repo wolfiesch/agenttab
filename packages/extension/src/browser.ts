@@ -125,6 +125,59 @@ function assertDeliverableSnapshot(result: Record<string, unknown>): Record<stri
   );
 }
 
+// Accessibility snapshots mint refs from the debugger-backed accessibility tree,
+// but some frameworks render editable elements that never enter that tree (for
+// example pre-hydration composers). These editables are still addressable by
+// backend node id, so full-tree snapshots append DOM fallback nodes for them.
+const DOM_EDITABLE_FALLBACK_SELECTOR = "textarea,input,[contenteditable]";
+const DOM_EDITABLE_FALLBACK_LIMIT = 40;
+const DOM_EDITABLE_INPUT_TYPES: Record<string, true> = {
+  "": true,
+  text: true,
+  search: true,
+  email: true,
+  url: true,
+  tel: true,
+  number: true,
+};
+
+function domEditableFallbackNode(
+  node: Record<string, unknown>,
+  pageRevision: number,
+): Record<string, unknown> | null {
+  const backendNodeId = node.backendNodeId;
+  if (typeof backendNodeId !== "number") return null;
+  const attributes = Array.isArray(node.attributes) ? node.attributes : [];
+  const attr = (name: string): string | undefined => {
+    for (let index = 0; index + 1 < attributes.length; index += 2) {
+      if (attributes[index] === name) return attributes[index + 1];
+    }
+    return undefined;
+  };
+  const tag = String(node.localName ?? node.nodeName ?? "").toLowerCase();
+  const editable =
+    tag === "textarea" ||
+    (tag === "input"
+      ? DOM_EDITABLE_INPUT_TYPES[(attr("type") ?? "").toLowerCase()] === true
+      : attr("contenteditable") !== undefined &&
+        (attr("contenteditable") ?? "").toLowerCase() !== "false");
+  if (!editable) return null;
+  const name =
+    attr("aria-label") ||
+    attr("placeholder") ||
+    attr("name") ||
+    attr("title") ||
+    attr("id") ||
+    tag;
+  return {
+    ref: `r${pageRevision}-${backendNodeId}`,
+    role: "textbox",
+    name,
+    ...(typeof node.value === "string" && node.value.length > 0 ? { value: node.value } : {}),
+    dom_fallback: true,
+  };
+}
+
 function base64ByteLength(value: string): number | null {
   if (value.length === 0) return 0;
   if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return null;
@@ -391,6 +444,14 @@ export class StandardBrowserRuntime {
         fetchRelatives: true,
       })
       : await this.send(tabId, "Accessibility.getFullAXTree", { depth: maxDepth });
+    const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
+    const axBackendIds = new Set<number>();
+    for (const node of nodes) {
+      if (typeof node.backendDOMNodeId === "number") axBackendIds.add(node.backendDOMNodeId);
+    }
+    const domFallbackNodes = typeof params.root_ref === "string"
+      ? []
+      : await this.domEditableFallbackNodes(tabId, pageRevision, axBackendIds);
     const after = await this.pageIdentity(tabId);
     if (before.documentId !== after.documentId || before.loaderId !== after.loaderId) {
       const currentPageRevision = await this.revisions.observeDocument(
@@ -403,7 +464,6 @@ export class StandardBrowserRuntime {
         currentPageRevision,
       });
     }
-    const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
     const encoded = nodes.slice(0, maxNodes).map((node) => ({
       ...(node.backendDOMNodeId
         ? { ref: `r${pageRevision}-${node.backendDOMNodeId}` }
@@ -418,9 +478,43 @@ export class StandardBrowserRuntime {
       tab_id: tabId,
       page_revision: pageRevision,
       mode,
-      nodes: encoded,
+      nodes: domFallbackNodes.length > 0 ? [...encoded, ...domFallbackNodes] : encoded,
       truncated: nodes.length > maxNodes,
+      ...(domFallbackNodes.length > 0 ? { dom_fallback_nodes: domFallbackNodes.length } : {}),
     });
+  }
+
+  private async domEditableFallbackNodes(
+    tabId: number,
+    pageRevision: number,
+    axBackendIds: ReadonlySet<number>,
+  ): Promise<Array<Record<string, unknown>>> {
+    try {
+      const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
+      const root = isRecord(document.root) ? document.root : null;
+      if (typeof root?.nodeId !== "number") return [];
+      const selected = await this.send(tabId, "DOM.querySelectorAll", {
+        nodeId: root.nodeId,
+        selector: DOM_EDITABLE_FALLBACK_SELECTOR,
+      });
+      const nodeIds = Array.isArray(selected.nodeIds)
+        ? selected.nodeIds.filter(
+          (candidate): candidate is number => typeof candidate === "number" && candidate !== 0,
+        )
+        : [];
+      const fallback: Array<Record<string, unknown>> = [];
+      for (const nodeId of nodeIds.slice(0, DOM_EDITABLE_FALLBACK_LIMIT)) {
+        const described = await this.send(tabId, "DOM.describeNode", { nodeId, depth: 0 });
+        const node = isRecord(described.node) ? described.node : null;
+        if (!node || typeof node.backendNodeId !== "number") continue;
+        if (axBackendIds.has(node.backendNodeId)) continue;
+        const encoded = domEditableFallbackNode(node, pageRevision);
+        if (encoded) fallback.push(encoded);
+      }
+      return fallback;
+    } catch {
+      return [];
+    }
   }
 
   async act(
