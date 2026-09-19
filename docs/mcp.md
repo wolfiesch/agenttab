@@ -72,6 +72,15 @@ For MCP, the capability store namespace is `mcp`; OMP uses `omp`; Pi uses `pi`. 
 | `browser_credentials` | `prepare` requires a task tab and expected page revision, then returns an opaque short-lived token when the default-enabled 1Password broker is available and one through three Login items match the host-derived current origin. Owner-only policy can disable it. `fill` consumes that token and selected username, password, or one-time-code field refs without returning any value. `next` advances to another bounded candidate. It never submits the form. |
 | `browser_finish` | Accepts `disposition: "auto" | "close" | "keep"` and optional task-owned `keep_tab_ids`. Automatic mode follows the popup cleanup policy: close task-created tabs while retaining adopted tabs, ask for confirmation, or retain all tabs. Successful finalization ungroups retained tabs, releases ownership, closes the Core connection, and returns closed and retained tab IDs. An open handoff notice never defers finalization; staged Commit review and other in-flight work defer it without destroying resumability. |
 
+For `click`, `type`, and `fill`, supply exactly one of `ref` or `selector`.
+A CSS selector is limited to 1–2048 characters and must match exactly one element;
+missing and ambiguous targets fail before mutation. The same task ownership,
+revision, sensitive-field, and Commit checks apply to either target form.
+Before Commit, the selector is resolved again and checked against the staged
+element identity. Execute against that checked element, never a later selector
+match. Existing `upload_file` selector first-match behavior is unchanged.
+
+
 Every existing-page mutation carries its expected page revision. If navigation or document replacement makes that revision stale, AgentTab rejects the operation rather than selecting a new target.
 
 `automation_route` is `full` for ordinary HTTP, HTTPS, and `about:blank` tabs. It is `tab_only` with `route_reason: "browser_restricted_origin"` for Chrome system pages, extension pages, DevTools, the Chrome Web Store, malformed URLs, and unknown schemes. Page inspection or interaction requested on a `tab_only` tab returns `browser_restricted_origin` with `outcome: "not_started"` and recovery that explicitly says not to retry the same AgentTab route. This is a browser platform boundary, not a policy denial and not permission that can be granted through AgentTab.

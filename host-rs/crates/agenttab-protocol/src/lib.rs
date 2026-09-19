@@ -449,14 +449,23 @@ pub struct BrowserActParams {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserAction {
     Click {
-        r#ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
     },
     Type {
-        r#ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
         text: String,
     },
     Fill {
-        r#ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
         text: String,
     },
     Select {
@@ -893,9 +902,53 @@ impl MethodParams {
 
 fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), ProtocolError> {
     match action {
-        BrowserAction::Click { r#ref } => require_ref(method, r#ref),
-        BrowserAction::Type { r#ref, text } | BrowserAction::Fill { r#ref, text } => {
-            require_ref(method, r#ref)?;
+        BrowserAction::Click { r#ref, selector } => match (r#ref, selector) {
+            (Some(value), None) => require_ref(method, value),
+            (None, Some(value)) => require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector"),
+            _ => require(
+                method,
+                false,
+                "click requires exactly one of ref or selector",
+            ),
+        },
+        BrowserAction::Type {
+            r#ref,
+            selector,
+            text,
+        } => {
+            match (r#ref, selector) {
+                (Some(value), None) => require_ref(method, value)?,
+                (None, Some(value)) => {
+                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
+                }
+                _ => {
+                    return require(
+                        method,
+                        false,
+                        "type requires exactly one of ref or selector",
+                    )
+                }
+            }
+            require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
+        }
+        BrowserAction::Fill {
+            r#ref,
+            selector,
+            text,
+        } => {
+            match (r#ref, selector) {
+                (Some(value), None) => require_ref(method, value)?,
+                (None, Some(value)) => {
+                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
+                }
+                _ => {
+                    return require(
+                        method,
+                        false,
+                        "fill requires exactly one of ref or selector",
+                    )
+                }
+            }
             require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
         }
         BrowserAction::Select { r#ref, value } => {
@@ -2253,6 +2306,53 @@ mod tests {
                 "selector": "input[type=\"file\"]",
                 "files": ["/tmp/a.png"]
             }),
+        ] {
+            assert!(RpcRequest::parse(request(
+                "browser_act",
+                json!({
+                    "tab_id": 7,
+                    "expected_page_revision": 1,
+                    "actions": [action]
+                }),
+                true,
+            ))
+            .is_err());
+        }
+
+        let (_, act_selectors) = RpcRequest::parse(request(
+            "browser_act",
+            json!({
+                "tab_id": 7,
+                "expected_page_revision": 1,
+                "actions": [
+                    {"kind": "click", "selector": "button.submit"},
+                    {"kind": "type", "selector": "input.search", "text": "agenttab"},
+                    {"kind": "fill", "selector": "input.email", "text": "test@example.com"}
+                ]
+            }),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(
+            act_selectors,
+            MethodParams::Act(BrowserActParams { actions, .. })
+                if matches!(
+                    actions.as_slice(),
+                    [
+                        BrowserAction::Click { selector: Some(sel1), r#ref: None },
+                        BrowserAction::Type { selector: Some(sel2), r#ref: None, text: t1 },
+                        BrowserAction::Fill { selector: Some(sel3), r#ref: None, text: t2 },
+                    ] if sel1 == "button.submit" && sel2 == "input.search" && t1 == "agenttab" && sel3 == "input.email" && t2 == "test@example.com"
+                )
+        ));
+
+        for action in [
+            json!({"kind": "click"}),
+            json!({"kind": "click", "ref": "e1", "selector": "button"}),
+            json!({"kind": "type", "text": "hello"}),
+            json!({"kind": "type", "ref": "e1", "selector": "input", "text": "hello"}),
+            json!({"kind": "fill", "text": "hello"}),
+            json!({"kind": "fill", "ref": "e1", "selector": "input", "text": "hello"}),
         ] {
             assert!(RpcRequest::parse(request(
                 "browser_act",
