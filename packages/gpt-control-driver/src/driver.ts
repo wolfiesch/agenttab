@@ -358,6 +358,18 @@ export function extractAssistantTurn(html: string): { text: string; imageUrls: s
   return { text, imageUrls: images, fingerprint: `${text}\u0000${images.join(",")}` };
 }
 
+export function nextAssistantProgress(
+  current: { assistantCount: number; lastAssistantFingerprint: string; awaitingAssistant: boolean },
+  fingerprint: string,
+): { assistantCount: number; lastAssistantFingerprint: string; awaitingAssistant: false } | undefined {
+  if (fingerprint === current.lastAssistantFingerprint) return undefined;
+  return {
+    assistantCount: current.assistantCount + (current.awaitingAssistant ? 1 : 0),
+    lastAssistantFingerprint: fingerprint,
+    awaitingAssistant: false,
+  };
+}
+
 async function readAssistant(session: DriverSession): Promise<{ count: number; text: string; imageUrls: string[] }> {
   const client = await connectSession(session.sessionId);
   try {
@@ -379,19 +391,13 @@ async function readAssistant(session: DriverSession): Promise<{ count: number; t
     }
     const turn = extractAssistantTurn(snapshot.content);
     const metadata = await readMetadata(session.sessionId);
-    let assistantCount = metadata.assistantCount;
-    if (metadata.awaitingAssistant && turn.fingerprint !== metadata.lastAssistantFingerprint) {
-      assistantCount += 1;
-    }
-    if (turn.fingerprint !== metadata.lastAssistantFingerprint || metadata.awaitingAssistant) {
-      await writeMetadata({
-        ...metadata,
-        assistantCount,
-        lastAssistantFingerprint: turn.fingerprint,
-        awaitingAssistant: false,
-      });
-    }
-    return { count: assistantCount, text: turn.text, imageUrls: turn.imageUrls };
+    const progress = nextAssistantProgress(metadata, turn.fingerprint);
+    if (progress) await writeMetadata({ ...metadata, ...progress });
+    return {
+      count: progress?.assistantCount ?? metadata.assistantCount,
+      text: turn.text,
+      imageUrls: turn.imageUrls,
+    };
   } finally {
     client.close();
   }

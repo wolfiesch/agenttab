@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { extractAssistantTurn } from "../src/driver.js";
+import { extractAssistantTurn, nextAssistantProgress } from "../src/driver.js";
 
 describe("extractAssistantTurn", () => {
   test("returns only assistant prose and approved generated images", () => {
@@ -23,6 +23,40 @@ describe("extractAssistantTurn", () => {
       <img src="https://oaiusercontent.com.attacker.example/image.png">
     `);
     expect(turn.imageUrls).toEqual([]);
+  });
+});
+
+describe("nextAssistantProgress", () => {
+  test("keeps waiting when polling still sees the previous assistant turn", () => {
+    expect(nextAssistantProgress({
+      assistantCount: 2,
+      lastAssistantFingerprint: "previous",
+      awaitingAssistant: true,
+    }, "previous")).toBeUndefined();
+  });
+
+  test("counts and records a new assistant turn", () => {
+    expect(nextAssistantProgress({
+      assistantCount: 2,
+      lastAssistantFingerprint: "previous",
+      awaitingAssistant: true,
+    }, "next")).toEqual({
+      assistantCount: 3,
+      lastAssistantFingerprint: "next",
+      awaitingAssistant: false,
+    });
+  });
+
+  test("records baseline content without incrementing the assistant count", () => {
+    expect(nextAssistantProgress({
+      assistantCount: 0,
+      lastAssistantFingerprint: "",
+      awaitingAssistant: false,
+    }, "baseline")).toEqual({
+      assistantCount: 0,
+      lastAssistantFingerprint: "baseline",
+      awaitingAssistant: false,
+    });
   });
 });
 
