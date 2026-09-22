@@ -450,6 +450,7 @@ export class StandardBrowserRuntime {
     }
   }
 
+
   restoreDebuggerCandidates(tabIds: readonly number[]): void {
     for (const tabId of tabIds) this.debuggerCandidates.add(tabId);
   }
@@ -1366,6 +1367,18 @@ export class StandardBrowserRuntime {
         setTimeout(delay.resolve, 100);
         await delay.promise;
       } while (Date.now() < deadline);
+      if (conditionKind === "download" && typeof condition.after === "string") {
+        const cursor = this.downloadCursors.get(String(condition.after));
+        const session = this.sessions.get(tabId);
+        if (cursor?.state === "armed" && session && session.downloads.size > 0) {
+          throw Object.assign(
+            new Error(
+              "Chrome blocked the download as an automatic multiple download; it never began, so no lifecycle events exist. Allow automatic downloads for this site in Chrome settings, navigate the tab again, or expect one download per page load",
+            ),
+            { code: "multiple_download_throttle", outcome: "unknown" },
+          );
+        }
+      }
       throw Object.assign(new Error(`Timed out waiting for ${String(condition.kind)}`), {
         code: "wait_timeout",
         outcome: "unknown",
@@ -2788,6 +2801,12 @@ export class StandardBrowserRuntime {
         // Chrome clears this target-scoped override when the debugger detaches.
         await this.authorizeDebuggerUse(tabId);
         await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
+        // Chrome's automatic multiple-download throttle silently blocks every
+        // download after the first one a page initiates. chrome.debugger
+        // sessions cannot opt into DevTools download behavior on any tested
+        // Chrome (tab-session and browser-target commands are rejected or
+        // ineffective), so waits diagnose the throttle instead of lifting it;
+        // see the wait timeout path.
       } catch (error) {
         try {
           await this.detachTrackedSession(tabId, session);
@@ -2830,6 +2849,7 @@ export class StandardBrowserRuntime {
       this.scheduleIdleDetach(tabId, session);
     }
   }
+
 
   private scheduleIdleDetach(tabId: number, session: DebugSession): void {
     if (session.busyCount > 0) return;

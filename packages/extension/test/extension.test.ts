@@ -2640,6 +2640,47 @@ describe("page revision monotonicity", () => {
     }
   });
 
+  test("diagnoses Chrome's multiple-download throttle when a second armed download never begins", async () => {
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
+    const firstCursor = await runtime.armDownload(TASK_A, 61);
+    emitDebuggerEvent(61, "Page.downloadWillBegin", {
+      guid: "first-download",
+      url: "https://example.test/first.bin",
+      suggestedFilename: "first.bin",
+    });
+    emitDebuggerEvent(61, "Page.downloadProgress", { guid: "first-download", state: "completed" });
+    await runtime.wait(61, { condition: { kind: "download", after: firstCursor }, timeout_ms: 1_000 }, undefined, TASK_A);
+    // Product code orders downloads by Date.now() millisecond stamps; cross
+    // one boundary so the completed download predates the next wait (real
+    // clocks, no injectable time source here).
+    await Bun.sleep(5);
+
+    const throttledCursor = await runtime.armDownload(TASK_A, 61);
+    await expect(runtime.wait(
+      61,
+      { condition: { kind: "download", after: throttledCursor }, timeout_ms: 10 },
+      undefined,
+      TASK_A,
+    )).rejects.toMatchObject({ code: "multiple_download_throttle" });
+
+    const freshCursor = await runtime.armDownload(TASK_A, 62);
+    await runtime.snapshot(TASK_A, 62, { mode: "accessibility" });
+    await expect(runtime.wait(
+      62,
+      { condition: { kind: "download", after: freshCursor }, timeout_ms: 10 },
+      undefined,
+      TASK_A,
+    )).rejects.toMatchObject({ code: "wait_timeout" });
+    await runtime.detach(61);
+    await runtime.detach(62);
+  });
+
   test("retains a correlated fast download after its debugger session detaches", async () => {
     const runtime = new StandardBrowserRuntime(
       new RevisionTracker(),
