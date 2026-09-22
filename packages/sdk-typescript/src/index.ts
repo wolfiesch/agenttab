@@ -24,15 +24,37 @@ export const SNAPSHOT_TEXT_MAX_BYTES = 1_000_000;
 export const SCREENSHOT_MAX_BYTES = 750_000;
 export const SCREENSHOT_MAX_DIMENSION = 16_384;
 
+export const STANDARD_PRESS_KEYS = [
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Enter",
+  "Escape",
+  "Tab",
+  "Home",
+  "End",
+  "Space",
+  "Backspace",
+  "Delete",
+  "a",
+  "z",
+  "y",
+] as const;
+
 export type BrowserOpenParams =
   | { mode: "create"; url?: string; placement?: "task"; background?: boolean }
   | { mode: "create"; url?: string; placement: "new_window"; background?: true }
   | { mode: "adopt_active" };
 
+type FrameScoped = { frame_id?: string };
+type Target = ({ ref: string; selector?: never } | { ref?: never; selector: string }) & FrameScoped;
+type DownloadTarget = Target & { expect_download?: boolean };
+
 export type BrowserSnapshotParams =
-  | { tab_id: number; mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number }
-  | { tab_id: number; mode: "text" | "html"; selector?: string; match?: "first" | "last"; max_bytes?: number }
-  | {
+  | ({ tab_id: number; mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number } & FrameScoped)
+  | ({ tab_id: number; mode: "text" | "html"; selector?: string; match?: "first" | "last"; max_bytes?: number } & FrameScoped)
+  | ({
     tab_id: number;
     mode: "screenshot";
     selector?: string;
@@ -42,19 +64,26 @@ export type BrowserSnapshotParams =
     max_width?: number;
     max_height?: number;
     max_bytes?: number;
-  };
+  } & FrameScoped);
+
+export type BrowserPressKey = typeof STANDARD_PRESS_KEYS[number];
+export type BrowserPressModifier = "Alt" | "Control" | "Meta" | "Shift";
 
 export type BrowserAction =
-  | ({ kind: "click" } & ({ ref: string; selector?: never } | { ref?: never; selector: string }))
-  | ({ kind: "type" | "fill"; text: string } & ({ ref: string; selector?: never } | { ref?: never; selector: string }))
-  | { kind: "select"; ref: string; value: string }
-  | { kind: "scroll"; delta_x: number; delta_y: number; ref?: string }
-  | { kind: "drag"; ref: string; target_ref: string }
-  | { kind: "navigate"; url: string }
-  | { kind: "go_back" | "go_forward" | "close" }
-  | { kind: "reload"; bypass_cache?: boolean }
-  | { kind: "dialog"; decision: "accept" | "dismiss" }
-  | ({ kind: "upload_file"; files: string[] } & ({ ref: string; selector?: never } | { ref?: never; selector: string }));
+  | ({ kind: "click" | "double_click" | "context_click" } & DownloadTarget)
+  | ({ kind: "hover" } & Target)
+  | ({ kind: "press"; key: BrowserPressKey; modifiers?: BrowserPressModifier[] } & DownloadTarget)
+  | ({ kind: "type" | "fill"; text: string } & Target)
+  | ({ kind: "select"; ref: string; value: string } & FrameScoped)
+  | ({ kind: "scroll"; delta_x: number; delta_y: number; ref?: string } & FrameScoped)
+  | ({ kind: "drag"; ref: string; target_ref: string } & FrameScoped)
+  | { kind: "navigate"; url: string; expect_download?: boolean }
+  | { kind: "go_back" | "go_forward"; expect_download?: boolean }
+  | { kind: "reload"; bypass_cache?: boolean; expect_download?: boolean }
+  | { kind: "close" }
+  | { kind: "dialog"; decision: "accept"; prompt_text?: string }
+  | { kind: "dialog"; decision: "dismiss"; prompt_text?: never }
+  | ({ kind: "upload_file"; files: string[] } & Target);
 
 export interface BrowserActParams {
   tab_id: number;
@@ -63,8 +92,11 @@ export interface BrowserActParams {
 }
 
 export type BrowserWaitCondition =
-  | { kind: "load" | "network_idle" | "download" }
-  | { kind: "url" | "text" | "selector"; value: string };
+  | { kind: "load" | "network_idle" }
+  | { kind: "download"; after?: string }
+  | { kind: "url" | "text"; value: string }
+  | { kind: "selector"; value: string; state?: "attached" | "detached" | "visible" | "hidden" | "enabled"; frame_id?: string }
+  | { kind: "value"; selector: string; value: string; frame_id?: string };
 
 export interface BrowserWaitParams {
   tab_id: number;

@@ -62,13 +62,6 @@ describe("AgentTab MCP surface", () => {
     expect(JSON.stringify(credentialTool.inputSchema)).not.toContain("submit_ref");
   });
 
-  test("browser_act advertises no press action", () => {
-    const actionTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_act")!;
-    expect(actionTool.inputSchema).not.toHaveProperty("$defs.press");
-    expect(actionTool.inputSchema).not.toMatchObject({
-      $defs: { action: { oneOf: expect.arrayContaining([{ $ref: "#/$defs/press" }]) } },
-    });
-  });
 
   test("browser_act exposes no direct focus transition", () => {
     const actionTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_act")!;

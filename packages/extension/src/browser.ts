@@ -1,6 +1,20 @@
 import { RevisionTracker } from "./revisions";
+import {
+  dispatchDomClick,
+  dispatchDomFill,
+  dispatchDomPress,
+  dispatchDomSelect,
+  dispatchDomType,
+  pageDomActionDeclaration,
+  validatePressChord,
+} from "./input-actions";
 import { automationRoute, restrictedOriginError } from "./routes";
 import { isRecord } from "./type-guards";
+import {
+  mintTargetRef,
+  parseTargetRef,
+  type ResolvedTarget,
+} from "./target-resolution";
 import {
   SCREENSHOT_MAX_BYTES,
   SNAPSHOT_TEXT_MAX_BYTES,
@@ -42,13 +56,35 @@ const SUPPORTED_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   url: true,
   text: true,
   selector: true,
+  value: true,
   network_idle: true,
   download: true,
 };
+function validateKeyboardAction(action: Record<string, unknown>): void {
+  if (action.kind !== "press") return;
+  const modifiers = action.modifiers;
+  if (typeof action.key !== "string" ||
+      modifiers !== undefined && (!Array.isArray(modifiers) ||
+        !modifiers.every((modifier) => typeof modifier === "string"))) {
+    throw Object.assign(new Error("press requires a supported key and modifier list"), {
+      code: "invalid_request",
+    });
+  }
+  const invalid = validatePressChord(action.key, modifiers ?? []);
+  if (invalid) {
+    throw Object.assign(new Error(invalid.agenttab_invalid_request), { code: "invalid_request" });
+  }
+}
 const SENSITIVE_FIELD_CHECK = "const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);const text=node=>String(node&&((node.innerText??node.textContent)??'')||'').trim();const ids=String(this.getAttribute&&this.getAttribute('aria-labelledby')||'')+' '+String(this.getAttribute&&this.getAttribute('aria-describedby')||'');const associated=(this.labels?Array.from(this.labels):[]).map(text).filter(Boolean);const root=this.ownerDocument||document;const accessible=[this.getAttribute&&this.getAttribute('aria-label'),...ids.trim().split(/\\s+/).filter(Boolean).map(id=>text(root.getElementById(id)))].filter(value=>typeof value==='string'&&value.trim());const role=String(this.getAttribute&&this.getAttribute('role')||'').toLowerCase();const rawDescriptor=[this.getAttribute&&this.getAttribute('name'),this.id,this.getAttribute&&this.getAttribute('aria-label'),this.getAttribute&&this.getAttribute('title'),this.getAttribute&&this.getAttribute('placeholder'),...associated,...accessible].filter(Boolean).join(' ');const descriptor=rawDescriptor.replace(/([a-z])([A-Z])/g,'$1 $2').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();const compactDescriptor=descriptor.replace(/\\s+/g,'');const tag=String(this.tagName||'').toUpperCase();const editable=tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||this.isContentEditable===true||role==='textbox'||role==='combobox'||role==='spinbutton';const namedSecret=/\\b(password|otp|totp|mfa(?: code|token)?|2fa(?: code)?|(?:two|multi) factor (?:authentication )?(?:code|token)|one time (?:code|password)|verification code|authentication code|auth code|(?:re ?|h ?)?captcha|(?:cvv|cvc|cvn)\\d*|cid|security code|card security code|card verification (?:value|code|number)|card number|credit card number|cc number|card (?:expiration|expiry) (?:date|month|year)|bank account number|routing number|iban)\\b/.test(descriptor)||['password','onetimecode','onetimepassword','verificationcode','authenticationcode','authcode','totp','2fa','2facode','twofactorcode','twofactortoken','twofactorauthenticationcode','multifactorcode','multifactortoken','multifactorauthenticationcode','captcha','cid','securitycode','cardverificationvalue','cardverificationcode','cardverificationnumber','cardnumber','creditcardnumber','ccnumber','cardsecuritycode','cardexpirationdate','cardexpirationmonth','cardexpirationyear','cardexpirydate','cardexpirymonth','cardexpiryyear','bankaccountnumber','routingnumber'].some(term=>compactDescriptor.includes(term));const tokenSecret=/\\b(pin|passcode)\\b/.test(descriptor);const sensitiveField=type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))||(editable&&(namedSecret||tokenSecret));";
+const DOM_SENSITIVE_ACTION_PRELUDE =
+  `${SENSITIVE_FIELD_CHECK}if(sensitiveField){return {agenttab_sensitive_field:true}}`;
+const DOWNLOAD_CURSOR_RETENTION_MS = 120_000;
+const MAX_DOWNLOAD_CURSORS = 512;
+const MAX_DOWNLOAD_CURSORS_PER_TAB = 32;
 
 interface JavaScriptDialog {
   generation: number;
+  type: string | null;
   fingerprint: Promise<string>;
 }
 
@@ -59,9 +95,34 @@ interface PendingWindowOpen {
   expiresAt: number;
 }
 
+type DownloadStatus = "in_progress" | "completed" | "canceled";
+type DownloadCursorState = "armed" | "bound" | "completed" | "canceled" | "ambiguous" | "detached";
+
+interface DownloadMetadata {
+  guid: string;
+  status: "completed";
+  url?: string;
+  suggestedFilename?: string;
+}
+
+interface DownloadCursor {
+  token: string;
+  taskId: string;
+  tabId: number;
+  armedAt: number;
+  expiresAt: number;
+  state: DownloadCursorState;
+  guid?: string;
+  download?: DownloadMetadata;
+}
+
 interface TrackedDownload {
   startedAt: number;
+  status: DownloadStatus;
   completedAt?: number;
+  url?: string;
+  suggestedFilename?: string;
+  cursor?: DownloadCursor;
 }
 
 interface DebugSession {
@@ -77,6 +138,8 @@ interface DebugSession {
   dialogGeneration: number;
   dialog?: JavaScriptDialog;
   pendingWindowOpen?: PendingWindowOpen;
+  frameContexts: Map<string, number>;
+  frameSessions: Map<string, string>;
 }
 
 interface AxValue {
@@ -98,6 +161,18 @@ interface AxNode {
 interface PageIdentity {
   documentId?: string;
   loaderId?: string;
+}
+interface FrameIdentity {
+  frameId: string;
+  loaderId?: string;
+  url?: string;
+}
+
+interface FrameDocument extends FrameIdentity {
+  documentId: string;
+  rootNodeId: number;
+  sessionId?: string;
+  contextId?: number;
 }
 
 const utf8Encoder = new TextEncoder();
@@ -199,6 +274,14 @@ export interface ActionExecution {
   result?: Record<string, unknown>;
   staged?: StagedCommit;
 }
+export interface TargetResolutionRequest {
+  pageRevision: number;
+  taskId?: string;
+  ref?: unknown;
+  selector?: string;
+  frameId?: string;
+  actionKind?: string;
+}
 
 interface PreparedDialog {
   binding: StagedDialog;
@@ -215,6 +298,7 @@ interface StagedConsequence {
 
 export class StandardBrowserRuntime {
   private readonly sessions = new Map<number, DebugSession>();
+  private readonly downloadCursors = new Map<string, DownloadCursor>();
   private readonly expectedDetaches = new Map<number, number>();
   private readonly debuggerCandidates = new Set<number>();
 
@@ -238,7 +322,30 @@ export class StandardBrowserRuntime {
         const session = this.sessions.get(source.tabId);
         if (!session) return;
         const params = isRecord(rawParams) ? rawParams : {};
-        if (method === "Network.requestWillBeSent" && typeof params.requestId === "string") {
+        if (
+          method === "Runtime.executionContextCreated" &&
+          isRecord(params.context) &&
+          typeof params.context.id === "number" &&
+          isRecord(params.context.auxData) &&
+          typeof params.context.auxData.frameId === "string"
+        ) {
+          session.frameContexts.set(params.context.auxData.frameId, params.context.id);
+        } else if (
+          method === "Target.attachedToTarget" &&
+          typeof params.sessionId === "string" &&
+          isRecord(params.targetInfo) &&
+          params.targetInfo.type === "iframe" &&
+          typeof params.targetInfo.targetId === "string"
+        ) {
+          session.frameSessions.set(params.targetInfo.targetId, params.sessionId);
+          void this.initializeChildFrameSession(source.tabId, params.sessionId);
+        } else if (method === "Target.detachedFromTarget" && typeof params.sessionId === "string") {
+          for (const [frameId, sessionId] of session.frameSessions) {
+            if (sessionId !== params.sessionId) continue;
+            session.frameSessions.delete(frameId);
+            session.frameContexts.delete(frameId);
+          }
+        } else if (method === "Network.requestWillBeSent" && typeof params.requestId === "string") {
           session.inflight.add(params.requestId);
           session.lastNetworkActivity = Date.now();
         } else if (
@@ -247,21 +354,17 @@ export class StandardBrowserRuntime {
         ) {
           session.inflight.delete(params.requestId);
           session.lastNetworkActivity = Date.now();
-          // chrome.downloads has no initiator tab. Debugger events are scoped by source.tabId,
-          // so a matching Page GUID is the only completion proof accepted here.
+          // chrome.downloads has no initiator tab. Page events are routed from
+          // the attached tab and carry the GUID that joins start and progress.
         } else if (method === "Page.downloadWillBegin" && typeof params.guid === "string") {
-          session.downloads.set(params.guid, { startedAt: Date.now() });
+          this.trackDownloadWillBegin(source.tabId, session, params);
         } else if (method === "Page.downloadProgress" && typeof params.guid === "string") {
-          const download = session.downloads.get(params.guid);
-          if (params.state === "completed" && download) {
-            download.completedAt = Date.now();
-          } else if (params.state === "canceled") {
-            session.downloads.delete(params.guid);
-          }
+          this.trackDownloadProgress(session, params.guid, params.state);
         } else if (method === "Page.javascriptDialogOpening") {
           session.dialogGeneration += 1;
           session.dialog = {
             generation: session.dialogGeneration,
+            type: typeof params.type === "string" ? params.type : null,
             fingerprint: sha256Hex({
               type: typeof params.type === "string" ? params.type : null,
               message: typeof params.message === "string" ? params.message : null,
@@ -298,6 +401,49 @@ export class StandardBrowserRuntime {
     return this.sessions.has(tabId) || this.debuggerCandidates.has(tabId);
   }
 
+  /**
+   * Arms target-scoped Page download correlation immediately before a
+   * download-capable action is dispatched. The opaque cursor is task-bound.
+   */
+  async armDownload(taskId: string, tabId: number): Promise<string> {
+    await this.ensureAttached(tabId);
+    this.pruneDownloadState();
+    this.invalidatePendingDownloadAttribution(tabId);
+    const pendingForTab = [...this.downloadCursors.values()].filter(
+      (cursor) =>
+        cursor.tabId === tabId &&
+        (cursor.state === "armed" || cursor.state === "bound"),
+    ).length;
+    if (
+      this.downloadCursors.size >= MAX_DOWNLOAD_CURSORS ||
+      pendingForTab >= MAX_DOWNLOAD_CURSORS_PER_TAB
+    ) {
+      throw Object.assign(new Error("Too many download actions are awaiting attribution"), {
+        code: "download_attribution_limit",
+      });
+    }
+    const token = randomToken();
+    this.downloadCursors.set(token, {
+      token,
+      taskId,
+      tabId,
+      armedAt: Date.now(),
+      expiresAt: Date.now() + DOWNLOAD_CURSOR_RETENTION_MS,
+      state: "armed",
+    });
+    return token;
+  }
+
+  invalidatePendingDownloadAttribution(tabId: number): void {
+    const expiresAt = Date.now() + DOWNLOAD_CURSOR_RETENTION_MS;
+    for (const cursor of this.downloadCursors.values()) {
+      if (cursor.tabId === tabId && cursor.state === "armed") {
+        cursor.state = "ambiguous";
+        cursor.expiresAt = expiresAt;
+      }
+    }
+  }
+
   restoreDebuggerCandidates(tabIds: readonly number[]): void {
     for (const tabId of tabIds) this.debuggerCandidates.add(tabId);
   }
@@ -308,6 +454,7 @@ export class StandardBrowserRuntime {
       if (this.debuggerCandidates.has(tabId)) {
         await this.detachRecovered(tabId);
       } else {
+        this.invalidateDownloadTracking(tabId);
         await this.invalidateStagedDialogs(tabId);
       }
       return;
@@ -328,6 +475,7 @@ export class StandardBrowserRuntime {
     }
     if (!session.attached) {
       if (this.sessions.get(tabId) === session) this.sessions.delete(tabId);
+      this.invalidateDownloadTracking(tabId);
       await this.invalidateStagedDialogs(tabId);
       return;
     }
@@ -360,6 +508,7 @@ export class StandardBrowserRuntime {
         candidate.attached === true && candidate.tabId === tabId,
     );
     if (!target) {
+      this.invalidateDownloadTracking(tabId);
       await this.invalidateStagedDialogs(tabId);
       await this.forgetTrackedDebuggerCandidate(tabId);
       return;
@@ -368,6 +517,7 @@ export class StandardBrowserRuntime {
     this.expectedDetaches.set(tabId, expected + 1);
     try {
       await chrome.debugger.detach({ tabId });
+      this.invalidateDownloadTracking(tabId);
       await this.invalidateStagedDialogs(tabId);
       await this.forgetTrackedDebuggerCandidate(tabId);
     } catch (error) {
@@ -383,6 +533,7 @@ export class StandardBrowserRuntime {
       try {
         await chrome.debugger.detach({ tabId });
         if (this.sessions.get(tabId) === session) this.sessions.delete(tabId);
+        this.invalidateDownloadTracking(tabId);
         await this.invalidateStagedDialogs(tabId);
         await this.forgetTrackedDebuggerCandidate(tabId);
       } catch (error) {
@@ -395,6 +546,7 @@ export class StandardBrowserRuntime {
     session.detachPromise = detaching;
     return detaching;
   }
+
   private async forgetTrackedDebuggerCandidate(tabId: number): Promise<void> {
     await this.forgetDebuggerCandidate(tabId);
     this.debuggerCandidates.delete(tabId);
@@ -411,6 +563,7 @@ export class StandardBrowserRuntime {
   private invalidateDetachedSession(tabId: number, session = this.sessions.get(tabId)): void {
     if (session?.idleTimer) clearTimeout(session.idleTimer);
     if (session && this.sessions.get(tabId) === session) this.sessions.delete(tabId);
+    this.invalidateDownloadTracking(tabId);
     void this.invalidateStagedDialogs(tabId);
   }
 
@@ -421,72 +574,235 @@ export class StandardBrowserRuntime {
     }
   }
 
-  async snapshot(tabId: number, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private trackDownloadWillBegin(
+    tabId: number,
+    session: DebugSession,
+    params: Record<string, unknown>,
+  ): void {
+    this.pruneDownloadState();
+    const now = Date.now();
+    const candidates = [...this.downloadCursors.values()].filter(
+      (cursor) => cursor.tabId === tabId && cursor.state === "armed" && cursor.expiresAt >= now,
+    );
+    const hasAmbiguityTombstone = [...this.downloadCursors.values()].some(
+      (cursor) => cursor.tabId === tabId && cursor.state === "ambiguous" && cursor.expiresAt >= now,
+    );
+    const cursor = !hasAmbiguityTombstone && candidates.length === 1 ? candidates[0] : undefined;
+    if (hasAmbiguityTombstone || candidates.length > 1) {
+      for (const candidate of candidates) candidate.state = "ambiguous";
+    }
+    session.downloads.set(String(params.guid), {
+      startedAt: now,
+      status: "in_progress",
+      ...(typeof params.url === "string" ? { url: params.url } : {}),
+      ...(typeof params.suggestedFilename === "string"
+        ? { suggestedFilename: params.suggestedFilename }
+        : {}),
+      ...(cursor ? { cursor } : {}),
+    });
+  }
+
+  private trackDownloadProgress(
+    session: DebugSession,
+    guid: string,
+    state: unknown,
+  ): void {
+    const download = session.downloads.get(guid);
+    if (!download || (state !== "completed" && state !== "canceled")) return;
+    const now = Date.now();
+    download.status = state;
+    download.completedAt = now;
+    if (!download.cursor) return;
+    download.cursor.state = state;
+    download.cursor.expiresAt = now + DOWNLOAD_CURSOR_RETENTION_MS;
+    if (state === "completed") {
+      download.cursor.download = {
+        guid,
+        status: "completed",
+        ...(download.url !== undefined ? { url: download.url } : {}),
+        ...(download.suggestedFilename !== undefined
+          ? { suggestedFilename: download.suggestedFilename }
+          : {}),
+      };
+    }
+  }
+
+  private invalidateDownloadTracking(tabId: number): void {
+    for (const cursor of this.downloadCursors.values()) {
+      if (
+        cursor.tabId === tabId &&
+        (cursor.state === "armed" || cursor.state === "bound")
+      ) {
+        cursor.state = "detached";
+        cursor.expiresAt = Date.now() + DOWNLOAD_CURSOR_RETENTION_MS;
+      }
+    }
+  }
+
+  private pruneDownloadState(): void {
+    const now = Date.now();
+    for (const [token, cursor] of this.downloadCursors) {
+      if (cursor.expiresAt < now) this.downloadCursors.delete(token);
+    }
+    for (const session of this.sessions.values()) {
+      for (const [guid, download] of session.downloads) {
+        if (download.startedAt + DOWNLOAD_CURSOR_RETENTION_MS < now) {
+          session.downloads.delete(guid);
+        }
+      }
+    }
+  }
+
+  private downloadCursorMatch(
+    taskId: string | undefined,
+    tabId: number,
+    condition: Record<string, unknown>,
+  ): DownloadMetadata | undefined {
+    if (typeof condition.after !== "string") return undefined;
+    this.pruneDownloadState();
+    if (taskId === undefined) {
+      throw Object.assign(new Error("Download cursors require a task-bound browser wait"), {
+        code: "invalid_download_cursor",
+      });
+    }
+    const cursor = this.downloadCursors.get(condition.after);
+    if (!cursor || cursor.taskId !== taskId || cursor.tabId !== tabId) {
+      throw Object.assign(new Error("Download cursor is invalid or belongs to another task"), {
+        code: "invalid_download_cursor",
+      });
+    }
+    if (cursor.state === "completed" && cursor.download) return cursor.download;
+    if (cursor.state === "canceled") {
+      throw Object.assign(new Error("The correlated download was canceled"), {
+        code: "download_canceled",
+        outcome: "unknown",
+      });
+    }
+    if (cursor.state === "ambiguous" || cursor.state === "detached") {
+      throw Object.assign(new Error("Download attribution was lost before completion"), {
+        code: "download_attribution_lost",
+        outcome: "unknown",
+      });
+    }
+    return undefined;
+  }
+
+  async snapshot(
+    taskId: string,
+    tabId: number,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const mode = params.mode;
     if (mode !== "text" && mode !== "html" && mode !== "screenshot" && mode !== "accessibility") {
       throw Object.assign(new Error("Unsupported snapshot mode"), { code: "invalid_request" });
     }
+    const frameId = typeof params.frame_id === "string" ? params.frame_id : undefined;
     await this.requireFullAutomationRoute(tabId, `capture a ${mode} snapshot`);
     if (mode === "text" || mode === "html") {
       return assertDeliverableSnapshot(await this.scriptSnapshot(tabId, mode, params));
     }
     if (mode === "screenshot") {
+      if (frameId !== undefined) {
+        throw Object.assign(new Error("Frame-scoped screenshots are not available"), { code: "frame_unavailable" });
+      }
       return assertDeliverableSnapshot(await this.screenshot(tabId, params));
     }
+    const rootBinding = parseTargetRef(params.root_ref);
+    const requestedFrameId = frameId ?? rootBinding?.frameId;
+    const frameDocument = await this.frameDocument(tabId, requestedFrameId);
+    const topDocument = requestedFrameId === undefined
+      ? frameDocument
+      : await this.frameDocument(tabId);
+    const isTopFrame = frameDocument.frameId === topDocument.frameId;
+    const pageRevision = await this.revisions.observeDocument(
+      tabId, topDocument.documentId, topDocument.loaderId,
+    );
     const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
     const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
-    const before = await this.pageIdentity(tabId);
-    const pageRevision = await this.revisions.observeDocument(
-      tabId,
-      before.documentId,
-      before.loaderId,
-    );
-    const result = typeof params.root_ref === "string"
-      ? await this.send(tabId, "Accessibility.getPartialAXTree", {
-        backendNodeId: this.backendNodeId(pageRevision, params.root_ref),
-        fetchRelatives: true,
+    const rootTarget = typeof params.root_ref === "string"
+      ? await this.resolveTarget(tabId, {
+        pageRevision,
+        ...(taskId !== undefined ? { taskId } : {}),
+        ref: params.root_ref,
+        ...(frameId !== undefined ? { frameId } : {}),
       })
-      : await this.send(tabId, "Accessibility.getFullAXTree", { depth: maxDepth });
+      : undefined;
+    const result = rootTarget !== undefined
+      ? await this.send(tabId, "Accessibility.getPartialAXTree", {
+        backendNodeId: rootTarget.backendNodeId,
+        fetchRelatives: true,
+      }, false, rootTarget.sessionId)
+      : await this.send(tabId, "Accessibility.getFullAXTree", {
+        depth: maxDepth,
+        ...(frameId !== undefined ? { frameId } : {}),
+      }, false, frameDocument.sessionId);
     const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
     const axBackendIds = new Set<number>();
     for (const node of nodes) {
       if (typeof node.backendDOMNodeId === "number") axBackendIds.add(node.backendDOMNodeId);
     }
-    const domFallbackNodes = typeof params.root_ref === "string"
-      ? []
-      : await this.#domEditableFallbackNodes(tabId, pageRevision, axBackendIds);
-    const after = await this.pageIdentity(tabId);
-    if (before.documentId !== after.documentId || before.loaderId !== after.loaderId) {
-      const currentPageRevision = await this.revisions.observeDocument(
-        tabId,
-        after.documentId,
-        after.loaderId,
-      );
-      throw Object.assign(new Error("Page changed while capturing the accessibility tree"), {
+    const domFallbackNodes = rootTarget === undefined
+      ? await this.#domEditableFallbackNodes(tabId, pageRevision, axBackendIds, frameDocument, taskId)
+      : [];
+    const after = await this.frameDocument(tabId, frameDocument.frameId);
+    if (frameDocument.documentId !== after.documentId) {
+      const currentPageRevision = isTopFrame
+        ? await this.revisions.observeDocument(tabId, after.documentId, after.loaderId)
+        : await this.revisions.current(tabId);
+      throw Object.assign(new Error("Frame changed while capturing the accessibility tree"), {
         code: "stale_revision",
         currentPageRevision,
       });
     }
-    const encoded = nodes.map((node) => ({
-      ...(node.backendDOMNodeId
-        ? { ref: `r${pageRevision}-${node.backendDOMNodeId}` }
-        : {}),
+    const mintRef = (backendNodeId: number): string => mintTargetRef({
+        tabId,
+        backendNodeId,
+        documentId: frameDocument.documentId,
+        frameId: frameDocument.frameId,
+        pageRevision,
+        taskId,
+      });
+    const encoded = nodes.slice(0, Math.max(0, maxNodes - domFallbackNodes.length)).map((node) => ({
+      ...(typeof node.backendDOMNodeId === "number" ? { ref: mintRef(node.backendDOMNodeId) } : {}),
+      ...(typeof node.backendDOMNodeId === "number" ? { frame_id: frameDocument.frameId } : {}),
       role: typeof node.role?.value === "string" ? node.role.value : "unknown",
       name: typeof node.name?.value === "string" ? node.name.value : "",
       ...(node.value?.value !== undefined ? { value: node.value.value } : {}),
       ...(node.description?.value !== undefined ? { description: node.description.value } : {}),
       ...(node.ignored ? { ignored: true } : {}),
     }));
-    // Fallback editables lead the combined list so they survive the
-    // max_nodes budget even when the accessibility tree alone fills it.
     const combined = [...domFallbackNodes, ...encoded];
+    const frames: Array<Record<string, unknown>> = [];
+    const frameTree = await this.send(tabId, "Page.getFrameTree", {});
+    const pendingFrames: Array<{ tree: unknown; parent?: string }> = [{ tree: frameTree.frameTree }];
+    for (const tree of await this.attachedFrameTrees(tabId)) pendingFrames.push({ tree });
+    const seenFrames = new Set<string>();
+    while (pendingFrames.length > 0 && frames.length < 256) {
+      const entry = pendingFrames.pop();
+      if (!entry || !isRecord(entry.tree) || !isRecord(entry.tree.frame)) continue;
+      const frame = entry.tree.frame;
+      if (typeof frame.id !== "string" || seenFrames.has(frame.id)) continue;
+      seenFrames.add(frame.id);
+      const parentId = entry.parent ?? (typeof frame.parentId === "string" ? frame.parentId : undefined);
+      frames.push({
+        frame_id: frame.id,
+        ...(parentId !== undefined ? { parent_frame_id: parentId } : {}),
+        ...(typeof frame.url === "string" ? { url: frame.url } : {}),
+      });
+      if (Array.isArray(entry.tree.childFrames)) {
+        for (const tree of entry.tree.childFrames) pendingFrames.push({ tree, parent: frame.id });
+      }
+    }
     return assertDeliverableSnapshot({
       tab_id: tabId,
       page_revision: pageRevision,
+      frame_id: frameDocument.frameId,
+      frames,
+      ...(pendingFrames.length > 0 ? { frames_truncated: true, frames_limit: 256 } : {}),
       mode,
       nodes: combined.slice(0, maxNodes),
-      truncated: combined.length > maxNodes,
+      truncated: nodes.length + domFallbackNodes.length > maxNodes,
       ...(domFallbackNodes.length > 0 ? { dom_fallback_nodes: domFallbackNodes.length } : {}),
     });
   }
@@ -495,15 +811,14 @@ export class StandardBrowserRuntime {
     tabId: number,
     pageRevision: number,
     axBackendIds: ReadonlySet<number>,
+    document: FrameDocument,
+    taskId: string,
   ): Promise<Array<Record<string, unknown>>> {
     try {
-      const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
-      const root = isRecord(document.root) ? document.root : null;
-      if (typeof root?.nodeId !== "number") return [];
       const selected = await this.send(tabId, "DOM.querySelectorAll", {
-        nodeId: root.nodeId,
+        nodeId: document.rootNodeId,
         selector: DOM_EDITABLE_FALLBACK_SELECTOR,
-      });
+      }, false, document.sessionId);
       const nodeIds = Array.isArray(selected.nodeIds)
         ? selected.nodeIds.filter(
           (candidate): candidate is number => typeof candidate === "number" && candidate !== 0,
@@ -515,12 +830,25 @@ export class StandardBrowserRuntime {
         if (fallback.length >= DOM_EDITABLE_FALLBACK_LIMIT) break;
         if (inspected >= DOM_EDITABLE_FALLBACK_INSPECT_LIMIT) break;
         inspected += 1;
-        const described = await this.send(tabId, "DOM.describeNode", { nodeId, depth: 0 });
+        const described = await this.send(tabId, "DOM.describeNode", { nodeId, depth: 0 }, false, document.sessionId);
         const node = isRecord(described.node) ? described.node : null;
         if (!node || typeof node.backendNodeId !== "number") continue;
         if (axBackendIds.has(node.backendNodeId)) continue;
         const encoded = domEditableFallbackNode(node, pageRevision);
-        if (encoded) fallback.push(encoded);
+        if (encoded) {
+          fallback.push({
+            ...encoded,
+            ref: mintTargetRef({
+                tabId,
+                backendNodeId: node.backendNodeId,
+                documentId: document.documentId,
+                frameId: document.frameId,
+                pageRevision,
+                taskId,
+              }),
+            frame_id: document.frameId,
+          });
+        }
       }
       return fallback;
     } catch {
@@ -571,8 +899,13 @@ export class StandardBrowserRuntime {
       const hasSelector = typeof action.selector === "string";
       if (
         action.kind === "click" ||
+        action.kind === "hover" ||
+        action.kind === "double_click" ||
+        action.kind === "context_click" ||
         action.kind === "type" ||
         action.kind === "fill" ||
+        action.kind === "select" ||
+        action.kind === "press" ||
         action.kind === "upload_file"
       ) {
         if (hasRef === hasSelector) {
@@ -581,12 +914,17 @@ export class StandardBrowserRuntime {
           });
         }
       }
-      const resolvedBackendNodeId = hasSelector
-        ? await this.backendNodeIdFromSelector(tabId, String(action.selector), String(action.kind))
-        : hasRef
-          ? this.backendNodeId(pageRevision, action.ref)
-          : undefined;
-      const stagedConsequence = await this.consequence(tabId, pageRevision, action, resolvedBackendNodeId);
+      validateKeyboardAction(action);
+      const resolvedTarget = hasSelector || hasRef
+        ? await this.resolveTarget(tabId, {
+          taskId,
+          pageRevision,
+          ...(hasRef ? { ref: String(action.ref) } : { selector: String(action.selector) }),
+          ...(typeof action.frame_id === "string" ? { frameId: action.frame_id } : {}),
+          actionKind: String(action.kind),
+        })
+        : undefined;
+      const stagedConsequence = await this.consequence(tabId, action, resolvedTarget);
       if (stagedConsequence && !(await readState()).skipCommitReview) {
         const staged: StagedCommit = {
           native_token: randomToken(),
@@ -609,6 +947,10 @@ export class StandardBrowserRuntime {
             target: stagedConsequence.target,
             ...(typeof action.ref === "string" ? { ref: action.ref } : {}),
             ...(typeof action.selector === "string" ? { selector: action.selector } : {}),
+            ...(typeof action.frame_id === "string" ? { frame_id: action.frame_id } : {}),
+            ...(typeof action.key === "string" ? { key: action.key, modifiers: action.modifiers ?? [] } : {}),
+            ...(typeof action.prompt_text === "string" ? { prompt_text: action.prompt_text } : {}),
+            ...(action.expect_download === true ? { expect_download: true } : {}),
           },
           ...(stagedConsequence.dialog !== undefined ? { dialog: stagedConsequence.dialog.binding } : {}),
         };
@@ -633,7 +975,7 @@ export class StandardBrowserRuntime {
           },
         };
       }
-      completedActions.push(await this.performAction(tabId, pageRevision, action, resolvedBackendNodeId));
+      completedActions.push(await this.performAction(taskId, tabId, pageRevision, action, resolvedTarget));
     }
     return {
       result: {
@@ -645,6 +987,7 @@ export class StandardBrowserRuntime {
   }
 
   async fillCredentials(
+    taskId: string,
     tabId: number,
     expectedRevision: unknown,
     fields: unknown,
@@ -667,10 +1010,32 @@ export class StandardBrowserRuntime {
         throw Object.assign(new Error("Credential field is malformed"), { code: "invalid_request" });
       }
       await this.revisions.assertExpected(tabId, pageRevision);
-      const backendNodeId = this.backendNodeId(pageRevision, field.ref);
+      const target = await this.resolveTarget(tabId, {
+        taskId,
+        pageRevision,
+        ref: field.ref,
+      });
+      const topFrame = await this.frameIdentity(tabId);
+      if (target.frameId !== topFrame.frameId) {
+        const targetFrame = await this.frameIdentity(tabId, target.frameId);
+        const sameOrigin = (() => {
+          if (topFrame.url === undefined || targetFrame.url === undefined) return false;
+          try {
+            return new URL(topFrame.url).origin === new URL(targetFrame.url).origin;
+          } catch {
+            return false;
+          }
+        })();
+        if (!sameOrigin) {
+          throw Object.assign(
+            new Error("Credentials cannot be filled in a cross-origin frame without frame-specific authorization"),
+            { code: "cross_origin_credentials_forbidden" },
+          );
+        }
+      }
       await this.callOnNode(
         tabId,
-        backendNodeId,
+        target.backendNodeId,
         `function(value,kind){
           const input=this;
           const isInput=input instanceof HTMLInputElement;
@@ -693,6 +1058,8 @@ export class StandardBrowserRuntime {
           input.dispatchEvent(new Event("change",{bubbles:true,composed:true}));
         }`,
         [{ value: field.value }, { value: field.kind }],
+        false,
+        target,
       );
     }
     return {
@@ -858,15 +1225,21 @@ export class StandardBrowserRuntime {
         code: "staged_commit_mismatch",
       });
     }
-    let checkedBackendNodeId: number | undefined;
+    let checkedTarget: ResolvedTarget | undefined;
     let currentTarget: Record<string, unknown>;
     try {
-      if (typeof action.ref === "string") {
-        checkedBackendNodeId = this.backendNodeId(staged.page_revision, action.ref);
-        currentTarget = await this.targetDescriptorForBackendNode(staged.tab_id, checkedBackendNodeId, action);
-      } else if (typeof action.selector === "string") {
-        checkedBackendNodeId = await this.backendNodeIdFromSelector(staged.tab_id, action.selector, String(action.kind));
-        currentTarget = await this.targetDescriptorForBackendNode(staged.tab_id, checkedBackendNodeId, action);
+      validateKeyboardAction(action);
+      if (typeof action.ref === "string" || typeof action.selector === "string") {
+        checkedTarget = await this.resolveTarget(staged.tab_id, {
+          taskId,
+          pageRevision: staged.page_revision,
+          ...(typeof action.ref === "string" ? { ref: action.ref } : { selector: String(action.selector) }),
+          ...(typeof action.frame_id === "string" ? { frameId: action.frame_id } : {}),
+          actionKind: action.kind,
+        });
+        currentTarget = await this.targetDescriptorForBackendNode(
+          staged.tab_id, checkedTarget.backendNodeId, action, checkedTarget,
+        );
       } else {
         currentTarget = { kind: action.kind };
       }
@@ -895,7 +1268,7 @@ export class StandardBrowserRuntime {
     });
     const result = action.kind === "dialog" && action.decision === "accept"
       ? await this.acceptStagedDialog(staged.tab_id, action, staged.dialog)
-      : await this.performAction(staged.tab_id, staged.page_revision, action, checkedBackendNodeId);
+      : await this.performAction(taskId, staged.tab_id, staged.page_revision, action, checkedTarget);
     return {
       tab_id: staged.tab_id,
       page_revision: await this.revisions.current(staged.tab_id),
@@ -920,6 +1293,7 @@ export class StandardBrowserRuntime {
     tabId: number,
     params: Record<string, unknown>,
     revalidate?: () => Promise<void>,
+    taskId?: string,
   ): Promise<Record<string, unknown>> {
     if (!isRecord(params.condition) || typeof params.condition.kind !== "string") {
       throw Object.assign(new Error("browser_wait requires a condition"), { code: "invalid_request" });
@@ -939,8 +1313,11 @@ export class StandardBrowserRuntime {
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30_000;
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
+    const retainedDownload = conditionKind === "download"
+      ? this.downloadCursorMatch(taskId, tabId, condition)
+      : undefined;
     let debuggerSession =
-      conditionKind === "network_idle" || conditionKind === "download"
+      (conditionKind === "network_idle" || (conditionKind === "download" && !retainedDownload))
         ? await this.acquireDebuggerBusyLease(tabId)
         : undefined;
     try {
@@ -956,7 +1333,8 @@ export class StandardBrowserRuntime {
         ) {
           debuggerSession = await this.acquireDebuggerBusyLease(tabId, debuggerSession);
         }
-        const matched = await this.conditionMatched(tabId, condition, waitStartedAtMs, debuggerSession);
+        const matched = retainedDownload ??
+          await this.conditionMatched(tabId, condition, waitStartedAtMs, debuggerSession, taskId);
         if (revalidate) await revalidate();
         if (matched) {
           return {
@@ -964,6 +1342,18 @@ export class StandardBrowserRuntime {
             page_revision: await this.revisions.current(tabId),
             condition: conditionKind,
             matched: true,
+            ...(matched !== true
+              ? {
+                download: {
+                  guid: matched.guid,
+                  status: matched.status,
+                  ...(matched.url !== undefined ? { url: matched.url } : {}),
+                  ...(matched.suggestedFilename !== undefined
+                    ? { suggested_filename: matched.suggestedFilename }
+                    : {}),
+                },
+              }
+              : {}),
           };
         }
         const delay = Promise.withResolvers<void>();
@@ -1002,26 +1392,52 @@ export class StandardBrowserRuntime {
     const requestedMaxBytes = typeof params.max_bytes === "number"
       ? Math.min(params.max_bytes, SNAPSHOT_TEXT_MAX_BYTES)
       : 256_000;
-    const before = await this.pageIdentity(tabId);
-    const pageRevision = await this.revisions.observeDocument(tabId, before.documentId, before.loaderId);
-    const [{ result }] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: (
-        snapshotMode: "text" | "html",
-        targetSelector: string | null,
-        targetMatch: "first" | "last",
-      ) => {
-        const matches = targetSelector ? document.querySelectorAll(targetSelector) : [];
-        const target = targetSelector
-          ? targetMatch === "last" ? matches[matches.length - 1] : matches[0]
-          : document.documentElement;
-        if (!target) throw new Error(`Selector did not match: ${targetSelector}`);
-        return snapshotMode === "text" ? target.textContent ?? "" : target.outerHTML;
-      },
-      args: [mode, selector, selectorMatch],
-    });
-    const after = await this.pageIdentity(tabId);
-    const currentPageRevision = await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
+    const frameId = typeof params.frame_id === "string" ? params.frame_id : undefined;
+    const before = await this.pageIdentity(tabId, frameId);
+    const topBefore = frameId === undefined ? before : await this.pageIdentity(tabId);
+    const pageRevision = await this.revisions.observeDocument(tabId, topBefore.documentId, topBefore.loaderId);
+    const readContent = (
+      snapshotMode: "text" | "html",
+      targetSelector: string | null,
+      targetMatch: "first" | "last",
+    ): string => {
+      const matches = targetSelector ? document.querySelectorAll(targetSelector) : [];
+      const target = targetSelector
+        ? targetMatch === "last" ? matches[matches.length - 1] : matches[0]
+        : document.documentElement;
+      if (!target) throw new Error(`Selector did not match: ${targetSelector}`);
+      return snapshotMode === "text" ? target.textContent ?? "" : target.outerHTML;
+    };
+    let result: unknown;
+    if (frameId === undefined) {
+      const [captured] = await chrome.scripting.executeScript({
+        target: { tabId }, func: readContent, args: [mode, selector, selectorMatch],
+      });
+      result = captured.result;
+    } else {
+      const frame = await this.frameDocument(tabId, frameId);
+      const resolved = await this.send(tabId, "DOM.resolveNode", {
+        nodeId: frame.rootNodeId,
+        ...(frame.contextId !== undefined ? { executionContextId: frame.contextId } : {}),
+      }, false, frame.sessionId);
+      if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
+        throw Object.assign(new Error("Frame document no longer resolves"), { code: "stale_ref" });
+      }
+      const captured = await this.send(tabId, "Runtime.callFunctionOn", {
+        objectId: resolved.object.objectId,
+        functionDeclaration: readContent.toString(),
+        arguments: [{ value: mode }, { value: selector }, { value: selectorMatch }],
+        returnByValue: true,
+      }, false, frame.sessionId);
+      if (isRecord(captured.exceptionDetails) || !isRecord(captured.result) ||
+          typeof captured.result.value !== "string") {
+        throw Object.assign(new Error("Could not read the requested frame content"), { code: "snapshot_failed" });
+      }
+      result = captured.result.value;
+    }
+    const after = await this.pageIdentity(tabId, frameId);
+    const topAfter = frameId === undefined ? after : await this.pageIdentity(tabId);
+    const currentPageRevision = await this.revisions.observeDocument(tabId, topAfter.documentId, topAfter.loaderId);
     if (
       before.documentId !== after.documentId ||
       before.loaderId !== after.loaderId ||
@@ -1040,6 +1456,7 @@ export class StandardBrowserRuntime {
       return {
         tab_id: tabId,
         page_revision: pageRevision,
+        ...(frameId !== undefined ? { frame_id: frameId } : {}),
         mode,
         content,
         truncated: contentBytes < bytes.length,
@@ -1178,9 +1595,8 @@ export class StandardBrowserRuntime {
 
   private async consequence(
     tabId: number,
-    pageRevision: number,
     action: Record<string, unknown>,
-    resolvedBackendNodeId?: number,
+    resolvedTarget?: ResolvedTarget,
   ): Promise<StagedConsequence | null> {
     if (action.kind === "close") {
       return {
@@ -1190,11 +1606,10 @@ export class StandardBrowserRuntime {
     }
     if (action.kind === "upload_file") {
       const count = Array.isArray(action.files) ? action.files.length : 0;
-      const target = typeof resolvedBackendNodeId === "number"
-        ? await this.targetDescriptorForBackendNode(tabId, resolvedBackendNodeId, action)
-        : typeof action.ref === "string"
-          ? await this.targetDescriptor(tabId, pageRevision, action.ref)
-          : await this.targetDescriptorBySelector(tabId, String(action.selector ?? ""), action);
+      if (!resolvedTarget) throw Object.assign(new Error("Upload requires a resolved target"), { code: "invalid_request" });
+      const target = await this.targetDescriptorForBackendNode(
+        tabId, resolvedTarget.backendNodeId, action, resolvedTarget,
+      );
       return {
         effect: `Upload ${count} ${count === 1 ? "file" : "files"} to the page`,
         target,
@@ -1204,14 +1619,18 @@ export class StandardBrowserRuntime {
       return {
         effect: "Accept a browser confirmation dialog",
         target: { kind: action.kind },
-        dialog: await this.stageDialog(tabId),
+        dialog: await this.stageDialog(tabId, action),
       };
     }
     if (
       action.kind !== "click" &&
+      action.kind !== "hover" &&
+      action.kind !== "double_click" &&
+      action.kind !== "context_click" &&
       action.kind !== "select" &&
       action.kind !== "fill" &&
-      action.kind !== "type"
+      action.kind !== "type" &&
+      action.kind !== "press"
     ) {
       return null;
     }
@@ -1222,11 +1641,20 @@ export class StandardBrowserRuntime {
         code: "invalid_request",
       });
     }
-    const target = typeof resolvedBackendNodeId === "number"
-      ? await this.targetDescriptorForBackendNode(tabId, resolvedBackendNodeId, action)
-      : hasRef
-        ? await this.targetDescriptor(tabId, pageRevision, action.ref, action)
-        : await this.targetDescriptorBySelector(tabId, String(action.selector ?? ""), action);
+    if (!resolvedTarget) throw Object.assign(new Error("Action requires a resolved target"), { code: "invalid_request" });
+    const target = await this.targetDescriptorForBackendNode(
+      tabId, resolvedTarget.backendNodeId, action, resolvedTarget,
+    );
+    // Review new gestures and chords before unlabelled custom page handlers run.
+    if (action.kind === "hover" || action.kind === "double_click" || action.kind === "context_click" ||
+        action.kind === "press" && Array.isArray(action.modifiers) && action.modifiers.length > 0) {
+      return {
+        effect: action.kind === "press"
+          ? `Press ${[...(Array.isArray(action.modifiers) ? action.modifiers : []), action.key].join("+")} on the reviewed control`
+          : `Perform ${action.kind} on the reviewed control`,
+        target,
+      };
+    }
     const label = [
       target.role,
       target.text,
@@ -1239,18 +1667,26 @@ export class StandardBrowserRuntime {
       target.form_method,
       ...(Array.isArray(target.associated_labels) ? target.associated_labels : []),
       ...(Array.isArray(target.accessible_labels) ? target.accessible_labels : []),
-      // Classify the page-owned control semantics, never caller-entered text or values.
-      // The selected option label is resolved from the page and can describe an
-      // immediately consequential selection even when its submitted value is opaque.
       target.requested_option_label,
     ].filter((value): value is string => typeof value === "string").join(" ").replace(/\s+/g, " ").trim();
+    if (action.kind === "press" && action.key !== "Enter" && action.key !== "Space") return null;
+    const formActivation =
+      action.kind === "press" &&
+      typeof target.form_action === "string" &&
+      (
+        action.key === "Enter" && (target.tag === "INPUT" || target.tag === "TEXTAREA" || target.tag === "BUTTON") ||
+        action.key === "Space" && (target.tag === "BUTTON" || target.type === "submit" || target.type === "reset")
+      );
     if (
+      formActivation ||
       /\b(buy|purchase|pay|send|transfer|delete|remove|publish|post|deploy|merge|approve|authorize|grant|revoke|unsubscribe|cancel subscription|place order|checkout|submit order|confirm order|permission)\b/i.test(
         label,
       )
     ) {
       return {
-        effect: `${action.kind === "click" ? "Activate" : "Change"} consequential control: ${label.slice(0, 160)}`,
+        effect: formActivation
+          ? `Activate form control by pressing ${String(action.key)}`
+          : `${action.kind === "click" || action.kind === "press" ? "Activate" : "Change"} consequential control: ${label.slice(0, 160)}`,
         target,
       };
     }
@@ -1267,7 +1703,11 @@ export class StandardBrowserRuntime {
     return sha256Hex({ task_id: taskId, tab_id: tabId, page_revision: pageRevision, action, target });
   }
 
-  private async stageDialog(tabId: number): Promise<PreparedDialog> {
+
+  private async stageDialog(
+    tabId: number,
+    action?: Record<string, unknown>,
+  ): Promise<PreparedDialog> {
     await this.ensureAttached(tabId);
     const dialog = this.sessions.get(tabId)?.dialog;
     if (!dialog) {
@@ -1275,6 +1715,7 @@ export class StandardBrowserRuntime {
         code: "invalid_request",
       });
     }
+    this.assertDialogPrompt(action, dialog, "invalid_request");
     const fingerprint = await dialog.fingerprint;
     if (this.sessions.get(tabId)?.dialog !== dialog) {
       throw Object.assign(new Error("JavaScript dialog changed before it could be staged"), {
@@ -1310,8 +1751,23 @@ export class StandardBrowserRuntime {
         code: "staged_commit_mismatch",
       });
     }
-    await this.send(tabId, "Page.handleJavaScriptDialog", { accept: true });
+    this.assertDialogPrompt(action, dialog, "staged_commit_mismatch");
+    const promptText = typeof action.prompt_text === "string" ? action.prompt_text : undefined;
+    await this.send(tabId, "Page.handleJavaScriptDialog", {
+      accept: true,
+      ...(promptText !== undefined ? { promptText } : {}),
+    });
     return { kind: "dialog", completed: true };
+  }
+
+  private assertDialogPrompt(
+    action: Record<string, unknown> | undefined,
+    dialog: JavaScriptDialog,
+    code: "invalid_request" | "staged_commit_mismatch",
+  ): void {
+    if (typeof action?.prompt_text !== "string") return;
+    if (dialog.type === "prompt") return;
+    throw Object.assign(new Error("prompt_text can only accept a JavaScript prompt"), { code });
   }
 
   private async invalidateStagedDialogs(tabId: number): Promise<void> {
@@ -1325,52 +1781,34 @@ export class StandardBrowserRuntime {
     });
   }
 
-  private async targetDescriptor(
-    tabId: number,
-    pageRevision: number,
-    ref: unknown,
-    action?: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
-    return this.targetDescriptorForBackendNode(
-      tabId,
-      this.backendNodeId(pageRevision, ref),
-      action,
-    );
-  }
 
-  private async targetDescriptorBySelector(
-    tabId: number,
-    selector: string,
-    action?: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
-    return this.targetDescriptorForBackendNode(
-      tabId,
-      await this.backendNodeIdFromSelector(tabId, selector),
-      action,
-    );
-  }
-
-  private async targetDescriptorForBackendNode(
+  async targetDescriptorForBackendNode(
     tabId: number,
     backendNodeId: number,
     action?: Record<string, unknown>,
+    target?: ResolvedTarget,
   ): Promise<Record<string, unknown>> {
     const requestedValue = action?.kind === "select"
       ? String(action.value ?? "")
       : action?.kind === "fill" || action?.kind === "type"
         ? String(action.text ?? "")
-        : null;
-    const resolved = await this.send(tabId, "DOM.resolveNode", { backendNodeId });
+        : action?.kind === "press"
+          ? String(action.key ?? "")
+          : null;
+    const resolved = await this.send(tabId, "DOM.resolveNode", {
+      backendNodeId,
+      ...(target?.contextId !== undefined ? { executionContextId: target.contextId } : {}),
+    }, false, target?.sessionId);
     if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
       throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
     }
     const described = await this.send(tabId, "Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
       functionDeclaration:
-        `function(requestedValue){${SENSITIVE_FIELD_CHECK}if(requestedValue!==null&&sensitiveField){return {agenttab_sensitive_field:true}}const f=this.form;const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_value:requestedValue,requested_option_label:option?String(option.label||option.textContent||'').trim():null}}`,
+        `function(requestedValue){${SENSITIVE_FIELD_CHECK}if(requestedValue!==null&&sensitiveField){return {agenttab_sensitive_field:true}}const f=this.form;const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_option_label:option?[option.label,option.textContent].filter(Boolean).join(' ').trim():null}}`,
       arguments: [{ value: requestedValue }],
       returnByValue: true,
-    });
+    }, false, target?.sessionId);
     if (!isRecord(described.result) || !isRecord(described.result.value)) {
       throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
     }
@@ -1383,33 +1821,41 @@ export class StandardBrowserRuntime {
     return {
       ...described.result.value,
       backend_node_id: backendNodeId,
+      ...(target !== undefined ? { frame_id: target.frameId, document_id: target.documentId } : {}),
     };
   }
 
   private async performAction(
+    taskId: string,
     tabId: number,
     pageRevision: number,
     action: Record<string, unknown>,
-    resolvedBackendNodeId?: number,
+    resolvedTarget?: ResolvedTarget,
   ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const kind = action.kind;
+    validateKeyboardAction(action);
+    this.invalidatePendingDownloadAttribution(tabId);
+    const downloadCursor = action.expect_download === true
+      ? await this.armDownload(taskId, tabId)
+      : undefined;
+    const downloadResult = downloadCursor === undefined ? {} : { download_cursor: downloadCursor };
     if (kind === "navigate") {
       if (typeof action.url !== "string") throw Object.assign(new Error("navigate requires url"), { code: "invalid_request" });
       await chrome.tabs.update(tabId, { url: action.url });
-      return { kind, started: true };
+      return { kind, started: true, ...downloadResult };
     }
     if (kind === "go_back") {
       await chrome.tabs.goBack(tabId);
-      return { kind, started: true };
+      return { kind, started: true, ...downloadResult };
     }
     if (kind === "go_forward") {
       await chrome.tabs.goForward(tabId);
-      return { kind, started: true };
+      return { kind, started: true, ...downloadResult };
     }
     if (kind === "reload") {
       await chrome.tabs.reload(tabId, { bypassCache: action.bypass_cache === true });
-      return { kind, started: true };
+      return { kind, started: true, ...downloadResult };
     }
     if (kind === "close") {
       await this.closeTab(tabId);
@@ -1429,7 +1875,7 @@ export class StandardBrowserRuntime {
       await this.send(tabId, "Page.handleJavaScriptDialog", { accept: false });
       return { kind, completed: true };
     }
-    if (kind === "scroll" && action.ref === undefined) {
+    if (kind === "scroll" && action.ref === undefined && action.frame_id === undefined) {
       await chrome.scripting.executeScript({
         target: { tabId },
         func: (deltaX: number, deltaY: number) => window.scrollBy(deltaX, deltaY),
@@ -1439,19 +1885,34 @@ export class StandardBrowserRuntime {
     }
     const hasRef = typeof action.ref === "string";
     const hasSelector = typeof action.selector === "string";
-    if (kind === "click" || kind === "type" || kind === "fill" || kind === "upload_file") {
+    if (
+      kind === "click" ||
+      kind === "hover" ||
+      kind === "double_click" ||
+      kind === "context_click" ||
+      kind === "type" ||
+      kind === "fill" ||
+      kind === "select" ||
+      kind === "press" ||
+      kind === "upload_file"
+    ) {
       if (hasRef === hasSelector) {
         throw Object.assign(new Error(`${kind} requires exactly one of ref or selector`), {
           code: "invalid_request",
         });
       }
     }
-    const backendNodeId = typeof resolvedBackendNodeId === "number"
-      ? resolvedBackendNodeId
-      : hasSelector
-        ? await this.backendNodeIdFromSelector(tabId, String(action.selector), String(kind))
-        : this.backendNodeId(pageRevision, action.ref);
-    if (kind === "click") {
+    const target = resolvedTarget ?? await this.resolveTarget(tabId, {
+      taskId,
+      pageRevision,
+      ...(hasRef ? { ref: String(action.ref) } : {
+        selector: kind === "scroll" ? "html" : String(action.selector),
+      }),
+      ...(typeof action.frame_id === "string" ? { frameId: action.frame_id } : {}),
+      actionKind: String(kind),
+    });
+    const backendNodeId = target.backendNodeId;
+    if (kind === "click" || kind === "press") {
       const [activeTab, existingTabs] = await Promise.all([
         chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab),
         chrome.tabs.query({}),
@@ -1469,7 +1930,16 @@ export class StandardBrowserRuntime {
       };
       if (session) session.pendingWindowOpen = pendingWindowOpen;
       try {
-        await this.callOnNode(tabId, backendNodeId, "function(){this.click()}", [], true);
+        await this.callOnNode(
+          tabId,
+          backendNodeId,
+          kind === "click"
+            ? pageDomActionDeclaration(dispatchDomClick)
+            : pageDomActionDeclaration(dispatchDomPress, DOM_SENSITIVE_ACTION_PRELUDE),
+          kind === "click" ? [] : [{ value: action.key }, { value: action.modifiers ?? [] }],
+          true,
+          target,
+        );
       } finally {
         const [currentActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         const actionOwnsFocusChange =
@@ -1496,22 +1966,28 @@ export class StandardBrowserRuntime {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        `function(value){${SENSITIVE_FIELD_CHECK}if(sensitiveField){return {agenttab_sensitive_field:true}}this.focus();if(this.isContentEditable){const doc=this.ownerDocument;const selection=doc.getSelection();let range=selection&&selection.rangeCount>0?selection.getRangeAt(0):null;if(!range||!this.contains(range.commonAncestorContainer)){range=doc.createRange();range.selectNodeContents(this);range.collapse(false)}range.deleteContents();const node=doc.createTextNode(value);range.insertNode(node);range.setStartAfter(node);range.collapse(true);if(selection){selection.removeAllRanges();selection.addRange(range)}}else{const prototype=this instanceof HTMLInputElement?HTMLInputElement.prototype:this instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:null;const descriptor=prototype&&Object.getOwnPropertyDescriptor(prototype,'value');const getter=descriptor&&descriptor.get;const setter=descriptor&&descriptor.set;const current=String(typeof getter==='function'?getter.call(this):(this.value||''));const start=Number.isInteger(this.selectionStart)?this.selectionStart:current.length;const end=Number.isInteger(this.selectionEnd)?this.selectionEnd:start;const next=current.slice(0,start)+value+current.slice(end);if(typeof setter==='function'){setter.call(this,next)}else{this.value=next}if(typeof this.setSelectionRange==='function'){const position=start+value.length;this.setSelectionRange(position,position)}}this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}))}`,
+        pageDomActionDeclaration(dispatchDomType, DOM_SENSITIVE_ACTION_PRELUDE),
         [{ value: String(action.text ?? "") }],
+        true,
+        target,
       );
     } else if (kind === "fill") {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        `function(value){${SENSITIVE_FIELD_CHECK}if(sensitiveField){return {agenttab_sensitive_field:true}}this.focus();if(this.isContentEditable){this.textContent=value}else{const prototype=this instanceof HTMLInputElement?HTMLInputElement.prototype:this instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:null;const setter=prototype&&Object.getOwnPropertyDescriptor(prototype,'value')?.set;if(typeof setter==='function'){setter.call(this,value)}else{this.value=value}}this.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:value}));this.dispatchEvent(new Event('change',{bubbles:true}))}`,
+        pageDomActionDeclaration(dispatchDomFill, DOM_SENSITIVE_ACTION_PRELUDE),
         [{ value: String(action.text ?? "") }],
+        true,
+        target,
       );
     } else if (kind === "select") {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        `function(value){${SENSITIVE_FIELD_CHECK}if(sensitiveField){return {agenttab_sensitive_field:true}}this.value=value;this.dispatchEvent(new Event('input',{bubbles:true}));this.dispatchEvent(new Event('change',{bubbles:true}))}`,
+        pageDomActionDeclaration(dispatchDomSelect, DOM_SENSITIVE_ACTION_PRELUDE),
         [{ value: String(action.value ?? "") }],
+        true,
+        target,
       );
     } else if (kind === "scroll") {
       await this.callOnNode(
@@ -1519,39 +1995,62 @@ export class StandardBrowserRuntime {
         backendNodeId,
         "function(x,y){this.scrollBy(x,y)}",
         [{ value: Number(action.delta_x ?? 0) }, { value: Number(action.delta_y ?? 0) }],
+        false,
+        target,
       );
     } else if (kind === "drag") {
-      const targetBackendNodeId = this.backendNodeId(pageRevision, action.target_ref);
-      const [source, target] = await Promise.all([
-        this.nodeCenter(tabId, backendNodeId),
-        this.nodeCenter(tabId, targetBackendNodeId),
+      const dropTarget = await this.resolveTarget(tabId, {
+        taskId, pageRevision, ref: String(action.target_ref), actionKind: "drag",
+        ...(typeof action.frame_id === "string" ? { frameId: action.frame_id } : {}),
+      });
+      if (target.sessionId !== dropTarget.sessionId || target.frameId !== dropTarget.frameId) {
+        throw Object.assign(new Error("Drag endpoints must belong to the same frame"), { code: "invalid_request" });
+      }
+      const [sourcePoint, dropPoint] = await Promise.all([
+        this.pointerTargetPoint(tabId, target),
+        this.pointerTargetPoint(tabId, dropTarget),
       ]);
-      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: source.x, y: source.y, button: "left", clickCount: 1 });
-      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: target.x, y: target.y, button: "left" });
-      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: target.x, y: target.y, button: "left", clickCount: 1 });
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...sourcePoint, button: "left", buttons: 1, clickCount: 1 }, false, target.sessionId);
+      try {
+        await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...dropPoint, button: "left", buttons: 1 }, false, target.sessionId);
+      } finally {
+        await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...dropPoint, button: "left", buttons: 0, clickCount: 1 }, false, target.sessionId);
+      }
+    } else if (kind === "hover" || kind === "double_click" || kind === "context_click") {
+      const point = await this.pointerTargetPoint(tabId, target);
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "none", buttons: 0 }, false, target.sessionId);
+      if (kind !== "hover") {
+        const button = kind === "context_click" ? "right" : "left";
+        const buttons = kind === "context_click" ? 2 : 1;
+        for (let clickCount = 1; clickCount <= (kind === "double_click" ? 2 : 1); clickCount += 1) {
+          await this.pointerTargetPoint(tabId, target, point);
+          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...point, button, buttons, clickCount }, false, target.sessionId);
+          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button, buttons: 0, clickCount }, false, target.sessionId);
+        }
+      }
     } else if (kind === "upload_file") {
       if (!Array.isArray(action.files) || !action.files.every((file) => typeof file === "string")) {
         throw Object.assign(new Error("upload_file requires file paths"), { code: "invalid_request" });
       }
-      await this.send(tabId, "DOM.setFileInputFiles", { files: action.files, backendNodeId });
+      await this.send(tabId, "DOM.setFileInputFiles", { files: action.files, backendNodeId }, false, target.sessionId);
     } else {
       throw Object.assign(new Error(`Unsupported standard action: ${String(kind)}`), {
         code: "invalid_request",
       });
     }
-    return { kind, completed: true };
+    return { kind, completed: true, ...downloadResult };
   }
-
   private async conditionMatched(
     tabId: number,
     condition: Record<string, unknown>,
     waitStartedAtMs: number,
     debuggerSession?: DebugSession,
-  ): Promise<boolean> {
+    taskId?: string,
+  ): Promise<boolean | DownloadMetadata> {
     const kind = condition.kind;
     if (kind === "load") return (await chrome.tabs.get(tabId)).status === "complete";
     if (kind === "url") return (await chrome.tabs.get(tabId)).url === condition.value;
-    if (kind === "text" || kind === "selector") {
+    if (kind === "text") {
       const before = await this.pageIdentity(tabId);
       const matchedRevision = await this.revisions.observeDocument(
         tabId,
@@ -1560,11 +2059,8 @@ export class StandardBrowserRuntime {
       );
       const [{ result }] = await chrome.scripting.executeScript({
         target: { tabId },
-        func: (conditionKind: string, value: string) =>
-          conditionKind === "text"
-            ? (document.documentElement.textContent ?? "").includes(value)
-            : document.querySelector(value) !== null,
-        args: [kind, String(condition.value ?? "")],
+        func: (value: string) => (document.documentElement.textContent ?? "").includes(value),
+        args: [String(condition.value ?? "")],
       });
       if (result !== true) return false;
       const after = await this.pageIdentity(tabId);
@@ -1579,6 +2075,58 @@ export class StandardBrowserRuntime {
         matchedRevision === currentRevision
       );
     }
+    if (kind === "selector" || kind === "value") {
+      const selector = kind === "selector" ? condition.value : condition.selector;
+      if (typeof selector !== "string") {
+        throw Object.assign(new Error(`Wait condition ${String(kind)} requires a selector`), {
+          code: "invalid_request",
+        });
+      }
+      const frameId = typeof condition.frame_id === "string" ? condition.frame_id : undefined;
+      const before = await this.frameDocument(tabId, frameId);
+      const rootFrame = await this.frameIdentity(tabId);
+      const isTopFrame = before.frameId === rootFrame.frameId;
+      const beforeRevision = isTopFrame
+        ? await this.revisions.observeDocument(tabId, before.documentId, before.loaderId)
+        : await this.revisions.current(tabId);
+      const state = condition.state;
+      let target: ResolvedTarget;
+      try {
+        target = await this.resolveTarget(tabId, {
+          pageRevision: beforeRevision,
+          selector,
+          ...(frameId !== undefined ? { frameId } : {}),
+          ...(taskId !== undefined ? { taskId } : {}),
+        });
+      } catch (error) {
+        if (isRecord(error) && error.code === "selector_not_found") {
+          const stable = await this.waitFrameUnchanged(
+            tabId,
+            before,
+            isTopFrame,
+            beforeRevision,
+          );
+          return kind === "selector" && state === "detached" && stable;
+        }
+        throw error;
+      }
+      if (
+        target.documentId !== before.documentId ||
+        !(await this.waitFrameUnchanged(tabId, before, isTopFrame, beforeRevision))
+      ) {
+        return false;
+      }
+      if (kind === "selector" && state === "detached") return false;
+      const observed = await this.inspectWaitTarget(tabId, target);
+      if (!(await this.waitFrameUnchanged(tabId, before, isTopFrame, beforeRevision))) {
+        return false;
+      }
+      if (kind === "value") return observed.value === String(condition.value ?? "");
+      if (state === "visible") return observed.visible === true;
+      if (state === "hidden") return observed.visible === false;
+      if (state === "enabled") return observed.enabled === true;
+      return observed.connected === true;
+    }
     if (kind === "network_idle") {
       const session = debuggerSession;
       if (!session || this.sessions.get(tabId) !== session || !session.attached) return false;
@@ -1590,12 +2138,22 @@ export class StandardBrowserRuntime {
       return session.inflight.size === 0 && Date.now() - session.lastNetworkActivity >= 500;
     }
     if (kind === "download") {
+      const retained = this.downloadCursorMatch(taskId, tabId, condition);
+      if (retained) return retained;
       const session = debuggerSession;
       if (!session || this.sessions.get(tabId) !== session || !session.attached) return false;
+      this.pruneDownloadState();
       for (const [guid, download] of session.downloads) {
-        if (download.completedAt === undefined) continue;
-        session.downloads.delete(guid);
-        if (download.completedAt >= waitStartedAtMs) return true;
+        if (download.status !== "completed" || download.completedAt === undefined) continue;
+        if (download.completedAt < waitStartedAtMs) continue;
+        return {
+          guid,
+          status: "completed",
+          ...(download.url !== undefined ? { url: download.url } : {}),
+          ...(download.suggestedFilename !== undefined
+            ? { suggestedFilename: download.suggestedFilename }
+            : {}),
+        };
       }
       return false;
     }
@@ -1603,54 +2161,145 @@ export class StandardBrowserRuntime {
       code: "invalid_request",
     });
   }
-  private backendNodeId(pageRevision: number, ref: unknown): number {
-    const match = /^r(\d+)-(\d+)$/.exec(String(ref ?? ""));
-    if (!match || Number(match[1]) !== pageRevision) {
-      throw Object.assign(new Error("Snapshot ref belongs to a stale page revision"), {
+  private async waitFrameUnchanged(
+    tabId: number,
+    before: FrameDocument,
+    isTopFrame: boolean,
+    beforeRevision: number,
+  ): Promise<boolean> {
+    try {
+      const after = await this.frameDocument(tabId, before.frameId);
+      if (after.documentId !== before.documentId) {
+        if (isTopFrame) {
+          await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
+        }
+        return false;
+      }
+      if (!isTopFrame) return true;
+      return (
+        await this.revisions.observeDocument(tabId, after.documentId, after.loaderId)
+      ) === beforeRevision;
+    } catch (error) {
+      if (
+        isRecord(error) &&
+        (error.code === "frame_not_found" || error.code === "frame_unavailable" || error.code === "stale_ref")
+      ) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private async inspectWaitTarget(
+    tabId: number,
+    target: ResolvedTarget,
+  ): Promise<Record<string, unknown>> {
+    const resolved = await this.send(
+      tabId,
+      "DOM.resolveNode",
+      { backendNodeId: target.backendNodeId },
+      false,
+      target.sessionId,
+    );
+    const object = isRecord(resolved.object) ? resolved.object : null;
+    if (typeof object?.objectId !== "string") {
+      throw Object.assign(new Error("Wait selector no longer resolves"), { code: "stale_ref" });
+    }
+    const inspected = await this.send(
+      tabId,
+      "Runtime.callFunctionOn",
+      {
+        objectId: object.objectId,
+        functionDeclaration:
+          "function(){const style=getComputedStyle(this);const box=this.getBoundingClientRect();const connected=this.isConnected===true;const visible=connected&&style.display!=='none'&&style.visibility!=='hidden'&&style.visibility!=='collapse'&&Number(style.opacity)!==0&&box.width>0&&box.height>0;const disabled=this.matches(':disabled')||this.getAttribute('aria-disabled')==='true';const raw=this.value;return {connected,visible,enabled:connected&&!disabled,value:typeof raw==='string'?raw:String(this.textContent??'')}}",
+        returnByValue: true,
+      },
+      false,
+      target.sessionId,
+    );
+    const result = isRecord(inspected.result) ? inspected.result : null;
+    if (!isRecord(result?.value)) {
+      throw Object.assign(new Error("Wait selector no longer resolves"), { code: "stale_ref" });
+    }
+    return result.value;
+  }
+
+
+  async resolveTarget(
+    tabId: number,
+    request: TargetResolutionRequest,
+  ): Promise<ResolvedTarget> {
+    const ref = request.ref;
+    const selector = request.selector;
+    const hasRef = ref !== undefined;
+    const hasSelector = selector !== undefined;
+    if (hasRef === hasSelector || (hasSelector && typeof selector !== "string")) {
+      throw Object.assign(new Error("Target resolution requires exactly one of ref or selector"), {
+        code: "invalid_request",
+      });
+    }
+    if (typeof selector === "string") {
+      const document = await this.frameDocument(tabId, request.frameId);
+      const backendNodeId = await this.backendNodeIdForDocument(tabId, document, selector);
+      return {
+        tabId,
+        backendNodeId,
+        documentId: document.documentId,
+        frameId: document.frameId,
+        pageRevision: request.pageRevision,
+        taskId: request.taskId ?? "",
+        ...(document.sessionId !== undefined ? { sessionId: document.sessionId } : {}),
+        ...(document.contextId !== undefined ? { contextId: document.contextId } : {}),
+      };
+    }
+    const binding = parseTargetRef(request.ref);
+    if (binding === null) {
+      throw Object.assign(new Error("Snapshot ref is not task-bound"), { code: "stale_ref" });
+    }
+    if (
+      binding.tabId !== tabId ||
+      binding.pageRevision !== request.pageRevision ||
+      binding.taskId !== request.taskId ||
+      (request.frameId !== undefined && binding.frameId !== request.frameId)
+    ) {
+      throw Object.assign(new Error("Snapshot ref belongs to a different task, frame, or page revision"), {
         code: "stale_ref",
       });
     }
-    return Number(match[2]);
+    const document = await this.frameDocument(tabId, binding.frameId);
+    if (document.documentId !== binding.documentId) {
+      throw Object.assign(new Error("Snapshot ref belongs to a stale frame document"), { code: "stale_ref" });
+    }
+    return {
+      ...binding,
+      ...(document.sessionId !== undefined ? { sessionId: document.sessionId } : {}),
+      ...(document.contextId !== undefined ? { contextId: document.contextId } : {}),
+    };
   }
 
-  private async backendNodeIdFromSelector(
+  async backendNodeIdFromSelector(
     tabId: number,
     selector: string,
-    actionKind?: string,
+    _actionKind?: string,
+    frameId?: string,
   ): Promise<number> {
-    const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
-    if (!isRecord(document.root) || typeof document.root.nodeId !== "number") {
-      throw Object.assign(new Error("Could not inspect the document"), {
-        code: "action_failed",
-      });
-    }
-    if (actionKind === "upload_file") {
-      const selected = await this.send(tabId, "DOM.querySelector", {
-        nodeId: document.root.nodeId,
-        selector,
-      });
-      if (typeof selected.nodeId !== "number" || selected.nodeId === 0) {
-        throw Object.assign(new Error(`Selector did not match: ${selector}`), {
-          code: "selector_not_found",
-        });
-      }
-      const described = await this.send(tabId, "DOM.describeNode", {
-        nodeId: selected.nodeId,
-        depth: 0,
-      });
-      if (!isRecord(described.node) || typeof described.node.backendNodeId !== "number") {
-        throw Object.assign(new Error("Selected upload target could not be resolved"), {
-          code: "action_failed",
-        });
-      }
-      return described.node.backendNodeId;
-    }
+    const document = await this.frameDocument(tabId, frameId);
+    return this.backendNodeIdForDocument(tabId, document, selector);
+  }
+
+  private async backendNodeIdForDocument(
+    tabId: number,
+    document: FrameDocument,
+    selector: string,
+  ): Promise<number> {
+    const openShadowMatch = await this.openShadowBackendNodeId(tabId, document, selector);
+    if (openShadowMatch !== null) return openShadowMatch;
     const selected = await this.send(tabId, "DOM.querySelectorAll", {
-      nodeId: document.root.nodeId,
+      nodeId: document.rootNodeId,
       selector,
-    });
+    }, false, document.sessionId);
     const nodeIds = Array.isArray(selected.nodeIds)
-      ? selected.nodeIds
+      ? selected.nodeIds.filter((nodeId): nodeId is number => typeof nodeId === "number" && nodeId !== 0)
       : typeof selected.nodeId === "number" && selected.nodeId !== 0
         ? [selected.nodeId]
         : [];
@@ -1664,28 +2313,86 @@ export class StandardBrowserRuntime {
         code: "ambiguous_selector",
       });
     }
-    const described = await this.send(tabId, "DOM.describeNode", {
-      nodeId: nodeIds[0],
-      depth: 0,
-    });
-    if (!isRecord(described.node) || typeof described.node.backendNodeId !== "number") {
-      throw Object.assign(new Error("Selected target could not be resolved"), {
-        code: "action_failed",
-      });
-    }
-    return described.node.backendNodeId;
+    return this.backendNodeIdForNodeId(tabId, nodeIds[0], document);
   }
 
-  private async callOnNode(
+  private async openShadowBackendNodeId(
+    tabId: number,
+    document: FrameDocument,
+    selector: string,
+  ): Promise<number | null> {
+    const evaluated = await this.send(tabId, "Runtime.evaluate", {
+      expression: "document",
+      returnByValue: false,
+      ...(document.contextId !== undefined ? { contextId: document.contextId } : {}),
+    }, false, document.sessionId);
+    const evaluatedResult = isRecord(evaluated.result) ? evaluated.result : null;
+    if (typeof evaluatedResult?.objectId !== "string") return null;
+    const count = await this.send(tabId, "Runtime.callFunctionOn", {
+      objectId: evaluatedResult.objectId,
+      functionDeclaration: `function(selector){const matches=new Set();const visit=root=>{for(const element of root.querySelectorAll(selector))matches.add(element);for(const host of root.querySelectorAll("*"))if(host.shadowRoot)visit(host.shadowRoot)};visit(this);return matches.size}`,
+      arguments: [{ value: selector }],
+      returnByValue: true,
+    }, false, document.sessionId);
+    const counted = isRecord(count.result) ? count.result : null;
+    if (typeof counted?.value !== "number") return null;
+    if (counted.value === 0) {
+      throw Object.assign(new Error(`Selector did not match: ${selector}`), {
+        code: "selector_not_found",
+      });
+    }
+    if (counted.value > 1) {
+      throw Object.assign(new Error(`Selector matched ${counted.value} elements: ${selector}`), {
+        code: "ambiguous_selector",
+      });
+    }
+    const matched = await this.send(tabId, "Runtime.callFunctionOn", {
+      objectId: evaluatedResult.objectId,
+      functionDeclaration: `function(selector){const matches=[];const visit=root=>{for(const element of root.querySelectorAll(selector))matches.push(element);for(const host of root.querySelectorAll("*"))if(host.shadowRoot)visit(host.shadowRoot)};visit(this);return matches[0]}`,
+      arguments: [{ value: selector }],
+      returnByValue: false,
+    }, false, document.sessionId);
+    const matchedResult = isRecord(matched.result) ? matched.result : null;
+    if (typeof matchedResult?.objectId !== "string") {
+      throw Object.assign(new Error("Selected target could not be resolved"), { code: "action_failed" });
+    }
+    const requested = await this.send(tabId, "DOM.requestNode", { objectId: matchedResult.objectId }, false, document.sessionId);
+    if (typeof requested.nodeId !== "number") {
+      throw Object.assign(new Error("Selected target could not be resolved"), { code: "action_failed" });
+    }
+    return this.backendNodeIdForNodeId(tabId, requested.nodeId, document);
+  }
+
+  private async backendNodeIdForNodeId(
+    tabId: number,
+    nodeId: number,
+    document: FrameDocument,
+  ): Promise<number> {
+    const described = await this.send(tabId, "DOM.describeNode", {
+      nodeId,
+      depth: 0,
+    }, false, document.sessionId);
+    const node = isRecord(described.node) ? described.node : null;
+    if (typeof node?.backendNodeId !== "number") {
+      throw Object.assign(new Error("Selected target could not be resolved"), { code: "action_failed" });
+    }
+    return node.backendNodeId;
+  }
+
+  async callOnNode(
     tabId: number,
     backendNodeId: number,
     functionDeclaration: string,
     args: Array<Record<string, unknown>>,
     userGesture = false,
+    target?: ResolvedTarget,
   ): Promise<void> {
     try {
-      const resolved = await this.send(tabId, "DOM.resolveNode", { backendNodeId });
-      if (!resolved.object || typeof resolved.object !== "object" || !("objectId" in resolved.object)) {
+      const resolved = await this.send(tabId, "DOM.resolveNode", {
+        backendNodeId,
+        ...(target?.contextId !== undefined ? { executionContextId: target.contextId } : {}),
+      }, false, target?.sessionId);
+      if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
         throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
       }
       const invoked = await this.send(tabId, "Runtime.callFunctionOn", {
@@ -1695,7 +2402,7 @@ export class StandardBrowserRuntime {
         awaitPromise: true,
         returnByValue: true,
         userGesture,
-      });
+      }, false, target?.sessionId);
       if (
         isRecord(invoked.result) &&
         isRecord(invoked.result.value) &&
@@ -1706,7 +2413,15 @@ export class StandardBrowserRuntime {
           recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
         });
       }
-
+      if (
+        isRecord(invoked.result) &&
+        isRecord(invoked.result.value) &&
+        typeof invoked.result.value.agenttab_invalid_request === "string"
+      ) {
+        throw Object.assign(new Error(invoked.result.value.agenttab_invalid_request), {
+          code: "invalid_request",
+        });
+      }
       if (isRecord(invoked.exceptionDetails)) {
         const text =
           typeof invoked.exceptionDetails.text === "string"
@@ -1715,9 +2430,7 @@ export class StandardBrowserRuntime {
         throw Object.assign(new Error(text), { code: "action_failed" });
       }
     } catch (error) {
-      if (isRecord(error) && error.code === "stale_ref") {
-        throw error;
-      }
+      if (isRecord(error) && error.code === "stale_ref") throw error;
       const message = error instanceof Error ? error.message : String(error);
       if (/no node with given id|could not find node|cannot find context|execution context was destroyed/i.test(message)) {
         throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
@@ -1759,8 +2472,60 @@ export class StandardBrowserRuntime {
     }
   }
 
-  private async nodeCenter(tabId: number, backendNodeId: number): Promise<{ x: number; y: number }> {
-    const model = await this.send(tabId, "DOM.getBoxModel", { backendNodeId });
+  private async pointerTargetPoint(
+    tabId: number,
+    target: ResolvedTarget,
+    expectedPoint?: { x: number; y: number },
+  ): Promise<{ x: number; y: number }> {
+    const document = await this.frameDocument(tabId, target.frameId);
+    if (document.documentId !== target.documentId) {
+      throw Object.assign(new Error("Pointer target document changed"), { code: "stale_ref" });
+    }
+    const point = await this.nodeCenter(tabId, target.backendNodeId, target);
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y) ||
+        expectedPoint && (point.x !== expectedPoint.x || point.y !== expectedPoint.y)) {
+      throw Object.assign(new Error("Pointer target moved before the gesture completed"), { code: "action_failed" });
+    }
+    const hit = await this.send(tabId, "DOM.getNodeForLocation", {
+      x: Math.round(point.x),
+      y: Math.round(point.y),
+      includeUserAgentShadowDOM: true,
+    }, false, target.sessionId);
+    if (typeof hit.backendNodeId !== "number") {
+      throw Object.assign(new Error("Pointer target is outside the visible viewport"), { code: "action_failed" });
+    }
+    const [owner, hitNode] = await Promise.all([
+      this.send(tabId, "DOM.resolveNode", {
+        backendNodeId: target.backendNodeId,
+        ...(target.contextId !== undefined ? { executionContextId: target.contextId } : {}),
+      }, false, target.sessionId),
+      this.send(tabId, "DOM.resolveNode", {
+        backendNodeId: hit.backendNodeId,
+        ...(target.contextId !== undefined ? { executionContextId: target.contextId } : {}),
+      }, false, target.sessionId),
+    ]);
+    if (!isRecord(owner.object) || typeof owner.object.objectId !== "string" ||
+        !isRecord(hitNode.object) || typeof hitNode.object.objectId !== "string") {
+      throw Object.assign(new Error("Pointer target no longer resolves"), { code: "stale_ref" });
+    }
+    const checked = await this.send(tabId, "Runtime.callFunctionOn", {
+      objectId: owner.object.objectId,
+      functionDeclaration: "function(hit){if(!this.isConnected)return false;for(let node=hit;node;node=node.parentNode||(node.getRootNode&&node.getRootNode().host)){if(node===this)return true}return false}",
+      arguments: [{ objectId: hitNode.object.objectId }],
+      returnByValue: true,
+    }, false, target.sessionId);
+    if (!isRecord(checked.result) || checked.result.value !== true) {
+      throw Object.assign(new Error("Another element obscures the reviewed pointer target"), { code: "action_failed" });
+    }
+    return point;
+  }
+
+  async nodeCenter(
+    tabId: number,
+    backendNodeId: number,
+    target?: ResolvedTarget,
+  ): Promise<{ x: number; y: number }> {
+    const model = await this.send(tabId, "DOM.getBoxModel", { backendNodeId }, false, target?.sessionId);
     if (!model.model || typeof model.model !== "object" || !("content" in model.model) || !Array.isArray(model.model.content)) {
       throw Object.assign(new Error("Dragged ref has no box model"), { code: "stale_ref" });
     }
@@ -1771,32 +2536,141 @@ export class StandardBrowserRuntime {
     };
   }
 
-  private async pageIdentity(tabId: number): Promise<PageIdentity> {
-    const document = await this.send(tabId, "DOM.getDocument", { depth: 0 });
-    const frameTree = await this.send(tabId, "Page.getFrameTree", {});
-    const root = isRecord(document.root) ? document.root : null;
-    const documentId = typeof root?.backendNodeId === "number"
-      ? `backend:${root.backendNodeId}`
-      : typeof root?.nodeId === "number"
-        ? `frontend:${root.nodeId}`
-        : undefined;
-    const loaderId = this.frameLoaderId(frameTree);
-    if (documentId === undefined && loaderId === undefined) {
-      throw Object.assign(new Error("Could not identify the page document"), {
-        code: "snapshot_failed",
-      });
-    }
+  private async pageIdentity(tabId: number, frameId?: string): Promise<PageIdentity> {
+    const document = await this.frameDocument(tabId, frameId);
     return {
-      ...(documentId !== undefined ? { documentId } : {}),
-      ...(loaderId !== undefined ? { loaderId } : {}),
+      documentId: document.documentId,
+      ...(document.loaderId !== undefined ? { loaderId: document.loaderId } : {}),
     };
   }
 
-  private frameLoaderId(result: Record<string, unknown>): string | undefined {
-    if (!result.frameTree || typeof result.frameTree !== "object" || !("frame" in result.frameTree)) return undefined;
-    const frame = result.frameTree.frame;
-    if (!frame || typeof frame !== "object" || !("loaderId" in frame)) return undefined;
-    return typeof frame.loaderId === "string" ? frame.loaderId : undefined;
+  private async frameIdentities(
+    tabId: number,
+    requestedFrameId?: string,
+  ): Promise<{ frame: FrameIdentity; root: FrameIdentity }> {
+    const result = await this.send(tabId, "Page.getFrameTree", {});
+    const rootTree = isRecord(result.frameTree) ? result.frameTree : null;
+    const identity = (tree: unknown): FrameIdentity | null => {
+      if (!isRecord(tree) || !isRecord(tree.frame)) return null;
+      const rawFrame = tree.frame;
+      return {
+        frameId: typeof rawFrame.id === "string" ? rawFrame.id : "top",
+        ...(typeof rawFrame.loaderId === "string" ? { loaderId: rawFrame.loaderId } : {}),
+        ...(typeof rawFrame.url === "string" ? { url: rawFrame.url } : {}),
+      };
+    };
+    const root = identity(rootTree);
+    if (root === null) {
+      throw Object.assign(new Error(`Frame is not reachable from this tab: ${String(requestedFrameId)}`), {
+        code: "frame_not_found",
+      });
+    }
+    if (requestedFrameId === undefined || requestedFrameId === root.frameId) {
+      return { frame: root, root };
+    }
+    const pending: unknown[] = isRecord(rootTree) && Array.isArray(rootTree.childFrames)
+      ? [...rootTree.childFrames]
+      : [];
+    pending.push(...await this.attachedFrameTrees(tabId));
+    while (pending.length > 0) {
+      const tree = pending.pop();
+      const frame = identity(tree);
+      if (frame === null) continue;
+      if (frame.frameId === requestedFrameId) return { frame, root };
+      if (isRecord(tree) && Array.isArray(tree.childFrames)) {
+        pending.push(...tree.childFrames);
+      }
+    }
+    throw Object.assign(new Error(`Frame is not reachable from this tab: ${String(requestedFrameId)}`), {
+      code: "frame_not_found",
+    });
+  }
+
+  private async attachedFrameTrees(tabId: number): Promise<unknown[]> {
+    const trees: unknown[] = [];
+    const session = this.sessions.get(tabId);
+    if (!session) return trees;
+    for (const sessionId of new Set(session.frameSessions.values())) {
+      const result = await this.send(tabId, "Page.getFrameTree", {}, false, sessionId);
+      if (isRecord(result.frameTree)) trees.push(result.frameTree);
+    }
+    return trees;
+  }
+
+  private async frameIdentity(tabId: number, requestedFrameId?: string): Promise<FrameIdentity> {
+    return (await this.frameIdentities(tabId, requestedFrameId)).frame;
+  }
+
+
+  private async frameDocument(tabId: number, requestedFrameId?: string): Promise<FrameDocument> {
+    const { frame, root } = await this.frameIdentities(tabId, requestedFrameId);
+    const session = this.sessions.get(tabId);
+    const sessionId = frame.frameId === root.frameId ? undefined : session?.frameSessions.get(frame.frameId);
+    if (sessionId !== undefined || frame.frameId === root.frameId) {
+      const document = await this.send(tabId, "DOM.getDocument", { depth: 0 }, false, sessionId);
+      const rawRoot = isRecord(document.root) ? document.root : null;
+      if (
+        rawRoot === null ||
+        typeof rawRoot.nodeId !== "number" ||
+        typeof rawRoot.backendNodeId !== "number"
+      ) {
+        throw Object.assign(new Error("Could not inspect the requested frame document"), {
+          code: "frame_unavailable",
+        });
+      }
+      return {
+        ...frame,
+        rootNodeId: rawRoot.nodeId,
+        documentId: `${frame.frameId}:${frame.loaderId ?? ""}:${rawRoot.backendNodeId}`,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+      };
+    }
+    const contextId = session?.frameContexts.get(frame.frameId);
+    if (contextId === undefined) {
+      throw Object.assign(
+        new Error("Frame-scoped control is unavailable because Chrome did not expose a debugger execution context"),
+        { code: "frame_unavailable" },
+      );
+    }
+    const evaluated = await this.send(tabId, "Runtime.evaluate", {
+      expression: "document",
+      contextId,
+      returnByValue: false,
+    });
+    const object = isRecord(evaluated.result) ? evaluated.result : null;
+    if (typeof object?.objectId !== "string") {
+      throw Object.assign(new Error("Frame document execution context is no longer available"), {
+        code: "stale_ref",
+      });
+    }
+    const requested = await this.send(tabId, "DOM.requestNode", { objectId: object.objectId });
+    if (typeof requested.nodeId !== "number") {
+      throw Object.assign(new Error("Could not inspect the requested frame document"), {
+        code: "frame_unavailable",
+      });
+    }
+    const described = await this.send(tabId, "DOM.describeNode", { nodeId: requested.nodeId, depth: 0 });
+    const node = isRecord(described.node) ? described.node : null;
+    if (typeof node?.backendNodeId !== "number") {
+      throw Object.assign(new Error("Could not inspect the requested frame document"), {
+        code: "frame_unavailable",
+      });
+    }
+    return {
+      ...frame,
+      rootNodeId: requested.nodeId,
+      documentId: `${frame.frameId}:${frame.loaderId ?? ""}:${node.backendNodeId}`,
+      contextId,
+    };
+  }
+
+  private async initializeChildFrameSession(tabId: number, sessionId: string): Promise<void> {
+    for (const method of ["Page.enable", "DOM.enable", "Accessibility.enable", "Runtime.enable"]) {
+      await this.send(tabId, method, {}, false, sessionId);
+    }
+    await this.send(tabId, "Target.setAutoAttach", {
+      autoAttach: true, waitForDebuggerOnStart: false, flatten: true,
+    }, false, sessionId);
   }
 
   private async ensureAttached(tabId: number): Promise<void> {
@@ -1815,6 +2689,8 @@ export class StandardBrowserRuntime {
         pageLoadInFlight: false,
         downloads: new Map(),
         dialogGeneration: 0,
+        frameContexts: new Map(),
+        frameSessions: new Map(),
       };
       this.sessions.set(tabId, session);
     }
@@ -1849,6 +2725,16 @@ export class StandardBrowserRuntime {
             session.lastNetworkActivity = Date.now();
           }
         }
+        await this.authorizeDebuggerUse(tabId);
+        await chrome.debugger.sendCommand(
+          { tabId },
+          "Target.setAutoAttach",
+          { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+        );
+        // Run animation-frame-driven widgets in background tabs without activating Chrome.
+        // Chrome clears this target-scoped override when the debugger detaches.
+        await this.authorizeDebuggerUse(tabId);
+        await chrome.debugger.sendCommand({ tabId }, "Emulation.setFocusEmulationEnabled", { enabled: true });
       } catch (error) {
         try {
           await this.detachTrackedSession(tabId, session);
@@ -1908,12 +2794,14 @@ export class StandardBrowserRuntime {
     method: string,
     params: Record<string, unknown>,
     recovered = false,
+    sessionId?: string,
   ): Promise<Record<string, unknown>> {
     const session = await this.acquireDebuggerBusyLease(tabId);
     let detached = false;
     try {
       await this.authorizeDebuggerUse(tabId);
-      const result: unknown = await chrome.debugger.sendCommand({ tabId }, method, params);
+      const target: chrome.debugger.DebuggerSession = sessionId === undefined ? { tabId } : { tabId, sessionId };
+      const result: unknown = await chrome.debugger.sendCommand(target, method, params);
       return isRecord(result) ? result : {};
     } catch (error) {
       if (
@@ -1927,7 +2815,7 @@ export class StandardBrowserRuntime {
     } finally {
       this.releaseDebuggerBusyLease(tabId, session);
     }
-    if (detached) return this.send(tabId, method, params, true);
+    if (detached) return this.send(tabId, method, params, true, sessionId);
     throw new Error("unreachable debugger recovery state");
   }
 }

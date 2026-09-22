@@ -5,10 +5,15 @@
   "$defs": {
     "ref": { "type": "string", "minLength": 1, "maxLength": 256 },
     "selector": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "frame_id": { "type": "string", "minLength": 1, "maxLength": 256 },
     "url": { "type": "string", "maxLength": 2048, "pattern": "^(https?://|about:)[^\\s]+$" },
     "action": {
       "oneOf": [
         { "$ref": "#/$defs/click" },
+        { "$ref": "#/$defs/hover" },
+        { "$ref": "#/$defs/double_click" },
+        { "$ref": "#/$defs/context_click" },
+        { "$ref": "#/$defs/press" },
         { "$ref": "#/$defs/type" },
         { "$ref": "#/$defs/fill" },
         { "$ref": "#/$defs/select" },
@@ -28,7 +33,84 @@
       "properties": {
         "kind": { "const": "click" },
         "ref": { "$ref": "#/$defs/ref" },
-        "selector": { "$ref": "#/$defs/selector" }
+        "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
+        "expect_download": { "type": "boolean", "default": false }
+      },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
+      "additionalProperties": false
+    },
+    "hover": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "hover" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" }
+      },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
+      "additionalProperties": false
+    },
+    "double_click": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "double_click" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
+        "expect_download": { "type": "boolean", "default": false }
+      },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
+      "additionalProperties": false
+    },
+    "context_click": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "context_click" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
+        "expect_download": { "type": "boolean", "default": false }
+      },
+      "oneOf": [
+        { "required": ["ref"] },
+        { "required": ["selector"] }
+      ],
+      "additionalProperties": false
+    },
+    "press": {
+      "type": "object",
+      "required": ["kind", "key"],
+      "properties": {
+        "kind": { "const": "press" },
+        "ref": { "$ref": "#/$defs/ref" },
+        "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
+        "expect_download": { "type": "boolean", "default": false },
+        "key": {
+          "enum": [
+            "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "Escape",
+            "Tab", "Home", "End", "Space", "Backspace", "Delete", "a", "z", "y"
+          ]
+        },
+        "modifiers": {
+          "type": "array",
+          "items": { "enum": ["Alt", "Control", "Meta", "Shift"] },
+          "maxItems": 4,
+          "uniqueItems": true
+        }
       },
       "oneOf": [
         { "required": ["ref"] },
@@ -43,6 +125,7 @@
         "kind": { "const": "type" },
         "ref": { "$ref": "#/$defs/ref" },
         "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
         "text": { "type": "string", "maxLength": 2048 }
       },
       "oneOf": [
@@ -58,6 +141,7 @@
         "kind": { "const": "fill" },
         "ref": { "$ref": "#/$defs/ref" },
         "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
         "text": { "type": "string", "maxLength": 2048 }
       },
       "oneOf": [
@@ -72,6 +156,7 @@
       "properties": {
         "kind": { "const": "select" },
         "ref": { "$ref": "#/$defs/ref" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
         "value": { "type": "string", "maxLength": 2048 }
       },
       "additionalProperties": false
@@ -82,6 +167,7 @@
       "properties": {
         "kind": { "const": "scroll" },
         "ref": { "$ref": "#/$defs/ref" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
         "delta_x": { "type": "integer", "minimum": -100000, "maximum": 100000 },
         "delta_y": { "type": "integer", "minimum": -100000, "maximum": 100000 }
       },
@@ -93,26 +179,38 @@
       "properties": {
         "kind": { "const": "drag" },
         "ref": { "$ref": "#/$defs/ref" },
-        "target_ref": { "$ref": "#/$defs/ref" }
+        "target_ref": { "$ref": "#/$defs/ref" },
+        "frame_id": { "$ref": "#/$defs/frame_id" }
       },
       "additionalProperties": false
     },
     "navigate": {
       "type": "object",
       "required": ["kind", "url"],
-      "properties": { "kind": { "const": "navigate" }, "url": { "$ref": "#/$defs/url" } },
+      "properties": {
+        "kind": { "const": "navigate" },
+        "url": { "$ref": "#/$defs/url" },
+        "expect_download": { "type": "boolean", "default": false }
+      },
       "additionalProperties": false
     },
     "history": {
       "type": "object",
       "required": ["kind"],
-      "properties": { "kind": { "enum": ["go_back", "go_forward"] } },
+      "properties": {
+        "kind": { "enum": ["go_back", "go_forward"] },
+        "expect_download": { "type": "boolean", "default": false }
+      },
       "additionalProperties": false
     },
     "reload": {
       "type": "object",
       "required": ["kind"],
-      "properties": { "kind": { "const": "reload" }, "bypass_cache": { "type": "boolean", "default": false } },
+      "properties": {
+        "kind": { "const": "reload" },
+        "bypass_cache": { "type": "boolean", "default": false },
+        "expect_download": { "type": "boolean", "default": false }
+      },
       "additionalProperties": false
     },
     "close": {
@@ -126,8 +224,15 @@
       "required": ["kind", "decision"],
       "properties": {
         "kind": { "const": "dialog" },
-        "decision": { "enum": ["accept", "dismiss"] }
+        "decision": { "enum": ["accept", "dismiss"] },
+        "prompt_text": { "type": "string", "maxLength": 4096 }
       },
+      "allOf": [
+        {
+          "if": { "required": ["prompt_text"] },
+          "then": { "properties": { "decision": { "const": "accept" } } }
+        }
+      ],
       "additionalProperties": false
     },
     "upload_file": {
@@ -137,6 +242,7 @@
         "kind": { "const": "upload_file" },
         "ref": { "$ref": "#/$defs/ref" },
         "selector": { "$ref": "#/$defs/selector" },
+        "frame_id": { "$ref": "#/$defs/frame_id" },
         "files": {
           "type": "array",
           "minItems": 1,

@@ -27,6 +27,15 @@ describe("AgentTab operation card rendering", () => {
     expect(rendered).not.toContain("private@example.com");
   });
 
+  test("press action cards show the targeted key without treating it as text input", () => {
+    const component = createCallComponent("browser_act", {
+      tab_id: 12,
+      expected_page_revision: 4,
+      actions: [{ kind: "press", ref: "ref=e5", key: "Enter" }],
+    }, theme);
+    expect(component.render(120)[0]).toContain("Press key · e5 · Enter · tab 12 · rev 4 · task-owned");
+  });
+
   test("compact wait cards identify condition, target, tab, and ownership", () => {
     const component = createCallComponent("browser_wait", {
       tab_id: 7,
@@ -90,6 +99,7 @@ describe("AgentTab operation card rendering", () => {
     expect(rendered).toContain("Evidence · 1 new tab");
     expect(rendered).toContain("Dialog · Confirm opened");
   });
+
 
   test("tab results summarize task lineage without dumping JSON", () => {
     const component = createResultComponent(

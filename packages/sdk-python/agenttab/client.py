@@ -13,7 +13,7 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, Mapping, Protocol, Sequence
+from typing import Any, BinaryIO, Literal, Mapping, NotRequired, Protocol, Sequence, TypedDict
 
 RPC_PROTOCOL = "agenttab.rpc"
 RPC_VERSION = 1
@@ -36,6 +36,83 @@ MUTATIONS = {
 }
 
 JsonObject = dict[str, Any]
+
+BrowserPressKey = Literal[
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "Escape", "Tab",
+    "Home", "End", "Space", "Backspace", "Delete", "a", "z", "y",
+]
+BrowserPressModifier = Literal["Alt", "Control", "Meta", "Shift"]
+SelectorWaitState = Literal["attached", "detached", "visible", "hidden", "enabled"]
+
+
+class BrowserGestureAction(TypedDict):
+    kind: Literal["click", "hover", "double_click", "context_click"]
+    ref: NotRequired[str]
+    selector: NotRequired[str]
+    frame_id: NotRequired[str]
+
+class BrowserDownloadGestureAction(TypedDict):
+    kind: Literal["click", "double_click", "context_click"]
+    expect_download: NotRequired[bool]
+    ref: NotRequired[str]
+    selector: NotRequired[str]
+    frame_id: NotRequired[str]
+
+
+class BrowserPressAction(TypedDict):
+    kind: Literal["press"]
+    key: BrowserPressKey
+    ref: NotRequired[str]
+    selector: NotRequired[str]
+    frame_id: NotRequired[str]
+    modifiers: NotRequired[list[BrowserPressModifier]]
+    expect_download: NotRequired[bool]
+
+
+class BrowserTextAction(TypedDict):
+    kind: Literal["type", "fill", "select", "upload_file"]
+    ref: NotRequired[str]
+    selector: NotRequired[str]
+    frame_id: NotRequired[str]
+    text: NotRequired[str]
+    value: NotRequired[str]
+    files: NotRequired[list[str]]
+
+
+class BrowserDialogAction(TypedDict):
+    kind: Literal["dialog"]
+    decision: Literal["accept", "dismiss"]
+    prompt_text: NotRequired[str]
+
+
+class BrowserNavigationAction(TypedDict):
+    kind: Literal["close", "scroll", "drag"]
+    url: NotRequired[str]
+    bypass_cache: NotRequired[bool]
+    ref: NotRequired[str]
+    target_ref: NotRequired[str]
+    frame_id: NotRequired[str]
+    delta_x: NotRequired[int]
+    delta_y: NotRequired[int]
+
+
+class BrowserDownloadNavigationAction(TypedDict):
+    kind: Literal["navigate", "go_back", "go_forward", "reload"]
+    expect_download: NotRequired[bool]
+    url: NotRequired[str]
+    bypass_cache: NotRequired[bool]
+
+
+BrowserAction = BrowserGestureAction | BrowserDownloadGestureAction | BrowserPressAction | BrowserTextAction | BrowserDialogAction | BrowserNavigationAction | BrowserDownloadNavigationAction
+
+
+class BrowserWaitCondition(TypedDict):
+    kind: Literal["load", "network_idle", "download", "url", "text", "selector", "value"]
+    value: NotRequired[str]
+    selector: NotRequired[str]
+    state: NotRequired[SelectorWaitState]
+    frame_id: NotRequired[str]
+    after: NotRequired[str]
 
 
 def resolve_transport_timeout(

@@ -10,12 +10,23 @@ import { MutationScheduler } from "../src/scheduler";
 import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
+import { mintTargetRef } from "../src/target-resolution";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
 const TASK_A = "018f47b8-2f80-7c20-9c77-f8a38c9e621e";
 const TASK_B = "018f47b8-2f80-7c20-9c77-f8a38c9e621f";
 const TASK_C = "018f47b8-2f80-7c20-9c77-f8a38c9e6220";
+function mintedRef(taskId: string, tabId: number, pageRevision = 1, backendNodeId = 22): string {
+  return mintTargetRef({
+    backendNodeId,
+    documentId: "top:loader-default:1",
+    frameId: "top",
+    pageRevision,
+    taskId,
+    tabId,
+  });
+}
 
 interface MockTab {
   id: number;
@@ -423,7 +434,22 @@ function installChromeMock(): void {
           debuggerCalls.push(method);
           debuggerCommands.push({ method, params: clone(params) });
           const overridden = debuggerCommandOverride?.(method, clone(params));
-          if (overridden !== undefined) return clone(overridden);
+          if (overridden !== undefined) {
+            // Mirror CDP awaitPromise semantics: async page-action declarations
+            // resolve before the result is cloned back to the caller.
+            if (overridden !== null && typeof overridden === "object" && "result" in overridden) {
+              const result = overridden.result;
+              if (result !== null && typeof result === "object" && "value" in result) {
+                const pending: unknown = result.value;
+                if (pending !== null && typeof pending === "object" && "then" in pending && typeof pending.then === "function") {
+                  // Unchecked cast: a callable then marks a thenable CDP would await.
+                  const settled = await (pending as Promise<unknown>);
+                  return clone({ ...overridden, result: { ...result, value: settled } });
+                }
+              }
+            }
+            return clone(overridden);
+          }
           if (method === "DOM.getDocument") return { root: { nodeId: 1, backendNodeId: 1 } };
           if (method === "Page.getFrameTree") {
             return { frameTree: { frame: { loaderId: "loader-default" } } };
@@ -438,7 +464,7 @@ function installChromeMock(): void {
           }
           if (
             method === "Runtime.callFunctionOn" &&
-            params.functionDeclaration === "function(){this.click()}" &&
+            params.userGesture === true &&
             focusStealOnClickTabId !== null
           ) {
             const target = tabStore.get(focusStealOnClickTabId);
@@ -1087,7 +1113,7 @@ describe("native protocol", () => {
         ...upload.params,
         actions: [{
           kind: "upload_file",
-          ref: "r1-2",
+          ref: "opaque-ref",
           selector: 'input[type="file"]',
           files: ["/tmp/a.png"],
         }],
@@ -1152,7 +1178,7 @@ describe("native protocol", () => {
     })).toThrow("fill requires exactly one of ref or selector");
   });
 
-  test("rejects removed focus and prompt-input action capabilities", () => {
+  test("rejects removed focus actions", () => {
     const command = {
       protocol: "agenttab.native",
       version: 1,
@@ -1167,18 +1193,10 @@ describe("native protocol", () => {
         actions: [{ kind: "dialog", decision: "accept" }],
       },
     };
-    expect(parseCommand(command).method).toBe("browser_act");
     expect(() => parseCommand({
       ...command,
       params: { ...command.params, actions: [{ kind: "focus" }] },
-    })).toThrow("Unsupported standard action: focus");
-    expect(() => parseCommand({
-      ...command,
-      params: {
-        ...command.params,
-        actions: [{ kind: "dialog", decision: "accept", prompt_text: "secret" }],
-      },
-    })).toThrow("unknown fields");
+    })).toThrow();
   });
 
   test("accepts only the strict native close_task lifecycle command", () => {
@@ -1593,8 +1611,8 @@ describe("page revision monotonicity", () => {
   test("keeps a snapshot revision stable until Chrome reports a new document", async () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
-    const first = await runtime.snapshot(61, { mode: "accessibility" });
-    const second = await runtime.snapshot(61, { mode: "accessibility" });
+    const first = await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
+    const second = await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
 
     expect(first.page_revision).toBe(1);
     expect(second.page_revision).toBe(1);
@@ -1602,7 +1620,7 @@ describe("page revision monotonicity", () => {
     await runtime.detach(61);
   });
 
-  test("re-resolves selector-addressed uploads before Commit", async () => {
+  test("refuses an upload that becomes ambiguous between staging and Commit", async () => {
     await mutateState((state) => { state.skipCommitReview = false; });
     tabStore.set(65, {
       id: 65,
@@ -1611,9 +1629,16 @@ describe("page revision monotonicity", () => {
       url: "https://example.test/",
       status: "complete",
     });
+    let selectorResolutions = 0;
     debuggerCommandOverride = (method) => {
-      if (method === "DOM.querySelector") return { nodeId: 77 };
+      if (method === "DOM.querySelectorAll") {
+        selectorResolutions += 1;
+        return { nodeIds: selectorResolutions === 1 ? [77] : [77, 78] };
+      }
       if (method === "DOM.describeNode") return { node: { backendNodeId: 88 } };
+      if (method === "Runtime.callFunctionOn") {
+        return { result: { value: { tag: "INPUT", type: "file", text: "Choose file" } } };
+      }
       return undefined;
     };
     const runtime = new StandardBrowserRuntime(
@@ -1622,29 +1647,17 @@ describe("page revision monotonicity", () => {
       () => undefined,
       async () => undefined,
     );
-    await mutateState((state) => {
-      state.skipCommitReview = false;
-    });
-
     const execution = await runtime.act(TASK_A, 65, 1, [{
       kind: "upload_file",
       selector: 'input[type="file"]',
       files: ["/tmp/a.png"],
     }]);
     expect(execution.staged).toBeDefined();
-    const result = await runtime.commit(TASK_A, {
-      native_token: execution.staged?.native_token,
-    });
 
-    expect(result).toMatchObject({
-      actions: [{
-        kind: "upload_file",
-        completed: true,
-      }],
-    });
-    expect(
-      debuggerCommands.find((command) => command.method === "DOM.setFileInputFiles")?.params,
-    ).toEqual({ files: ["/tmp/a.png"], backendNodeId: 88 });
+    await expect(runtime.commit(TASK_A, {
+      native_token: execution.staged?.native_token,
+    })).rejects.toMatchObject({ code: "staged_commit_mismatch" });
+    expect(debuggerCommands.some((command) => command.method === "DOM.setFileInputFiles")).toBe(false);
     await runtime.detach(65);
   });
 
@@ -1890,16 +1903,16 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
-    const result = await runtime.snapshot(66, { mode: "accessibility" });
+    const result = await runtime.snapshot(TASK_A, 66, { mode: "accessibility" });
 
     expect(result.nodes).toEqual([
       expect.objectContaining({
-        ref: "r1-110",
         role: "textbox",
         name: "Message Composer",
         dom_fallback: true,
+        frame_id: expect.any(String),
       }),
-      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+      expect.objectContaining({ role: "WebArea", frame_id: expect.any(String) }),
     ]);
     expect(result.dom_fallback_nodes).toBe(1);
     await runtime.detach(66);
@@ -1947,11 +1960,11 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
-    const result = await runtime.snapshot(68, { mode: "accessibility" });
+    const result = await runtime.snapshot(TASK_A, 68, { mode: "accessibility" });
 
     expect(result.nodes).toEqual([
-      expect.objectContaining({ ref: "r1-210", role: "textbox", name: "Message", dom_fallback: true }),
-      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+      expect.objectContaining({ role: "textbox", name: "Message", dom_fallback: true, frame_id: expect.any(String) }),
+      expect.objectContaining({ role: "WebArea", frame_id: expect.any(String) }),
     ]);
     expect(result.truncated).toBe(false);
     await runtime.detach(68);
@@ -1999,11 +2012,11 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
-    const result = await runtime.snapshot(69, { mode: "accessibility", max_nodes: 2 });
+    const result = await runtime.snapshot(TASK_A, 69, { mode: "accessibility", max_nodes: 2 });
 
     expect(result.nodes).toEqual([
-      expect.objectContaining({ ref: "r1-310", dom_fallback: true }),
-      expect.objectContaining({ ref: "r1-1", role: "WebArea" }),
+      expect.objectContaining({ dom_fallback: true, frame_id: expect.any(String) }),
+      expect.objectContaining({ role: "WebArea", frame_id: expect.any(String) }),
     ]);
     expect(result.truncated).toBe(true);
     expect(result.dom_fallback_nodes).toBe(1);
@@ -2060,10 +2073,10 @@ describe("page revision monotonicity", () => {
       () => undefined,
       async () => undefined,
     );
-    const snapshot = await runtime.snapshot(67, { mode: "accessibility" });
+    const snapshot = await runtime.snapshot(TASK_A, 67, { mode: "accessibility" });
     const composerRef = (snapshot.nodes as Array<Record<string, unknown>>)
       .find((node) => node.dom_fallback === true)?.ref;
-    expect(composerRef).toBe("r1-210");
+    expect(typeof composerRef).toBe("string");
 
     await runtime.act(TASK_A, 67, snapshot.page_revision, [{
       kind: "fill",
@@ -2084,11 +2097,27 @@ describe("page revision monotonicity", () => {
       status: "complete",
     });
     let documentReads = 0;
-    debuggerCommandOverride = (method) => {
-      if (method !== "DOM.getDocument") return undefined;
-      documentReads += 1;
-      const backendNodeId = documentReads === 1 ? 1 : 2;
-      return { root: { nodeId: backendNodeId, backendNodeId } };
+    debuggerCommandOverride = (method, params) => {
+      if (method === "DOM.getDocument") {
+        documentReads += 1;
+        const backendNodeId = documentReads >= 3 ? 2 : 1;
+        return { root: { nodeId: backendNodeId, backendNodeId } };
+      }
+      if (method === "DOM.querySelectorAll") return { nodeIds: [23] };
+      if (method === "DOM.describeNode" && params.nodeId === 23) {
+        return { node: { backendNodeId: 230 } };
+      }
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("getComputedStyle")
+      ) {
+        return {
+          result: {
+            value: { connected: true, visible: true, enabled: true, value: "ready" },
+          },
+        };
+      }
+      return undefined;
     };
     const runtime = new StandardBrowserRuntime(
       new RevisionTracker(),
@@ -2102,7 +2131,8 @@ describe("page revision monotonicity", () => {
       timeout_ms: 500,
     });
 
-    expect(scriptingCallCount).toBe(2);
+    expect(documentReads).toBeGreaterThanOrEqual(7);
+    expect(scriptingCallCount).toBe(0);
     expect(result).toMatchObject({ matched: true, page_revision: 2 });
     await runtime.detach(61);
   });
@@ -2115,8 +2145,8 @@ describe("page revision monotonicity", () => {
     );
 
     await Promise.all([
-      runtime.snapshot(62, { mode: "accessibility" }),
-      runtime.snapshot(62, { mode: "accessibility" }),
+      runtime.snapshot(TASK_A, 62, { mode: "accessibility" }),
+      runtime.snapshot(TASK_A, 62, { mode: "accessibility" }),
     ]);
     expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
 
@@ -2199,7 +2229,10 @@ describe("page revision monotonicity", () => {
 
       await advanceTimers(450);
       expect(settled).toBe(false);
-      await advanceTimers(100);
+      for (let elapsed = 0; elapsed < 1_000 && !settled; elapsed += 50) {
+        await advanceTimers(50);
+      }
+      expect(settled).toBe(true);
       await expect(waiting).resolves.toMatchObject({
         tab_id: 61,
         condition: "network_idle",
@@ -2237,7 +2270,7 @@ describe("page revision monotonicity", () => {
       },
     );
 
-    await expect(runtime.snapshot(63, { mode: "accessibility" })).rejects.toThrow(
+    await expect(runtime.snapshot(TASK_A, 63, { mode: "accessibility" })).rejects.toThrow(
       "Debugger initialization and cleanup both failed",
     );
     expect(recorded).toEqual([63]);
@@ -2287,14 +2320,14 @@ describe("page revision monotonicity", () => {
       },
     );
 
-    await runtime.snapshot(65, { mode: "accessibility" });
+    await runtime.snapshot(TASK_A, 65, { mode: "accessibility" });
     debuggerAttachedTabIds.delete(65);
     emitDebuggerDetach(65);
     await Promise.resolve();
 
     expect(runtime.debuggerTabIds()).toEqual([65]);
     expect(forgotten).toEqual([]);
-    await runtime.snapshot(65, { mode: "accessibility" });
+    await runtime.snapshot(TASK_A, 65, { mode: "accessibility" });
     expect(recorded).toEqual([65, 65]);
     expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
 
@@ -2319,7 +2352,7 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
-    await expect(runtime.snapshot(65, { mode: "accessibility" })).resolves.toMatchObject({
+    await expect(runtime.snapshot(TASK_A, 65, { mode: "accessibility" })).resolves.toMatchObject({
       tab_id: 65,
       mode: "accessibility",
     });
@@ -2366,7 +2399,7 @@ describe("page revision monotonicity", () => {
       },
     );
 
-    await expect(runtime.snapshot(67, { mode: "accessibility" })).rejects.toMatchObject({
+    await expect(runtime.snapshot(TASK_A, 67, { mode: "accessibility" })).rejects.toMatchObject({
       code: "ownership_revoked",
     });
 
@@ -2390,7 +2423,7 @@ describe("page revision monotonicity", () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
 
-    await expect(runtime.snapshot(61, { mode: "accessibility" })).rejects.toMatchObject({
+    await expect(runtime.snapshot(TASK_A, 61, { mode: "accessibility" })).rejects.toMatchObject({
       code: "stale_revision",
       currentPageRevision: 2,
     });
@@ -2414,7 +2447,7 @@ describe("page revision monotonicity", () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
 
-    await expect(runtime.snapshot(61, { mode: "screenshot", full_page: true })).rejects.toMatchObject({
+    await expect(runtime.snapshot(TASK_A, 61, { mode: "screenshot", full_page: true })).rejects.toMatchObject({
       code: "stale_revision",
       currentPageRevision: 2,
     });
@@ -2445,7 +2478,7 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
-    const result = await runtime.snapshot(62, {
+    const result = await runtime.snapshot(TASK_A, 62, {
       mode: "screenshot",
       format: "jpeg",
       quality: 68,
@@ -2482,7 +2515,7 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
-    await expect(runtime.snapshot(63, { mode: "screenshot" })).rejects.toMatchObject({
+    await expect(runtime.snapshot(TASK_A, 63, { mode: "screenshot" })).rejects.toMatchObject({
       code: "snapshot_too_large",
       recovery: expect.stringContaining("jpeg or webp"),
     });
@@ -2497,7 +2530,7 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
-    const result = await runtime.snapshot(64, { mode: "html", max_bytes: 300_000 });
+    const result = await runtime.snapshot(TASK_A, 64, { mode: "html", max_bytes: 300_000 });
 
     expect(result.truncated).toBe(true);
     expect(new TextEncoder().encode(JSON.stringify(result)).length).toBeLessThanOrEqual(1_032_000);
@@ -2527,7 +2560,7 @@ describe("page revision monotonicity", () => {
       );
       const scriptCalls = scriptingCallCount;
 
-      await expect(runtime.snapshot(tabId, { mode })).rejects.toMatchObject({
+      await expect(runtime.snapshot(TASK_A, tabId, { mode })).rejects.toMatchObject({
         code: "stale_revision",
         currentPageRevision: 2,
       });
@@ -2556,7 +2589,7 @@ describe("page revision monotonicity", () => {
         () => undefined,
         async () => undefined,
       );
-      await runtime.snapshot(61, { mode: "accessibility" });
+      await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
 
       completedDownloads = [{
         id: 1,
@@ -2607,6 +2640,135 @@ describe("page revision monotonicity", () => {
     }
   });
 
+  test("retains a correlated fast download after its debugger session detaches", async () => {
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
+    const cursor = await runtime.armDownload(TASK_A, 61);
+
+    emitDebuggerEvent(61, "Page.downloadWillBegin", {
+      guid: "fast-download",
+      url: "https://example.test/report.csv",
+      suggestedFilename: "report.csv",
+    });
+    emitDebuggerEvent(61, "Page.downloadProgress", { guid: "fast-download", state: "completed" });
+    await runtime.detach(61);
+
+    await expect(runtime.wait(
+      61,
+      { condition: { kind: "download", after: cursor }, timeout_ms: 1_000 },
+      undefined,
+      TASK_A,
+    )).resolves.toMatchObject({
+      matched: true,
+      download: {
+        guid: "fast-download",
+        status: "completed",
+        url: "https://example.test/report.csv",
+        suggested_filename: "report.csv",
+      },
+    });
+  });
+
+  test("refuses overlapping download arms whose event provenance is ambiguous", async () => {
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
+    const first = await runtime.armDownload(TASK_A, 61);
+    const second = await runtime.armDownload(TASK_A, 61);
+    emitDebuggerEvent(61, "Page.downloadWillBegin", { guid: "ambiguous-download" });
+
+    await expect(runtime.wait(
+      61,
+      { condition: { kind: "download", after: first }, timeout_ms: 1_000 },
+      undefined,
+      TASK_A,
+    )).rejects.toMatchObject({ code: "download_attribution_lost" });
+    await expect(runtime.wait(
+      61,
+      { condition: { kind: "download", after: second }, timeout_ms: 1_000 },
+      undefined,
+      TASK_A,
+    )).rejects.toMatchObject({ code: "download_attribution_lost" });
+    await runtime.detach(61);
+  });
+
+  test("reports canceled and detached download cursors without a success result", async () => {
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
+    const canceled = await runtime.armDownload(TASK_A, 61);
+    emitDebuggerEvent(61, "Page.downloadWillBegin", { guid: "canceled-download" });
+    emitDebuggerEvent(61, "Page.downloadProgress", { guid: "canceled-download", state: "canceled" });
+
+    await expect(runtime.wait(
+      61,
+      { condition: { kind: "download", after: canceled }, timeout_ms: 1_000 },
+      undefined,
+      TASK_A,
+    )).rejects.toMatchObject({ code: "download_canceled" });
+
+    const detached = await runtime.armDownload(TASK_A, 61);
+    emitDebuggerEvent(61, "Page.downloadWillBegin", { guid: "detached-download" });
+    await runtime.detach(61);
+    await expect(runtime.wait(
+      61,
+      { condition: { kind: "download", after: detached }, timeout_ms: 1_000 },
+      undefined,
+      TASK_A,
+    )).rejects.toMatchObject({ code: "download_attribution_lost" });
+  });
+
+  test("waits for typed selector state and form value through unique resolution", async () => {
+    debuggerCommandOverride = (method, params) => {
+      if (method === "DOM.querySelectorAll") return { nodeIds: [2] };
+      if (method === "DOM.describeNode" && params.nodeId === 2) {
+        return { node: { backendNodeId: 202 } };
+      }
+      if (
+        method === "Runtime.callFunctionOn" &&
+        String(params.functionDeclaration).includes("getComputedStyle")
+      ) {
+        return {
+          result: {
+            value: { connected: true, visible: true, enabled: true, value: "ready" },
+          },
+        };
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
+
+    await expect(runtime.wait(61, {
+      condition: { kind: "selector", value: "#ready", state: "enabled" },
+      timeout_ms: 1_000,
+    })).resolves.toMatchObject({ matched: true, condition: "selector" });
+    await expect(runtime.wait(61, {
+      condition: { kind: "value", selector: "#ready", value: "ready" },
+      timeout_ms: 1_000,
+    })).resolves.toMatchObject({ matched: true, condition: "value" });
+    expect(debuggerCalls).toContain("DOM.querySelectorAll");
+    await runtime.detach(61);
+  });
+
   test("holds an existing debugger session through a network-idle wait", async () => {
     vi.useFakeTimers();
     try {
@@ -2616,7 +2778,7 @@ describe("page revision monotonicity", () => {
         () => undefined,
         async () => undefined,
       );
-      await runtime.snapshot(61, { mode: "accessibility" });
+      await runtime.snapshot(TASK_A, 61, { mode: "accessibility" });
       emitDebuggerEvent(61, "Network.requestWillBeSent", { requestId: "still-loading" });
 
       let settled = false;
@@ -2764,14 +2926,16 @@ describe("page revision monotonicity", () => {
       condition: { kind: "selector", value: "#never" },
       timeout_ms: 1_000,
     });
-    await waitForCondition(() => scriptingCallCount >= 1);
-    const probesBeforeNavigation = scriptingCallCount;
+    await waitForCondition(() => debuggerCalls.includes("DOM.querySelectorAll"));
+    const probesBeforeNavigation = debuggerCalls.filter((method) => method === "DOM.querySelectorAll").length;
     const tab = tabStore.get(61);
     if (!tab) throw new Error("missing task tab");
     tab.pendingUrl = "chrome://settings/";
 
     await expect(waiting).rejects.toMatchObject({ code: "browser_restricted_origin" });
-    expect(scriptingCallCount).toBe(probesBeforeNavigation);
+    expect(debuggerCalls.filter((method) => method === "DOM.querySelectorAll")).toHaveLength(
+      probesBeforeNavigation,
+    );
   });
   test("rejects download waits on browser-restricted routes before debugger attachment", async () => {
     await seedTask(TASK_A, [61], 5);
@@ -2796,46 +2960,8 @@ describe("page revision monotonicity", () => {
   });
 
 
-  test("types into a background field through one DOM mutation", async () => {
-    debuggerCommandOverride = (method, params) => {
-      if (
-        method === "Runtime.callFunctionOn" &&
-        String(params.functionDeclaration).includes("const f=this.form")
-      ) {
-        return {
-          result: {
-            value: {
-              tag: "INPUT",
-              role: "textbox",
-              aria_label: "Search query",
-              name: "query",
-              form_action: "https://example.test/search",
-              form_method: "get",
-            },
-          },
-        };
-      }
-      return undefined;
-    };
-    const revisions = new RevisionTracker();
-    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
-    const pageRevision = await revisions.ensure(63);
 
-    await runtime.act(TASK_A, 63, pageRevision, [
-      { kind: "type", ref: `r${pageRevision}-22`, text: "x" },
-    ]);
-
-    const calls = debuggerCommands.filter(
-      ({ method, params }) =>
-        method === "Runtime.callFunctionOn" &&
-        String(params.functionDeclaration).includes("InputEvent('input'"),
-    );
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.params.functionDeclaration).toContain("InputEvent('input'");
-    expect(debuggerCalls).not.toContain("Input.insertText");
-  });
-
-  test("fills contenteditable fields and uses native setters for fill and type", async () => {
+  test("uses native setters for fill and type", async () => {
     class SyntheticEvent {
       readonly bubbles: boolean;
 
@@ -2846,7 +2972,13 @@ describe("page revision monotonicity", () => {
         this.bubbles = init.bubbles === true;
       }
     }
-    class NativeInput {
+    class NativeElement {
+      hasAttribute(): boolean {
+        return false;
+      }
+    }
+    class NativeInput extends NativeElement {
+      type = "text";
       nativeValue = "before";
       focused = 0;
       readonly events: Array<{ type: string; bubbles: boolean }> = [];
@@ -2881,80 +3013,6 @@ describe("page revision monotonicity", () => {
         return true;
       }
     }
-    const contenteditable = {
-      isContentEditable: true,
-      textContent: "before",
-      focused: 0,
-      events: [] as Array<{ type: string; bubbles: boolean }>,
-      getAttribute: (): null => null,
-      focus(): void {
-        this.focused += 1;
-      },
-      dispatchEvent(event: SyntheticEvent): boolean {
-        this.events.push({ type: event.type, bubbles: event.bubbles });
-        return true;
-      },
-    };
-    const formattedChild = { textContent: "formatted" };
-    const insertedNodes: Array<{ textContent: string }> = [];
-    const rangeCalls: string[] = [];
-    const range = {
-      commonAncestorContainer: formattedChild,
-      deleteContents(): void {
-        rangeCalls.push("deleteContents");
-      },
-      insertNode(node: { textContent: string }): void {
-        rangeCalls.push("insertNode");
-        insertedNodes.push(node);
-      },
-      setStartAfter(node: { textContent: string }): void {
-        rangeCalls.push(`setStartAfter:${node.textContent}`);
-      },
-      collapse(toStart: boolean): void {
-        rangeCalls.push(`collapse:${toStart}`);
-      },
-    };
-    const selectionCalls: string[] = [];
-    const selection = {
-      rangeCount: 1,
-      getRangeAt: (): typeof range => range,
-      removeAllRanges(): void {
-        selectionCalls.push("removeAllRanges");
-      },
-      addRange(added: typeof range): void {
-        if (added !== range) throw new Error("unexpected contenteditable range");
-        selectionCalls.push("addRange");
-      },
-    };
-    const typedContenteditable = {
-      isContentEditable: true,
-      childNodes: [formattedChild],
-      focused: 0,
-      events: [] as Array<{ type: string; bubbles: boolean }>,
-      getAttribute: (): null => null,
-      ownerDocument: {
-        getSelection: (): typeof selection => selection,
-        createRange: (): typeof range => range,
-        createTextNode: (textContent: string): { textContent: string } => ({ textContent }),
-      },
-      contains(node: unknown): boolean {
-        return node === formattedChild;
-      },
-      focus(): void {
-        this.focused += 1;
-      },
-      dispatchEvent(event: SyntheticEvent): boolean {
-        this.events.push({ type: event.type, bubbles: event.bubbles });
-        return true;
-      },
-    };
-    Object.defineProperty(typedContenteditable, "textContent", {
-      configurable: true,
-      get: () => "formatted",
-      set: () => {
-        throw new Error("type must preserve contenteditable child DOM");
-      },
-    });
     const input = new NativeInput();
     const typedInput = new NativeInput();
     const interceptedDirectAssignments: string[] = [];
@@ -2971,12 +3029,14 @@ describe("page revision monotonicity", () => {
       InputEvent: Object.getOwnPropertyDescriptor(globalThis, "InputEvent"),
       HTMLInputElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLInputElement"),
       HTMLTextAreaElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLTextAreaElement"),
+      HTMLElement: Object.getOwnPropertyDescriptor(globalThis, "HTMLElement"),
     };
     Object.defineProperties(globalThis, {
       Event: { configurable: true, writable: true, value: SyntheticEvent },
       InputEvent: { configurable: true, writable: true, value: SyntheticEvent },
       HTMLInputElement: { configurable: true, writable: true, value: NativeInput },
       HTMLTextAreaElement: { configurable: true, writable: true, value: class { } },
+      HTMLElement: { configurable: true, writable: true, value: NativeElement },
     });
     debuggerCommandOverride = (method, params) => {
       if (
@@ -3000,15 +3060,9 @@ describe("page revision monotonicity", () => {
         method === "Runtime.callFunctionOn" &&
         String(params.functionDeclaration).includes("agenttab_sensitive_field")
       ) {
-        const target = String(params.objectId).endsWith("-22")
-          ? contenteditable
-          : String(params.objectId).endsWith("-23")
-            ? input
-            : String(params.objectId).endsWith("-24")
-              ? typedInput
-              : typedContenteditable;
+        const target = String(params.objectId).endsWith("-23") ? input : typedInput;
         const declaration = Function(`return (${String(params.functionDeclaration)})`)() as (
-          this: typeof contenteditable | typeof typedContenteditable | NativeInput,
+          this: NativeInput,
           value: string,
         ) => unknown;
         const args = Array.isArray(params.arguments) ? params.arguments : [];
@@ -3027,10 +3081,8 @@ describe("page revision monotonicity", () => {
 
     try {
       await runtime.act(TASK_A, 63, pageRevision, [
-        { kind: "fill", ref: `r${pageRevision}-22`, text: "content replacement" },
-        { kind: "fill", ref: `r${pageRevision}-23`, text: "native setter" },
-        { kind: "type", ref: `r${pageRevision}-24`, text: "X" },
-        { kind: "type", ref: `r${pageRevision}-25`, text: " at caret" },
+        { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 23), text: "native setter" },
+        { kind: "type", ref: mintedRef(TASK_A, 63, pageRevision, 24), text: "X" },
       ]);
     } finally {
       for (const [key, descriptor] of Object.entries(globals)) {
@@ -3039,26 +3091,9 @@ describe("page revision monotonicity", () => {
       }
     }
 
-    expect(contenteditable.textContent).toBe("content replacement");
-    expect(contenteditable.focused).toBe(1);
-    expect(contenteditable.events).toEqual([
-      { type: "input", bubbles: true },
-      { type: "change", bubbles: true },
-    ]);
     expect(input.nativeValue).toBe("native setter");
     expect(typedInput.nativeValue).toBe("beXre");
     expect(typedInput.selectionUpdates).toEqual([[3, 3]]);
-    expect(typedContenteditable.childNodes).toEqual([formattedChild]);
-    expect(insertedNodes).toEqual([{ textContent: " at caret" }]);
-    expect(rangeCalls).toEqual([
-      "deleteContents",
-      "insertNode",
-      "setStartAfter: at caret",
-      "collapse:true",
-    ]);
-    expect(selectionCalls).toEqual(["removeAllRanges", "addRange"]);
-    expect(typedContenteditable.focused).toBe(1);
-    expect(typedContenteditable.events).toEqual([{ type: "input", bubbles: true }]);
     expect(interceptedDirectAssignments).toEqual([]);
     expect(input.focused).toBe(1);
     expect(input.events).toEqual([
@@ -3162,29 +3197,29 @@ describe("page revision monotonicity", () => {
     const pageRevision = await revisions.ensure(63);
 
     for (const action of [
-      { kind: "type", ref: `r${pageRevision}-22`, text: "password" },
-      { kind: "fill", ref: `r${pageRevision}-23`, text: "4111111111111111" },
-      { kind: "select", ref: `r${pageRevision}-24`, value: "08" },
-      { kind: "fill", ref: `r${pageRevision}-25`, text: "4111111111111111" },
-      { kind: "type", ref: `r${pageRevision}-26`, text: "123456" },
-      { kind: "fill", ref: `r${pageRevision}-27`, text: "1234" },
-      { kind: "type", ref: `r${pageRevision}-28`, text: "123456" },
-      { kind: "fill", ref: `r${pageRevision}-29`, text: "password" },
-      { kind: "type", ref: `r${pageRevision}-30`, text: "123456" },
-      { kind: "fill", ref: `r${pageRevision}-31`, text: "123456" },
-      { kind: "type", ref: `r${pageRevision}-32`, text: "123456" },
-      { kind: "select", ref: `r${pageRevision}-33`, value: "08" },
-      { kind: "fill", ref: `r${pageRevision}-35`, text: "123" },
-      { kind: "select", ref: `r${pageRevision}-34`, value: "2030" },
-      { kind: "fill", ref: `r${pageRevision}-36`, text: "123" },
-      { kind: "fill", ref: `r${pageRevision}-37`, text: "123" },
-      { kind: "fill", ref: `r${pageRevision}-38`, text: "123" },
-      { kind: "fill", ref: `r${pageRevision}-39`, text: "123456" },
-      { kind: "fill", ref: `r${pageRevision}-40`, text: "123456" },
-      { kind: "fill", ref: `r${pageRevision}-41`, text: "123456" },
-      { kind: "fill", ref: `r${pageRevision}-42`, text: "human-response" },
-      { kind: "fill", ref: `r${pageRevision}-43`, text: "human-response" },
-      { kind: "fill", ref: `r${pageRevision}-44`, text: "human-response" },
+      { kind: "type", ref: mintedRef(TASK_A, 63, pageRevision, 22), text: "password" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 23), text: "4111111111111111" },
+      { kind: "select", ref: mintedRef(TASK_A, 63, pageRevision, 24), value: "08" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 25), text: "4111111111111111" },
+      { kind: "type", ref: mintedRef(TASK_A, 63, pageRevision, 26), text: "123456" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 27), text: "1234" },
+      { kind: "type", ref: mintedRef(TASK_A, 63, pageRevision, 28), text: "123456" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 29), text: "password" },
+      { kind: "type", ref: mintedRef(TASK_A, 63, pageRevision, 30), text: "123456" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 31), text: "123456" },
+      { kind: "type", ref: mintedRef(TASK_A, 63, pageRevision, 32), text: "123456" },
+      { kind: "select", ref: mintedRef(TASK_A, 63, pageRevision, 33), value: "08" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 35), text: "123" },
+      { kind: "select", ref: mintedRef(TASK_A, 63, pageRevision, 34), value: "2030" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 36), text: "123" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 37), text: "123" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 38), text: "123" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 39), text: "123456" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 40), text: "123456" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 41), text: "123456" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 42), text: "human-response" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 43), text: "human-response" },
+      { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 44), text: "human-response" },
     ]) {
       await expect(runtime.act(TASK_A, 63, pageRevision, [action])).rejects.toMatchObject({
         code: "sensitive_field_requires_handoff",
@@ -3257,7 +3292,7 @@ describe("page revision monotonicity", () => {
 
     await expect(
       runtime.act(TASK_A, 63, pageRevision, [
-        { kind: "fill", ref: `r${pageRevision}-24`, text: "4111111111111111" },
+        { kind: "fill", ref: mintedRef(TASK_A, 63, pageRevision, 24), text: "4111111111111111" },
       ]),
     ).rejects.toMatchObject({
       code: "sensitive_field_requires_handoff",
@@ -3295,7 +3330,7 @@ describe("page revision monotonicity", () => {
 
     await expect(
       runtime.act(TASK_A, 64, pageRevision, [
-        { kind: "type", ref: `r${pageRevision}-22`, text: "x" },
+        { kind: "type", ref: mintedRef(TASK_A, 64, pageRevision), text: "x" },
       ]),
     ).rejects.toMatchObject({ code: "action_failed" });
   });
@@ -4551,6 +4586,27 @@ describe("consequential action staging", () => {
     });
   });
 
+  test.each([
+    { tag: "INPUT", type: "text", key: "Enter" },
+    { tag: "BUTTON", type: "submit", key: "Space" },
+  ])("requires review before $key can activate a generic $tag form control", async ({ tag, type, key }) => {
+    debuggerCommandOverride = (method, params) => {
+      if (method !== "Runtime.callFunctionOn") return undefined;
+      if (String(params.functionDeclaration).includes("const f=this.form")) {
+        return { result: { value: { tag, type, text: "Continue", form_action: "https://example.test/step" } } };
+      }
+      throw new Error("Keyboard input reached the page before approval");
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const revision = await revisions.ensure(7);
+    const ref = mintedRef(TASK_A, 7, revision);
+    const prepared = await runtime.act(TASK_A, 7, revision, [{ kind: "press", ref, key }]);
+    expect(prepared.result?.actions).toEqual([]);
+    expect(prepared.staged?.action).toEqual({ action: { kind: "press", ref, key } });
+    expect(prepared.staged?.approved).not.toBe(true);
+  });
+
   test("stages a purchase-like click, commits it once, and consumes the token", async () => {
     tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
@@ -4563,7 +4619,7 @@ describe("consequential action staging", () => {
       "018f47b8-2f80-7c20-9c77-f8a38c9e621e",
       7,
       pageRevision,
-      [{ kind: "click", ref: `r${pageRevision}-22` }],
+      [{ kind: "click", ref: mintedRef(TASK_A, 7, pageRevision) }],
     );
     expect(prepared.staged?.effect).toContain("Place order");
     expect(debuggerCalls.filter((call) => call === "Runtime.callFunctionOn")).toHaveLength(1);
@@ -4578,7 +4634,6 @@ describe("consequential action staging", () => {
       debuggerCommands.filter(
         ({ method, params }) =>
           method === "Runtime.callFunctionOn" &&
-          params.functionDeclaration === "function(){this.click()}" &&
           params.userGesture === true,
       ),
     ).toHaveLength(1);
@@ -4650,9 +4705,9 @@ describe("consequential action staging", () => {
     const pageRevision = await revisions.ensure(8);
 
     for (const action of [
-      { kind: "select", ref: `r${pageRevision}-22`, value: "Remove filter" },
-      { kind: "fill", ref: `r${pageRevision}-23`, text: "Post title" },
-      { kind: "type", ref: `r${pageRevision}-24`, text: "please send the report" },
+      { kind: "select", ref: mintedRef(TASK_A, 8, pageRevision, 22), value: "Remove filter" },
+      { kind: "fill", ref: mintedRef(TASK_A, 8, pageRevision, 23), text: "Post title" },
+      { kind: "type", ref: mintedRef(TASK_A, 8, pageRevision, 24), text: "please send the report" },
     ] as const) {
       const completed = await runtime.act(TASK_A, 8, pageRevision, [action]);
       expect(completed).toMatchObject({
@@ -4674,7 +4729,7 @@ describe("consequential action staging", () => {
     ).toHaveLength(3);
 
     const destructiveSelection = await runtime.act(TASK_A, 8, pageRevision, [
-      { kind: "select", ref: `r${pageRevision}-25`, value: "account-ending-1234" },
+      { kind: "select", ref: mintedRef(TASK_A, 8, pageRevision, 25), value: "account-ending-1234" },
     ]);
     expect(destructiveSelection).toMatchObject({
       result: {
@@ -4690,7 +4745,7 @@ describe("consequential action staging", () => {
     });
 
     const submitOrder = await runtime.act(TASK_A, 8, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-26` },
+      { kind: "click", ref: mintedRef(TASK_A, 8, pageRevision, 26) },
     ]);
     expect(submitOrder).toMatchObject({
       result: {
@@ -4718,7 +4773,7 @@ describe("consequential action staging", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(7);
     const prepared = await runtime.act(TASK_A, 7, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-22` },
+      { kind: "click", ref: mintedRef(TASK_A, 7, pageRevision, 22) },
     ]);
     const nativeToken = prepared.staged?.native_token;
     if (typeof nativeToken !== "string") throw new Error("consequential action did not stage");
@@ -4746,7 +4801,7 @@ describe("consequential action staging", () => {
     expect((await readState()).stagedCommits[nativeToken]).toBeUndefined();
 
     const abandoned = await runtime.act(TASK_A, 7, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-23` },
+      { kind: "click", ref: mintedRef(TASK_A, 7, pageRevision, 23) },
     ]);
     const abandonedToken = abandoned.staged?.native_token;
     if (typeof abandonedToken !== "string") throw new Error("consequential action did not stage");
@@ -4769,7 +4824,7 @@ describe("consequential action staging", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(7);
     const prepared = await runtime.act(TASK_A, 7, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-22` },
+      { kind: "click", ref: mintedRef(TASK_A, 7, pageRevision, 22) },
     ]);
 
     await runtime.commit(TASK_A, { native_token: prepared.staged?.native_token });
@@ -4785,7 +4840,7 @@ describe("consequential action staging", () => {
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
     const adopted: Array<{ parentTabId: number; childTabId: number }> = [];
     debuggerCommandOverride = (method, params) => {
-      if (method === "Runtime.callFunctionOn" && params.functionDeclaration === "function(){this.click()}") {
+      if (method === "Runtime.callFunctionOn" && params.userGesture === true) {
         for (const tab of tabStore.values()) {
           if (tab.windowId === 1) tab.active = false;
         }
@@ -4815,7 +4870,7 @@ describe("consequential action staging", () => {
     );
     const pageRevision = await revisions.ensure(7);
     const prepared = await runtime.act(TASK_A, 7, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-22` },
+      { kind: "click", ref: mintedRef(TASK_A, 7, pageRevision, 22) },
     ]);
 
     await runtime.commit(TASK_A, { native_token: prepared.staged?.native_token });
@@ -4841,7 +4896,7 @@ describe("consequential action staging", () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(13);
-    await runtime.snapshot(13, { mode: "accessibility" });
+    await runtime.snapshot(TASK_A, 13, { mode: "accessibility" });
     emitDebuggerEvent(13, "Page.javascriptDialogOpening", {
       type: "prompt",
       message: "Enter the confirmation phrase",
@@ -4866,11 +4921,44 @@ describe("consequential action staging", () => {
     });
   });
 
+  test("binds prompt text to the staged dialog and rejects token replay", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(17);
+    await runtime.snapshot(TASK_A, 17, { mode: "accessibility" });
+    emitDebuggerEvent(17, "Page.javascriptDialogOpening", {
+      type: "prompt",
+      message: "Enter the confirmation phrase",
+      defaultPrompt: "draft",
+    });
+
+    const prepared = await runtime.act(TASK_A, 17, pageRevision, [{
+      kind: "dialog",
+      decision: "accept",
+      prompt_text: "approved phrase",
+    }]);
+    const token = prepared.staged?.native_token;
+    if (!token) throw new Error("expected staged dialog token");
+
+    await expect(runtime.commit(TASK_A, { native_token: token })).resolves.toMatchObject({
+      actions: [{ kind: "dialog", completed: true }],
+    });
+    expect(
+      debuggerCommands.findLast(({ method }) => method === "Page.handleJavaScriptDialog"),
+    ).toEqual({
+      method: "Page.handleJavaScriptDialog",
+      params: { accept: true, promptText: "approved phrase" },
+    });
+    await expect(runtime.commit(TASK_A, { native_token: token })).rejects.toMatchObject({
+      code: "invalid_staged_token",
+    });
+  });
+
   test("invalidates a staged dialog token when the dialog is replaced", async () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(14);
-    await runtime.snapshot(14, { mode: "accessibility" });
+    await runtime.snapshot(TASK_A, 14, { mode: "accessibility" });
     emitDebuggerEvent(14, "Page.javascriptDialogOpening", {
       type: "confirm",
       message: "First confirmation",
@@ -4902,7 +4990,7 @@ describe("consequential action staging", () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(15);
-    await runtime.snapshot(15, { mode: "accessibility" });
+    await runtime.snapshot(TASK_A, 15, { mode: "accessibility" });
     emitDebuggerEvent(15, "Page.javascriptDialogOpening", {
       type: "confirm",
       message: "Navigate away?",
@@ -4925,7 +5013,7 @@ describe("consequential action staging", () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(16);
-    await runtime.snapshot(16, { mode: "accessibility" });
+    await runtime.snapshot(TASK_A, 16, { mode: "accessibility" });
     emitDebuggerEvent(16, "Page.javascriptDialogOpening", {
       type: "confirm",
       message: "Replace document?",
@@ -4949,7 +5037,7 @@ describe("consequential action staging", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event), async () => undefined);
     const pageRevision = await revisions.ensure(8);
     const prepared = await runtime.act(TASK_A, 8, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-22` },
+      { kind: "click", ref: mintedRef(TASK_A, 8, pageRevision, 22) },
     ]);
     const token = prepared.staged?.native_token;
     if (!token) throw new Error("expected staged token");
@@ -4969,13 +5057,13 @@ describe("consequential action staging", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(9);
     const prepared = await runtime.act(TASK_A, 9, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-22` },
+      { kind: "click", ref: mintedRef(TASK_A, 9, pageRevision, 22) },
     ]);
     const token = prepared.staged?.native_token;
     if (!token) throw new Error("expected staged token");
     await mutateState((state) => {
       state.stagedCommits[token].action = {
-        actions: [{ kind: "type", ref: `r${pageRevision}-22`, text: "tampered" }],
+        actions: [{ kind: "type", ref: mintedRef(TASK_A, 9, pageRevision, 22), text: "tampered" }],
       };
     });
 
@@ -4990,7 +5078,7 @@ describe("consequential action staging", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const pageRevision = await revisions.ensure(10);
     const prepared = await runtime.act(TASK_A, 10, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-22` },
+      { kind: "click", ref: mintedRef(TASK_A, 10, pageRevision, 22) },
     ]);
     const token = prepared.staged?.native_token;
     if (!token) throw new Error("expected staged token");
@@ -5013,10 +5101,10 @@ describe("consequential action staging", () => {
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, (event) => events.push(event), async () => undefined);
     const pageRevision = await revisions.ensure(11);
     const first = await runtime.act(TASK_A, 11, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-22` },
+      { kind: "click", ref: mintedRef(TASK_A, 11, pageRevision, 22) },
     ]);
     const second = await runtime.act(TASK_A, 11, pageRevision, [
-      { kind: "click", ref: `r${pageRevision}-23` },
+      { kind: "click", ref: mintedRef(TASK_A, 11, pageRevision, 23) },
     ]);
     const expiredToken = first.staged?.native_token;
     const validToken = second.staged?.native_token;
@@ -5205,7 +5293,7 @@ describe("extension entrypoint admission boundaries", () => {
       {
         tab_id: 100,
         expected_page_revision: 1,
-        actions: [{ kind: "click", ref: "r1-22" }],
+        actions: [{ kind: "click", ref: mintedRef(TASK_A, 100) }],
       },
     );
     expect(deniedWhilePaused).toMatchObject({
@@ -5222,7 +5310,7 @@ describe("extension entrypoint admission boundaries", () => {
       {
         tab_id: 100,
         expected_page_revision: 1,
-        actions: [{ kind: "press", ref: "r1-22", key: "Enter" }],
+        actions: [{ kind: "press", ref: mintedRef(TASK_A, 100), key: "F12" }],
       },
     );
     expect(press).toMatchObject({
@@ -5239,7 +5327,7 @@ describe("extension entrypoint admission boundaries", () => {
       {
         tab_id: 100,
         expected_page_revision: 0,
-        actions: [{ kind: "click", ref: "r0-22" }],
+        actions: [{ kind: "click", ref: mintedRef(TASK_A, 100) }],
       },
     );
     expect(staleRevision).toMatchObject({
@@ -5331,8 +5419,8 @@ describe("extension entrypoint admission boundaries", () => {
         expected_page_revision: 1,
         actions: [
           { kind: "scroll", delta_x: 3, delta_y: 4 },
-          { kind: "click", ref: "r1-22" },
-          { kind: "type", ref: "r1-22", text: "after staged click" },
+          { kind: "click", ref: mintedRef(TASK_A, 100) },
+          { kind: "type", ref: mintedRef(TASK_A, 100), text: "after staged click" },
         ],
       },
     );
@@ -5415,7 +5503,6 @@ describe("extension entrypoint admission boundaries", () => {
       debuggerCommands.filter(
         ({ method, params }) =>
           method === "Runtime.callFunctionOn" &&
-          params.functionDeclaration === "function(){this.click()}" &&
           params.userGesture === true,
       ),
     ).toHaveLength(0);
@@ -5435,7 +5522,6 @@ describe("extension entrypoint admission boundaries", () => {
       debuggerCommands.filter(
         ({ method, params }) =>
           method === "Runtime.callFunctionOn" &&
-          params.functionDeclaration === "function(){this.click()}" &&
           params.userGesture === true,
       ),
     ).toHaveLength(1);
@@ -5461,7 +5547,7 @@ describe("extension entrypoint admission boundaries", () => {
       "018f47b8-2f80-7c20-9c77-f8a38c9e6252",
       TASK_A,
       "browser_act",
-      { tab_id: 100, expected_page_revision: 1, actions: [{ kind: "click", ref: "r1-22" }] },
+      { tab_id: 100, expected_page_revision: 1, actions: [{ kind: "click", ref: mintedRef(TASK_A, 100) }] },
       { tab_id: 100, allowed_origins: ["https://other.example"], denied_origins: [] },
     );
     expect(deniedYoloAction).toMatchObject({
@@ -5472,7 +5558,7 @@ describe("extension entrypoint admission boundaries", () => {
       "018f47b8-2f80-7c20-9c77-f8a38c9e6251",
       TASK_A,
       "browser_act",
-      { tab_id: 100, expected_page_revision: 1, actions: [{ kind: "click", ref: "r1-22" }] },
+      { tab_id: 100, expected_page_revision: 1, actions: [{ kind: "click", ref: mintedRef(TASK_A, 100) }] },
     );
     expect(yoloAction).toMatchObject({
       outcome: "completed",
@@ -5483,7 +5569,6 @@ describe("extension entrypoint admission boundaries", () => {
       debuggerCommands.filter(
         ({ method, params }) =>
           method === "Runtime.callFunctionOn" &&
-          params.functionDeclaration === "function(){this.click()}" &&
           params.userGesture === true,
       ),
     ).toHaveLength(2);

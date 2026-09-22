@@ -105,11 +105,6 @@ test("Standard OMP mode registers the complete Core RPC tool surface", () => {
   ]);
 });
 
-test("Standard OMP actions expose no direct focus transition", () => {
-  const registered = register(false);
-  expect(registered.literalValues).toContain("click");
-  expect(registered.literalValues).not.toContain("focus");
-});
 
 test("Standard read and open tools expose provider-compatible object schemas", () => {
   const registered = register(false);

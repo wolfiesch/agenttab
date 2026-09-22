@@ -133,6 +133,15 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
             {
                 "tab_id": 1,
                 "expected_page_revision": 2,
+                "actions": [{"kind": "press", "selector": "button.submit", "key": "Enter"}],
+            },
+            mutation=True,
+        ),
+        core_request(
+            "browser_act",
+            {
+                "tab_id": 1,
+                "expected_page_revision": 2,
                 "actions": [
                     {
                         "kind": "upload_file",
@@ -142,6 +151,36 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
                 ],
             },
             mutation=True,
+        ),
+        core_request(
+            "browser_act",
+            {
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "actions": [
+                    {"kind": "hover", "selector": "button.submit", "frame_id": "frame-1"},
+                    {"kind": "double_click", "ref": "e7", "frame_id": "frame-1", "expect_download": True},
+                    {"kind": "context_click", "ref": "e8"},
+                    {"kind": "press", "selector": "input.editor", "key": "z", "modifiers": ["Control", "Shift"]},
+                    {"kind": "dialog", "decision": "accept", "prompt_text": "confirmed"},
+                ],
+            },
+            mutation=True,
+        ),
+        core_request(
+            "browser_wait",
+            {"tab_id": 1, "condition": {"kind": "selector", "value": "input.editor", "state": "visible", "frame_id": "frame-1"}},
+            mutation=False,
+        ),
+        core_request(
+            "browser_wait",
+            {"tab_id": 1, "condition": {"kind": "value", "selector": "input.editor", "value": "ready", "frame_id": "frame-1"}},
+            mutation=False,
+        ),
+        core_request(
+            "browser_wait",
+            {"tab_id": 1, "condition": {"kind": "download", "after": "cursor-1"}},
+            mutation=False,
         ),
         core_request(
             "browser_wait",
@@ -238,6 +277,10 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
     for invalid_action, label in [
         ({"kind": "click"}, "missing click target"),
         ({"kind": "click", "ref": "e1", "selector": "button"}, "ambiguous click target"),
+        ({"kind": "press", "key": "Enter"}, "missing press target"),
+        ({"kind": "press", "ref": "e1", "selector": "button", "key": "Enter"}, "ambiguous press target"),
+        ({"kind": "press", "ref": "e1", "key": "Shift"}, "unsupported press key"),
+        ({"kind": "press", "ref": "e1", "key": "Enter", "modifiers": ["Control", "Control"]}, "duplicate press modifiers"),
         ({"kind": "type", "text": "hello"}, "missing type target"),
         ({"kind": "type", "ref": "e1", "selector": "input", "text": "hello"}, "ambiguous type target"),
         ({"kind": "fill", "text": "hello"}, "missing fill target"),
@@ -253,6 +296,28 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
             mutation=True,
         )
         expect_invalid(request_validator, invalid_req, label)
+    for invalid_action, label in [
+        ({"kind": "dialog", "decision": "dismiss", "prompt_text": "forbidden"}, "dialog prompt dismiss"),
+        ({"kind": "dialog", "decision": "accept", "prompt_text": "x" * 4097}, "oversized dialog prompt"),
+        ({"kind": "press", "ref": "e1", "key": "a", "modifiers": ["Control", "Control"]}, "duplicate press modifier"),
+        ({"kind": "hover", "ref": "e1", "expect_download": True}, "hover download expectation"),
+        ({"kind": "hover", "ref": "e1", "selector": "button"}, "ambiguous hover target"),
+    ]:
+        expect_invalid(
+            request_validator,
+            core_request("browser_act", {"tab_id": 1, "expected_page_revision": 2, "actions": [invalid_action]}, mutation=True),
+            label,
+        )
+    for invalid_condition, label in [
+        ({"kind": "download", "after": ""}, "empty download cursor"),
+        ({"kind": "value", "selector": "input", "value": "ok", "state": "visible"}, "value wait state"),
+        ({"kind": "selector", "value": "input", "frame_id": ""}, "empty wait frame"),
+    ]:
+        expect_invalid(
+            request_validator,
+            core_request("browser_wait", {"tab_id": 1, "condition": invalid_condition}, mutation=False),
+            label,
+        )
     unknown = dict(requests[0], unexpected=True)
     expect_invalid(request_validator, unknown, "unknown request field")
 
