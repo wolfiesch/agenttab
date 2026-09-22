@@ -3753,6 +3753,30 @@ describe("ownership and task isolation", () => {
     expect(tabStore.get(22)).toMatchObject({ windowId: 1, groupId: 5, active: false });
   });
 
+  test("opens a page-requested window as an inactive tab in the requesting task", async () => {
+    await seedTask(TASK_A, [21]);
+    tabStore.set(20, { id: 20, windowId: 1, groupId: -1, active: true });
+    const ownership = new OwnershipLedger(
+      new MutationScheduler(),
+      new RevisionTracker(),
+      () => undefined,
+    );
+
+    const childTabId = await ownership.openRequestedChild(21, "https://example.test/report");
+
+    expect((await readState()).tasks[TASK_A]?.tabIds).toEqual([21, childTabId]);
+    expect(tabStore.get(childTabId)).toMatchObject({
+      windowId: 1,
+      groupId: 5,
+      active: false,
+      url: "https://example.test/report",
+    });
+    expect(tabStore.get(20)?.active).toBe(true);
+    await expect(ownership.openRequestedChild(20, "https://example.test/other")).rejects.toMatchObject({
+      code: "ownership_denied",
+    });
+  });
+
   test("preserves a child in a foreign tab group despite its owned opener", async () => {
     await seedTask(TASK_A, [21]);
     tabStore.set(22, {
@@ -4880,6 +4904,62 @@ describe("consequential action staging", () => {
     expect(tabStore.get(90)?.active).toBe(true);
     expect(tabStore.get(91)?.active).toBe(false);
     expect(focusedWindowUpdates).toEqual([1]);
+  });
+
+  test("opens page-requested windows as background task tabs and reports each outcome", async () => {
+    tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    const requested: Array<{ parentTabId: number; url: string }> = [];
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Runtime.callFunctionOn" && params.userGesture === true) {
+        expect(String(params.functionDeclaration)).toContain("captureWindowRequests(this,");
+        return {
+          result: {
+            value: {
+              agenttab_window_requests: [
+                { url: "https://example.test/report", opener_severed: true },
+                { url: "https://example.test/denied", opener_severed: false },
+                { url: "about:blank", opener_severed: true, refused: "script_written_window" },
+              ],
+            },
+          },
+        };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+      async () => undefined,
+      async () => undefined,
+      async () => undefined,
+      async (parentTabId, url) => {
+        requested.push({ parentTabId, url });
+        if (url.endsWith("/denied")) throw Object.assign(new Error("denied"), { code: "ownership_denied" });
+        return 91;
+      },
+    );
+    const pageRevision = await revisions.ensure(7);
+    const prepared = await runtime.act(TASK_A, 7, pageRevision, [
+      { kind: "click", ref: mintedRef(TASK_A, 7, pageRevision, 22) },
+    ]);
+    const committed = await runtime.commit(TASK_A, { native_token: prepared.staged?.native_token });
+
+    expect(requested).toEqual([
+      { parentTabId: 7, url: "https://example.test/report" },
+      { parentTabId: 7, url: "https://example.test/denied" },
+    ]);
+    const action = (committed.actions as Array<Record<string, unknown>>)[0];
+    expect(action.opened_tabs).toEqual([
+      { tab_id: 91, url: "https://example.test/report", outcome: "opened", opener_severed: true },
+      { url: "https://example.test/denied", outcome: "failed", reason: "ownership_denied" },
+      { url: "about:blank", outcome: "refused", reason: "script_written_window" },
+    ]);
+    expect(tabStore.get(90)?.active).toBe(true);
+    expect(focusedWindowUpdates).toEqual([]);
   });
 
   test("rejects dialog acceptance staging when no JavaScript dialog is open", async () => {

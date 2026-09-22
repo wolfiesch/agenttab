@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  captureWindowRequests,
   dispatchDomClick,
   dispatchDomFill,
   dispatchDomPress,
@@ -529,5 +530,121 @@ describe("background DOM input actions", () => {
     } finally {
       restore();
     }
+  });
+});
+
+class CaptureElement {
+  constructor(
+    readonly localName: string,
+    private readonly attributes: Record<string, string> = {},
+  ) {}
+
+  hasAttribute(name: string): boolean {
+    return name in this.attributes;
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes[name] ?? null;
+  }
+}
+
+class CaptureClick {
+  defaultPrevented = false;
+
+  constructor(private readonly path: unknown[]) {}
+
+  composedPath(): unknown[] {
+    return this.path;
+  }
+
+  preventDefault(): void {
+    this.defaultPrevented = true;
+  }
+}
+
+function captureView() {
+  const nativeCalls: unknown[][] = [];
+  const listeners: Array<(event: CaptureClick) => void> = [];
+  const nativeOpen = (...args: unknown[]) => {
+    nativeCalls.push(args);
+    return { native: true };
+  };
+  const view = {
+    Element: CaptureElement,
+    document: { baseURI: "https://app.example/start/" },
+    open: nativeOpen as unknown,
+    addEventListener: (_type: string, listener: (event: CaptureClick) => void) => listeners.push(listener),
+    removeEventListener: (_type: string, listener: (event: CaptureClick) => void) => {
+      listeners.splice(listeners.indexOf(listener), 1);
+    },
+  };
+  const click = (anchor: CaptureElement): CaptureClick => {
+    const event = new CaptureClick([anchor]);
+    for (const listener of [...listeners]) listener(event);
+    return event;
+  };
+  const target = { ownerDocument: { defaultView: view } } as unknown as Element;
+  return { view, nativeOpen, nativeCalls, listeners, click, target };
+}
+
+describe("window request capture", () => {
+  test("diverts new-window requests into a background tab list and restores the page", async () => {
+    const page = captureView();
+    type Open = (url?: string, name?: string, features?: string) => unknown;
+    let returned: unknown[] = [];
+    let anchorEvent: CaptureClick | undefined;
+    let selfAnchorEvent: CaptureClick | undefined;
+
+    const result = await captureWindowRequests(page.target, () => {
+      const open = page.view.open as Open;
+      returned = [
+        open("/report?id=1", "_blank", "width=420,height=320"),
+        open("https://other.example/", "reports", "noopener"),
+        open("", "_blank"),
+        open("javascript:alert(1)"),
+        open("/same", "_self"),
+      ];
+      anchorEvent = page.click(new CaptureElement("a", { href: "child.html", target: "_blank", rel: "opener" }));
+      selfAnchorEvent = page.click(new CaptureElement("a", { href: "next.html" }));
+    });
+
+    expect(returned).toEqual([null, null, null, null, { native: true }]);
+    expect(page.nativeCalls).toEqual([["/same", "_self", undefined]]);
+    expect(anchorEvent?.defaultPrevented).toBe(true);
+    expect(selfAnchorEvent?.defaultPrevented).toBe(false);
+    expect(result).toEqual({
+      agenttab_window_requests: [
+        { url: "https://app.example/report?id=1", opener_severed: true },
+        { url: "https://other.example/", opener_severed: false },
+        { url: "about:blank", opener_severed: true, refused: "script_written_window" },
+        { url: "javascript:alert(1)", opener_severed: true, refused: "unsupported_scheme" },
+        { url: "https://app.example/start/child.html", opener_severed: true },
+      ],
+    });
+    expect(page.view.open).toBe(page.nativeOpen);
+    expect(page.listeners).toEqual([]);
+  });
+
+  test("leaves download anchors to the page and keeps action errors and exceptions", async () => {
+    const page = captureView();
+    let download: CaptureClick | undefined;
+    const quiet = await captureWindowRequests(page.target, () => {
+      download = page.click(new CaptureElement("a", { href: "file.csv", target: "_blank", download: "" }));
+    });
+    expect(quiet).toBeUndefined();
+    expect(download?.defaultPrevented).toBe(false);
+
+    const failed = await captureWindowRequests(page.target, () => {
+      (page.view.open as (url: string) => unknown)("/ignored");
+      return { agenttab_invalid_request: "click target is disabled" };
+    });
+    expect(failed).toEqual({ agenttab_invalid_request: "click target is disabled" });
+    expect(page.view.open).toBe(page.nativeOpen);
+
+    await expect(captureWindowRequests(page.target, () => {
+      throw new Error("handler failed");
+    })).rejects.toThrow("handler failed");
+    expect(page.view.open).toBe(page.nativeOpen);
+    expect(page.listeners).toEqual([]);
   });
 });

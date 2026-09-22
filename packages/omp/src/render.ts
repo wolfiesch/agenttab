@@ -633,7 +633,13 @@ function present(...values: Array<string | undefined>): string[] {
 
 function extractEvidence(details: Record<string, unknown>): string[] {
   const evidence: string[] = [];
-  const openedTabs = Array.isArray(details.opened_tabs) ? details.opened_tabs.length : 0;
+  const actionTabs = Array.isArray(details.actions)
+    ? details.actions.flatMap((action) => {
+      const tabs = toRecord(action).opened_tabs;
+      return Array.isArray(tabs) ? tabs.filter((tab) => fieldString(toRecord(tab), "outcome") === "opened") : [];
+    })
+    : [];
+  const openedTabs = (Array.isArray(details.opened_tabs) ? details.opened_tabs.length : 0) + actionTabs.length;
   const closedTabs = Array.isArray(details.closed_tabs) ? details.closed_tabs.length : 0;
   if (openedTabs > 0) evidence.push(`Evidence · ${openedTabs} new tab${openedTabs === 1 ? "" : "s"}`);
   if (closedTabs > 0) evidence.push(`Evidence · ${closedTabs} tab${closedTabs === 1 ? "" : "s"} closed`);

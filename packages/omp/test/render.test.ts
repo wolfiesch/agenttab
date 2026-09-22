@@ -100,6 +100,24 @@ describe("AgentTab operation card rendering", () => {
     expect(rendered).toContain("Dialog · Confirm opened");
   });
 
+  test("counts only opened page-requested tabs reported on each action", () => {
+    const component = createResultComponent(
+      "browser_act",
+      {
+        details: {
+          page_revision: 6,
+          actions: [
+            { kind: "click", completed: true, opened_tabs: [{ tab_id: 31, outcome: "opened" }, { url: "about:blank", outcome: "refused" }] },
+            { kind: "press", completed: true, opened_tabs: [{ tab_id: 32, outcome: "opened" }] },
+          ],
+        },
+      },
+      { expanded: true },
+      theme,
+      { tab_id: 18, actions: [{ kind: "click", ref: "ref=e3" }, { kind: "press", ref: "ref=e4", key: "Enter" }] },
+    );
+    expect(component.render(120).join("\n")).toContain("Evidence · 2 new tabs");
+  });
 
   test("tab results summarize task lineage without dumping JSON", () => {
     const component = createResultComponent(

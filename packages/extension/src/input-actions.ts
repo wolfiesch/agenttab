@@ -580,6 +580,77 @@ export function dispatchDomPress(
   return defaultResult;
 }
 
+export interface WindowRequest {
+  url: string;
+  opener_severed: boolean;
+  refused?: string;
+}
+
+/**
+ * Runs a gesture action while diverting the new windows it requests. Chrome
+ * activates any window a page opens, so the page's `window.open` returns null
+ * and new-window anchor navigations are cancelled; the extension then opens
+ * each recorded URL as a background task tab. A handler that stops click
+ * propagation or opens a window asynchronously escapes this capture.
+ */
+export async function captureWindowRequests(target: Element, run: () => unknown): Promise<unknown> {
+  const view = target.ownerDocument.defaultView;
+  if (!view) return run();
+  const requests: WindowRequest[] = [];
+  const record = (raw: string, openerSevered: boolean): void => {
+    let url: URL;
+    try {
+      url = new URL(raw, view.document.baseURI);
+    } catch {
+      requests.push({ url: raw.slice(0, 2048), opener_severed: openerSevered, refused: "invalid_url" });
+      return;
+    }
+    const refused = url.protocol === "http:" || url.protocol === "https:"
+      ? undefined
+      : "unsupported_scheme";
+    requests.push({ url: url.href, opener_severed: openerSevered, ...(refused ? { refused } : {}) });
+  };
+  const sameBrowsingContext = (name: string): boolean =>
+    name === "" || name === "_self" || name === "_top" || name === "_parent";
+  const nativeOpen = view.open;
+  view.open = function (url?: string | URL, name?: string, features?: string): WindowProxy | null {
+    // window.open treats an empty name as _blank; only explicit same-context names navigate in place.
+    const targetName = String(name ?? "").toLowerCase();
+    if (targetName !== "" && sameBrowsingContext(targetName)) {
+      return nativeOpen.call(view, url, name, features);
+    }
+    const raw = url === undefined ? "" : String(url);
+    if (raw === "" || raw === "about:blank") {
+      requests.push({ url: "about:blank", opener_severed: true, refused: "script_written_window" });
+      return null;
+    }
+    const featureList = String(features ?? "").toLowerCase().split(/[\s,]+/);
+    record(raw, !featureList.includes("noopener") && !featureList.includes("noreferrer"));
+    return null;
+  };
+  const onClick = (event: Event): void => {
+    if (event.defaultPrevented) return;
+    const anchor = event.composedPath().find((node): node is HTMLAnchorElement =>
+      node instanceof view.Element &&
+      (node.localName === "a" || node.localName === "area") &&
+      node.hasAttribute("href"));
+    if (!anchor || anchor.hasAttribute("download")) return;
+    if (sameBrowsingContext((anchor.getAttribute("target") ?? "").toLowerCase())) return;
+    event.preventDefault();
+    const rel = (anchor.getAttribute("rel") ?? "").toLowerCase().split(/\s+/);
+    record(anchor.getAttribute("href") ?? "", rel.includes("opener") && !rel.includes("noopener"));
+  };
+  view.addEventListener("click", onClick);
+  let result: unknown;
+  try {
+    result = await run();
+  } finally {
+    view.open = nativeOpen;
+    view.removeEventListener("click", onClick);
+  }
+  if (result !== undefined) return result;
+  return requests.length === 0 ? undefined : { agenttab_window_requests: requests };
+}
 
 const PAGE_HELPERS = [
   invalidRequest,
@@ -604,6 +675,7 @@ const PAGE_HELPERS = [
   contenteditableCommandForPress,
   validateEditablePressDefault,
   dispatchEditablePressDefault,
+  captureWindowRequests,
 ].map((helper) => `const ${helper.name}=${helper.toString()};`).join("");
 const PAGE_INPUT_TYPE_TABLES =
   `const TEXT_INPUT_TYPES=${JSON.stringify(TEXT_INPUT_TYPES)};` +
@@ -626,4 +698,12 @@ export function pageDomActionDeclaration(
   prelude = "",
 ): string {
   return `function(...args){${prelude}${PAGE_INPUT_TYPE_TABLES}${PAGE_HELPERS}return (${action.toString()}).apply(this,args)}`;
+}
+
+/** Serializes a click or press whose requested new windows become background task tabs. */
+export function pageGestureActionDeclaration(
+  action: typeof dispatchDomClick | typeof dispatchDomPress,
+  prelude = "",
+): string {
+  return `function(...args){${prelude}${PAGE_INPUT_TYPE_TABLES}${PAGE_HELPERS}return captureWindowRequests(this,()=>(${action.toString()}).apply(this,args))}`;
 }

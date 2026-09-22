@@ -6,6 +6,7 @@ import {
   dispatchDomSelect,
   dispatchDomType,
   pageDomActionDeclaration,
+  pageGestureActionDeclaration,
   validatePressChord,
 } from "./input-actions";
 import { automationRoute, restrictedOriginError } from "./routes";
@@ -81,6 +82,7 @@ const DOM_SENSITIVE_ACTION_PRELUDE =
 const DOWNLOAD_CURSOR_RETENTION_MS = 120_000;
 const MAX_DOWNLOAD_CURSORS = 512;
 const MAX_DOWNLOAD_CURSORS_PER_TAB = 32;
+const MAX_WINDOW_REQUESTS_PER_ACTION = 8;
 
 interface JavaScriptDialog {
   generation: number;
@@ -269,6 +271,7 @@ type EventSink = (event: string, payload: Record<string, unknown>) => void;
 type AuthorizeDebuggerUse = (tabId: number) => Promise<void>;
 type DebuggerLifecycle = (tabId: number) => Promise<void>;
 type AdoptOwnedChild = (parentTabId: number, childTabId: number) => Promise<void>;
+type OpenRequestedChild = (parentTabId: number, url: string) => Promise<number>;
 
 export interface ActionExecution {
   result?: Record<string, unknown>;
@@ -310,6 +313,9 @@ export class StandardBrowserRuntime {
     private readonly recordDebuggerCandidate: DebuggerLifecycle = async () => undefined,
     private readonly forgetDebuggerCandidate: DebuggerLifecycle = async () => undefined,
     private readonly adoptOwnedChild: AdoptOwnedChild = async () => undefined,
+    private readonly openRequestedChild: OpenRequestedChild = async () => {
+      throw Object.assign(new Error("Background task tabs are unavailable"), { code: "action_failed" });
+    },
   ) {
     chrome.debugger.onDetach.addListener((source: { tabId?: number }) => {
       if (source.tabId === undefined) return;
@@ -1912,6 +1918,7 @@ export class StandardBrowserRuntime {
       actionKind: String(kind),
     });
     const backendNodeId = target.backendNodeId;
+    let windowRequests: Array<Record<string, unknown>> = [];
     if (kind === "click" || kind === "press") {
       const [activeTab, existingTabs] = await Promise.all([
         chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab),
@@ -1930,16 +1937,19 @@ export class StandardBrowserRuntime {
       };
       if (session) session.pendingWindowOpen = pendingWindowOpen;
       try {
-        await this.callOnNode(
+        const value = await this.callOnNode(
           tabId,
           backendNodeId,
           kind === "click"
-            ? pageDomActionDeclaration(dispatchDomClick)
-            : pageDomActionDeclaration(dispatchDomPress, DOM_SENSITIVE_ACTION_PRELUDE),
+            ? pageGestureActionDeclaration(dispatchDomClick)
+            : pageGestureActionDeclaration(dispatchDomPress, DOM_SENSITIVE_ACTION_PRELUDE),
           kind === "click" ? [] : [{ value: action.key }, { value: action.modifiers ?? [] }],
           true,
           target,
         );
+        if (isRecord(value) && Array.isArray(value.agenttab_window_requests)) {
+          windowRequests = await this.openWindowRequests(tabId, value.agenttab_window_requests);
+        }
       } finally {
         const [currentActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         const actionOwnsFocusChange =
@@ -2038,8 +2048,50 @@ export class StandardBrowserRuntime {
         code: "invalid_request",
       });
     }
-    return { kind, completed: true, ...downloadResult };
+    return {
+      kind,
+      completed: true,
+      ...(windowRequests.length > 0 ? { opened_tabs: windowRequests } : {}),
+      ...downloadResult,
+    };
   }
+
+  /**
+   * Opens each window a gesture requested as a background tab owned by the
+   * acting task. The page saw `window.open` return null, so a refused or failed
+   * request is reported rather than retried through a focus-stealing route.
+   */
+  private async openWindowRequests(
+    tabId: number,
+    requests: unknown[],
+  ): Promise<Array<Record<string, unknown>>> {
+    const opened: Array<Record<string, unknown>> = [];
+    for (const request of requests.slice(0, MAX_WINDOW_REQUESTS_PER_ACTION)) {
+      if (!isRecord(request) || typeof request.url !== "string") continue;
+      const url = request.url;
+      if (typeof request.refused === "string") {
+        opened.push({ url, outcome: "refused", reason: request.refused });
+        continue;
+      }
+      try {
+        const childTabId = await this.openRequestedChild(tabId, url);
+        opened.push({
+          tab_id: childTabId,
+          url,
+          outcome: "opened",
+          ...(request.opener_severed === true ? { opener_severed: true } : {}),
+        });
+      } catch (error) {
+        opened.push({
+          url,
+          outcome: "failed",
+          reason: isRecord(error) && typeof error.code === "string" ? error.code : "action_failed",
+        });
+      }
+    }
+    return opened;
+  }
+
   private async conditionMatched(
     tabId: number,
     condition: Record<string, unknown>,
@@ -2386,7 +2438,7 @@ export class StandardBrowserRuntime {
     args: Array<Record<string, unknown>>,
     userGesture = false,
     target?: ResolvedTarget,
-  ): Promise<void> {
+  ): Promise<unknown> {
     try {
       const resolved = await this.send(tabId, "DOM.resolveNode", {
         backendNodeId,
@@ -2429,6 +2481,7 @@ export class StandardBrowserRuntime {
             : "Page action raised an exception";
         throw Object.assign(new Error(text), { code: "action_failed" });
       }
+      return isRecord(invoked.result) ? invoked.result.value : undefined;
     } catch (error) {
       if (isRecord(error) && error.code === "stale_ref") throw error;
       const message = error instanceof Error ? error.message : String(error);

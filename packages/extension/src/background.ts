@@ -98,6 +98,7 @@ browser = new StandardBrowserRuntime(
     const child = await chrome.tabs.get(childTabId).catch(() => null);
     if (child) await ownership.adoptOwnedChild(child, parentTabId);
   },
+  (parentTabId, url) => ownership.openRequestedChild(parentTabId, url),
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber((tabId) => browser.discardHumanInteractionCapture(tabId));
