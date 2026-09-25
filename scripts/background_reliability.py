@@ -35,18 +35,21 @@ def frontmost_app() -> str | None:
         return None
 
 
-def chrome_tabs(chrome_app: str) -> dict[str, Any] | None:
+def chrome_tabs(chrome_app: str, *, launched: bool = False) -> dict[str, Any] | None:
     """Return Chrome window, tab, and active-tab IDs without reading page URLs.
 
-    `chrome_app` is an application name or bundle path.
+    `chrome_app` is an application name or bundle path. JXA reports an instance
+    started with `open -n` as not running, so a `launched` instance, whose process
+    the caller has already found, skips that guard.
     """
     if sys.platform != "darwin":
         raise RuntimeError("the background reliability focus probe currently requires macOS")
     application = json.dumps(chrome_app)
+    guard = "" if launched else "if (!chrome.running()) return JSON.stringify({ windows: [] });"
     script = f"""
 function run() {{
 const chrome = Application({application});
-if (!chrome.running()) return JSON.stringify({{ windows: [] }});
+{guard}
 return JSON.stringify({{
   windows: chrome.windows().map((window) => {{
     const active = window.activeTab();
@@ -328,7 +331,7 @@ def wait_for_launched_chrome(launched: LaunchedChrome, timeout_seconds: float) -
             launched.pid = launched.find_pid()
         if launched.pid is not None:
             try:
-                snapshot = chrome_tabs(str(launched.bundle))
+                snapshot = chrome_tabs(str(launched.bundle), launched=True)
             except RuntimeError as error:
                 missing = str(error)
             else:
@@ -405,7 +408,7 @@ def main() -> int:
             )
             wait_for_launched_chrome(launched, args.connect_timeout_seconds)
             chrome_app = str(launched.bundle)
-        baseline = chrome_tabs(chrome_app)
+        baseline = chrome_tabs(chrome_app, launched=launched is not None)
         baseline_frontmost = frontmost_app()
         baseline_active = active_tabs(baseline)
         client, opened = open_background_tab(
@@ -420,7 +423,7 @@ def main() -> int:
         deadline = time.monotonic() + args.duration_seconds
         iteration = 0
         while True:
-            current = chrome_tabs(chrome_app)
+            current = chrome_tabs(chrome_app, launched=launched is not None)
             current_frontmost = frontmost_app()
             violations.extend(
                 focus_violations(
@@ -460,7 +463,7 @@ def main() -> int:
         tab_id = opened["tab_id"]
         cleanup_deadline = time.monotonic() + args.cleanup_timeout_seconds
         try:
-            while tab_id in tab_ids(chrome_tabs(chrome_app)):
+            while tab_id in tab_ids(chrome_tabs(chrome_app, launched=launched is not None)):
                 if time.monotonic() >= cleanup_deadline:
                     cleanup_error = f"disposable task tab {tab_id} remained after client disconnect"
                     break
