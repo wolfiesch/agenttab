@@ -38,6 +38,7 @@ jobs:
             -type f -print -quit)"
           test -n "$chrome_binary"
           "$chrome_binary" --version
+          echo "AGENTTAB_CHROME_BINARY=$chrome_binary" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:
@@ -104,18 +105,15 @@ jobs:
               --target "$target"
           done
 
-      - name: Reload the provisioned AgentTab extension
-        if: ${{ startsWith(runner.name, 'wolfie-m1') }}
-        env:
-          AGENTTAB_CHROME_APP: Google Chrome for Testing
-        run: scripts/reload_unpacked_extension.sh --chrome-app "$AGENTTAB_CHROME_APP"
-
       - name: Verify background-tab reliability through Core RPC v2
         if: ${{ startsWith(runner.name, 'wolfie-m1') }}
-        env:
-          AGENTTAB_CHROME_APP: Google Chrome for Testing
+        shell: bash
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/background_reliability.py \
+            --launch-chrome "$AGENTTAB_CHROME_BINARY" \
+            --extension-dir packages/extension/dist \
+            --host-binary "${CARGO_TARGET_DIR:-$RUNNER_TEMP/agenttab-nightly-cargo}/release/agenttab-host" \
+            --connect-timeout-seconds 30 \
             --duration-seconds 60 \
             --output "$RUNNER_TEMP/agenttab-background-reliability.json"
 

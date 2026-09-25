@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,11 +34,14 @@ def frontmost_app() -> str | None:
         return None
 
 
-def chrome_tabs(chrome_app: str) -> dict[str, Any] | None:
-    """Return Chrome window, tab, and active-tab IDs without reading page URLs."""
+def chrome_tabs(chrome_target: str | int) -> dict[str, Any] | None:
+    """Return Chrome window, tab, and active-tab IDs without reading page URLs.
+
+    `chrome_target` is an application name or, for a launched instance, its process ID.
+    """
     if sys.platform != "darwin":
         raise RuntimeError("the background reliability focus probe currently requires macOS")
-    application = json.dumps(chrome_app)
+    application = json.dumps(chrome_target)
     script = f"""
 function run() {{
 const chrome = Application({application});
@@ -154,6 +160,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval-seconds", type=float, default=2)
     parser.add_argument("--connect-timeout-seconds", type=float, default=10)
     parser.add_argument("--cleanup-timeout-seconds", type=float, default=5)
+    parser.add_argument(
+        "--launch-chrome",
+        metavar="BINARY",
+        help="launch this Chrome executable with an isolated profile, extension, and host",
+    )
+    parser.add_argument("--extension-dir", help="unpacked development extension for --launch-chrome")
+    parser.add_argument("--host-binary", help="agenttab-host executable for --launch-chrome")
     parser.add_argument("--url", default="https://example.com")
     parser.add_argument(
         "--output",
@@ -172,7 +185,96 @@ def parse_args() -> argparse.Namespace:
         parser.error("--connect-timeout-seconds must be positive")
     if args.cleanup_timeout_seconds < 0:
         parser.error("--cleanup-timeout-seconds must be non-negative")
+    if args.launch_chrome and not (args.extension_dir and args.host_binary):
+        parser.error("--launch-chrome requires --extension-dir and --host-binary")
+    if not args.launch_chrome and (args.extension_dir or args.host_binary):
+        parser.error("--extension-dir and --host-binary require --launch-chrome")
     return args
+
+
+@dataclass
+class LaunchedChrome:
+    process: subprocess.Popen[bytes]
+    root: Path
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def launch_isolated_chrome(
+    chrome_binary: str,
+    extension_dir: str,
+    host_binary: str,
+) -> LaunchedChrome:
+    """Start Chrome with a disposable profile that loads the extension and its native host.
+
+    Chrome on macOS and Linux reads per-user native messaging manifests from
+    `<user-data-dir>/NativeMessagingHosts`, and the host inherits Chrome's
+    environment, so the whole runtime stays inside one temporary directory.
+    """
+    identity = json.loads((REPO / "config" / "identity.json").read_text(encoding="utf-8"))
+    extension_id = identity["developmentExtension"]["id"]
+    # A short root keeps `<state>/run/agenttab.sock` under the Unix socket path limit.
+    root = Path(tempfile.mkdtemp(prefix="agt-", dir="/tmp"))
+    profile = root / "profile"
+    manifests = profile / "NativeMessagingHosts"
+    manifests.mkdir(parents=True)
+    (manifests / f"{identity['nativeHost']}.json").write_text(
+        json.dumps({
+            "name": identity["nativeHost"],
+            "description": "AgentTab background reliability probe",
+            "path": str(Path(host_binary).resolve()),
+            "type": "stdio",
+            "allowed_origins": [f"chrome-extension://{extension_id}/"],
+        }),
+        encoding="utf-8",
+    )
+    state = root / "state"
+    os.environ["AGENTTAB_STATE_DIR"] = str(state)
+    with (root / "chrome.log").open("wb") as log:
+        process = subprocess.Popen(
+            [
+                chrome_binary,
+                f"--user-data-dir={profile}",
+                f"--load-extension={Path(extension_dir).resolve()}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "about:blank",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+        )
+    return LaunchedChrome(process=process, root=root)
+
+
+def wait_for_launched_chrome(launched: LaunchedChrome, timeout_seconds: float) -> None:
+    """Wait until the launched browser has a window and its host socket exists."""
+    socket_file = Path(os.environ["AGENTTAB_STATE_DIR"]) / "run" / "agenttab.sock"
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if launched.process.poll() is not None:
+            raise RuntimeError(f"launched Chrome exited with status {launched.process.returncode}")
+        try:
+            snapshot = chrome_tabs(launched.process.pid)
+            if snapshot and snapshot["windows"] and socket_file.exists():
+                return
+        except RuntimeError as error:
+            last_error = error
+        time.sleep(0.25)
+    raise RuntimeError(
+        f"launched Chrome did not open a window with a live AgentTab host within "
+        f"{timeout_seconds:g} seconds: {last_error or 'socket or window missing'}"
+    )
 
 
 def open_background_tab(
@@ -224,9 +326,19 @@ def main() -> int:
     cleanup_error: str | None = None
     opened: dict[str, Any] | None = None
     client: AgentTabClient | None = None
+    launched: LaunchedChrome | None = None
+    chrome_target: str | int = args.chrome_app
 
     try:
-        baseline = chrome_tabs(args.chrome_app)
+        if args.launch_chrome:
+            launched = launch_isolated_chrome(
+                args.launch_chrome,
+                args.extension_dir,
+                args.host_binary,
+            )
+            chrome_target = launched.process.pid
+            wait_for_launched_chrome(launched, args.connect_timeout_seconds)
+        baseline = chrome_tabs(chrome_target)
         baseline_frontmost = frontmost_app()
         baseline_active = active_tabs(baseline)
         client, opened = open_background_tab(
@@ -241,7 +353,7 @@ def main() -> int:
         deadline = time.monotonic() + args.duration_seconds
         iteration = 0
         while True:
-            current = chrome_tabs(args.chrome_app)
+            current = chrome_tabs(chrome_target)
             current_frontmost = frontmost_app()
             violations.extend(
                 focus_violations(
@@ -281,13 +393,16 @@ def main() -> int:
         tab_id = opened["tab_id"]
         cleanup_deadline = time.monotonic() + args.cleanup_timeout_seconds
         try:
-            while tab_id in tab_ids(chrome_tabs(args.chrome_app)):
+            while tab_id in tab_ids(chrome_tabs(chrome_target)):
                 if time.monotonic() >= cleanup_deadline:
                     cleanup_error = f"disposable task tab {tab_id} remained after client disconnect"
                     break
                 time.sleep(0.1)
         except Exception as error:
             cleanup_error = str(error)
+
+    if launched is not None:
+        launched.close()
 
     report = {
         "success": not violations and cleanup_error is None and run_error is None,
