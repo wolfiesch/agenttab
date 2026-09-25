@@ -304,22 +304,24 @@ def wait_for_launched_chrome(launched: LaunchedChrome, timeout_seconds: float) -
     """Wait until the launched browser has a window and its host socket exists."""
     socket_file = Path(os.environ["AGENTTAB_STATE_DIR"]) / "run" / "agenttab.sock"
     deadline = time.monotonic() + timeout_seconds
-    last_error: Exception | None = None
+    missing = "browser process not found"
     while time.monotonic() < deadline:
         if launched.pid is None:
             launched.pid = launched.find_pid()
         if launched.pid is not None:
             try:
                 snapshot = chrome_tabs(launched.pid)
-                if snapshot and snapshot["windows"] and socket_file.exists():
-                    return
             except RuntimeError as error:
-                last_error = error
+                missing = str(error)
+            else:
+                windows = bool(snapshot and snapshot["windows"])
+                if windows and socket_file.exists():
+                    return
+                missing = "no browser window" if not windows else f"no host socket at {socket_file}"
         time.sleep(0.25)
-    state = "browser process not found" if launched.pid is None else "socket or window missing"
     raise RuntimeError(
         f"launched Chrome did not open a window with a live AgentTab host within "
-        f"{timeout_seconds:g} seconds: {last_error or state}"
+        f"{timeout_seconds:g} seconds: {missing}"
     )
 
 
