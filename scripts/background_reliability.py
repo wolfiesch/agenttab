@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -163,7 +164,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--launch-chrome",
         metavar="BINARY",
-        help="launch this Chrome executable with an isolated profile, extension, and host",
+        help="launch this Chrome executable with the extension, host, and a disposable runtime",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        help="Chrome user data directory for --launch-chrome; automation must already be enabled in it",
     )
     parser.add_argument("--extension-dir", help="unpacked development extension for --launch-chrome")
     parser.add_argument("--host-binary", help="agenttab-host executable for --launch-chrome")
@@ -185,47 +190,79 @@ def parse_args() -> argparse.Namespace:
         parser.error("--connect-timeout-seconds must be positive")
     if args.cleanup_timeout_seconds < 0:
         parser.error("--cleanup-timeout-seconds must be non-negative")
-    if args.launch_chrome and not (args.extension_dir and args.host_binary):
-        parser.error("--launch-chrome requires --extension-dir and --host-binary")
-    if not args.launch_chrome and (args.extension_dir or args.host_binary):
-        parser.error("--extension-dir and --host-binary require --launch-chrome")
+    launch_options = (args.profile_dir, args.extension_dir, args.host_binary)
+    if args.launch_chrome and not all(launch_options):
+        parser.error("--launch-chrome requires --profile-dir, --extension-dir, and --host-binary")
+    if not args.launch_chrome and any(launch_options):
+        parser.error("--profile-dir, --extension-dir, and --host-binary require --launch-chrome")
     return args
 
 
 @dataclass
 class LaunchedChrome:
-    process: subprocess.Popen[bytes]
+    binary: Path
+    profile: Path
     root: Path
+    pid: int | None = None
+
+    def find_pid(self) -> int | None:
+        """Return the browser process for this profile, excluding its helper processes."""
+        listing = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,args="],
+            text=True,
+            capture_output=True,
+            check=False,
+        ).stdout
+        marker = f"--user-data-dir={self.profile}"
+        for line in listing.splitlines():
+            pid, _, command = line.strip().partition(" ")
+            if command.startswith(f"{self.binary} ") and marker in command:
+                return int(pid)
+        return None
 
     def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
+        pid = self.pid or self.find_pid()
+        if pid is not None:
             try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    os.kill(pid, 0)
+                    time.sleep(0.1)
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         shutil.rmtree(self.root, ignore_errors=True)
 
 
 def launch_isolated_chrome(
     chrome_binary: str,
+    profile_dir: str,
     extension_dir: str,
     host_binary: str,
 ) -> LaunchedChrome:
-    """Start Chrome with a disposable profile that loads the extension and its native host.
+    """Start Chrome with the built extension, its native host, and a disposable runtime.
 
-    Chrome on macOS and Linux reads per-user native messaging manifests from
-    `<user-data-dir>/NativeMessagingHosts`, and the host inherits Chrome's
-    environment, so the whole runtime stays inside one temporary directory.
+    The profile persists because enabling automation is a user-gesture permission
+    grant that is made once when the runner is provisioned. Chrome on macOS reads
+    per-user native messaging manifests from `<user-data-dir>/NativeMessagingHosts`,
+    and the host inherits Chrome's environment, so each run's host state stays in
+    its own temporary directory. The browser is started through LaunchServices in
+    the background: a process executed directly by a CI agent is not registered
+    with the login session and never answers the Apple events that the focus
+    probe depends on.
     """
+    binary = Path(chrome_binary).resolve()
+    bundle = next((path for path in binary.parents if path.suffix == ".app"), None)
+    if bundle is None:
+        raise RuntimeError(f"{binary} is not inside a macOS application bundle")
+    profile = Path(profile_dir).resolve()
+    if not profile.is_dir():
+        raise RuntimeError(f"Chrome profile {profile} is not provisioned; see docs/verification.md")
     identity = json.loads((REPO / "config" / "identity.json").read_text(encoding="utf-8"))
     extension_id = identity["developmentExtension"]["id"]
-    # A short root keeps `<state>/run/agenttab.sock` under the Unix socket path limit.
-    root = Path(tempfile.mkdtemp(prefix="agt-", dir="/tmp"))
-    profile = root / "profile"
     manifests = profile / "NativeMessagingHosts"
-    manifests.mkdir(parents=True)
+    manifests.mkdir(exist_ok=True)
     (manifests / f"{identity['nativeHost']}.json").write_text(
         json.dumps({
             "name": identity["nativeHost"],
@@ -236,24 +273,31 @@ def launch_isolated_chrome(
         }),
         encoding="utf-8",
     )
+    # A short root keeps `<state>/run/agenttab.sock` under the Unix socket path limit.
+    root = Path(tempfile.mkdtemp(prefix="agt-", dir="/tmp")).resolve()
     state = root / "state"
     os.environ["AGENTTAB_STATE_DIR"] = str(state)
-    with (root / "chrome.log").open("wb") as log:
-        process = subprocess.Popen(
+    launched = LaunchedChrome(binary=binary, profile=profile, root=root)
+    try:
+        subprocess.run(
             [
-                chrome_binary,
+                "open", "-n", "-g", "-a", str(bundle),
+                "--env", f"AGENTTAB_STATE_DIR={state}",
+                "--args",
                 f"--user-data-dir={profile}",
                 f"--load-extension={Path(extension_dir).resolve()}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "about:blank",
             ],
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            env=os.environ.copy(),
+            check=True,
+            capture_output=True,
+            text=True,
         )
-    return LaunchedChrome(process=process, root=root)
+    except subprocess.CalledProcessError as error:
+        launched.close()
+        raise RuntimeError(f"cannot launch {bundle}: {error.stderr.strip()}") from error
+    return launched
 
 
 def wait_for_launched_chrome(launched: LaunchedChrome, timeout_seconds: float) -> None:
@@ -262,18 +306,20 @@ def wait_for_launched_chrome(launched: LaunchedChrome, timeout_seconds: float) -
     deadline = time.monotonic() + timeout_seconds
     last_error: Exception | None = None
     while time.monotonic() < deadline:
-        if launched.process.poll() is not None:
-            raise RuntimeError(f"launched Chrome exited with status {launched.process.returncode}")
-        try:
-            snapshot = chrome_tabs(launched.process.pid)
-            if snapshot and snapshot["windows"] and socket_file.exists():
-                return
-        except RuntimeError as error:
-            last_error = error
+        if launched.pid is None:
+            launched.pid = launched.find_pid()
+        if launched.pid is not None:
+            try:
+                snapshot = chrome_tabs(launched.pid)
+                if snapshot and snapshot["windows"] and socket_file.exists():
+                    return
+            except RuntimeError as error:
+                last_error = error
         time.sleep(0.25)
+    state = "browser process not found" if launched.pid is None else "socket or window missing"
     raise RuntimeError(
         f"launched Chrome did not open a window with a live AgentTab host within "
-        f"{timeout_seconds:g} seconds: {last_error or 'socket or window missing'}"
+        f"{timeout_seconds:g} seconds: {last_error or state}"
     )
 
 
@@ -333,11 +379,13 @@ def main() -> int:
         if args.launch_chrome:
             launched = launch_isolated_chrome(
                 args.launch_chrome,
+                args.profile_dir,
                 args.extension_dir,
                 args.host_binary,
             )
-            chrome_target = launched.process.pid
             wait_for_launched_chrome(launched, args.connect_timeout_seconds)
+            assert launched.pid is not None
+            chrome_target = launched.pid
         baseline = chrome_tabs(chrome_target)
         baseline_frontmost = frontmost_app()
         baseline_active = active_tabs(baseline)
