@@ -105,6 +105,23 @@ jobs:
               --target "$target"
           done
 
+      - name: TEMP diagnose runner Apple events
+        if: ${{ startsWith(runner.name, 'wolfie-m1') }}
+        shell: bash
+        run: |
+          set +e
+          app="$(cd "$(dirname "$AGENTTAB_CHROME_BINARY")/../.." && pwd)"
+          echo "session: $(launchctl managername) asid=$(ps -o sess= -p $$)"
+          p=$(mktemp -d /tmp/agtdiag.XXXX)
+          open -g -n -a "$app" --args --user-data-dir="$p" --no-first-run --no-default-browser-check about:blank
+          sleep 6
+          pgrep -fl -- "--user-data-dir=$p" | grep -v Helper | cut -c1-40
+          lsappinfo list | grep -B1 -A4 "Chrome for Testing" | cut -c1-120
+          osascript -l JavaScript -e "Application(\"$app\").windows().length"; echo rc=$?
+          osascript -l JavaScript -e "Application(\"Google Chrome for Testing\").windows().length"; echo rc=$?
+          osascript -l JavaScript -e 'Application("System Events").processes.whose({name:{_contains:"Chrome for Testing"}}).name()'; echo rc=$?
+          pkill -f -- "--user-data-dir=$p"; sleep 2; rm -rf "$p"
+
       - name: Verify background-tab reliability through Core RPC v2
         if: ${{ startsWith(runner.name, 'wolfie-m1') }}
         shell: bash
