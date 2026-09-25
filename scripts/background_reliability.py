@@ -35,14 +35,14 @@ def frontmost_app() -> str | None:
         return None
 
 
-def chrome_tabs(chrome_target: str | int) -> dict[str, Any] | None:
+def chrome_tabs(chrome_app: str) -> dict[str, Any] | None:
     """Return Chrome window, tab, and active-tab IDs without reading page URLs.
 
-    `chrome_target` is an application name or, for a launched instance, its process ID.
+    `chrome_app` is an application name or bundle path.
     """
     if sys.platform != "darwin":
         raise RuntimeError("the background reliability focus probe currently requires macOS")
-    application = json.dumps(chrome_target)
+    application = json.dumps(chrome_app)
     script = f"""
 function run() {{
 const chrome = Application({application});
@@ -198,26 +198,35 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def browser_processes(binary: Path) -> list[tuple[int, str]]:
+    """Return main browser processes started from `binary`, excluding helpers."""
+    listing = subprocess.run(
+        ["ps", "-axww", "-o", "pid=,args="],
+        text=True,
+        capture_output=True,
+        check=False,
+    ).stdout
+    processes = []
+    for line in listing.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if command == str(binary) or command.startswith(f"{binary} "):
+            processes.append((int(pid), command))
+    return processes
+
+
 @dataclass
 class LaunchedChrome:
     binary: Path
+    bundle: Path
     profile: Path
     root: Path
     pid: int | None = None
 
     def find_pid(self) -> int | None:
-        """Return the browser process for this profile, excluding its helper processes."""
-        listing = subprocess.run(
-            ["ps", "-axww", "-o", "pid=,args="],
-            text=True,
-            capture_output=True,
-            check=False,
-        ).stdout
         marker = f"--user-data-dir={self.profile}"
-        for line in listing.splitlines():
-            pid, _, command = line.strip().partition(" ")
-            if command.startswith(f"{self.binary} ") and marker in command:
-                return int(pid)
+        for pid, command in browser_processes(self.binary):
+            if marker in command:
+                return pid
         return None
 
     def close(self) -> None:
@@ -247,15 +256,24 @@ def launch_isolated_chrome(
     grant that is made once when the runner is provisioned. Chrome on macOS reads
     per-user native messaging manifests from `<user-data-dir>/NativeMessagingHosts`,
     and the host inherits Chrome's environment, so each run's host state stays in
-    its own temporary directory. The browser is started through LaunchServices in
-    the background: a process executed directly by a CI agent is not registered
-    with the login session and never answers the Apple events that the focus
-    probe depends on.
+    its own temporary directory.
+
+    The browser is started through LaunchServices in the background because a
+    process executed directly by a CI agent never answers Apple events. The CI
+    agent cannot address a LaunchServices application by process ID either, so
+    the focus probe addresses the bundle and requires it to be the only running
+    instance.
     """
     binary = Path(chrome_binary).resolve()
     bundle = next((path for path in binary.parents if path.suffix == ".app"), None)
     if bundle is None:
         raise RuntimeError(f"{binary} is not inside a macOS application bundle")
+    running = [pid for pid, _ in browser_processes(binary)]
+    if running:
+        raise RuntimeError(
+            f"{bundle.stem} is already running (pid {', '.join(map(str, running))}); "
+            "the focus probe needs the launched instance to be the only one"
+        )
     profile = Path(profile_dir).resolve()
     if not profile.is_dir():
         raise RuntimeError(f"Chrome profile {profile} is not provisioned; see docs/verification.md")
@@ -277,7 +295,7 @@ def launch_isolated_chrome(
     root = Path(tempfile.mkdtemp(prefix="agt-", dir="/tmp")).resolve()
     state = root / "state"
     os.environ["AGENTTAB_STATE_DIR"] = str(state)
-    launched = LaunchedChrome(binary=binary, profile=profile, root=root)
+    launched = LaunchedChrome(binary=binary, bundle=bundle, profile=profile, root=root)
     try:
         subprocess.run(
             [
@@ -310,7 +328,7 @@ def wait_for_launched_chrome(launched: LaunchedChrome, timeout_seconds: float) -
             launched.pid = launched.find_pid()
         if launched.pid is not None:
             try:
-                snapshot = chrome_tabs(launched.pid)
+                snapshot = chrome_tabs(str(launched.bundle))
             except RuntimeError as error:
                 missing = str(error)
             else:
@@ -375,7 +393,7 @@ def main() -> int:
     opened: dict[str, Any] | None = None
     client: AgentTabClient | None = None
     launched: LaunchedChrome | None = None
-    chrome_target: str | int = args.chrome_app
+    chrome_app: str = args.chrome_app
 
     try:
         if args.launch_chrome:
@@ -386,9 +404,8 @@ def main() -> int:
                 args.host_binary,
             )
             wait_for_launched_chrome(launched, args.connect_timeout_seconds)
-            assert launched.pid is not None
-            chrome_target = launched.pid
-        baseline = chrome_tabs(chrome_target)
+            chrome_app = str(launched.bundle)
+        baseline = chrome_tabs(chrome_app)
         baseline_frontmost = frontmost_app()
         baseline_active = active_tabs(baseline)
         client, opened = open_background_tab(
@@ -403,7 +420,7 @@ def main() -> int:
         deadline = time.monotonic() + args.duration_seconds
         iteration = 0
         while True:
-            current = chrome_tabs(chrome_target)
+            current = chrome_tabs(chrome_app)
             current_frontmost = frontmost_app()
             violations.extend(
                 focus_violations(
@@ -443,7 +460,7 @@ def main() -> int:
         tab_id = opened["tab_id"]
         cleanup_deadline = time.monotonic() + args.cleanup_timeout_seconds
         try:
-            while tab_id in tab_ids(chrome_tabs(chrome_target)):
+            while tab_id in tab_ids(chrome_tabs(chrome_app)):
                 if time.monotonic() >= cleanup_deadline:
                     cleanup_error = f"disposable task tab {tab_id} remained after client disconnect"
                     break

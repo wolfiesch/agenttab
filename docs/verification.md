@@ -47,7 +47,7 @@ Never Commit a real send, purchase, delete, permission grant, or upload against 
 
 ### Nightly background-tab reliability
 
-The nightly workflow runs `scripts/background_reliability.py --launch-chrome` on the trusted M1 runner. Each run starts Chrome for Testing in the background with the freshly built development extension, writes a native messaging manifest for the freshly built host into the profile, keeps host state in a temporary directory, and quits that browser afterwards.
+The nightly workflow runs `scripts/background_reliability.py --launch-chrome` on the trusted M1 runner. Each run starts Chrome for Testing in the background with the freshly built development extension, writes a native messaging manifest for the freshly built host into the profile, keeps host state in a temporary directory, and quits that browser afterwards. The focus probe addresses Chrome for Testing by application bundle, so no other instance of it may be running on the runner.
 
 The profile at `~/Library/Application Support/agenttab-ci/nightly-profile` persists between runs because the optional `scripting` grant needs a user gesture. Provision it once on the runner: open Chrome for Testing with `--user-data-dir` set to that directory and `--load-extension` set to the runner checkout's `packages/extension/dist`, choose **Enable automation** in the AgentTab popup, and quit. If the grant is missing, the probe fails with `AgentTab automation permissions have not been enabled`.
 
