@@ -14,12 +14,26 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.request import Request, urlopen
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "sdk-python"))
+sys.path.insert(0, str(REPO))
 
 from agenttab import AgentTabClient, AgentTabError  # noqa: E402
+from tests.architecture.verify_permissions import DevToolsSocket  # noqa: E402
+
+# Chrome's own tab inventory, read from the AgentTab service worker. The IDs are
+# the `chrome.tabs` IDs that `browser_open` returns; page URLs are never read.
+TAB_INVENTORY = """(async () => {
+  const windows = new Map();
+  for (const tab of await chrome.tabs.query({})) {
+    if (!windows.has(tab.windowId)) windows.set(tab.windowId, []);
+    windows.get(tab.windowId).push({ tab_id: tab.id, active: tab.active });
+  }
+  return { windows: [...windows].map(([window_id, tabs]) => ({ window_id, tabs })) };
+})()"""
 
 
 def frontmost_app() -> str | None:
@@ -35,21 +49,15 @@ def frontmost_app() -> str | None:
         return None
 
 
-def chrome_tabs(chrome_app: str, *, launched: bool = False) -> dict[str, Any] | None:
-    """Return Chrome window, tab, and active-tab IDs without reading page URLs.
-
-    `chrome_app` is an application name or bundle path. JXA reports an instance
-    started with `open -n` as not running, so a `launched` instance, whose process
-    the caller has already found, skips that guard.
-    """
+def chrome_tabs(chrome_app: str) -> dict[str, Any] | None:
+    """Return Chrome window, tab, and active-tab IDs without reading page URLs."""
     if sys.platform != "darwin":
         raise RuntimeError("the background reliability focus probe currently requires macOS")
     application = json.dumps(chrome_app)
-    guard = "" if launched else "if (!chrome.running()) return JSON.stringify({ windows: [] });"
     script = f"""
 function run() {{
 const chrome = Application({application});
-{guard}
+if (!chrome.running()) return JSON.stringify({{ windows: [] }});
 return JSON.stringify({{
   windows: chrome.windows().map((window) => {{
     const active = window.activeTab();
@@ -220,9 +228,10 @@ def browser_processes(binary: Path) -> list[tuple[int, str]]:
 @dataclass
 class LaunchedChrome:
     binary: Path
-    bundle: Path
     profile: Path
     root: Path
+    extension_id: str
+    timeout_seconds: float
     pid: int | None = None
 
     def find_pid(self) -> int | None:
@@ -231,6 +240,38 @@ class LaunchedChrome:
             if marker in command:
                 return pid
         return None
+
+    def tabs(self) -> dict[str, Any]:
+        """Return this browser's tab inventory through its loopback DevTools endpoint."""
+        try:
+            port = int((self.profile / "DevToolsActivePort").read_text(encoding="utf-8").split()[0])
+            request = Request(f"http://127.0.0.1:{port}/json/list", headers={"Accept": "application/json"})
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                targets = json.load(response)
+        except (OSError, ValueError, IndexError) as error:
+            raise RuntimeError(f"Chrome DevTools endpoint is unavailable: {error}") from error
+        worker = f"chrome-extension://{self.extension_id}/"
+        websocket = next(
+            (
+                target["webSocketDebuggerUrl"]
+                for target in targets
+                if isinstance(target, dict)
+                and target.get("type") == "service_worker"
+                and str(target.get("url", "")).startswith(worker)
+                and isinstance(target.get("webSocketDebuggerUrl"), str)
+            ),
+            None,
+        )
+        if websocket is None:
+            raise RuntimeError("the AgentTab service worker is not running")
+        channel = DevToolsSocket(websocket, self.timeout_seconds)
+        try:
+            value = channel.evaluate(TAB_INVENTORY, "tab inventory")
+        finally:
+            channel.close()
+        if not isinstance(value.get("windows"), list):
+            raise RuntimeError("the AgentTab service worker returned an invalid tab inventory")
+        return value
 
     def close(self) -> None:
         pid = self.pid or self.find_pid()
@@ -252,6 +293,7 @@ def launch_isolated_chrome(
     profile_dir: str,
     extension_dir: str,
     host_binary: str,
+    timeout_seconds: float,
 ) -> LaunchedChrome:
     """Start Chrome with the built extension, its native host, and a disposable runtime.
 
@@ -261,22 +303,14 @@ def launch_isolated_chrome(
     and the host inherits Chrome's environment, so each run's host state stays in
     its own temporary directory.
 
-    The browser is started through LaunchServices in the background because a
-    process executed directly by a CI agent never answers Apple events. The CI
-    agent cannot address a LaunchServices application by process ID either, so
-    the focus probe addresses the bundle and requires it to be the only running
-    instance.
+    The browser is started through LaunchServices in the background so it never
+    takes focus, and it exposes a loopback DevTools endpoint for the tab inventory.
+    A CI agent cannot answer the macOS Automation consent that Apple events need.
     """
     binary = Path(chrome_binary).resolve()
     bundle = next((path for path in binary.parents if path.suffix == ".app"), None)
     if bundle is None:
         raise RuntimeError(f"{binary} is not inside a macOS application bundle")
-    running = [pid for pid, _ in browser_processes(binary)]
-    if running:
-        raise RuntimeError(
-            f"{bundle.stem} is already running (pid {', '.join(map(str, running))}); "
-            "the focus probe needs the launched instance to be the only one"
-        )
     profile = Path(profile_dir).resolve()
     if not profile.is_dir():
         raise RuntimeError(f"Chrome profile {profile} is not provisioned; see docs/verification.md")
@@ -294,11 +328,19 @@ def launch_isolated_chrome(
         }),
         encoding="utf-8",
     )
+    # A stale port file from a previous run would point the inventory at a dead endpoint.
+    (profile / "DevToolsActivePort").unlink(missing_ok=True)
     # A short root keeps `<state>/run/agenttab.sock` under the Unix socket path limit.
     root = Path(tempfile.mkdtemp(prefix="agt-", dir="/tmp")).resolve()
     state = root / "state"
     os.environ["AGENTTAB_STATE_DIR"] = str(state)
-    launched = LaunchedChrome(binary=binary, bundle=bundle, profile=profile, root=root)
+    launched = LaunchedChrome(
+        binary=binary,
+        profile=profile,
+        root=root,
+        extension_id=extension_id,
+        timeout_seconds=timeout_seconds,
+    )
     try:
         subprocess.run(
             [
@@ -307,6 +349,8 @@ def launch_isolated_chrome(
                 "--args",
                 f"--user-data-dir={profile}",
                 f"--load-extension={Path(extension_dir).resolve()}",
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=0",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "about:blank",
@@ -331,11 +375,11 @@ def wait_for_launched_chrome(launched: LaunchedChrome, timeout_seconds: float) -
             launched.pid = launched.find_pid()
         if launched.pid is not None:
             try:
-                snapshot = chrome_tabs(str(launched.bundle), launched=True)
+                snapshot = launched.tabs()
             except RuntimeError as error:
                 missing = str(error)
             else:
-                windows = bool(snapshot and snapshot["windows"])
+                windows = bool(snapshot["windows"])
                 if windows and socket_file.exists():
                     return
                 missing = "no browser window" if not windows else f"no host socket at {socket_file}"
@@ -396,7 +440,7 @@ def main() -> int:
     opened: dict[str, Any] | None = None
     client: AgentTabClient | None = None
     launched: LaunchedChrome | None = None
-    chrome_app: str = args.chrome_app
+    inspect: Callable[[], dict[str, Any] | None] = lambda: chrome_tabs(args.chrome_app)
 
     try:
         if args.launch_chrome:
@@ -405,10 +449,11 @@ def main() -> int:
                 args.profile_dir,
                 args.extension_dir,
                 args.host_binary,
+                args.connect_timeout_seconds,
             )
             wait_for_launched_chrome(launched, args.connect_timeout_seconds)
-            chrome_app = str(launched.bundle)
-        baseline = chrome_tabs(chrome_app, launched=launched is not None)
+            inspect = launched.tabs
+        baseline = inspect()
         baseline_frontmost = frontmost_app()
         baseline_active = active_tabs(baseline)
         client, opened = open_background_tab(
@@ -423,7 +468,7 @@ def main() -> int:
         deadline = time.monotonic() + args.duration_seconds
         iteration = 0
         while True:
-            current = chrome_tabs(chrome_app, launched=launched is not None)
+            current = inspect()
             current_frontmost = frontmost_app()
             violations.extend(
                 focus_violations(
@@ -463,7 +508,7 @@ def main() -> int:
         tab_id = opened["tab_id"]
         cleanup_deadline = time.monotonic() + args.cleanup_timeout_seconds
         try:
-            while tab_id in tab_ids(chrome_tabs(chrome_app, launched=launched is not None)):
+            while tab_id in tab_ids(inspect()):
                 if time.monotonic() >= cleanup_deadline:
                     cleanup_error = f"disposable task tab {tab_id} remained after client disconnect"
                     break
