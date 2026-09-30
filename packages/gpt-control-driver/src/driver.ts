@@ -6,7 +6,7 @@ import {
   type BrowserAction,
 } from "../../sdk-typescript/src/index.js";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { parse } from "node-html-parser";
@@ -15,10 +15,19 @@ const COMMIT_REVIEW_TIMEOUT_MS = 300_000;
 const COMMIT_REVIEW_POLL_MS = 500;
 const STATE_DIRECTORY = join(process.env.AGENTTAB_STATE_DIR ?? join(homedir(), ".agenttab"), "gpt-control");
 const PROTOCOL_VERSION = 1;
-const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]';
+// ChatGPT marks each assistant reply with a screen-reader heading followed by the reply body. The older
+// `data-message-author-role` attribute survives only on an empty placeholder, so it is the fallback.
+const ASSISTANT_SELECTORS = ['h4[data-conversation-role="assistant"] + *', '[data-message-author-role="assistant"]'] as const;
+// Present only while ChatGPT is still streaming text or rendering an image.
+const BUSY_SELECTOR = 'button[data-testid="stop-button"], button[aria-label*="Stop" i]';
+const CHATGPT_ORIGIN = "https://chatgpt.com";
+const DOWNLOAD_DIRECTORY = process.env.AGENTTAB_DOWNLOAD_DIR ?? join(homedir(), "Downloads");
+const DOWNLOAD_NAME_PATTERN = /^ChatGPT Image .*\.png$/;
+const DOWNLOAD_TIMEOUT_MS = 60_000;
 const FILE_INPUT_SELECTOR = 'input[type="file"]';
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_HOSTS = ["oaiusercontent.com", "files.openai.com"] as const;
+const BLOB_IMAGE_PATTERN = /^blob:https:\/\/chatgpt\.com\/[0-9a-f-]{36}$/i;
 
 interface DriverRequest {
   version: number;
@@ -329,6 +338,8 @@ async function submitPrompt(session: DriverSession, prompt: string): Promise<voi
 }
 
 function approvedImageUrl(raw: string): string | undefined {
+  // Generated images render from same-origin blob URLs; only the page can resolve them (see saveImage).
+  if (BLOB_IMAGE_PATTERN.test(raw)) return raw;
   let url: URL;
   try {
     url = new URL(raw);
@@ -350,7 +361,9 @@ export function extractAssistantTurn(html: string): { text: string; imageUrls: s
     seen.add(approved);
     images.push(approved);
   }
+  // Image turns have no `.markdown` body; their buttons ("Edit", share) are controls, not model output.
   const content = root.querySelector(".markdown") ?? root;
+  if (content === root) for (const control of root.querySelectorAll("button")) control.remove();
   const text = content.structuredText
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -370,27 +383,47 @@ export function nextAssistantProgress(
   };
 }
 
+/**
+ * Returns the outerHTML of the first or last match, or undefined when nothing matches. Depending on the
+ * extension build a miss is either a `Selector did not match` error or empty content; a real element's
+ * outerHTML is never empty, so both mean the same thing.
+ */
+async function matchedHtml(
+  client: AgentTabClient,
+  tabId: number,
+  selector: string,
+  match: "first" | "last",
+  maxBytes: number,
+): Promise<string | undefined> {
+  try {
+    const snapshot = await client.call<"browser_snapshot", HtmlSnapshot>("browser_snapshot", {
+      tab_id: tabId,
+      mode: "html",
+      selector,
+      match,
+      max_bytes: maxBytes,
+    });
+    return snapshot.content || undefined;
+  } catch (error) {
+    if (error instanceof AgentTabError && error.code === "snapshot_failed" && /Selector did not match/.test(error.message)) return undefined;
+    throw error;
+  }
+}
+
 async function readAssistant(session: DriverSession): Promise<{ count: number; text: string; imageUrls: string[] }> {
   const client = await connectSession(session.sessionId);
   try {
-    let snapshot: HtmlSnapshot;
-    try {
-      snapshot = await client.call<"browser_snapshot", HtmlSnapshot>("browser_snapshot", {
-        tab_id: session.pageId,
-        mode: "html",
-        selector: ASSISTANT_SELECTOR,
-        match: "last",
-        max_bytes: 1_000_000,
-      });
-    } catch (error) {
-      if (error instanceof AgentTabError && error.code === "snapshot_failed" && /Selector did not match/.test(error.message)) {
-        const metadata = await readMetadata(session.sessionId);
-        return { count: metadata.assistantCount, text: "", imageUrls: [] };
-      }
-      throw error;
-    }
-    const turn = extractAssistantTurn(snapshot.content);
     const metadata = await readMetadata(session.sessionId);
+    const unchanged = { count: metadata.assistantCount, text: "", imageUrls: [] };
+    // A turn that is still streaming, or an image still rendering progressive previews, is not a reply yet.
+    if (await matchedHtml(client, session.pageId, BUSY_SELECTOR, "first", 256)) return unchanged;
+    let html: string | undefined;
+    for (const selector of ASSISTANT_SELECTORS) {
+      html = await matchedHtml(client, session.pageId, selector, "last", 1_000_000);
+      if (html) break;
+    }
+    if (!html) return unchanged;
+    const turn = extractAssistantTurn(html);
     const progress = nextAssistantProgress(metadata, turn.fingerprint);
     if (progress) await writeMetadata({ ...metadata, ...progress });
     return {
@@ -398,6 +431,91 @@ async function readAssistant(session: DriverSession): Promise<{ count: number; t
       text: turn.text,
       imageUrls: turn.imageUrls,
     };
+  } finally {
+    client.close();
+  }
+}
+
+async function waitForDownload(since: number): Promise<string> {
+  const deadline = Date.now() + DOWNLOAD_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    for (const name of await readdir(DOWNLOAD_DIRECTORY)) {
+      if (!DOWNLOAD_NAME_PATTERN.test(name)) continue;
+      const path = join(DOWNLOAD_DIRECTORY, name);
+      const info = await stat(path).catch(() => undefined);
+      if (info?.isFile() && info.birthtimeMs >= since && info.size > 0) return path;
+    }
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 250);
+    await promise;
+  }
+  throw new Error(`ChatGPT image download did not appear in ${DOWNLOAD_DIRECTORY} within ${DOWNLOAD_TIMEOUT_MS} ms; set AGENTTAB_DOWNLOAD_DIR if Chrome saves elsewhere`);
+}
+
+async function moveFile(source: string, destination: string): Promise<void> {
+  try {
+    await rename(source, destination);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    await copyFile(source, destination);
+    await rm(source, { force: true });
+  }
+}
+
+async function buttonNodes(client: AgentTabClient, tabId: number, name: RegExp): Promise<{ revision: number; buttons: AccessibilityNode[] }> {
+  const snapshot = await client.call<"browser_snapshot", AccessibilitySnapshot>("browser_snapshot", {
+    tab_id: tabId,
+    mode: "accessibility",
+    max_depth: 80,
+    max_nodes: 5_000,
+  });
+  const buttons = snapshot.nodes.filter((node) => node.role === "button" && typeof node.ref === "string" && name.test(node.name ?? ""));
+  return { revision: snapshot.page_revision, buttons };
+}
+
+/**
+ * Saves a generated image at full resolution. Its blob URL resolves only inside the page, so the image is
+ * downloaded through ChatGPT's own share dialog and moved from Chrome's download directory to `outputPath`.
+ */
+async function saveImage(session: DriverSession, url: string, outputPath: string): Promise<string> {
+  if (!isAbsolute(outputPath)) throw new Error("Image output path must be absolute");
+  if (!BLOB_IMAGE_PATTERN.test(url)) throw new Error("save_image accepts only ChatGPT blob image URLs");
+  const client = await connectSession(session.sessionId);
+  try {
+    // Standard actions target accessibility refs, so the image's share button is found by document position:
+    // the Nth generated image in the thread owns the Nth "Share generated image" button.
+    const thread = await matchedHtml(client, session.pageId, "main", "last", 1_000_000);
+    if (!thread) throw new Error("ChatGPT thread is not rendered");
+    const sources = parse(thread)
+      .querySelectorAll('[data-testid="generated-image-gallery"] img[alt^="Generated image"]')
+      .map((image) => image.getAttribute("src"));
+    const index = sources.lastIndexOf(url);
+    if (index < 0) throw new Error("Generated image is no longer in the ChatGPT thread");
+    const share = await buttonNodes(client, session.pageId, /^Share generated image \d+$/);
+    if (share.buttons.length !== sources.length) {
+      throw new Error(`Found ${share.buttons.length} image share buttons for ${sources.length} generated images`);
+    }
+    const since = Date.now();
+    await completeAction(client, session.pageId, share.revision, [{ kind: "click", ref: share.buttons[index].ref! }]);
+    await client.call("browser_wait", {
+      tab_id: session.pageId,
+      condition: { kind: "selector", value: '[role="dialog"] button[aria-label="Download"]' },
+      timeout_ms: 10_000,
+    }, { timeoutMs: 20_000 });
+    const download = await buttonNodes(client, session.pageId, /^Download$/);
+    const button = download.buttons.at(-1);
+    if (!button?.ref) throw new Error("ChatGPT share dialog has no Download button");
+    await completeAction(client, session.pageId, download.revision, [{ kind: "click", ref: button.ref }]);
+    const downloaded = await waitForDownload(since);
+    await mkdir(dirname(outputPath), { recursive: true });
+    await moveFile(downloaded, outputPath);
+    await chmod(outputPath, 0o600);
+    if (await matchedHtml(client, session.pageId, '[role="dialog"]', "last", 256)) {
+      const close = await buttonNodes(client, session.pageId, /^Close/);
+      const closeButton = close.buttons.at(-1);
+      if (closeButton?.ref) await completeAction(client, session.pageId, close.revision, [{ kind: "click", ref: closeButton.ref }]);
+    }
+    return outputPath;
   } finally {
     client.close();
   }
@@ -485,6 +603,8 @@ async function dispatch(request: DriverRequest): Promise<unknown> {
       return null;
     case "screenshot":
       return captureScreenshot(sessionField(params), stringField(params, "outputPath"));
+    case "save_image":
+      return saveImage(sessionField(params), stringField(params, "url"), stringField(params, "outputPath"));
     default:
       throw new Error(`Unsupported GPT-Control browser driver action: ${request.action}`);
   }

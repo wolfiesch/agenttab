@@ -24,6 +24,18 @@ describe("extractAssistantTurn", () => {
     `);
     expect(turn.imageUrls).toEqual([]);
   });
+
+  test("reads image-only turns: ChatGPT blob images, no control labels", () => {
+    const turn = extractAssistantTurn(`
+      <div data-testid="generated-image-gallery">
+        <button aria-label="Generated image 1"><img src="blob:https://chatgpt.com/6a8feb64-4550-4148-ab34-4a3101d26886"></button>
+        <button aria-label="Edit generated image 1">Edit</button>
+        <img src="blob:https://attacker.example/6a8feb64-4550-4148-ab34-4a3101d26886">
+      </div>
+    `);
+    expect(turn.text).toBe("");
+    expect(turn.imageUrls).toEqual(["blob:https://chatgpt.com/6a8feb64-4550-4148-ab34-4a3101d26886"]);
+  });
 });
 
 describe("nextAssistantProgress", () => {
