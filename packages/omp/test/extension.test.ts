@@ -17,30 +17,105 @@ afterEach(() => {
   else process.env.AGENTTAB_DEVELOPER = originalDeveloper;
 });
 
-const literalValues: unknown[] = [];
-const enumValues: unknown[] = [];
-
-function stubSchema(kind: string): Record<string, unknown> {
-  let schema: Record<string, unknown>;
-  schema = new Proxy({ kind }, {
-    get: (target, property) => property in target
-      ? Reflect.get(target, property)
-      : (..._args: unknown[]) => schema,
-  });
-  return schema;
+/** What a tool schema accepts: field names, string values, per-field upper bounds, and unique-item fields. */
+interface Vocabulary {
+  names: Set<string>;
+  values: Set<string>;
+  limits: Map<string, number>;
+  unique: Set<string>;
 }
 
+function emptyVocabulary(): Vocabulary {
+  return { names: new Set(), values: new Set(), limits: new Map(), unique: new Set() };
+}
+
+function limit(vocabulary: Vocabulary, field: string, bound: number) {
+  vocabulary.limits.set(field, Math.max(vocabulary.limits.get(field) ?? bound, bound));
+}
+
+function absorb(target: Vocabulary, source: Vocabulary) {
+  for (const name of source.names) target.names.add(name);
+  for (const value of source.values) target.values.add(value);
+  for (const [field, bound] of source.limits) limit(target, field, bound);
+  for (const field of source.unique) target.unique.add(field);
+}
+
+/** The same vocabulary read from a JSON Schema tree, as the Pi adapter registers it. */
+function jsonSchemaVocabulary(node: unknown, vocabulary = emptyVocabulary()): Vocabulary {
+  if (Array.isArray(node)) {
+    for (const item of node) jsonSchemaVocabulary(item, vocabulary);
+  } else if (node !== null && typeof node === "object") {
+    const record = node as Record<string, unknown>;
+    if (record.properties !== null && typeof record.properties === "object") {
+      for (const [field, value] of Object.entries(record.properties as Record<string, Record<string, unknown>>)) {
+        vocabulary.names.add(field);
+        const bound = value.maximum ?? value.maxLength ?? value.maxItems;
+        if (typeof bound === "number") limit(vocabulary, field, bound);
+        if (value.uniqueItems === true) vocabulary.unique.add(field);
+      }
+    }
+    if (typeof record.const === "string") vocabulary.values.add(record.const);
+    if (Array.isArray(record.enum)) for (const value of record.enum) if (typeof value === "string") vocabulary.values.add(value);
+    for (const child of Object.values(record)) jsonSchemaVocabulary(child, vocabulary);
+  }
+  return vocabulary;
+}
+
+interface StubState {
+  vocabulary: Vocabulary;
+  max?: number;
+  refined?: boolean;
+}
+
+function stubSchema(kind: string, state: StubState): Record<string, unknown> {
+  return new Proxy({ kind, state }, {
+    get: (target, property) => property in target
+      ? Reflect.get(target, property)
+      : (...args: unknown[]) => stubSchema(kind, {
+        ...state,
+        ...(property === "max" ? { max: Number(args[0]) } : {}),
+        ...(property === "refine" ? { refined: true } : {}),
+      }),
+  });
+}
+
+function stubState(schema: unknown): StubState {
+  if (schema !== null && typeof schema === "object" && "state" in schema) {
+    const { state } = schema;
+    if (state !== null && typeof state === "object" && "vocabulary" in state) {
+      // Only stubSchema builds objects carrying `state.vocabulary`.
+      const stub: StubState = state as StubState;
+      return stub;
+    }
+  }
+  throw new Error("Expected a schema built by the Zod stub.");
+}
+
+/** A fluent stand-in for the Zod API that records what each built schema accepts. */
 const zod: Record<string, unknown> = new Proxy({}, {
   get: (_target, property) => (...args: unknown[]) => {
-    if (property === "literal") literalValues.push(args[0]);
-    if (property === "enum" && Array.isArray(args[0])) enumValues.push(...args[0]);
-    return stubSchema(String(property));
+    const vocabulary = emptyVocabulary();
+    const [first, second] = args;
+    if (property === "literal" && typeof first === "string") vocabulary.values.add(first);
+    if (property === "enum" && Array.isArray(first)) for (const value of first) vocabulary.values.add(String(value));
+    if (property === "object" && first !== null && typeof first === "object") {
+      for (const [field, child] of Object.entries(first)) {
+        const state = stubState(child);
+        vocabulary.names.add(field);
+        absorb(vocabulary, state.vocabulary);
+        if (state.max !== undefined) limit(vocabulary, field, state.max);
+        if (state.refined === true) vocabulary.unique.add(field);
+      }
+    }
+    if (property === "union" && Array.isArray(first)) for (const child of first) absorb(vocabulary, stubState(child).vocabulary);
+    if (property === "array" || property === "record") {
+      for (const child of [first, second]) if (child !== undefined) absorb(vocabulary, stubState(child).vocabulary);
+    }
+    return stubSchema(String(property), { vocabulary });
   },
 });
 
 function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
-  literalValues.length = 0;
-  enumValues.length = 0;
   if (developer) process.env.AGENTTAB_DEVELOPER = "1";
   else delete process.env.AGENTTAB_DEVELOPER;
   const tools: Array<Record<string, unknown>> = [];
@@ -73,7 +148,7 @@ function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
   // The fluent Proxy implements the exact schema calls under test; the production runtime injects concrete Zod.
   const compatibleApi = api as unknown as AgentApi;
   makeExtension(async () => client)(compatibleApi);
-  return { tools, calls, literalValues: [...literalValues], enumValues: [...enumValues] };
+  return { tools, calls };
 }
 
 async function executeTool(
@@ -112,7 +187,22 @@ test("Standard read and open tools expose provider-compatible object schemas", (
   const snapshot = registered.tools.find((tool) => tool.name === "browser_snapshot");
   expect(open?.parameters).toMatchObject({ kind: "object" });
   expect(snapshot?.parameters).toMatchObject({ kind: "object" });
-  expect(registered.enumValues).toContain("new_window");
+  expect(stubState(open?.parameters).vocabulary.values).toContain("new_window");
+});
+
+test("OMP schemas accept every field, value, and bound the Pi schemas accept", () => {
+  const omp = new Map(register(false).tools.map((tool) => [tool.name, stubState(tool.parameters).vocabulary]));
+  for (const tool of register(false, "pi").tools) {
+    const pi = jsonSchemaVocabulary(JSON.parse(JSON.stringify(tool.parameters)));
+    const ours = omp.get(String(tool.name)) ?? emptyVocabulary();
+    expect({
+      tool: tool.name,
+      missingNames: [...pi.names].filter((name) => !ours.names.has(name)),
+      missingValues: [...pi.values].filter((value) => !ours.values.has(value)),
+      stricterBounds: [...pi.limits].filter(([field, bound]) => (ours.limits.get(field) ?? Infinity) < bound),
+      missingUnique: [...pi.unique].filter((field) => !ours.unique.has(field)),
+    }).toEqual({ tool: tool.name, missingNames: [], missingValues: [], stricterBounds: [], missingUnique: [] });
+  }
 });
 
 test("developer mode adds only browser_developer", () => {
