@@ -5988,5 +5988,20 @@ describe("extension entrypoint admission boundaries", () => {
       outcome: "completed",
       result: { tab_id: 103, page_revision: 2, url: "https://example.test/slow/landed" },
     });
+
+    // A tab closed while its first load is pending fails the open instead of reporting a dead tab.
+    const closedOpen = sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6312",
+      TASK_C,
+      "browser_open",
+      { mode: "create", url: "https://example.test/abandoned" },
+    );
+    await waitForCondition(() => JSON.stringify(port.posted).includes('"tab_id":104'));
+    tabStore.delete(104);
+    for (const listener of tabRemovedListeners) listener(104);
+    expect(await closedOpen).toMatchObject({
+      outcome: "not_started",
+      error: { code: "ownership_revoked", recovery: "Call browser_open again." },
+    });
   });
 });

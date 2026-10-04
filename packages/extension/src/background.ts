@@ -391,7 +391,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     }
     if (command.method === "browser_open") {
       const opened = await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params));
-      return completed(command.request_id, await settleOpenedTab(opened));
+      return completed(command.request_id, await settleOpenedTab(command.task_id, opened));
     }
     if (command.method === "browser_tabs") {
       const result = await scheduler.enqueueGlobal(() => ownership.inventory());
@@ -606,7 +606,7 @@ function errorDetails(error: unknown): Record<string, unknown> | undefined {
  * on first use. The wait runs outside the global scheduler because the queued tab events
  * take ownership transitions that `browser_open` would otherwise hold.
  */
-async function settleOpenedTab(opened: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function settleOpenedTab(taskId: string, opened: Record<string, unknown>): Promise<Record<string, unknown>> {
   const tabId = opened.tab_id;
   if (typeof tabId !== "number") return opened;
   let release!: () => void;
@@ -622,11 +622,17 @@ async function settleOpenedTab(opened: Record<string, unknown>): Promise<Record<
   });
   try {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab) return opened;
-    if (tab.status !== "complete") await Promise.race([loaded, deadline]);
-    // Tab events drain serially, so this barrier runs after any revision bump already dispatched.
+    if (tab && tab.status !== "complete") await Promise.race([loaded, deadline]);
+    // Tab events drain serially, so this barrier runs after any revision bump or removal already dispatched.
     await Promise.race([new Promise<void>((resolve) => runAfterStart(resolve)), deadline]);
-    return await ownership.describeTab(tabId).catch(() => opened);
+    const settled = await ownership.describeTab(tabId).catch(() => null);
+    if (!settled || (await ownership.taskIdForTab(tabId)) !== taskId) {
+      throw Object.assign(new Error("The opened tab was closed or left its task before it finished loading"), {
+        code: "ownership_revoked",
+        recovery: "Call browser_open again.",
+      });
+    }
+    return settled;
   } finally {
     clearTimeout(timer);
     waiters.delete(release);
@@ -645,6 +651,7 @@ chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) =
   runAfterStart(() => ownership.adoptOwnedChild(tab));
 });
 chrome.tabs.onRemoved.addListener((removedTabId: number) => {
+  for (const releaseWaiter of tabLoadWaiters.get(removedTabId) ?? []) releaseWaiter();
   runAfterStart(async () => {
     const owner = await ownership.taskIdForTab(removedTabId);
     if (!owner && !browser.tracksTab(removedTabId)) return;
