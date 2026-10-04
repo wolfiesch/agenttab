@@ -454,7 +454,7 @@ function operationContext(
   };
 }
 
-function contextMeta(context: OperationCard["context"]): string[] {
+export function contextMeta(context: OperationCard["context"]): string[] {
   return present(
     context.taskId ? `task ${shortId(context.taskId)}` : undefined,
     tabMeta(context.tabId),
@@ -644,7 +644,7 @@ function observationItems(details: unknown): unknown[] {
   return Array.isArray(snapshot.nodes) ? snapshot.nodes : [];
 }
 
-function expandedLines(details: unknown): string[] {
+export function expandedLines(details: unknown): string[] {
   if (details === undefined) return [];
   const safe = sanitize(details);
   let text: string;
