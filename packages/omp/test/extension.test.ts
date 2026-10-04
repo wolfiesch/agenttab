@@ -19,6 +19,23 @@ afterEach(() => {
 
 const literalValues: unknown[] = [];
 const enumValues: unknown[] = [];
+const objectKeys: string[] = [];
+
+/** Property names and string `const`/`enum` values anywhere in a JSON Schema tree. */
+function schemaVocabulary(node: unknown, names = new Set<string>(), values = new Set<string>()) {
+  if (Array.isArray(node)) {
+    for (const item of node) schemaVocabulary(item, names, values);
+  } else if (node !== null && typeof node === "object") {
+    const record = node as Record<string, unknown>;
+    if (record.properties !== null && typeof record.properties === "object") {
+      for (const name of Object.keys(record.properties)) names.add(name);
+    }
+    if (typeof record.const === "string") values.add(record.const);
+    if (Array.isArray(record.enum)) for (const value of record.enum) if (typeof value === "string") values.add(value);
+    for (const child of Object.values(record)) schemaVocabulary(child, names, values);
+  }
+  return { names, values };
+}
 
 function stubSchema(kind: string): Record<string, unknown> {
   let schema: Record<string, unknown>;
@@ -34,6 +51,7 @@ const zod: Record<string, unknown> = new Proxy({}, {
   get: (_target, property) => (...args: unknown[]) => {
     if (property === "literal") literalValues.push(args[0]);
     if (property === "enum" && Array.isArray(args[0])) enumValues.push(...args[0]);
+    if (property === "object" && args[0] !== null && typeof args[0] === "object") objectKeys.push(...Object.keys(args[0]));
     return stubSchema(String(property));
   },
 });
@@ -41,6 +59,7 @@ const zod: Record<string, unknown> = new Proxy({}, {
 function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
   literalValues.length = 0;
   enumValues.length = 0;
+  objectKeys.length = 0;
   if (developer) process.env.AGENTTAB_DEVELOPER = "1";
   else delete process.env.AGENTTAB_DEVELOPER;
   const tools: Array<Record<string, unknown>> = [];
@@ -73,7 +92,13 @@ function register(developer: boolean, runtime: "omp" | "pi" = "omp") {
   // The fluent Proxy implements the exact schema calls under test; the production runtime injects concrete Zod.
   const compatibleApi = api as unknown as AgentApi;
   makeExtension(async () => client)(compatibleApi);
-  return { tools, calls, literalValues: [...literalValues], enumValues: [...enumValues] };
+  return {
+    tools,
+    calls,
+    literalValues: [...literalValues],
+    enumValues: [...enumValues],
+    objectKeys: [...objectKeys],
+  };
 }
 
 async function executeTool(
@@ -113,6 +138,18 @@ test("Standard read and open tools expose provider-compatible object schemas", (
   expect(open?.parameters).toMatchObject({ kind: "object" });
   expect(snapshot?.parameters).toMatchObject({ kind: "object" });
   expect(registered.enumValues).toContain("new_window");
+});
+
+test("OMP schemas expose every field and value the Pi schemas accept", () => {
+  const omp = register(false);
+  const ompNames = new Set(omp.objectKeys);
+  const ompValues = new Set([...omp.literalValues, ...omp.enumValues]);
+  for (const tool of register(false, "pi").tools) {
+    const { names, values } = schemaVocabulary(JSON.parse(JSON.stringify(tool.parameters)));
+    const missingNames = [...names].filter((name) => !ompNames.has(name));
+    const missingValues = [...values].filter((value) => !ompValues.has(value));
+    expect({ tool: tool.name, missingNames, missingValues }).toEqual({ tool: tool.name, missingNames: [], missingValues: [] });
+  }
 });
 
 test("developer mode adds only browser_developer", () => {

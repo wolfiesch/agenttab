@@ -160,10 +160,12 @@ const DEFINITIONS: ReadonlyArray<{
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
         mode: z.enum(["accessibility", "text", "html", "screenshot"]),
+        frame_id: z.string().min(1).max(256).optional(),
         root_ref: z.string().min(1).optional(),
         max_depth: z.number().int().min(1).max(200).optional(),
         max_nodes: z.number().int().min(1).max(5000).optional(),
         selector: z.string().min(1).optional(),
+        match: z.enum(["first", "last"]).optional(),
         full_page: z.boolean().optional(),
         format: z.enum(["png", "jpeg", "webp"]).optional(),
         quality: z.number().int().min(0).max(100).optional(),
@@ -180,50 +182,55 @@ const DEFINITIONS: ReadonlyArray<{
       schema: (z) => {
         const ref = z.string().min(1).max(256);
         const selector = z.string().min(1).max(2048);
+        const frame_id = ref.optional();
+        const expect_download = z.boolean().optional();
+        const value = z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS);
+        const gesture = z.enum(["click", "double_click", "context_click"]);
+        const press = {
+          kind: z.literal("press"),
+          frame_id,
+          expect_download,
+          key: z.enum(STANDARD_PRESS_KEYS),
+          modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).max(4).optional(),
+        };
+        const files = z.array(z.string().min(1).max(512)).min(1).max(4);
         const action = z.union([
-          z.object({ kind: z.literal("click"), ref }).strict(),
-          z.object({ kind: z.literal("click"), selector }).strict(),
-          z.object({
-            kind: z.literal("press"),
-            ref,
-            key: z.enum(STANDARD_PRESS_KEYS),
-          }).strict(),
-          z.object({
-            kind: z.literal("press"),
-            selector,
-            key: z.enum(STANDARD_PRESS_KEYS),
-          }).strict(),
-          z.object({ kind: z.literal("type"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
-          z.object({ kind: z.literal("type"), selector, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
-          z.object({ kind: z.literal("fill"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
-          z.object({ kind: z.literal("fill"), selector, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
-          z.object({ kind: z.literal("select"), ref, value: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
+          z.object({ kind: gesture, ref, frame_id, expect_download }).strict(),
+          z.object({ kind: gesture, selector, frame_id, expect_download }).strict(),
+          z.object({ kind: z.literal("hover"), ref, frame_id }).strict(),
+          z.object({ kind: z.literal("hover"), selector, frame_id }).strict(),
+          z.object({ ...press, ref }).strict(),
+          z.object({ ...press, selector }).strict(),
+          z.object({ kind: z.literal("type"), ref, frame_id, text: value }).strict(),
+          z.object({ kind: z.literal("type"), selector, frame_id, text: value }).strict(),
+          z.object({ kind: z.literal("fill"), ref, frame_id, text: value }).strict(),
+          z.object({ kind: z.literal("fill"), selector, frame_id, text: value }).strict(),
+          z.object({ kind: z.literal("select"), ref, frame_id, value }).strict(),
           z.object({
             kind: z.literal("scroll"),
             ref: ref.optional(),
+            frame_id,
             delta_x: z.number().int().min(-100_000).max(100_000),
             delta_y: z.number().int().min(-100_000).max(100_000),
           }).strict(),
-          z.object({ kind: z.literal("drag"), ref, target_ref: ref }).strict(),
-          z.object({ kind: z.literal("navigate"), url: z.string().max(2048).regex(/^(https?:\/\/|about:)[^\s]+$/) }).strict(),
-          z.object({ kind: z.literal("go_back") }).strict(),
-          z.object({ kind: z.literal("go_forward") }).strict(),
-          z.object({ kind: z.literal("reload"), bypass_cache: z.boolean().optional() }).strict(),
+          z.object({ kind: z.literal("drag"), ref, target_ref: ref, frame_id }).strict(),
+          z.object({
+            kind: z.literal("navigate"),
+            url: z.string().max(2048).regex(/^(https?:\/\/|about:)[^\s]+$/),
+            expect_download,
+          }).strict(),
+          z.object({ kind: z.literal("go_back"), expect_download }).strict(),
+          z.object({ kind: z.literal("go_forward"), expect_download }).strict(),
+          z.object({ kind: z.literal("reload"), bypass_cache: z.boolean().optional(), expect_download }).strict(),
           z.object({ kind: z.literal("close") }).strict(),
           z.object({
             kind: z.literal("dialog"),
-            decision: z.enum(["accept", "dismiss"]),
+            decision: z.literal("accept"),
+            prompt_text: z.string().max(4096).optional(),
           }).strict(),
-          z.object({
-            kind: z.literal("upload_file"),
-            ref,
-            files: z.array(z.string().min(1).max(512)).min(1).max(4),
-          }).strict(),
-          z.object({
-            kind: z.literal("upload_file"),
-            selector,
-            files: z.array(z.string().min(1).max(512)).min(1).max(4),
-          }).strict(),
+          z.object({ kind: z.literal("dialog"), decision: z.literal("dismiss") }).strict(),
+          z.object({ kind: z.literal("upload_file"), ref, frame_id, files }).strict(),
+          z.object({ kind: z.literal("upload_file"), selector, frame_id, files }).strict(),
         ]);
         return z.object({
           tab_id: z.number().int().min(0),
@@ -240,8 +247,21 @@ const DEFINITIONS: ReadonlyArray<{
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
         condition: z.union([
-          z.object({ kind: z.enum(["load", "network_idle", "download"]) }).strict(),
-          z.object({ kind: z.enum(["url", "text", "selector"]), value: z.string().min(1).max(65_536) }).strict(),
+          z.object({ kind: z.enum(["load", "network_idle"]) }).strict(),
+          z.object({ kind: z.literal("download"), after: z.string().min(1).max(256).optional() }).strict(),
+          z.object({ kind: z.enum(["url", "text"]), value: z.string().min(1).max(2048) }).strict(),
+          z.object({
+            kind: z.literal("selector"),
+            value: z.string().min(1).max(2048),
+            state: z.enum(["attached", "detached", "visible", "hidden", "enabled"]).optional(),
+            frame_id: z.string().min(1).max(256).optional(),
+          }).strict(),
+          z.object({
+            kind: z.literal("value"),
+            selector: z.string().min(1).max(2048),
+            value: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS),
+            frame_id: z.string().min(1).max(256).optional(),
+          }).strict(),
         ]),
         timeout_ms: z.number().int().min(1).max(120_000).optional(),
       }).strict(),
