@@ -30,6 +30,7 @@ interface SchemaNode {
   max(value: number): SchemaNode;
   min(value: number): SchemaNode;
   optional(): SchemaNode;
+  refine(check: (value: readonly unknown[]) => boolean, message: string): SchemaNode;
   regex(pattern: RegExp): SchemaNode;
   strict(): SchemaNode;
 }
@@ -171,7 +172,8 @@ const DEFINITIONS: ReadonlyArray<{
         quality: z.number().int().min(0).max(100).optional(),
         max_width: z.number().int().min(1).max(SCREENSHOT_MAX_DIMENSION).optional(),
         max_height: z.number().int().min(1).max(SCREENSHOT_MAX_DIMENSION).optional(),
-        max_bytes: z.number().int().min(1).max(SCREENSHOT_MAX_BYTES).optional(),
+        // One flat object covers every mode; Core enforces the lower screenshot cap per mode.
+        max_bytes: z.number().int().min(1).max(SNAPSHOT_TEXT_MAX_BYTES).optional(),
       }).strict(),
     },
     {
@@ -191,7 +193,10 @@ const DEFINITIONS: ReadonlyArray<{
           frame_id,
           expect_download,
           key: z.enum(STANDARD_PRESS_KEYS),
-          modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).max(4).optional(),
+          modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"]))
+            .max(4)
+            .refine((values) => new Set(values).size === values.length, "modifiers must be unique")
+            .optional(),
         };
         const files = z.array(z.string().min(1).max(512)).min(1).max(4);
         const action = z.union([
@@ -332,7 +337,9 @@ const DEFINITIONS: ReadonlyArray<{
       approval: "write",
       schema: (z) => z.object({
         disposition: z.enum(["auto", "close", "keep"]).optional(),
-        keep_tab_ids: z.array(z.number().int().min(1)).optional(),
+        keep_tab_ids: z.array(z.number().int().min(1))
+          .refine((values) => new Set(values).size === values.length, "keep_tab_ids must be unique")
+          .optional(),
       }).strict(),
     },
   ];
