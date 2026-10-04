@@ -12,6 +12,7 @@ interface TabLike {
   id?: number;
   windowId?: number;
   groupId?: number;
+  index?: number;
   openerTabId?: number;
   active?: boolean;
   url?: string;
@@ -76,6 +77,11 @@ export class OwnershipLedger {
 
   adoptOwnedChild(tab: TabLike, sourceTabId?: number): Promise<void> {
     return this.serialize(() => this.adoptOwnedChildNow(tab, sourceTabId));
+  }
+
+  /** Opens a page-requested new window as a background tab owned by the source tab's task. */
+  openRequestedChild(parentTabId: number, url: string): Promise<number> {
+    return this.serialize(() => this.openRequestedChildNow(parentTabId, url));
   }
 
   revokeIfMoved(tabId: number): Promise<boolean> {
@@ -377,6 +383,33 @@ export class OwnershipLedger {
     } catch {
       // A popup or Chrome grouping race is not authority to close a user tab.
     }
+  }
+
+  private async openRequestedChildNow(parentTabId: number, url: string): Promise<number> {
+    const state = await readState();
+    const parentTask = Object.values(state.tasks).find((task) => task.tabIds.includes(parentTabId));
+    if (!parentTask) {
+      throw Object.assign(new Error("The requesting tab is no longer owned by an AgentTab task"), {
+        code: "ownership_denied",
+      });
+    }
+    const ownedParent = await this.assertOwnedNow(parentTask.taskId, parentTabId);
+    const parent = (await chrome.tabs.get(parentTabId)) as TabLike;
+    const tab = (await chrome.tabs.create({
+      url,
+      active: false,
+      openerTabId: parentTabId,
+      ...(Number.isInteger(parent.windowId) ? { windowId: parent.windowId } : {}),
+      ...(Number.isInteger(parent.index) ? { index: (parent.index as number) + 1 } : {}),
+    })) as TabLike;
+    if (!Number.isInteger(tab.id)) throw new Error("Chrome did not return a created tab ID");
+    try {
+      await this.grant(ownedParent.taskId, tab.id as number, ownedParent.name, true);
+    } catch (error) {
+      await chrome.tabs.remove(tab.id as number).catch(() => undefined);
+      throw error;
+    }
+    return tab.id as number;
   }
 
   private async revokeIfMovedNow(tabId: number): Promise<boolean> {

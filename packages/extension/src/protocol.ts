@@ -242,93 +242,125 @@ function assertBoundedString(value: unknown, field: string, minimum: number, max
 }
 
 function assertUrl(value: unknown, field = "url"): string {
-  const url = assertBoundedString(value, field, 1, 16_384);
+  const url = assertBoundedString(value, field, 1, 2_048);
   if (!URL_PATTERN.test(url)) commandError(`${field} must be an http(s) or about URL without whitespace`);
   return url;
 }
 
-function assertAction(value: unknown): Record<string, unknown> {
-  if (!isRecord(value) || typeof value.kind !== "string") {
-    commandError("Each browser action requires a kind");
+function assertFrameId(value: unknown, field = "frame_id"): void {
+  if (value !== undefined) assertBoundedString(value, field, 1, 256);
+}
+
+function assertTarget(action: Record<string, unknown>, kind: string): void {
+  if ((action.ref === undefined) === (action.selector === undefined)) {
+    commandError(`${kind} requires exactly one of ref or selector`);
   }
+  if (action.ref !== undefined) assertBoundedString(action.ref, `${kind}.ref`, 1, 256);
+  if (action.selector !== undefined) assertBoundedString(action.selector, `${kind}.selector`, 1, 2_048);
+  assertFrameId(action.frame_id, `${kind}.frame_id`);
+}
+
+function assertExpectDownload(action: Record<string, unknown>, kind: string): void {
+  if (action.expect_download !== undefined && typeof action.expect_download !== "boolean") {
+    commandError(`${kind}.expect_download must be a boolean`);
+  }
+}
+
+function assertPressChord(action: Record<string, unknown>): void {
+  const keys = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "Escape", "Tab", "Home", "End", "Space", "Backspace", "Delete", "a", "z", "y"];
+  if (typeof action.key !== "string" || !keys.includes(action.key)) commandError("press.key must be a supported standard key");
+  if (action.modifiers === undefined) {
+    if (action.key === "a" || action.key === "z" || action.key === "y") commandError(`press ${action.key} requires exactly one of Control or Meta, with optional Shift`);
+    return;
+  }
+  if (!Array.isArray(action.modifiers) || action.modifiers.length > 4 ||
+    !action.modifiers.every((modifier) => modifier === "Alt" || modifier === "Control" || modifier === "Meta" || modifier === "Shift") ||
+    new Set(action.modifiers).size !== action.modifiers.length) {
+    commandError("press.modifiers must be a unique subset of Alt, Control, Meta, Shift");
+  }
+  if (action.key === "a" || action.key === "z" || action.key === "y") {
+    const control = action.modifiers.includes("Control");
+    const meta = action.modifiers.includes("Meta");
+    if (control === meta || action.modifiers.includes("Alt")) commandError(`press ${action.key} requires exactly one of Control or Meta, with optional Shift`);
+  }
+}
+
+function assertAction(value: unknown): Record<string, unknown> {
+  if (!isRecord(value) || typeof value.kind !== "string") commandError("Each browser action requires a kind");
   const action = value;
   switch (action.kind) {
     case "click":
-      assertExactObject(action, ["kind"], ["ref", "selector"], "click action");
-      if ((action.ref === undefined) === (action.selector === undefined)) {
-        commandError("click requires exactly one of ref or selector");
-      }
-      if (action.ref !== undefined) assertBoundedString(action.ref, "click.ref", 1, 256);
-      if (action.selector !== undefined) assertBoundedString(action.selector, "click.selector", 1, 2_048);
+    case "double_click":
+    case "context_click":
+      assertExactObject(action, ["kind"], ["ref", "selector", "frame_id", "expect_download"], `${action.kind} action`);
+      assertTarget(action, action.kind);
+      assertExpectDownload(action, action.kind);
+      return action;
+    case "hover":
+      assertExactObject(action, ["kind"], ["ref", "selector", "frame_id"], "hover action");
+      assertTarget(action, "hover");
+      return action;
+    case "press":
+      assertExactObject(action, ["kind", "key"], ["ref", "selector", "frame_id", "expect_download", "modifiers"], "press action");
+      assertTarget(action, "press");
+      assertExpectDownload(action, "press");
+      assertPressChord(action);
       return action;
     case "type":
     case "fill":
-      assertExactObject(action, ["kind", "text"], ["ref", "selector"], `${action.kind} action`);
-      if ((action.ref === undefined) === (action.selector === undefined)) {
-        commandError(`${action.kind} requires exactly one of ref or selector`);
-      }
-      if (action.ref !== undefined) assertBoundedString(action.ref, `${action.kind}.ref`, 1, 256);
-      if (action.selector !== undefined) {
-        assertBoundedString(action.selector, `${action.kind}.selector`, 1, 2_048);
-      }
-      assertBoundedString(action.text, `${action.kind}.text`, 0, 1_048_576);
+      assertExactObject(action, ["kind", "text"], ["ref", "selector", "frame_id"], `${action.kind} action`);
+      assertTarget(action, action.kind);
+      assertBoundedString(action.text, `${action.kind}.text`, 0, 2_048);
       return action;
     case "select":
-      assertExactObject(action, ["kind", "ref", "value"], [], "select action");
+      assertExactObject(action, ["kind", "ref", "value"], ["frame_id"], "select action");
       assertBoundedString(action.ref, "select.ref", 1, 256);
-      assertBoundedString(action.value, "select.value", 0, 65_536);
+      assertFrameId(action.frame_id, "select.frame_id");
+      assertBoundedString(action.value, "select.value", 0, 2_048);
       return action;
     case "scroll":
-      assertExactObject(action, ["kind", "delta_x", "delta_y"], ["ref"], "scroll action");
+      assertExactObject(action, ["kind", "delta_x", "delta_y"], ["ref", "frame_id"], "scroll action");
       if (action.ref !== undefined) assertBoundedString(action.ref, "scroll.ref", 1, 256);
-      if (!isIntegerInRange(action.delta_x, -100_000, 100_000) || !isIntegerInRange(action.delta_y, -100_000, 100_000)) {
-        commandError("scroll deltas must be integers between -100000 and 100000");
-      }
+      assertFrameId(action.frame_id, "scroll.frame_id");
+      if (!isIntegerInRange(action.delta_x, -100_000, 100_000) || !isIntegerInRange(action.delta_y, -100_000, 100_000)) commandError("scroll deltas must be integers between -100000 and 100000");
       return action;
     case "drag":
-      assertExactObject(action, ["kind", "ref", "target_ref"], [], "drag action");
+      assertExactObject(action, ["kind", "ref", "target_ref"], ["frame_id"], "drag action");
       assertBoundedString(action.ref, "drag.ref", 1, 256);
       assertBoundedString(action.target_ref, "drag.target_ref", 1, 256);
+      assertFrameId(action.frame_id, "drag.frame_id");
       return action;
     case "navigate":
-      assertExactObject(action, ["kind", "url"], [], "navigate action");
+      assertExactObject(action, ["kind", "url"], ["expect_download"], "navigate action");
       assertUrl(action.url);
+      assertExpectDownload(action, "navigate");
       return action;
     case "go_back":
     case "go_forward":
-    case "close":
-      assertExactObject(action, ["kind"], [], `${action.kind} action`);
+      assertExactObject(action, ["kind"], ["expect_download"], `${action.kind} action`);
+      assertExpectDownload(action, action.kind);
       return action;
     case "reload":
-      assertExactObject(action, ["kind"], ["bypass_cache"], "reload action");
-      if (action.bypass_cache !== undefined && typeof action.bypass_cache !== "boolean") {
-        commandError("reload.bypass_cache must be a boolean");
-      }
+      assertExactObject(action, ["kind"], ["bypass_cache", "expect_download"], "reload action");
+      if (action.bypass_cache !== undefined && typeof action.bypass_cache !== "boolean") commandError("reload.bypass_cache must be a boolean");
+      assertExpectDownload(action, "reload");
+      return action;
+    case "close":
+      assertExactObject(action, ["kind"], [], "close action");
       return action;
     case "dialog":
-      assertExactObject(action, ["kind", "decision"], [], "dialog action");
-      if (action.decision !== "accept" && action.decision !== "dismiss") {
-        commandError("dialog.decision must be accept or dismiss");
+      assertExactObject(action, ["kind", "decision"], ["prompt_text"], "dialog action");
+      if (action.decision !== "accept" && action.decision !== "dismiss") commandError("dialog.decision must be accept or dismiss");
+      if (action.prompt_text !== undefined) {
+        if (action.decision !== "accept") commandError("dialog.prompt_text requires accept");
+        assertBoundedString(action.prompt_text, "dialog.prompt_text", 0, 4_096);
       }
       return action;
     case "upload_file":
-      assertExactObject(action, ["kind", "files"], ["ref", "selector"], "upload_file action");
-      if ((action.ref === undefined) === (action.selector === undefined)) {
-        commandError("upload_file requires exactly one of ref or selector");
-      }
-      if (action.ref !== undefined) assertBoundedString(action.ref, "upload_file.ref", 1, 256);
-      if (action.selector !== undefined) {
-        assertBoundedString(action.selector, "upload_file.selector", 1, 2_048);
-      }
-      if (!Array.isArray(action.files) || action.files.length === 0 || action.files.length > 32 ||
-        !action.files.every((file) => isBoundedString(file, 1, 16_384))) {
-        commandError("upload_file.files must contain between 1 and 32 file paths");
-      }
+      assertExactObject(action, ["kind", "files"], ["ref", "selector", "frame_id"], "upload_file action");
+      assertTarget(action, "upload_file");
+      if (!Array.isArray(action.files) || action.files.length === 0 || action.files.length > 4 || !action.files.every((file) => isBoundedString(file, 1, 512))) commandError("upload_file.files must contain between 1 and 4 file paths");
       return action;
-    case "set_viewport":
-      commandError("set_viewport is unavailable in Standard mode");
-    case "press":
-      commandError("press is unavailable in Standard mode because it has no identifiable target");
     default:
       commandError(`Unsupported standard action: ${action.kind}`);
   }
@@ -339,6 +371,7 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
     value,
     ["tab_id", "mode"],
     [
+      "frame_id",
       "root_ref",
       "max_depth",
       "max_nodes",
@@ -355,14 +388,16 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
   );
   assertTabId(params.tab_id);
   if (params.mode === "accessibility") {
-    assertExactObject(params, ["tab_id", "mode"], ["root_ref", "max_depth", "max_nodes"], "accessibility snapshot parameters");
+    assertExactObject(params, ["tab_id", "mode"], ["frame_id", "root_ref", "max_depth", "max_nodes"], "accessibility snapshot parameters");
+    assertFrameId(params.frame_id);
     if (params.root_ref !== undefined) assertBoundedString(params.root_ref, "root_ref", 1, 256);
     if (params.max_depth !== undefined && !isIntegerInRange(params.max_depth, 1, 200)) commandError("max_depth must be between 1 and 200");
     if (params.max_nodes !== undefined && !isIntegerInRange(params.max_nodes, 1, 5_000)) commandError("max_nodes must be between 1 and 5000");
     return params;
   }
   if (params.mode === "text" || params.mode === "html") {
-    assertExactObject(params, ["tab_id", "mode"], ["selector", "match", "max_bytes"], "text or html snapshot parameters");
+    assertExactObject(params, ["tab_id", "mode"], ["frame_id", "selector", "match", "max_bytes"], "text or html snapshot parameters");
+    assertFrameId(params.frame_id);
     if (params.selector !== undefined) assertBoundedString(params.selector, "selector", 1, 2_048);
     if (params.match !== undefined && params.match !== "first" && params.match !== "last") {
       commandError("match must be first or last");
@@ -379,10 +414,11 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
     assertExactObject(
       params,
       ["tab_id", "mode"],
-      ["selector", "full_page", "format", "quality", "max_width", "max_height", "max_bytes"],
+      ["frame_id", "selector", "full_page", "format", "quality", "max_width", "max_height", "max_bytes"],
       "screenshot parameters",
     );
-    if (params.selector !== undefined) assertBoundedString(params.selector, "selector", 1, 65_536);
+    assertFrameId(params.frame_id);
+    if (params.selector !== undefined) assertBoundedString(params.selector, "selector", 1, 2_048);
     if (params.full_page !== undefined && typeof params.full_page !== "boolean") commandError("full_page must be a boolean");
     if (params.selector !== undefined && params.full_page === true) commandError("screenshot cannot combine selector and full_page");
     if (
@@ -411,24 +447,38 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
   }
   commandError("Unsupported snapshot mode");
 }
-
 function assertWaitParams(value: unknown): Record<string, unknown> {
   const params = assertExactObject(value, ["tab_id", "condition"], ["timeout_ms"], "browser_wait parameters");
   assertTabId(params.tab_id);
-  if (params.timeout_ms !== undefined && !isIntegerInRange(params.timeout_ms, 1, 120_000)) {
-    commandError("timeout_ms must be between 1 and 120000");
-  }
-  if (!isRecord(params.condition) || typeof params.condition.kind !== "string") {
-    commandError("browser_wait requires a condition");
-  }
+  if (params.timeout_ms !== undefined && !isIntegerInRange(params.timeout_ms, 1, 120_000)) commandError("timeout_ms must be between 1 and 120000");
+  if (!isRecord(params.condition) || typeof params.condition.kind !== "string") commandError("browser_wait requires a condition");
   const condition = params.condition;
-  if (condition.kind === "load" || condition.kind === "network_idle" || condition.kind === "download") {
+  if (condition.kind === "load" || condition.kind === "network_idle") {
     assertExactObject(condition, ["kind"], [], "wait condition");
     return params;
   }
-  if (condition.kind === "url" || condition.kind === "text" || condition.kind === "selector") {
+  if (condition.kind === "download") {
+    assertExactObject(condition, ["kind"], ["after"], "download wait condition");
+    if (condition.after !== undefined) assertBoundedString(condition.after, "condition.after", 1, 256);
+    return params;
+  }
+  if (condition.kind === "url" || condition.kind === "text") {
     assertExactObject(condition, ["kind", "value"], [], "wait condition");
-    assertBoundedString(condition.value, "condition.value", 1, 65_536);
+    assertBoundedString(condition.value, "condition.value", 1, 2_048);
+    return params;
+  }
+  if (condition.kind === "selector") {
+    assertExactObject(condition, ["kind", "value"], ["state", "frame_id"], "selector wait condition");
+    assertBoundedString(condition.value, "condition.value", 1, 2_048);
+    if (condition.state !== undefined && !["attached", "detached", "visible", "hidden", "enabled"].includes(String(condition.state))) commandError("condition.state must be a supported selector state");
+    assertFrameId(condition.frame_id, "condition.frame_id");
+    return params;
+  }
+  if (condition.kind === "value") {
+    assertExactObject(condition, ["kind", "selector", "value"], ["frame_id"], "value wait condition");
+    assertBoundedString(condition.selector, "condition.selector", 1, 2_048);
+    assertBoundedString(condition.value, "condition.value", 0, 2_048);
+    assertFrameId(condition.frame_id, "condition.frame_id");
     return params;
   }
   commandError(`Unsupported wait condition: ${condition.kind}`);

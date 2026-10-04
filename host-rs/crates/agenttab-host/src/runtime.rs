@@ -1661,15 +1661,15 @@ fn is_tab_only_request(params: &MethodParams) -> bool {
             matches!(
                 action,
                 BrowserAction::Navigate { .. }
-                    | BrowserAction::GoBack
-                    | BrowserAction::GoForward
+                    | BrowserAction::GoBack { .. }
+                    | BrowserAction::GoForward { .. }
                     | BrowserAction::Reload { .. }
                     | BrowserAction::Close
             )
         }),
         MethodParams::Wait(params) => matches!(
             &params.condition,
-            WaitCondition::Load | WaitCondition::Url { .. } | WaitCondition::Download
+            WaitCondition::Load | WaitCondition::Url { .. } | WaitCondition::Download { .. }
         ),
         MethodParams::Handoff(BrowserHandoffParams::Request { .. }) => true,
         _ => false,
@@ -3452,7 +3452,7 @@ mod tests {
                     &json!({
                         "tab_id": 3,
                         "expected_page_revision": 7,
-                        "actions": [{"kind": "click", "ref": "e9"}]
+                        "actions": [{"kind": "click", "ref": "e9", "expect_download": false}]
                     }),
                 ),
             )

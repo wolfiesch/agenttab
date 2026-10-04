@@ -278,9 +278,13 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
     const kind = fieldString(action, "kind") ?? "action";
     const titles: Record<string, string> = {
       click: "Click",
+      hover: "Hover",
+      double_click: "Double-click",
+      context_click: "Context-click",
+      press: "Press key",
       type: "Type",
       fill: "Fill",
-      select: "Select option",
+      select: "Select",
       scroll: "Scroll",
       drag: "Drag",
       navigate: "Navigate",
@@ -293,7 +297,12 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
     };
     let target: string | undefined;
     const targetRefOrSelector = fieldString(action, "ref") ?? fieldString(action, "selector");
-    if (kind === "type" || kind === "fill") {
+    if (kind === "press") {
+      const modifiers = Array.isArray(action.modifiers)
+        ? action.modifiers.filter((value): value is string => typeof value === "string").join("+")
+        : undefined;
+      target = joinMeta(selectorMeta(targetRefOrSelector), modifiers, fieldString(action, "key"));
+    } else if (kind === "type" || kind === "fill") {
       target = joinMeta(selectorMeta(targetRefOrSelector), charCount(fieldString(action, "text")));
     } else if (kind === "select") {
       target = joinMeta(selectorMeta(targetRefOrSelector), "value hidden");
@@ -320,7 +329,11 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
     } else {
       target = selectorMeta(targetRefOrSelector);
     }
-    return joinMeta(titles[kind] ?? humanize(kind), target) ?? humanize(kind);
+    return joinMeta(
+      titles[kind] ?? humanize(kind),
+      target,
+      fieldBoolean(action, "expect_download") === true ? "expects download" : undefined,
+    ) ?? humanize(kind);
   });
 }
 
@@ -620,7 +633,13 @@ function present(...values: Array<string | undefined>): string[] {
 
 function extractEvidence(details: Record<string, unknown>): string[] {
   const evidence: string[] = [];
-  const openedTabs = Array.isArray(details.opened_tabs) ? details.opened_tabs.length : 0;
+  const actionTabs = Array.isArray(details.actions)
+    ? details.actions.flatMap((action) => {
+      const tabs = toRecord(action).opened_tabs;
+      return Array.isArray(tabs) ? tabs.filter((tab) => fieldString(toRecord(tab), "outcome") === "opened") : [];
+    })
+    : [];
+  const openedTabs = (Array.isArray(details.opened_tabs) ? details.opened_tabs.length : 0) + actionTabs.length;
   const closedTabs = Array.isArray(details.closed_tabs) ? details.closed_tabs.length : 0;
   if (openedTabs > 0) evidence.push(`Evidence · ${openedTabs} new tab${openedTabs === 1 ? "" : "s"}`);
   if (closedTabs > 0) evidence.push(`Evidence · ${closedTabs} tab${closedTabs === 1 ? "" : "s"} closed`);

@@ -168,9 +168,24 @@ describe("Core RPC transport deadlines", () => {
 });
 
 if (false) {
+  const validPressAction: BrowserAction = { kind: "press", ref: "e1@1", key: "Enter" };
+  const validEditorChord: BrowserAction = { kind: "press", selector: "input", key: "z", modifiers: ["Control", "Shift"] };
+  const frameScopedGesture: BrowserAction = { kind: "double_click", ref: "e1@1", frame_id: "frame-1" };
+  void validPressAction;
+  void validEditorChord;
+  void frameScopedGesture;
   // @ts-expect-error Standard browser actions never expose an agent-controlled focus transition.
   const forbiddenFocusAction: BrowserAction = { kind: "focus" };
+  // @ts-expect-error Press actions require exactly one target.
+  const pressWithoutTarget: BrowserAction = { kind: "press", key: "Enter" };
+  // @ts-expect-error Press actions accept only the Standard key allowlist.
+  const pressWithUnsupportedKey: BrowserAction = { kind: "press", ref: "e1@1", key: "Shift" };
+  // @ts-expect-error Prompt text is permitted only for dialog acceptance.
+  const dismissWithPrompt: BrowserAction = { kind: "dialog", decision: "dismiss", prompt_text: "forbidden" };
   void forbiddenFocusAction;
+  void pressWithoutTarget;
+  void pressWithUnsupportedKey;
+  void dismissWithPrompt;
 }
 
 test("routes concurrent out-of-order responses by request id", async () => {

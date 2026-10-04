@@ -7,6 +7,7 @@ import {
   SCREENSHOT_MAX_DIMENSION,
   SNAPSHOT_TEXT_MAX_BYTES,
   STANDARD_ACTION_VALUE_MAX_CHARS,
+  STANDARD_PRESS_KEYS,
   createUuidV7,
   createResumeCapabilityStore,
   type MethodParams,
@@ -182,6 +183,16 @@ const DEFINITIONS: ReadonlyArray<{
         const action = z.union([
           z.object({ kind: z.literal("click"), ref }).strict(),
           z.object({ kind: z.literal("click"), selector }).strict(),
+          z.object({
+            kind: z.literal("press"),
+            ref,
+            key: z.enum(STANDARD_PRESS_KEYS),
+          }).strict(),
+          z.object({
+            kind: z.literal("press"),
+            selector,
+            key: z.enum(STANDARD_PRESS_KEYS),
+          }).strict(),
           z.object({ kind: z.literal("type"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
           z.object({ kind: z.literal("type"), selector, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),
           z.object({ kind: z.literal("fill"), ref, text: z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS) }).strict(),

@@ -22,6 +22,9 @@ const MAX_ACTION_VALUE_CHARS: usize = 2_048;
 const MAX_UPLOAD_FILES: usize = 4;
 const MAX_UPLOAD_PATH_CHARS: usize = 512;
 const MAX_WAIT_CONDITION_CHARS: usize = 2_048;
+const MAX_FRAME_ID_CHARS: usize = 256;
+const MAX_DOWNLOAD_CURSOR_CHARS: usize = 256;
+const MAX_DIALOG_PROMPT_CHARS: usize = 4_096;
 const MAX_HANDOFF_PROMPT_CHARS: usize = 2_000;
 const MAX_HANDOFF_COMPLETION_CHARS: usize = 2_048;
 const MAX_STAGED_TOKEN_CHARS: usize = 256;
@@ -379,6 +382,8 @@ pub enum BrowserSnapshotParams {
     Accessibility {
         tab_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         root_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_depth: Option<u16>,
@@ -387,6 +392,8 @@ pub enum BrowserSnapshotParams {
     },
     Text {
         tab_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,6 +404,8 @@ pub enum BrowserSnapshotParams {
     Html {
         tab_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_bytes: Option<u32>,
@@ -405,6 +414,8 @@ pub enum BrowserSnapshotParams {
     },
     Screenshot {
         tab_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
         #[serde(default)]
@@ -453,12 +464,59 @@ pub enum BrowserAction {
         r#ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+        #[serde(default)]
+        expect_download: bool,
+    },
+    Hover {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+    },
+    DoubleClick {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+        #[serde(default)]
+        expect_download: bool,
+    },
+    ContextClick {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+        #[serde(default)]
+        expect_download: bool,
+    },
+    Press {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+        #[serde(default)]
+        expect_download: bool,
+        key: PressKey,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        modifiers: Vec<PressModifier>,
     },
     Type {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
         text: String,
     },
     Fill {
@@ -466,42 +524,106 @@ pub enum BrowserAction {
         r#ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
         text: String,
     },
     Select {
         r#ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
         value: String,
     },
     Scroll {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
         delta_x: i64,
         delta_y: i64,
     },
     Drag {
         r#ref: String,
         target_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
     },
     Navigate {
         url: String,
+        #[serde(default)]
+        expect_download: bool,
     },
-    GoBack,
-    GoForward,
+    GoBack {
+        #[serde(default)]
+        expect_download: bool,
+    },
+    GoForward {
+        #[serde(default)]
+        expect_download: bool,
+    },
     Reload {
         #[serde(default)]
         bypass_cache: bool,
+        #[serde(default)]
+        expect_download: bool,
     },
     Close,
     Dialog {
         decision: DialogDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_text: Option<String>,
     },
     UploadFile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
         files: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum PressKey {
+    #[serde(rename = "ArrowUp")]
+    ArrowUp,
+    #[serde(rename = "ArrowDown")]
+    ArrowDown,
+    #[serde(rename = "ArrowLeft")]
+    ArrowLeft,
+    #[serde(rename = "ArrowRight")]
+    ArrowRight,
+    #[serde(rename = "Enter")]
+    Enter,
+    #[serde(rename = "Escape")]
+    Escape,
+    #[serde(rename = "Tab")]
+    Tab,
+    #[serde(rename = "Home")]
+    Home,
+    #[serde(rename = "End")]
+    End,
+    #[serde(rename = "Space")]
+    Space,
+    #[serde(rename = "Backspace")]
+    Backspace,
+    #[serde(rename = "Delete")]
+    Delete,
+    #[serde(rename = "a")]
+    A,
+    #[serde(rename = "z")]
+    Z,
+    #[serde(rename = "y")]
+    Y,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PressModifier {
+    Alt,
+    Control,
+    Meta,
+    Shift,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,10 +651,39 @@ fn default_wait_timeout() -> u64 {
 pub enum WaitCondition {
     Load,
     NetworkIdle,
-    Download,
-    Url { value: String },
-    Text { value: String },
-    Selector { value: String },
+    Download {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    Url {
+        value: String,
+    },
+    Text {
+        value: String,
+    },
+    Selector {
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<SelectorWaitState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+    },
+    Value {
+        selector: String,
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        frame_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectorWaitState {
+    Attached,
+    Detached,
+    Visible,
+    Hidden,
+    Enabled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -662,11 +813,13 @@ impl MethodParams {
                 }
             }
             Self::Snapshot(BrowserSnapshotParams::Accessibility {
+                frame_id,
                 root_ref,
                 max_depth,
                 max_nodes,
                 ..
             }) => {
+                validate_optional_frame_id(method, frame_id)?;
                 if let Some(value) = root_ref {
                     require_len(method, value, 1, MAX_REF_CHARS, "root_ref")?;
                 }
@@ -686,17 +839,20 @@ impl MethodParams {
                 }
             }
             Self::Snapshot(BrowserSnapshotParams::Text {
+                frame_id,
                 selector,
                 r#match,
                 max_bytes,
                 ..
             })
             | Self::Snapshot(BrowserSnapshotParams::Html {
+                frame_id,
                 selector,
                 r#match,
                 max_bytes,
                 ..
             }) => {
+                validate_optional_frame_id(method, frame_id)?;
                 if let Some(value) = selector {
                     require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
                 }
@@ -714,6 +870,7 @@ impl MethodParams {
                 }
             }
             Self::Snapshot(BrowserSnapshotParams::Screenshot {
+                frame_id,
                 selector,
                 full_page,
                 format,
@@ -723,6 +880,7 @@ impl MethodParams {
                 max_bytes,
                 ..
             }) => {
+                validate_optional_frame_id(method, frame_id)?;
                 if let Some(value) = selector {
                     require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
                 }
@@ -775,20 +933,7 @@ impl MethodParams {
                     (1..=120_000).contains(&params.timeout_ms),
                     "timeout_ms must be between 1 and 120000",
                 )?;
-                match &params.condition {
-                    WaitCondition::Url { value }
-                    | WaitCondition::Text { value }
-                    | WaitCondition::Selector { value } => {
-                        require_len(
-                            method,
-                            value,
-                            1,
-                            MAX_WAIT_CONDITION_CHARS,
-                            "condition.value",
-                        )?;
-                    }
-                    WaitCondition::Load | WaitCondition::NetworkIdle | WaitCondition::Download => {}
-                }
+                validate_wait_condition(method, &params.condition)?;
             }
             Self::Handoff(BrowserHandoffParams::Request {
                 prompt,
@@ -819,7 +964,9 @@ impl MethodParams {
                 BrowserHandoffParams::Status { notice_id }
                 | BrowserHandoffParams::Resolve { notice_id }
                 | BrowserHandoffParams::Dismiss { notice_id },
-            ) => require_len(method, notice_id, 1, usize::MAX, "notice_id")?,
+            ) => {
+                require(method, !notice_id.is_empty(), "notice_id is required")?;
+            }
             Self::Credentials(BrowserCredentialsParams::Prepare { .. }) => {}
             Self::Credentials(
                 BrowserCredentialsParams::Fill {
@@ -859,15 +1006,13 @@ impl MethodParams {
                     }
                 }
             }
-            Self::Commit(params) => {
-                require_len(
-                    method,
-                    &params.staged_token,
-                    32,
-                    MAX_STAGED_TOKEN_CHARS,
-                    "staged_token",
-                )?;
-            }
+            Self::Commit(params) => require_len(
+                method,
+                &params.staged_token,
+                32,
+                MAX_STAGED_TOKEN_CHARS,
+                "staged_token",
+            )?,
             Self::Finish(params) => {
                 require(
                     method,
@@ -902,78 +1047,90 @@ impl MethodParams {
 
 fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), ProtocolError> {
     match action {
-        BrowserAction::Click { r#ref, selector } => match (r#ref, selector) {
-            (Some(value), None) => require_ref(method, value),
-            (None, Some(value)) => require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector"),
-            _ => require(
-                method,
-                false,
-                "click requires exactly one of ref or selector",
-            ),
-        },
+        BrowserAction::Click {
+            r#ref,
+            selector,
+            frame_id,
+            ..
+        }
+        | BrowserAction::Hover {
+            r#ref,
+            selector,
+            frame_id,
+        }
+        | BrowserAction::DoubleClick {
+            r#ref,
+            selector,
+            frame_id,
+            ..
+        }
+        | BrowserAction::ContextClick {
+            r#ref,
+            selector,
+            frame_id,
+            ..
+        } => validate_target(method, r#ref, selector, frame_id, "gesture"),
+        BrowserAction::Press {
+            r#ref,
+            selector,
+            frame_id,
+            key,
+            modifiers,
+            ..
+        } => {
+            validate_target(method, r#ref, selector, frame_id, "press")?;
+            validate_press_chord(method, *key, modifiers)
+        }
         BrowserAction::Type {
             r#ref,
             selector,
+            frame_id,
             text,
-        } => {
-            match (r#ref, selector) {
-                (Some(value), None) => require_ref(method, value)?,
-                (None, Some(value)) => {
-                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
-                }
-                _ => {
-                    return require(
-                        method,
-                        false,
-                        "type requires exactly one of ref or selector",
-                    )
-                }
-            }
-            require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
         }
-        BrowserAction::Fill {
+        | BrowserAction::Fill {
             r#ref,
             selector,
+            frame_id,
             text,
         } => {
-            match (r#ref, selector) {
-                (Some(value), None) => require_ref(method, value)?,
-                (None, Some(value)) => {
-                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?;
-                }
-                _ => {
-                    return require(
-                        method,
-                        false,
-                        "fill requires exactly one of ref or selector",
-                    )
-                }
-            }
+            validate_target(method, r#ref, selector, frame_id, "text action")?;
             require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
         }
-        BrowserAction::Select { r#ref, value } => {
+        BrowserAction::Select {
+            r#ref,
+            frame_id,
+            value,
+        } => {
             require_ref(method, r#ref)?;
+            validate_optional_frame_id(method, frame_id)?;
             require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "value")
         }
         BrowserAction::Scroll {
             r#ref,
+            frame_id,
             delta_x,
             delta_y,
         } => {
             if let Some(value) = r#ref {
                 require_ref(method, value)?;
             }
+            validate_optional_frame_id(method, frame_id)?;
             require(
                 method,
                 delta_x.unsigned_abs() <= 100_000 && delta_y.unsigned_abs() <= 100_000,
                 "scroll deltas must be between -100000 and 100000",
             )
         }
-        BrowserAction::Drag { r#ref, target_ref } => {
+        BrowserAction::Drag {
+            r#ref,
+            target_ref,
+            frame_id,
+        } => {
             require_ref(method, r#ref)?;
-            require_ref(method, target_ref)
+            require_ref(method, target_ref)?;
+            validate_optional_frame_id(method, frame_id)
         }
-        BrowserAction::Navigate { url } => {
+        BrowserAction::Navigate { url, .. } => {
             require_len(method, url, 1, MAX_URL_CHARS, "url")?;
             require(
                 method,
@@ -981,25 +1138,27 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
                 "url must use http, https, or about without whitespace",
             )
         }
-        BrowserAction::Dialog { .. } => Ok(()),
+        BrowserAction::Dialog {
+            decision,
+            prompt_text,
+        } => {
+            if let Some(value) = prompt_text {
+                require(
+                    method,
+                    matches!(decision, DialogDecision::Accept),
+                    "prompt_text requires dialog accept",
+                )?;
+                require_len(method, value, 0, MAX_DIALOG_PROMPT_CHARS, "prompt_text")?;
+            }
+            Ok(())
+        }
         BrowserAction::UploadFile {
             r#ref,
             selector,
+            frame_id,
             files,
         } => {
-            match (r#ref, selector) {
-                (Some(value), None) => require_ref(method, value)?,
-                (None, Some(value)) => {
-                    require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?
-                }
-                _ => {
-                    return require(
-                        method,
-                        false,
-                        "upload_file requires exactly one of ref or selector",
-                    )
-                }
-            }
+            validate_target(method, r#ref, selector, frame_id, "upload_file")?;
             require(
                 method,
                 (1..=MAX_UPLOAD_FILES).contains(&files.len()),
@@ -1010,10 +1169,130 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             }
             Ok(())
         }
-        BrowserAction::GoBack
-        | BrowserAction::GoForward
+        BrowserAction::GoBack { .. }
+        | BrowserAction::GoForward { .. }
         | BrowserAction::Reload { .. }
         | BrowserAction::Close => Ok(()),
+    }
+}
+
+fn validate_target(
+    method: RpcMethod,
+    r#ref: &Option<String>,
+    selector: &Option<String>,
+    frame_id: &Option<String>,
+    kind: &str,
+) -> Result<(), ProtocolError> {
+    match (r#ref, selector) {
+        (Some(value), None) => require_ref(method, value)?,
+        (None, Some(value)) => require_len(method, value, 1, MAX_SELECTOR_CHARS, "selector")?,
+        _ => {
+            return require(
+                method,
+                false,
+                format!("{kind} requires exactly one of ref or selector"),
+            )
+        }
+    }
+    validate_optional_frame_id(method, frame_id)
+}
+
+fn validate_optional_frame_id(
+    method: RpcMethod,
+    frame_id: &Option<String>,
+) -> Result<(), ProtocolError> {
+    if let Some(value) = frame_id {
+        require_len(method, value, 1, MAX_FRAME_ID_CHARS, "frame_id")?;
+    }
+    Ok(())
+}
+
+fn validate_press_chord(
+    method: RpcMethod,
+    key: PressKey,
+    modifiers: &[PressModifier],
+) -> Result<(), ProtocolError> {
+    require(
+        method,
+        modifiers.len() <= 4,
+        "modifiers must contain at most 4 items",
+    )?;
+    for (index, modifier) in modifiers.iter().enumerate() {
+        require(
+            method,
+            !modifiers[..index].contains(modifier),
+            "modifiers must not contain duplicates",
+        )?;
+    }
+    if matches!(key, PressKey::A | PressKey::Z | PressKey::Y) {
+        let control = modifiers.contains(&PressModifier::Control);
+        let meta = modifiers.contains(&PressModifier::Meta);
+        require(
+            method,
+            control ^ meta,
+            "a, z, and y require exactly one of Control or Meta",
+        )?;
+        require(
+            method,
+            !modifiers.contains(&PressModifier::Alt),
+            "a, z, and y cannot use Alt",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_wait_condition(
+    method: RpcMethod,
+    condition: &WaitCondition,
+) -> Result<(), ProtocolError> {
+    match condition {
+        WaitCondition::Url { value } | WaitCondition::Text { value } => require_len(
+            method,
+            value,
+            1,
+            MAX_WAIT_CONDITION_CHARS,
+            "condition.value",
+        ),
+        WaitCondition::Selector {
+            value, frame_id, ..
+        } => {
+            require_len(
+                method,
+                value,
+                1,
+                MAX_WAIT_CONDITION_CHARS,
+                "condition.value",
+            )?;
+            validate_optional_frame_id(method, frame_id)
+        }
+        WaitCondition::Value {
+            selector,
+            value,
+            frame_id,
+        } => {
+            require_len(
+                method,
+                selector,
+                1,
+                MAX_SELECTOR_CHARS,
+                "condition.selector",
+            )?;
+            require_len(method, value, 0, MAX_ACTION_VALUE_CHARS, "condition.value")?;
+            validate_optional_frame_id(method, frame_id)
+        }
+        WaitCondition::Download { after } => {
+            if let Some(value) = after {
+                require_len(
+                    method,
+                    value,
+                    1,
+                    MAX_DOWNLOAD_CURSOR_CHARS,
+                    "condition.after",
+                )?;
+            }
+            Ok(())
+        }
+        WaitCondition::Load | WaitCondition::NetworkIdle => Ok(()),
     }
 }
 
@@ -1030,7 +1309,7 @@ fn validate_developer_params(
         require_len(method, key, 1, MAX_DEVELOPER_PARAM_KEY_CHARS, "params key")?;
         match value {
             Value::String(value) => {
-                require_len(method, value, 0, MAX_DEVELOPER_VALUE_CHARS, "params string")?;
+                require_len(method, value, 0, MAX_DEVELOPER_VALUE_CHARS, "params string")?
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
             Value::Array(values) => {
@@ -1041,21 +1320,19 @@ fn validate_developer_params(
                 )?;
                 for value in values {
                     match value {
-                        Value::String(value) => {
-                            require_len(
-                                method,
-                                value,
-                                0,
-                                MAX_DEVELOPER_VALUE_CHARS,
-                                "params array string",
-                            )?;
-                        }
+                        Value::String(value) => require_len(
+                            method,
+                            value,
+                            0,
+                            MAX_DEVELOPER_VALUE_CHARS,
+                            "params array string",
+                        )?,
                         Value::Null | Value::Bool(_) | Value::Number(_) => {}
                         Value::Array(_) | Value::Object(_) => {
                             return Err(ProtocolError::InvalidParamConstraint {
                                 method,
                                 message: "params arrays may contain only scalar values".into(),
-                            });
+                            })
                         }
                     }
                 }
@@ -1064,7 +1341,7 @@ fn validate_developer_params(
                 return Err(ProtocolError::InvalidParamConstraint {
                     method,
                     message: "params values must be scalars or arrays of scalars".into(),
-                });
+                })
             }
         }
     }
@@ -2066,13 +2343,85 @@ mod tests {
         assert!(RpcRequest::parse(unknown_action_field).is_err());
     }
     #[test]
-    fn standard_actions_reject_press() {
-        let press = json!({
+    fn standard_press_action_requires_a_target_and_supported_key() {
+        let valid = json!({
             "tab_id": 7,
             "expected_page_revision": 11,
-            "actions": [{"kind": "press", "ref": "e4", "key": "Enter"}]
+            "actions": [{"kind": "press", "selector": "button.submit", "key": "Enter"}]
         });
-        assert!(RpcRequest::parse(request("browser_act", press, true)).is_err());
+        assert!(matches!(
+            RpcRequest::parse(request("browser_act", valid, true)).unwrap().1,
+            MethodParams::Act(BrowserActParams { actions, .. })
+                if matches!(
+                    actions.as_slice(),
+                    [BrowserAction::Press {
+                        r#ref: None,
+                        selector: Some(selector),
+                        key: PressKey::Enter,
+                        ..
+                    }] if selector == "button.submit"
+                )
+        ));
+
+        for action in [
+            json!({"kind": "press", "key": "Enter"}),
+            json!({"kind": "press", "ref": "e4", "selector": "button", "key": "Enter"}),
+            json!({"kind": "press", "ref": "e4", "key": "Shift"}),
+            json!({"kind": "press", "ref": "e4", "key": "a"}),
+            json!({"kind": "press", "ref": "e4", "key": "a", "modifiers": ["Control", "Meta"]}),
+            json!({"kind": "press", "ref": "e4", "key": "a", "modifiers": ["Control", "Control"]}),
+        ] {
+            assert!(RpcRequest::parse(request(
+                "browser_act",
+                json!({"tab_id": 7, "expected_page_revision": 11, "actions": [action]}),
+                true,
+            ))
+            .is_err());
+        }
+    }
+    #[test]
+    fn reliability_action_and_wait_contracts_are_strict() {
+        let act = json!({
+            "tab_id": 7,
+            "expected_page_revision": 11,
+            "actions": [
+                {"kind": "hover", "selector": "button", "frame_id": "frame-1"},
+                {"kind": "double_click", "ref": "e4", "frame_id": "frame-1"},
+                {"kind": "context_click", "ref": "e5"},
+                {"kind": "press", "ref": "e6", "key": "z", "modifiers": ["Control", "Shift"]},
+                {"kind": "dialog", "decision": "accept", "prompt_text": "answer"}
+            ]
+        });
+        assert!(RpcRequest::parse(request("browser_act", act, true)).is_ok());
+        assert!(RpcRequest::parse(request(
+            "browser_wait",
+            json!({"tab_id": 7, "condition": {"kind": "selector", "value": "input", "state": "visible", "frame_id": "frame-1"}}),
+            false,
+        )).is_ok());
+        assert!(RpcRequest::parse(request(
+            "browser_wait",
+            json!({"tab_id": 7, "condition": {"kind": "value", "selector": "input", "value": "ready", "frame_id": "frame-1"}}),
+            false,
+        )).is_ok());
+        for (method, params, mutation) in [
+            (
+                "browser_act",
+                json!({"tab_id": 7, "expected_page_revision": 11, "actions": [{"kind": "dialog", "decision": "dismiss", "prompt_text": "no"}]}),
+                true,
+            ),
+            (
+                "browser_act",
+                json!({"tab_id": 7, "expected_page_revision": 11, "actions": [{"kind": "press", "ref": "e4", "key": "a"}]}),
+                true,
+            ),
+            (
+                "browser_wait",
+                json!({"tab_id": 7, "condition": {"kind": "download", "after": ""}}),
+                false,
+            ),
+        ] {
+            assert!(RpcRequest::parse(request(method, params, mutation)).is_err());
+        }
     }
 
     #[test]
@@ -2339,9 +2688,9 @@ mod tests {
                 if matches!(
                     actions.as_slice(),
                     [
-                        BrowserAction::Click { selector: Some(sel1), r#ref: None },
-                        BrowserAction::Type { selector: Some(sel2), r#ref: None, text: t1 },
-                        BrowserAction::Fill { selector: Some(sel3), r#ref: None, text: t2 },
+                        BrowserAction::Click { selector: Some(sel1), r#ref: None, .. },
+                        BrowserAction::Type { selector: Some(sel2), r#ref: None, text: t1, .. },
+                        BrowserAction::Fill { selector: Some(sel3), r#ref: None, text: t2, .. },
                     ] if sel1 == "button.submit" && sel2 == "input.search" && t1 == "agenttab" && sel3 == "input.email" && t2 == "test@example.com"
                 )
         ));
@@ -2458,6 +2807,7 @@ mod tests {
         let action_cases = [
             json!({"kind": "type", "ref": ref_value, "text": escaped(MAX_ACTION_TEXT_CHARS)}),
             json!({"kind": "fill", "ref": escaped(MAX_REF_CHARS), "text": escaped(MAX_ACTION_TEXT_CHARS)}),
+            json!({"kind": "press", "ref": escaped(MAX_REF_CHARS), "key": "ArrowDown"}),
             json!({"kind": "select", "ref": escaped(MAX_REF_CHARS), "value": escaped(MAX_ACTION_VALUE_CHARS)}),
             json!({"kind": "dialog", "decision": "accept"}),
             json!({
@@ -2526,8 +2876,7 @@ mod tests {
             action_schema.pointer("/$defs/upload_file/properties/files/items/maxLength"),
             Some(&json!(MAX_UPLOAD_PATH_CHARS))
         );
-        assert!(action_schema.pointer("/$defs/press").is_none());
-        assert!(!action_schema["$defs"]["action"]["oneOf"]
+        assert!(action_schema["$defs"]["action"]["oneOf"]
             .as_array()
             .unwrap()
             .iter()

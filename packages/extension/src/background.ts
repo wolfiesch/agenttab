@@ -98,6 +98,7 @@ browser = new StandardBrowserRuntime(
     const child = await chrome.tabs.get(childTabId).catch(() => null);
     if (child) await ownership.adoptOwnedChild(child, parentTabId);
   },
+  (parentTabId, url) => ownership.openRequestedChild(parentTabId, url),
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber((tabId) => browser.discardHumanInteractionCapture(tabId));
@@ -460,6 +461,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await ownership.assertOwned(command.task_id, targetTabId);
         await assertCurrentOrigin(targetTabId, command.origin_policy);
         return browser.fillCredentials(
+          command.task_id,
           targetTabId,
           params.expected_page_revision,
           params.fields,
@@ -473,7 +475,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         if (command.method === "browser_snapshot") {
           await ownership.assertOwned(command.task_id, targetTabId);
           await assertCurrentOrigin(targetTabId, command.origin_policy);
-          return browser.snapshot(targetTabId, params);
+          return browser.snapshot(command.task_id, targetTabId, params);
         }
         const revalidate = async () => {
           if (!scheduler.isAccepting()) {
@@ -485,7 +487,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
             throw scheduler.notStarted("AgentTab stopped the active browser wait");
           }
         };
-        return browser.wait(targetTabId, params, revalidate);
+        return browser.wait(targetTabId, params, revalidate, command.task_id);
       });
       return completed(command.request_id, result);
     }

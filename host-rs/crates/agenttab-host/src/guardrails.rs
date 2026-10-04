@@ -203,8 +203,8 @@ impl Guardrails {
             MethodParams::Act(params) => {
                 for action in &params.actions {
                     match action {
-                        BrowserAction::Navigate { url } => self.authorize_url(url)?,
-                        BrowserAction::GoBack | BrowserAction::GoForward
+                        BrowserAction::Navigate { url, .. } => self.authorize_url(url)?,
+                        BrowserAction::GoBack { .. } | BrowserAction::GoForward { .. }
                             if self.has_origin_constraints() =>
                         {
                             return Err(RpcError::new(
@@ -624,6 +624,7 @@ mod tests {
             actions: vec![BrowserAction::UploadFile {
                 r#ref: Some("e1".into()),
                 selector: None,
+                frame_id: None,
                 files: vec![std::env::current_exe().unwrap().display().to_string()],
             }],
         });
@@ -693,7 +694,9 @@ mod tests {
         let history = MethodParams::Act(agenttab_protocol::BrowserActParams {
             tab_id: 1,
             expected_page_revision: 2,
-            actions: vec![BrowserAction::GoBack],
+            actions: vec![BrowserAction::GoBack {
+                expect_download: false,
+            }],
         });
         assert_eq!(
             guardrails
@@ -755,6 +758,7 @@ mod tests {
             actions: vec![BrowserAction::UploadFile {
                 r#ref: Some("e1".into()),
                 selector: None,
+                frame_id: None,
                 files: vec![link.display().to_string()],
             }],
         });
@@ -782,6 +786,7 @@ mod tests {
             actions: vec![BrowserAction::UploadFile {
                 r#ref: Some("e1".into()),
                 selector: None,
+                frame_id: None,
                 files: vec![hardlink.display().to_string()],
             }],
         });

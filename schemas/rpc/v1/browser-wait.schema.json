@@ -8,15 +8,46 @@
         {
           "type": "object",
           "required": ["kind"],
-          "properties": { "kind": { "enum": ["load", "network_idle", "download"] } },
+          "properties": { "kind": { "enum": ["load", "network_idle"] } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "download" },
+            "after": { "type": "string", "minLength": 1, "maxLength": 256 }
+          },
           "additionalProperties": false
         },
         {
           "type": "object",
           "required": ["kind", "value"],
           "properties": {
-            "kind": { "enum": ["url", "text", "selector"] },
+            "kind": { "enum": ["url", "text"] },
             "value": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "selector" },
+            "value": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "state": { "enum": ["attached", "detached", "visible", "hidden", "enabled"] },
+            "frame_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "selector", "value"],
+          "properties": {
+            "kind": { "const": "value" },
+            "selector": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "value": { "type": "string", "maxLength": 2048 },
+            "frame_id": { "type": "string", "minLength": 1, "maxLength": 256 }
           },
           "additionalProperties": false
         }
