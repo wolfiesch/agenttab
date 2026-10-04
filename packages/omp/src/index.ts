@@ -12,6 +12,7 @@ import {
   type MethodParams,
   type MutationMethod,
 } from "../../sdk-typescript/src/index";
+import { describeCallView, describeResultView } from "./native";
 import { piSchema } from "./pi-schema";
 import {
   createCallComponent,
@@ -480,6 +481,10 @@ export function makeExtension(clientFactory?: ClientFactory) {
             createCallComponent(definition.name, args, theme),
           renderResult: (result: ToolResult, options: RenderOptions, theme: RenderTheme, args: unknown) =>
             createResultComponent(definition.name, result, options, theme, args),
+          describeCall: (args: unknown) => describeCallView(definition.name, args),
+          describeResult: (result: ToolResult, options: RenderOptions, args: unknown) =>
+            describeResultView(definition.name, result, options, args),
+          mergeCallAndResult: true,
         }
         : {
           renderCall: (args: unknown, theme: RenderTheme) =>
