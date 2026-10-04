@@ -283,45 +283,36 @@ const DEFINITIONS: ReadonlyArray<{
       label: "Browser Handoff",
       description: "Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id.",
       approval: "write",
-      schema: (z) => z.union([
-        z.object({
-          operation: z.literal("request"),
-          tab_id: z.number().int().min(0),
-          expected_page_revision: z.number().int().min(0),
-          prompt: z.string().min(1).max(2000),
-          completion: z.object({
-            kind: z.enum(["url", "selector"]),
-            value: z.string().min(1).max(65_536),
-          }).strict().optional(),
-          timeout_ms: z.number().int().min(1000).max(900_000).optional(),
-        }).strict(),
-        z.object({
-          operation: z.enum(["status", "resolve", "dismiss"]),
-          notice_id: z.string().min(1).max(256),
-        }).strict(),
-      ]),
+      // One flat object covers every operation: OpenAI-compatible providers reject a root union.
+      // Core enforces which fields each operation requires.
+      schema: (z) => z.object({
+        operation: z.enum(["request", "status", "resolve", "dismiss"]),
+        tab_id: z.number().int().min(0).optional(),
+        expected_page_revision: z.number().int().min(0).optional(),
+        prompt: z.string().min(1).max(2000).optional(),
+        completion: z.object({
+          kind: z.enum(["url", "selector"]),
+          value: z.string().min(1).max(65_536),
+        }).strict().optional(),
+        timeout_ms: z.number().int().min(1000).max(900_000).optional(),
+        notice_id: z.string().min(1).max(256).optional(),
+      }).strict(),
     },
     {
       name: "browser_credentials",
       label: "Browser Credentials",
       description: "Prefer this before human handoff: use a URL-matching 1Password Login without exposing its values. Prepare first; more than three matches require the user. Fill only, then submit through Browser Act.",
       approval: "write",
-      schema: (z) => z.union([
-        z.object({
-          action: z.literal("prepare"),
-          tab_id: z.number().int().min(0),
-          expected_page_revision: z.number().int().min(0),
-        }).strict(),
-        z.object({
-          action: z.enum(["fill", "next"]),
-          tab_id: z.number().int().min(0),
-          expected_page_revision: z.number().int().min(0),
-          credential_token: z.string().min(32).max(256),
-          username_ref: z.string().min(1).max(256).optional(),
-          password_ref: z.string().min(1).max(256).optional(),
-          otp_ref: z.string().min(1).max(256).optional(),
-        }).strict(),
-      ]),
+      // One flat object covers every action; Core enforces credential_token for fill and next.
+      schema: (z) => z.object({
+        action: z.enum(["prepare", "fill", "next"]),
+        tab_id: z.number().int().min(0),
+        expected_page_revision: z.number().int().min(0),
+        credential_token: z.string().min(32).max(256).optional(),
+        username_ref: z.string().min(1).max(256).optional(),
+        password_ref: z.string().min(1).max(256).optional(),
+        otp_ref: z.string().min(1).max(256).optional(),
+      }).strict(),
     },
     {
       name: "browser_commit",

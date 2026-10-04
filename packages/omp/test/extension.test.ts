@@ -181,12 +181,12 @@ test("Standard OMP mode registers the complete Core RPC tool surface", () => {
 });
 
 
-test("Standard read and open tools expose provider-compatible object schemas", () => {
-  const registered = register(false);
+test("every OMP tool exposes a provider-compatible root object schema", () => {
+  const registered = register(true);
+  for (const tool of registered.tools) {
+    expect({ tool: tool.name, parameters: tool.parameters }).toMatchObject({ tool: tool.name, parameters: { kind: "object" } });
+  }
   const open = registered.tools.find((tool) => tool.name === "browser_open");
-  const snapshot = registered.tools.find((tool) => tool.name === "browser_snapshot");
-  expect(open?.parameters).toMatchObject({ kind: "object" });
-  expect(snapshot?.parameters).toMatchObject({ kind: "object" });
   expect(stubState(open?.parameters).vocabulary.values).toContain("new_window");
 });
 
