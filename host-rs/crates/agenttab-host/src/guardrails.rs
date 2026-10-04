@@ -694,7 +694,9 @@ mod tests {
         let history = MethodParams::Act(agenttab_protocol::BrowserActParams {
             tab_id: 1,
             expected_page_revision: 2,
-            actions: vec![BrowserAction::GoBack { expect_download: false }],
+            actions: vec![BrowserAction::GoBack {
+                expect_download: false,
+            }],
         });
         assert_eq!(
             guardrails
