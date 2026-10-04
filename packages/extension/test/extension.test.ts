@@ -79,6 +79,7 @@ let debuggerCalls: string[];
 let tabStore: Map<number, MockTab>;
 let removedTabIds: number[];
 let failGrouping: boolean;
+let autoCompleteCreatedTabs: boolean;
 let nextTabId: number;
 let nextGroupId: number;
 let scriptResult: unknown;
@@ -329,6 +330,7 @@ function installChromeMock(): void {
   tabStore = new Map();
   removedTabIds = [];
   failGrouping = false;
+  autoCompleteCreatedTabs = true;
   nextTabId = 100;
   nextGroupId = 50;
   scriptResult = true;
@@ -523,11 +525,18 @@ function installChromeMock(): void {
           return clone(tabs);
         },
         async create(options: Record<string, unknown>) {
-          return clone(createTab(
+          const tab = createTab(
             typeof options.url === "string" ? options.url : "about:blank",
             options.active === true,
             typeof options.windowId === "number" ? options.windowId : 1,
-          ));
+          );
+          // Chrome delivers the created tab's load events after `tabs.create` resolves.
+          if (autoCompleteCreatedTabs) {
+            queueMicrotask(() => {
+              for (const listener of tabUpdatedListeners) listener(tab.id, { status: "complete" });
+            });
+          }
+          return clone(tab);
         },
         async move(tabIds: number | number[], options: { windowId: number; index: number }) {
           const moved: MockTab[] = [];
@@ -3376,6 +3385,31 @@ describe("page revision monotonicity", () => {
     ).rejects.toMatchObject({ code: "action_failed" });
   });
 
+  test("names the failing batch step and returns the results of the steps that ran", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(64);
+
+    const failure = await runtime.act(TASK_A, 64, pageRevision, [
+      { kind: "scroll", delta_x: 0, delta_y: 100 },
+      { kind: "click" },
+    ]).then(() => null, (error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "invalid_request",
+      message: "Action 2 of 2 (click) failed after 1 earlier action completed: click requires exactly one of ref or selector",
+      failedActionIndex: 1,
+      completedActions: [{ kind: "scroll" }],
+      outcome: "unknown",
+    });
+
+    const firstStepFailure = await runtime.act(TASK_A, 64, pageRevision, [
+      { kind: "click" },
+      { kind: "scroll", delta_x: 0, delta_y: 100 },
+    ]).then(() => null, (error: unknown) => error);
+    expect(firstStepFailure).toMatchObject({ failedActionIndex: 0, completedActions: [] });
+    expect(firstStepFailure).not.toHaveProperty("outcome");
+  });
+
   test("advances a tab revision past its generation floor after revocation and re-adoption", async () => {
     await seedTask(TASK_A, [62]);
     const tab = tabStore.get(62);
@@ -5939,5 +5973,72 @@ describe("extension entrypoint admission boundaries", () => {
     expect(debuggerAttachedTabIds.has(101)).toBe(false);
     expect((await readState()).automationCleanup.tabIds).toEqual([]);
     expect((await readState()).tasks[TASK_B]).toMatchObject({ groupId: null, tabIds: [] });
+
+    // Chrome can report a created tab as complete before it delivers the initial `loading` event;
+    // open reports the revision only after the queue has processed that load's `complete` event.
+    autoCompleteCreatedTabs = false;
+    const loadingOpen = sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6311",
+      TASK_C,
+      "browser_open",
+      { mode: "create", url: "https://example.test/slow" },
+    );
+    await waitForCondition(() => JSON.stringify(port.posted).includes('"tab_id":103'));
+    await flushPromiseQueue();
+    expect(JSON.stringify(port.posted)).not.toContain("018f47b8-2f80-7c20-9c77-f8a38c9e6311");
+    const loadingTab = tabStore.get(103);
+    if (!loadingTab) throw new Error("loading task tab is unavailable");
+    loadingTab.url = "https://example.test/slow/landed";
+    for (const listener of tabUpdatedListeners) listener(103, { status: "loading" });
+    for (const listener of tabUpdatedListeners) listener(103, { status: "complete" });
+    expect(await loadingOpen).toMatchObject({
+      outcome: "completed",
+      result: { tab_id: 103, page_revision: 2, url: "https://example.test/slow/landed" },
+    });
+
+    // A tab closed while its first load is pending fails the open instead of reporting a dead tab.
+    const closedOpen = sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6312",
+      TASK_C,
+      "browser_open",
+      { mode: "create", url: "https://example.test/abandoned" },
+    );
+    await waitForCondition(() => JSON.stringify(port.posted).includes('"tab_id":104'));
+    tabStore.delete(104);
+    for (const listener of tabRemovedListeners) listener(104);
+    expect(await closedOpen).toMatchObject({
+      outcome: "not_started",
+      error: { code: "ownership_revoked", recovery: "Call browser_open again." },
+    });
+
+    // A load that never completes releases the open at the deadline with the tab's current state.
+    const stuckRequestId = "018f47b8-2f80-7c20-9c77-f8a38c9e6313";
+    const stuckResponse = () => port.posted.find((message) =>
+      isRecord(message) && message.kind === "response" && message.request_id === stuckRequestId);
+    vi.useFakeTimers();
+    try {
+      port.receive({
+        protocol: "agenttab.native",
+        version: 1,
+        kind: "command",
+        request_id: stuckRequestId,
+        task_id: TASK_C,
+        connection_id: NATIVE_CONNECTION_ID,
+        method: "browser_open",
+        params: { mode: "create", url: "https://example.test/stuck" },
+      });
+      for (let turn = 0; turn < 20 && !JSON.stringify(port.posted).includes('"tab_id":105'); turn += 1) {
+        await advanceTimers(0);
+      }
+      await advanceTimers(9_500);
+      expect(stuckResponse()).toBeUndefined();
+      await advanceTimers(1_000);
+      expect(stuckResponse()).toMatchObject({
+        outcome: "completed",
+        result: { tab_id: 105, page_revision: 1, url: "https://example.test/stuck" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
