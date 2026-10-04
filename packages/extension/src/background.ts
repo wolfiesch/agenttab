@@ -33,6 +33,8 @@ let automationCleanupPending = false;
 let automationCleanupDelayMs = AUTOMATION_CLEANUP_RETRY_BASE_MS;
 let automationCleanupTimer: ReturnType<typeof setTimeout> | undefined;
 let automationCleanupQueue = Promise.resolve();
+const OPEN_SETTLE_TIMEOUT_MS = 10_000;
+const tabLoadWaiters = new Map<number, Set<() => void>>();
 
 const PRE_DISPATCH_ERRORS: Record<string, true> = {
   invalid_request: true,
@@ -388,7 +390,8 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       throw automationRequired();
     }
     if (command.method === "browser_open") {
-      return completed(command.request_id, await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params)));
+      const opened = await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params));
+      return completed(command.request_id, await settleOpenedTab(opened));
     }
     if (command.method === "browser_tabs") {
       const result = await scheduler.enqueueGlobal(() => ownership.inventory());
@@ -515,9 +518,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       normalized instanceof Error ? normalized.message : String(normalized),
       errorOutcome(normalized, mutating, code),
       errorRecovery(normalized),
-      isRecord(normalized) && typeof normalized.currentPageRevision === "number"
-        ? { current_page_revision: normalized.currentPageRevision }
-        : undefined,
+      errorDetails(normalized),
     );
   }
 }
@@ -588,6 +589,51 @@ function runAfterStart(operation: () => void | Promise<void> = () => undefined):
   startupOperations.enqueue(operation);
 }
 
+function errorDetails(error: unknown): Record<string, unknown> | undefined {
+  if (!isRecord(error)) return undefined;
+  const details = {
+    ...(typeof error.currentPageRevision === "number" ? { current_page_revision: error.currentPageRevision } : {}),
+    ...(typeof error.failedActionIndex === "number" ? { failed_action_index: error.failedActionIndex } : {}),
+    ...(Array.isArray(error.completedActions) ? { completed_actions: error.completedActions } : {}),
+  };
+  return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/**
+ * Return an opened tab only after its first navigation is reflected in its page revision.
+ * Chrome starts loading a created tab after `tabs.create` returns, and the queued `loading`
+ * event bumps the revision; returning before that hands the caller a revision that is stale
+ * on first use. The wait runs outside the global scheduler because the queued tab events
+ * take ownership transitions that `browser_open` would otherwise hold.
+ */
+async function settleOpenedTab(opened: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const tabId = opened.tab_id;
+  if (typeof tabId !== "number") return opened;
+  let release!: () => void;
+  const loaded = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const waiters = tabLoadWaiters.get(tabId) ?? new Set<() => void>();
+  waiters.add(release);
+  tabLoadWaiters.set(tabId, waiters);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, OPEN_SETTLE_TIMEOUT_MS);
+  });
+  try {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) return opened;
+    if (tab.status !== "complete") await Promise.race([loaded, deadline]);
+    // Tab events drain serially, so this barrier runs after any revision bump already dispatched.
+    await Promise.race([new Promise<void>((resolve) => runAfterStart(resolve)), deadline]);
+    return await ownership.describeTab(tabId).catch(() => opened);
+  } finally {
+    clearTimeout(timer);
+    waiters.delete(release);
+    if (waiters.size === 0) tabLoadWaiters.delete(tabId);
+  }
+}
+
 async function reconcileOwnership(): Promise<void> {
   const revokedTabIds = await ownership.reconcile();
   await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
@@ -617,21 +663,27 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
     return;
   }
   runAfterStart(async () => {
-    const owner = await ownership.taskIdForTab(updatedTabId);
-    if (!owner) return;
-    if (changeInfo.status === "loading") {
-      scheduler.invalidateTab(updatedTabId);
-      await revisions.markNavigation(updatedTabId);
-    }
-    if ("groupId" in changeInfo) {
-      const revoked = await ownership.revokeIfMoved(updatedTabId);
-      if (revoked) {
-        await handoff.cancelForTab(updatedTabId);
-        await browser.detach(updatedTabId);
+    try {
+      const owner = await ownership.taskIdForTab(updatedTabId);
+      if (!owner) return;
+      if (changeInfo.status === "loading") {
+        scheduler.invalidateTab(updatedTabId);
+        await revisions.markNavigation(updatedTabId);
       }
-    }
-    if (typeof changeInfo.url === "string" || changeInfo.status === "complete") {
-      await ownership.publishInventory();
+      if ("groupId" in changeInfo) {
+        const revoked = await ownership.revokeIfMoved(updatedTabId);
+        if (revoked) {
+          await handoff.cancelForTab(updatedTabId);
+          await browser.detach(updatedTabId);
+        }
+      }
+      if (typeof changeInfo.url === "string" || changeInfo.status === "complete") {
+        await ownership.publishInventory();
+      }
+    } finally {
+      if (changeInfo.status === "complete") {
+        for (const releaseWaiter of tabLoadWaiters.get(updatedTabId) ?? []) releaseWaiter();
+      }
     }
   });
 });

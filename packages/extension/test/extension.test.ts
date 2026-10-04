@@ -79,6 +79,7 @@ let debuggerCalls: string[];
 let tabStore: Map<number, MockTab>;
 let removedTabIds: number[];
 let failGrouping: boolean;
+let createdTabStatus: string;
 let nextTabId: number;
 let nextGroupId: number;
 let scriptResult: unknown;
@@ -329,6 +330,7 @@ function installChromeMock(): void {
   tabStore = new Map();
   removedTabIds = [];
   failGrouping = false;
+  createdTabStatus = "complete";
   nextTabId = 100;
   nextGroupId = 50;
   scriptResult = true;
@@ -376,7 +378,7 @@ function installChromeMock(): void {
     event: debuggerEventListeners,
   };
   const createTab = (url = "about:blank", active = false, windowId = 1): MockTab => {
-    const tab = { id: nextTabId++, windowId, groupId: -1, active, url, status: "complete" };
+    const tab = { id: nextTabId++, windowId, groupId: -1, active, url, status: createdTabStatus };
     tabStore.set(tab.id, tab);
     return tab;
   };
@@ -3376,6 +3378,31 @@ describe("page revision monotonicity", () => {
     ).rejects.toMatchObject({ code: "action_failed" });
   });
 
+  test("names the failing batch step and returns the results of the steps that ran", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(64);
+
+    const failure = await runtime.act(TASK_A, 64, pageRevision, [
+      { kind: "scroll", delta_x: 0, delta_y: 100 },
+      { kind: "click" },
+    ]).then(() => null, (error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "invalid_request",
+      message: "Action 2 of 2 (click) failed after 1 earlier action completed: click requires exactly one of ref or selector",
+      failedActionIndex: 1,
+      completedActions: [{ kind: "scroll" }],
+      outcome: "unknown",
+    });
+
+    const firstStepFailure = await runtime.act(TASK_A, 64, pageRevision, [
+      { kind: "click" },
+      { kind: "scroll", delta_x: 0, delta_y: 100 },
+    ]).then(() => null, (error: unknown) => error);
+    expect(firstStepFailure).toMatchObject({ failedActionIndex: 0, completedActions: [] });
+    expect(firstStepFailure).not.toHaveProperty("outcome");
+  });
+
   test("advances a tab revision past its generation floor after revocation and re-adoption", async () => {
     await seedTask(TASK_A, [62]);
     const tab = tabStore.get(62);
@@ -5939,5 +5966,27 @@ describe("extension entrypoint admission boundaries", () => {
     expect(debuggerAttachedTabIds.has(101)).toBe(false);
     expect((await readState()).automationCleanup.tabIds).toEqual([]);
     expect((await readState()).tasks[TASK_B]).toMatchObject({ groupId: null, tabIds: [] });
+
+    // Chrome starts loading a created tab after tabs.create returns; open reports the revision after that load.
+    createdTabStatus = "loading";
+    const loadingOpen = sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e6311",
+      TASK_C,
+      "browser_open",
+      { mode: "create", url: "https://example.test/slow" },
+    );
+    await waitForCondition(() => JSON.stringify(port.posted).includes('"tab_id":103'));
+    for (const listener of tabUpdatedListeners) listener(103, { status: "loading" });
+    await flushPromiseQueue();
+    expect(JSON.stringify(port.posted)).not.toContain("018f47b8-2f80-7c20-9c77-f8a38c9e6311");
+    const loadingTab = tabStore.get(103);
+    if (!loadingTab) throw new Error("loading task tab is unavailable");
+    loadingTab.status = "complete";
+    loadingTab.url = "https://example.test/slow/landed";
+    for (const listener of tabUpdatedListeners) listener(103, { status: "complete" });
+    expect(await loadingOpen).toMatchObject({
+      outcome: "completed",
+      result: { tab_id: 103, page_revision: 2, url: "https://example.test/slow/landed" },
+    });
   });
 });

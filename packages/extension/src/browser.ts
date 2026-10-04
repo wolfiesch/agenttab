@@ -76,6 +76,27 @@ function validateKeyboardAction(action: Record<string, unknown>): void {
     throw Object.assign(new Error(invalid.agenttab_invalid_request), { code: "invalid_request" });
   }
 }
+/**
+ * Name the failing step of a multi-action batch and carry the results of the steps that ran.
+ * Earlier steps already changed the page, so a failure after them can never be `not_started`.
+ */
+function batchStepFailure(
+  error: unknown,
+  index: number,
+  actions: ReadonlyArray<Record<string, unknown>>,
+  completedActions: Array<Record<string, unknown>>,
+): unknown {
+  if (!(error instanceof Error)) return error;
+  if (actions.length > 1) {
+    const completed = completedActions.length === 1 ? "1 earlier action" : `${completedActions.length} earlier actions`;
+    error.message = `Action ${index + 1} of ${actions.length} (${String(actions[index]?.kind)}) failed after ${completed} completed: ${error.message}`;
+  }
+  return Object.assign(error, {
+    failedActionIndex: index,
+    completedActions,
+    ...(completedActions.length > 0 ? { outcome: "unknown" } : {}),
+  });
+}
 const SENSITIVE_FIELD_CHECK = "const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);const text=node=>String(node&&((node.innerText??node.textContent)??'')||'').trim();const ids=String(this.getAttribute&&this.getAttribute('aria-labelledby')||'')+' '+String(this.getAttribute&&this.getAttribute('aria-describedby')||'');const associated=(this.labels?Array.from(this.labels):[]).map(text).filter(Boolean);const root=this.ownerDocument||document;const accessible=[this.getAttribute&&this.getAttribute('aria-label'),...ids.trim().split(/\\s+/).filter(Boolean).map(id=>text(root.getElementById(id)))].filter(value=>typeof value==='string'&&value.trim());const role=String(this.getAttribute&&this.getAttribute('role')||'').toLowerCase();const rawDescriptor=[this.getAttribute&&this.getAttribute('name'),this.id,this.getAttribute&&this.getAttribute('aria-label'),this.getAttribute&&this.getAttribute('title'),this.getAttribute&&this.getAttribute('placeholder'),...associated,...accessible].filter(Boolean).join(' ');const descriptor=rawDescriptor.replace(/([a-z])([A-Z])/g,'$1 $2').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();const compactDescriptor=descriptor.replace(/\\s+/g,'');const tag=String(this.tagName||'').toUpperCase();const editable=tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||this.isContentEditable===true||role==='textbox'||role==='combobox'||role==='spinbutton';const namedSecret=/\\b(password|otp|totp|mfa(?: code|token)?|2fa(?: code)?|(?:two|multi) factor (?:authentication )?(?:code|token)|one time (?:code|password)|verification code|authentication code|auth code|(?:re ?|h ?)?captcha|(?:cvv|cvc|cvn)\\d*|cid|security code|card security code|card verification (?:value|code|number)|card number|credit card number|cc number|card (?:expiration|expiry) (?:date|month|year)|bank account number|routing number|iban)\\b/.test(descriptor)||['password','onetimecode','onetimepassword','verificationcode','authenticationcode','authcode','totp','2fa','2facode','twofactorcode','twofactortoken','twofactorauthenticationcode','multifactorcode','multifactortoken','multifactorauthenticationcode','captcha','cid','securitycode','cardverificationvalue','cardverificationcode','cardverificationnumber','cardnumber','creditcardnumber','ccnumber','cardsecuritycode','cardexpirationdate','cardexpirationmonth','cardexpirationyear','cardexpirydate','cardexpirymonth','cardexpiryyear','bankaccountnumber','routingnumber'].some(term=>compactDescriptor.includes(term));const tokenSecret=/\\b(pin|passcode)\\b/.test(descriptor);const sensitiveField=type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))||(editable&&(namedSecret||tokenSecret));";
 const DOM_SENSITIVE_ACTION_PRELUDE =
   `${SENSITIVE_FIELD_CHECK}if(sensitiveField){return {agenttab_sensitive_field:true}}`;
@@ -888,101 +909,107 @@ export class StandardBrowserRuntime {
       await this.requireFullAutomationRoute(tabId, "perform page actions");
     }
     const completedActions: Array<Record<string, unknown>> = [];
-    for (const [index, action] of validated.entries()) {
-      if (
-        index < validated.length - 1 &&
-        (action.kind === "navigate" ||
-          action.kind === "go_back" ||
-          action.kind === "go_forward" ||
-          action.kind === "reload" ||
-          action.kind === "close")
-      ) {
-        throw Object.assign(new Error(`${String(action.kind)} must be the final action in a batch`), {
-          code: "invalid_request",
-        });
-      }
-      await this.revisions.assertExpected(tabId, pageRevision);
-      const hasRef = typeof action.ref === "string";
-      const hasSelector = typeof action.selector === "string";
-      if (
-        action.kind === "click" ||
-        action.kind === "hover" ||
-        action.kind === "double_click" ||
-        action.kind === "context_click" ||
-        action.kind === "type" ||
-        action.kind === "fill" ||
-        action.kind === "select" ||
-        action.kind === "press" ||
-        action.kind === "upload_file"
-      ) {
-        if (hasRef === hasSelector) {
-          throw Object.assign(new Error(`${action.kind} requires exactly one of ref or selector`), {
+    let stepIndex = 0;
+    try {
+      for (const [index, action] of validated.entries()) {
+        stepIndex = index;
+        if (
+          index < validated.length - 1 &&
+          (action.kind === "navigate" ||
+            action.kind === "go_back" ||
+            action.kind === "go_forward" ||
+            action.kind === "reload" ||
+            action.kind === "close")
+        ) {
+          throw Object.assign(new Error(`${String(action.kind)} must be the final action in a batch`), {
             code: "invalid_request",
           });
         }
-      }
-      validateKeyboardAction(action);
-      const resolvedTarget = hasSelector || hasRef
-        ? await this.resolveTarget(tabId, {
-          taskId,
-          pageRevision,
-          ...(hasRef ? { ref: String(action.ref) } : { selector: String(action.selector) }),
-          ...(typeof action.frame_id === "string" ? { frameId: action.frame_id } : {}),
-          actionKind: String(action.kind),
-        })
-        : undefined;
-      const stagedConsequence = await this.consequence(tabId, action, resolvedTarget);
-      if (stagedConsequence && !(await readState()).skipCommitReview) {
-        const staged: StagedCommit = {
-          native_token: randomToken(),
-          task_id: taskId,
-          tab_id: tabId,
-          page_revision: pageRevision,
-          effect: stagedConsequence.effect,
-          fingerprint: await this.stageFingerprint(
-            taskId,
-            tabId,
-            pageRevision,
-            action,
-            stagedConsequence.target,
-          ),
-          expires_at_ms: Date.now() + 300_000,
-          action: { action },
-          preview: {
-            effect: stagedConsequence.effect,
-            kind: action.kind,
-            target: stagedConsequence.target,
-            ...(typeof action.ref === "string" ? { ref: action.ref } : {}),
-            ...(typeof action.selector === "string" ? { selector: action.selector } : {}),
-            ...(typeof action.frame_id === "string" ? { frame_id: action.frame_id } : {}),
-            ...(typeof action.key === "string" ? { key: action.key, modifiers: action.modifiers ?? [] } : {}),
-            ...(typeof action.prompt_text === "string" ? { prompt_text: action.prompt_text } : {}),
-            ...(action.expect_download === true ? { expect_download: true } : {}),
-          },
-          ...(stagedConsequence.dialog !== undefined ? { dialog: stagedConsequence.dialog.binding } : {}),
-        };
-        await mutateState((state) => {
-          if (
-            stagedConsequence.dialog !== undefined &&
-            this.sessions.get(tabId)?.dialog !== stagedConsequence.dialog.live
-          ) {
-            throw Object.assign(new Error("JavaScript dialog changed before it could be staged"), {
+        await this.revisions.assertExpected(tabId, pageRevision);
+        const hasRef = typeof action.ref === "string";
+        const hasSelector = typeof action.selector === "string";
+        if (
+          action.kind === "click" ||
+          action.kind === "hover" ||
+          action.kind === "double_click" ||
+          action.kind === "context_click" ||
+          action.kind === "type" ||
+          action.kind === "fill" ||
+          action.kind === "select" ||
+          action.kind === "press" ||
+          action.kind === "upload_file"
+        ) {
+          if (hasRef === hasSelector) {
+            throw Object.assign(new Error(`${action.kind} requires exactly one of ref or selector`), {
               code: "invalid_request",
             });
           }
-          state.stagedCommits[staged.native_token] = staged;
-        });
-        return {
-          staged,
-          result: {
+        }
+        validateKeyboardAction(action);
+        const resolvedTarget = hasSelector || hasRef
+          ? await this.resolveTarget(tabId, {
+            taskId,
+            pageRevision,
+            ...(hasRef ? { ref: String(action.ref) } : { selector: String(action.selector) }),
+            ...(typeof action.frame_id === "string" ? { frameId: action.frame_id } : {}),
+            actionKind: String(action.kind),
+          })
+          : undefined;
+        const stagedConsequence = await this.consequence(tabId, action, resolvedTarget);
+        if (stagedConsequence && !(await readState()).skipCommitReview) {
+          const staged: StagedCommit = {
+            native_token: randomToken(),
+            task_id: taskId,
             tab_id: tabId,
-            page_revision: await this.revisions.current(tabId),
-            actions: completedActions,
-            staged_index: index,
-          },
-        };
+            page_revision: pageRevision,
+            effect: stagedConsequence.effect,
+            fingerprint: await this.stageFingerprint(
+              taskId,
+              tabId,
+              pageRevision,
+              action,
+              stagedConsequence.target,
+            ),
+            expires_at_ms: Date.now() + 300_000,
+            action: { action },
+            preview: {
+              effect: stagedConsequence.effect,
+              kind: action.kind,
+              target: stagedConsequence.target,
+              ...(typeof action.ref === "string" ? { ref: action.ref } : {}),
+              ...(typeof action.selector === "string" ? { selector: action.selector } : {}),
+              ...(typeof action.frame_id === "string" ? { frame_id: action.frame_id } : {}),
+              ...(typeof action.key === "string" ? { key: action.key, modifiers: action.modifiers ?? [] } : {}),
+              ...(typeof action.prompt_text === "string" ? { prompt_text: action.prompt_text } : {}),
+              ...(action.expect_download === true ? { expect_download: true } : {}),
+            },
+            ...(stagedConsequence.dialog !== undefined ? { dialog: stagedConsequence.dialog.binding } : {}),
+          };
+          await mutateState((state) => {
+            if (
+              stagedConsequence.dialog !== undefined &&
+              this.sessions.get(tabId)?.dialog !== stagedConsequence.dialog.live
+            ) {
+              throw Object.assign(new Error("JavaScript dialog changed before it could be staged"), {
+                code: "invalid_request",
+              });
+            }
+            state.stagedCommits[staged.native_token] = staged;
+          });
+          return {
+            staged,
+            result: {
+              tab_id: tabId,
+              page_revision: await this.revisions.current(tabId),
+              actions: completedActions,
+              staged_index: index,
+            },
+          };
+        }
+        completedActions.push(await this.performAction(taskId, tabId, pageRevision, action, resolvedTarget));
       }
-      completedActions.push(await this.performAction(taskId, tabId, pageRevision, action, resolvedTarget));
+    } catch (error) {
+      throw batchStepFailure(error, stepIndex, validated, completedActions);
     }
     return {
       result: {

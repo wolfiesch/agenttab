@@ -307,7 +307,7 @@ export class OwnershipLedger {
       await chrome.tabs.remove(createdTabId).catch(() => undefined);
       throw error;
     }
-    return this.tabResult(createdTabId);
+    return this.describeTab(createdTabId);
   }
 
   private async adoptActiveNow(taskId: string): Promise<Record<string, unknown>> {
@@ -324,7 +324,7 @@ export class OwnershipLedger {
       await chrome.action.setBadgeText({ tabId, text: "✦" }).catch(() => undefined);
       setTimeout(() => void chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined), 2000);
     }
-    return this.tabResult(tabId);
+    return this.describeTab(tabId);
   }
 
   private async adoptOwnedChildNow(tab: TabLike, sourceTabId?: number): Promise<void> {
@@ -735,7 +735,8 @@ export class OwnershipLedger {
     return tab;
   }
 
-  private async tabResult(tabId: number): Promise<Record<string, unknown>> {
+  /** The `browser_open` result for an owned tab, read from Chrome and the revision ledger now. */
+  async describeTab(tabId: number): Promise<Record<string, unknown>> {
     const tab = (await chrome.tabs.get(tabId)) as TabLike;
     const state = await readState();
     const owner = Object.values(state.tasks).find((task) => task.tabIds.includes(tabId));
