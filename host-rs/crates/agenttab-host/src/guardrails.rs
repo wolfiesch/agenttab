@@ -943,7 +943,7 @@ mod tests {
         }
         let past = std::time::SystemTime::now() - Duration::from_secs(3600);
         for directory in [&old_upload, &unrelated] {
-            File::open(directory).unwrap().set_modified(past).unwrap();
+            set_directory_modified(directory, past);
         }
 
         Guardrails::sweep_stale_uploads(staging, Duration::from_secs(900)).unwrap();
@@ -951,5 +951,24 @@ mod tests {
         assert!(!old_upload.exists());
         assert!(fresh_upload.join("file.png").exists());
         assert!(unrelated.join("file.png").exists());
+    }
+
+    fn set_directory_modified(directory: &Path, time: std::time::SystemTime) {
+        let mut options = fs::OpenOptions::new();
+        #[cfg(unix)]
+        options.read(true);
+        // Windows opens a directory handle only with backup semantics, and
+        // changing its timestamps needs the write-attributes right.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+            };
+            options
+                .access_mode(FILE_WRITE_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        }
+        options.open(directory).unwrap().set_modified(time).unwrap();
     }
 }
