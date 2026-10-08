@@ -2,7 +2,7 @@ use crate::audit::{canonicalize, now_ms, AuditEntry, AuditLog};
 use crate::credentials::{
     BrokerError, CredentialBroker, NeedsUserReason, PrepareResult, SelectResult,
 };
-use crate::guardrails::{GuardrailLoadError, Guardrails};
+use crate::guardrails::{GuardrailLoadError, Guardrails, STALE_UPLOAD_AGE};
 use crate::journal::{
     BeginDecision, InventoryReconciliation, Journal, JournalError, StagedCommitApproval,
     StagedCommitConsumption, StagedReplayResolution,
@@ -178,6 +178,9 @@ impl Runtime {
         native: Arc<dyn NativeTransport>,
     ) -> Result<Arc<Self>, RuntimeBuildError> {
         paths.prepare()?;
+        // Delivered uploads outlive their deferred cleanup thread when the host
+        // exits; remove any left behind by a previous host process.
+        let _ = Guardrails::sweep_stale_uploads(&paths.upload_staging_dir, STALE_UPLOAD_AGE);
         let journal = Arc::new(Journal::open(&paths.state_db)?);
         let tab_urls = Arc::new(RwLock::new(HashMap::new()));
         let sink = Arc::new(JournalNativeEventSink {
@@ -1204,7 +1207,11 @@ impl Runtime {
             origin_policy,
             timeout,
         );
-        if let Err(error) = Guardrails::cleanup_staged_uploads(&committed_uploads) {
+        // Chrome hands the page a path-backed File and reads it only when the
+        // page does, so uploads that reached the page must stay on disk.
+        if native_result.is_ok() {
+            Guardrails::retire_delivered_uploads(committed_uploads);
+        } else if let Err(error) = Guardrails::cleanup_staged_uploads(&committed_uploads) {
             let _ = Guardrails::cleanup_staged_uploads(&staged_uploads);
             return RpcResponse::failure(request_id, Outcome::Unknown, error);
         }
@@ -1322,9 +1329,7 @@ impl Runtime {
                 }
             };
         }
-        if let Err(error) = Guardrails::cleanup_staged_uploads(&staged_uploads) {
-            return RpcResponse::failure(request_id, Outcome::Unknown, error);
-        }
+        Guardrails::retire_delivered_uploads(staged_uploads);
         if native.staged.is_some() {
             return RpcResponse::failure(
                 request_id,
@@ -3506,7 +3511,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_upload_survives_review_and_is_removed_after_commit() {
+    fn staged_upload_survives_review_and_stays_readable_after_commit() {
         let native = FakeNative::staging();
         let (_temp, runtime, connection, upload_root) =
             connected_runtime_with_upload_root(native.clone());
@@ -3566,7 +3571,11 @@ mod tests {
         );
 
         assert_eq!(committed["outcome"], "completed");
-        assert!(!std::path::Path::new(&staged_path).exists());
+        // The page reads a file input lazily, so the committed bytes must remain.
+        assert_eq!(
+            std::fs::read(&staged_path).unwrap(),
+            b"approved upload bytes"
+        );
     }
 
     #[test]
@@ -3643,7 +3652,7 @@ mod tests {
             }),
         );
         assert_eq!(committed["outcome"], "completed");
-        assert!(!std::path::Path::new(&success_path).exists());
+        assert!(std::path::Path::new(&success_path).exists());
         assert!(runtime
             .journal
             .abandon_popup_staged_commit(task_id, 3, &success_handle)
