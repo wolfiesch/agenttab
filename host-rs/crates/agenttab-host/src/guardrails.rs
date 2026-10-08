@@ -7,12 +7,19 @@ use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_DLP_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+/// How long an upload stays readable after it reached the page. Chrome reads a
+/// file input's bytes lazily, when the page reads or submits the File.
+const DELIVERED_UPLOAD_RETENTION: Duration = Duration::from_secs(10 * 60);
+/// Staging directories older than this are leftovers from an exited host. It
+/// exceeds both the delivered-upload retention and the staged-commit lifetime.
+pub(crate) const STALE_UPLOAD_AGE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Error)]
 pub enum GuardrailLoadError {
@@ -393,12 +400,23 @@ impl Guardrails {
 
     pub(crate) fn cleanup_staged_uploads(paths: &[PathBuf]) -> Result<(), RpcError> {
         let mut first_error = None;
+        let mut record = |result: io::Result<()>| match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        };
         for path in paths {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) if first_error.is_none() => first_error = Some(error),
-                Err(_) => {}
+            record(fs::remove_file(path));
+            // Each staged file lives alone in a per-upload UUID directory so the
+            // page sees the source file name; remove only that directory.
+            if let Some(directory) = path.parent().filter(|directory| {
+                directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| Uuid::parse_str(name).is_ok())
+            }) {
+                record(fs::remove_dir(directory));
             }
         }
         match first_error {
@@ -413,6 +431,42 @@ impl Guardrails {
         }
     }
 
+    /// Removes uploads that reached the page once the page has had time to
+    /// read them. A host that exits first leaves them to `sweep_stale_uploads`.
+    pub(crate) fn retire_delivered_uploads(paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(DELIVERED_UPLOAD_RETENTION);
+            let _ = Self::cleanup_staged_uploads(&paths);
+        });
+    }
+
+    /// Removes per-upload staging directories last modified before `older_than`.
+    pub(crate) fn sweep_stale_uploads(
+        staging_directory: &Path,
+        older_than: Duration,
+    ) -> io::Result<()> {
+        for entry in fs::read_dir(staging_directory)? {
+            let entry = entry?;
+            let is_upload_directory = entry.file_type()?.is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| Uuid::parse_str(name).is_ok());
+            let is_stale = entry
+                .metadata()?
+                .modified()?
+                .elapsed()
+                .is_ok_and(|age| age >= older_than);
+            if is_upload_directory && is_stale {
+                fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
     fn authorize_file(&self, path: &Path) -> Result<(), RpcError> {
         self.open_authorized_file(path).map(|_| ())
     }
@@ -425,7 +479,29 @@ impl Guardrails {
                 format!("Cannot resolve private upload staging directory: {error}"),
             )
         })?;
-        let staged_path = staging_directory.join(format!("{}.upload", Uuid::new_v4()));
+        // Keep the source file name: pages derive the File name and MIME type
+        // from it, and type-checking upload widgets reject an unknown extension.
+        let file_name = path
+            .canonicalize()
+            .ok()
+            .and_then(|canonical| canonical.file_name().map(std::ffi::OsStr::to_os_string));
+        let file_name = file_name.ok_or_else(|| {
+            RpcError::new("upload_file_unavailable", "Upload file has no file name")
+        })?;
+        let staged_directory = staging_directory.join(Uuid::new_v4().to_string());
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&staged_directory).map_err(|error| {
+            RpcError::new(
+                "upload_file_unavailable",
+                format!("Cannot create private upload staging directory: {error}"),
+            )
+        })?;
+        let staged_path = staged_directory.join(file_name);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -434,6 +510,7 @@ impl Guardrails {
             options.mode(0o600);
         }
         let mut staged = options.open(&staged_path).map_err(|error| {
+            let _ = fs::remove_dir(&staged_directory);
             RpcError::new(
                 "upload_file_unavailable",
                 format!("Cannot create private upload staging file: {error}"),
@@ -446,14 +523,14 @@ impl Guardrails {
             &mut staged,
         )
         .map_err(|error| {
-            let _ = fs::remove_file(&staged_path);
+            let _ = Self::cleanup_staged_uploads(std::slice::from_ref(&staged_path));
             RpcError::new(
                 "upload_file_unavailable",
                 format!("Cannot stage upload file: {error}"),
             )
         })?;
         if copied > self.policy.dlp_max_file_bytes {
-            let _ = fs::remove_file(&staged_path);
+            let _ = Self::cleanup_staged_uploads(std::slice::from_ref(&staged_path));
             return Err(RpcError::new(
                 "upload_file_too_large",
                 format!(
@@ -463,7 +540,7 @@ impl Guardrails {
             ));
         }
         staged.sync_all().map_err(|error| {
-            let _ = fs::remove_file(&staged_path);
+            let _ = Self::cleanup_staged_uploads(std::slice::from_ref(&staged_path));
             RpcError::new(
                 "upload_file_unavailable",
                 format!("Cannot finalize staged upload file: {error}"),
@@ -795,5 +872,84 @@ mod tests {
             .stage_uploads(&hardlinked, &mut serialized, &staging_directory)
             .unwrap_err();
         assert_eq!(error.code, "upload_file_hardlinked");
+    }
+
+    #[test]
+    fn upload_staging_keeps_source_file_name_and_cleans_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let allowed_root = temp.path().join("allowed");
+        let staging_directory = temp.path().join("staging");
+        fs::create_dir(&allowed_root).unwrap();
+        fs::create_dir(&staging_directory).unwrap();
+        let source = allowed_root.join("avatar.png");
+        fs::write(&source, b"png bytes").unwrap();
+        let oversized = allowed_root.join("large.png");
+        fs::write(&oversized, vec![0_u8; 32]).unwrap();
+        let guardrails = Guardrails::from_policy(Policy {
+            dlp_allowed_roots: vec![allowed_root.clone()],
+            dlp_max_file_bytes: 16,
+            ..Policy::default()
+        })
+        .unwrap();
+        let upload = |file: &std::path::Path| {
+            MethodParams::Act(agenttab_protocol::BrowserActParams {
+                tab_id: 7,
+                expected_page_revision: 1,
+                actions: vec![BrowserAction::UploadFile {
+                    r#ref: Some("e1".into()),
+                    selector: None,
+                    frame_id: None,
+                    files: vec![file.display().to_string()],
+                }],
+            })
+        };
+
+        let params = upload(&source);
+        let mut serialized = params.value();
+        let staged = guardrails
+            .stage_uploads(&params, &mut serialized, &staging_directory)
+            .unwrap();
+        let staged_path = PathBuf::from(serialized["actions"][0]["files"][0].as_str().unwrap());
+        assert_eq!(staged_path.file_name().unwrap(), "avatar.png");
+        let staged_directory = staged_path.parent().unwrap();
+        assert_eq!(
+            staged_directory.parent().unwrap(),
+            staging_directory.canonicalize().unwrap()
+        );
+        assert_eq!(fs::read(&staged_path).unwrap(), b"png bytes");
+        Guardrails::cleanup_staged_uploads(&staged).unwrap();
+        assert!(!staged_directory.exists());
+        assert!(staging_directory.is_dir());
+
+        let params = upload(&oversized);
+        let mut serialized = params.value();
+        let error = guardrails
+            .stage_uploads(&params, &mut serialized, &staging_directory)
+            .unwrap_err();
+        assert_eq!(error.code, "upload_file_too_large");
+        assert_eq!(fs::read_dir(&staging_directory).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stale_upload_sweep_removes_only_old_upload_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = temp.path();
+        let old_upload = staging.join(Uuid::new_v4().to_string());
+        let fresh_upload = staging.join(Uuid::new_v4().to_string());
+        let unrelated = staging.join("not-an-upload");
+        for directory in [&old_upload, &fresh_upload, &unrelated] {
+            fs::create_dir(directory).unwrap();
+            fs::write(directory.join("file.png"), b"bytes").unwrap();
+        }
+        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for directory in [&old_upload, &unrelated] {
+            File::open(directory).unwrap().set_modified(past).unwrap();
+        }
+
+        Guardrails::sweep_stale_uploads(staging, Duration::from_secs(900)).unwrap();
+
+        assert!(!old_upload.exists());
+        assert!(fresh_upload.join("file.png").exists());
+        assert!(unrelated.join("file.png").exists());
     }
 }

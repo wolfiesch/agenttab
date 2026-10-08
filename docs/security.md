@@ -76,7 +76,7 @@ This keeps human-only input out of agent requests. It cannot protect secrets fro
 
 ## Upload guardrails
 
-`upload_file` is available only for regular files below a configured `dlp_allowed_roots` path and under the configured size limit. The host canonicalizes the path, rejects symlink races and Unix hard-linked files, verifies the opened file, copies it into a private staging directory, and uses the staged copy for the action. On Unix, staging files are mode `0600`; staged files are removed after the terminal Commit path when cleanup succeeds.
+`upload_file` is available only for regular files below a configured `dlp_allowed_roots` path and under the configured size limit. The host canonicalizes the path, rejects symlink races and Unix hard-linked files, verifies the opened file, copies it into a private staging directory, and uses the staged copy for the action. Each copy keeps the source file name inside its own per-upload directory, because pages derive the uploaded file's name and type from it. On Unix, staging directories are mode `0700` and staging files are mode `0600`. Chrome reads a file input's bytes only when the page reads or submits the file, so an upload that reached the page stays on disk for 10 minutes before the host removes it. Uploads that never reach the page are removed immediately, and a starting host removes per-upload directories older than 15 minutes that an exited host left behind.
 
 These checks limit accidental path selection. They do not establish that a permitted file is safe to disclose or that the destination is trustworthy. Upload is a recognizable Commit effect and should be reviewed by the human.
 
