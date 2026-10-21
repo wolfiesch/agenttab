@@ -3830,6 +3830,7 @@ export class StandardBrowserRuntime {
           pageOrigin: facts.page_origin,
           now,
           probe: facts.probe,
+          ...(facts.document_status !== undefined ? { documentStatus: facts.document_status } : {}),
           catalogVersion: CHALLENGE_CATALOG.catalog_version,
           newId: newChallengeId,
         }),
@@ -3863,6 +3864,7 @@ export class StandardBrowserRuntime {
     return {
       probe: augmented === null ? "scripting" : "debugger",
       page_origin: page.page_origin,
+      ...(Number.isInteger(page.document_status) ? { document_status: page.document_status } : {}),
       ...(augmented?.status !== undefined ? { status: augmented.status } : {}),
       ...(augmented?.headers !== undefined ? { headers: augmented.headers } : {}),
       scripts: page.scripts,

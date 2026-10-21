@@ -96,6 +96,13 @@ BLOCKED_BODY = b"""<!doctype html>
 <button id="outside" type="button" onclick="fetch('/__clicked?page=blocked')">Outside</button>
 </body></html>
 """
+# A Cloudflare-style gate that reloads itself once the fixture marks it solved, as a cleared challenge page does.
+SOLVABLE_BODY = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Blocked</title></head>
+<body><h1>Blocked</h1>
+<script>setInterval(() => fetch('/__solved').then((r) => { if (r.status === 200) location.reload(); }), 250);</script>
+</body></html>
+"""
 
 
 class Fixtures:
@@ -104,6 +111,7 @@ class Fixtures:
     def __init__(self) -> None:
         self.vendor_state: dict[str, str] = {}
         self.clicks: dict[str, int] = {}
+        self.solved = False
         self.lock = threading.Lock()
         fixtures = self
 
@@ -130,6 +138,17 @@ class Fixtures:
                     self._send(403, BLOCKED_BODY, {"cf-mitigated": "challenge"})
                 elif parsed.path == "/limited":
                     self._send(429, BLOCKED_BODY, {"Retry-After": "30"})
+                elif parsed.path == "/cf-solvable":
+                    with fixtures.lock:
+                        solved = fixtures.solved
+                    if solved:
+                        self._send(200, PAGES["/clean"])
+                    else:
+                        self._send(403, SOLVABLE_BODY, {"cf-mitigated": "challenge"})
+                elif parsed.path == "/__solved":
+                    with fixtures.lock:
+                        solved = fixtures.solved
+                    self._send(200 if solved else 204, b"")
                 elif parsed.path == "/__vendor":
                     with fixtures.lock:
                         fixtures.vendor_state[query.get("name", [""])[0]] = query.get("state", [""])[0]
@@ -692,6 +711,56 @@ class Smoke:
                 s.observed["dismiss"] = {"ok": dismissed["ok"], "error": error_code(dismissed)}
                 s.check("notice dismissed", dismissed["ok"], error_code(dismissed))
 
+    def scenario_header_handoff(self, s: Scenario) -> None:
+        """A handoff detaches the debugger, so only a scripting scan can see a header-only gate end."""
+        tab_id, rev, _ = self.open_tab("/clean")
+        rev = revision(self.snapshot(tab_id), rev)  # Attaches the debugger before the gate's response.
+        gated, _, rev = self.navigate(s, tab_id, rev, "/cf-solvable")
+        event = gated.get("challenge", {})
+        s.observed["detected"] = event_fields(event)
+        if not s.check("header-only gate detected by the debugger probe",
+                       event.get("state") == "active" and event.get("detector", {}).get("probe") == "debugger",
+                       event.get("detector")):
+            return
+        requested = self.rpc.call(
+            "browser_handoff",
+            {"operation": "request", "tab_id": tab_id, "expected_page_revision": rev,
+             "prompt": "Smoke test: clear the header-only fixture gate",
+             "completion": {"kind": "challenge_cleared", "value": event["challenge_id"]}},
+        )
+        if not s.check("handoff request ok", requested["ok"], error_code(requested)):
+            return
+        notice_id = requested["result"]["notice_id"]
+        try:
+            standing = self.rpc.call("browser_handoff", {"operation": "resolve", "notice_id": notice_id})
+            s.observed["resolve_while_gated"] = {"error": error_code(standing),
+                                                 "challenge": event_fields(standing.get("challenge"))}
+            s.check("resolve while gated completion_not_met", error_code(standing) == "completion_not_met",
+                    error_code(standing))
+
+            with self.fixtures.lock:
+                self.fixtures.solved = True
+            deadline = time.monotonic() + 10
+            resolved = standing
+            while time.monotonic() < deadline:
+                time.sleep(0.5)
+                resolved = self.rpc.call("browser_handoff", {"operation": "resolve", "notice_id": notice_id})
+                if error_code(resolved) != "completion_not_met":
+                    break
+            terminal = resolved.get("challenge", {})
+            s.observed["resolve_after_clear"] = {"ok": resolved["ok"], "error": error_code(resolved),
+                                                 "challenge": event_fields(terminal)}
+            s.check("resolve succeeds once the gate clears", resolved["ok"], error_code(resolved))
+            s.check("resolve reports the episode cleared",
+                    terminal.get("challenge_id") == event["challenge_id"] and terminal.get("state") == "cleared",
+                    terminal.get("state"))
+            s.check("cleared by the scripting probe", terminal.get("detector", {}).get("probe") == "scripting",
+                    terminal.get("detector"))
+        finally:
+            with self.fixtures.lock:
+                self.fixtures.solved = False
+            self.rpc.call("browser_handoff", {"operation": "dismiss", "notice_id": notice_id})
+
     def scenario_schema(self, s: Scenario) -> None:
         events = [entry["event"] for entry in self.rpc.events]
         s.observed["event_count"] = len(events)
@@ -941,6 +1010,7 @@ def main() -> int:
         smoke.run("hcaptcha", smoke.scenario_hcaptcha)
         smoke.run("header_detection", smoke.scenario_headers)
         smoke.run("handoff", smoke.scenario_handoff)
+        smoke.run("header_handoff", smoke.scenario_header_handoff)
         smoke.run("schema", smoke.scenario_schema)
         if args.measure:
             print(f"[measure] {args.measure} iterations", flush=True)

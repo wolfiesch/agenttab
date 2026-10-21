@@ -102,6 +102,11 @@ export interface ProbeFacts {
   page_origin: string;
   status?: number;
   headers?: Record<string, string>;
+  /**
+   * Main-document HTTP status from the page's navigation timing, read by every probe. Never a
+   * matcher signal: it only tells a later scan whether it is looking at the same response.
+   */
+  document_status?: number;
   scripts: UrlFact[];
   frames: FrameFact[];
   elements: ElementFact[];
@@ -111,6 +116,7 @@ export interface ProbeFacts {
 /** What the serialized page-side probe returns. */
 export interface ChallengePageFacts {
   page_origin: string;
+  document_status?: number;
   scripts: UrlFact[];
   frames: FrameFact[];
   elements: ElementFact[];
@@ -169,6 +175,8 @@ export interface ChallengeEpisode extends ChallengeEvent {
   budget_ms?: number;
   /** False when every matched rule was header/status-only, so a scripting scan cannot observe its absence. Never emitted. */
   observable_by_scripting?: boolean;
+  /** Main-document status of the last detection; a scan of a document with another status saw a different response. Never emitted. */
+  document_status?: number;
   terminal_reported: boolean;
 }
 
@@ -555,6 +563,8 @@ export interface ChallengeContext {
   tabId: number;
   pageRevision: number;
   pageOrigin: string;
+  /** Main-document status of the scanned page, when the page reported one. */
+  documentStatus?: number;
   now: number;
   probe: ChallengeProbe;
   catalogVersion: string;
@@ -623,6 +633,8 @@ function applyDetection(
   if (retry !== undefined) episode.retry_after_ms = retry;
   else delete episode.retry_after_ms;
   episode.observable_by_scripting = detection.observable_by_scripting;
+  if (ctx.documentStatus !== undefined) episode.document_status = ctx.documentStatus;
+  else delete episode.document_status;
   refreshNext(episode, ctx.now);
 }
 
@@ -780,11 +792,15 @@ export function advance(
       if (
         ctx.probe === "scripting" &&
         ctx.pageOrigin === episode.page_origin &&
-        episode.observable_by_scripting === false
+        episode.observable_by_scripting === false &&
+        !(ctx.documentStatus !== undefined && episode.document_status !== undefined &&
+          ctx.documentStatus !== episode.document_status)
       ) {
         // Its evidence was header/status only; the scripting probe cannot see those, so a clean
-        // scan proves nothing. Keep the episode active and re-emit it (detected_at and
-        // page_revision stay at the last real observation; only the derived next step refreshes).
+        // scan of the same response proves nothing. Keep the episode active and re-emit it (detected_at
+        // and page_revision stay at the last real observation; only the derived next step refreshes).
+        // A document served with another status is a different response, such as the page a cleared
+        // gate reloads into, so it falls through and ends the episode.
         refreshNext(episode, ctx.now);
         ended.push(episode);
         continue;
@@ -890,7 +906,8 @@ export function parseChallengeEpisode(value: unknown): ChallengeEpisode | undefi
     (raw.retry_after_ms !== undefined && !nonNegativeInt(raw.retry_after_ms)) ||
     (raw.notice_id !== undefined && (typeof raw.notice_id !== "string" || raw.notice_id.length === 0)) ||
     (raw.budget_ms !== undefined && !nonNegativeInt(raw.budget_ms)) ||
-    (raw.observable_by_scripting !== undefined && typeof raw.observable_by_scripting !== "boolean")
+    (raw.observable_by_scripting !== undefined && typeof raw.observable_by_scripting !== "boolean") ||
+    (raw.document_status !== undefined && !nonNegativeInt(raw.document_status))
   ) {
     return undefined;
   }
@@ -927,6 +944,7 @@ export function parseChallengeEpisode(value: unknown): ChallengeEpisode | undefi
     signature_id: raw.signature_id,
     ...(typeof raw.budget_ms === "number" ? { budget_ms: raw.budget_ms } : {}),
     observable_by_scripting: raw.observable_by_scripting !== false,
+    ...(typeof raw.document_status === "number" ? { document_status: raw.document_status } : {}),
     terminal_reported: raw.terminal_reported,
   } as ChallengeEpisode;
   return episode;
@@ -1055,5 +1073,22 @@ export function collectChallengeFacts(selectors: string[], tokenSelectors: strin
     return { selector, present: Boolean(matches && matches.length > 0), non_empty: nonEmpty };
   });
 
-  return { page_origin: window.location.origin, scripts, frames, elements, tokens };
+  // The main document's HTTP status. Chrome reports 0 when it has none, for example on `about:blank`.
+  let documentStatus = 0;
+  try {
+    const navigation = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+    const status: unknown = navigation?.responseStatus;
+    if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) documentStatus = status;
+  } catch {
+    documentStatus = 0;
+  }
+
+  return {
+    page_origin: window.location.origin,
+    ...(documentStatus !== 0 ? { document_status: documentStatus } : {}),
+    scripts,
+    frames,
+    elements,
+    tokens,
+  };
 }

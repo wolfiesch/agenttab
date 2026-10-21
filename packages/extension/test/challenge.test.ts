@@ -636,7 +636,12 @@ function scan(
   overrides: Partial<Parameters<typeof advance>[2]> = {},
   catalog: ChallengeCatalog = CATALOG,
 ): Step {
-  const step = advance(episodes, detect(catalog, probe), ctx({ pageOrigin: probe.page_origin, probe: probe.probe, ...overrides }));
+  const status = probe.document_status === undefined ? {} : { documentStatus: probe.document_status };
+  const step = advance(
+    episodes,
+    detect(catalog, probe),
+    ctx({ pageOrigin: probe.page_origin, probe: probe.probe, ...status, ...overrides }),
+  );
   if (step.event) expectSchemaConformant(step.event);
   return step;
 }
@@ -810,6 +815,31 @@ describe("episodes: evidence the scripting probe cannot observe", () => {
   test("Cloudflare detected by header alone is not cleared by a scripting scan", () => {
     const active = scan([], facts({ probe: "debugger", status: 403, headers: { "cf-mitigated": "challenge" } }));
     expect(scan(active.episodes, clean(), { now: T0 + 3_000 }).event?.state).toBe("active");
+  });
+
+  test("a scripting scan of a document with another status ends a header-only episode", () => {
+    // A handoff detaches the debugger, so the scan after a human clears the gate is a scripting scan.
+    const cf = facts({ probe: "debugger", status: 403, headers: { "cf-mitigated": "challenge" }, document_status: 403 });
+    const active = scan([], cf, { now: T0, pageRevision: 3 });
+    const same = scan(active.episodes, facts({ document_status: 403 }), { now: T0 + 1_000, pageRevision: 4 });
+    expect(same.event).toMatchObject({ state: "active", challenge_id: active.event?.challenge_id, page_revision: 3 });
+    const unknown = scan(same.episodes, clean(), { now: T0 + 2_000, pageRevision: 4 });
+    expect(unknown.event?.state).toBe("active");
+    const reloaded = scan(unknown.episodes, facts({ document_status: 200 }), { now: T0 + 3_000, pageRevision: 5 });
+    expect(reloaded.event).toMatchObject({
+      state: "cleared", next: "none", challenge_id: active.event?.challenge_id, page_revision: 5,
+    });
+  });
+
+  test("the detection status persists and never appears in events", () => {
+    const active = scan([], { ...awsCaptcha(), document_status: 405 });
+    expect(JSON.stringify(active.event)).not.toContain("405");
+    const stored = JSON.parse(JSON.stringify(active.episodes[0]));
+    expect(parseChallengeEpisode(stored)?.document_status).toBe(405);
+    expect(parseChallengeEpisode({ ...stored, document_status: "405" })).toBeUndefined();
+    const restored = [parseChallengeEpisode(stored)!];
+    expect(scan(restored, facts({ document_status: 405 }), { now: T0 + 1_000 }).event?.state).toBe("active");
+    expect(scan(restored, facts({ document_status: 200 }), { now: T0 + 1_000 }).event?.state).toBe("cleared");
   });
 
   test("a cross-origin scripting scan still supersedes a header-only episode", () => {
@@ -1114,7 +1144,7 @@ interface FakeBox { width: number; height: number; left?: number; top?: number }
 describe("collectChallengeFacts", () => {
   const TOKEN_VALUE = "example-response-token-123";
 
-  function run(selectors: string[], tokenSelectors: string[]): unknown {
+  function run(selectors: string[], tokenSelectors: string[], navigation: unknown[] = []): unknown {
     const node = (box: FakeBox, extra: Record<string, unknown> = {}, shown = true) => ({
       checkVisibility: () => shown,
       getBoundingClientRect: () => ({ width: box.width, height: box.height, left: box.left ?? 10, top: box.top ?? 10 }),
@@ -1156,12 +1186,21 @@ describe("collectChallengeFacts", () => {
       location: { origin: "https://shop.example" },
       getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
     };
+    const fakePerformance = { getEntriesByType: (type: string) => (type === "navigation" ? navigation : []) };
     // Re-create the function from its source in a scope that has no module bindings: any
     // reference to something outside its body surfaces as a ReferenceError here, exactly as it
     // would in the page after chrome.scripting serializes it.
-    const probe = new Function("document", "window", `return (${collectChallengeFacts.toString()});`)(fakeDocument, fakeWindow);
+    const probe = new Function("document", "window", "performance", `return (${collectChallengeFacts.toString()});`)(
+      fakeDocument, fakeWindow, fakePerformance,
+    );
     return probe(selectors, tokenSelectors);
   }
+
+  test("reports the main document's response status only when the page has one", () => {
+    expect((run([], [], [{ responseStatus: 403 }]) as ProbeFactsPage).document_status).toBe(403);
+    expect(run([], [], [{ responseStatus: 0 }])).not.toHaveProperty("document_status");
+    expect(run([], [])).not.toHaveProperty("document_status");
+  });
 
   test("is self-contained and reports script, frame, element, and token facts", () => {
     const result = run(
