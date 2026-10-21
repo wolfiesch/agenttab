@@ -6238,3 +6238,35 @@ describe("scripting route when Chrome refuses the debugger", () => {
     ).rejects.toMatchObject({ code: "debugger_unavailable", outcome: "unknown" });
   });
 });
+
+describe("gestures interrupted after the first input event", () => {
+  test.each(["double_click", "context_click", "drag"])(
+    "reports %s as unknown when authorization is revoked mid-gesture",
+    async (kind) => {
+      let revoked = false;
+      const revisions = new RevisionTracker();
+      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => {
+        if (revoked) throw Object.assign(new Error("ownership changed"), { code: "ownership_revoked" });
+      });
+      let pressed = 0;
+      debuggerCommandOverride = (method, params) => {
+        if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+          pressed += 1;
+          revoked = true;
+          return {};
+        }
+        if (method === "DOM.getNodeForLocation") return { backendNodeId: 22 };
+        if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("isConnected")) {
+          return { result: { value: true } };
+        }
+        return undefined;
+      };
+      const revision = await revisions.ensure(7);
+      const ref = mintedRef(TASK_A, 7, revision);
+      await expect(
+        runtime.act(TASK_A, 7, revision, [{ kind, ref, ...(kind === "drag" ? { target_ref: ref } : {}) }]),
+      ).rejects.toMatchObject({ code: "ownership_revoked", outcome: "unknown" });
+      expect(pressed).toBe(1);
+    },
+  );
+});
