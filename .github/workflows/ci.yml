@@ -206,6 +206,23 @@ jobs:
         if: ${{ runner.os != 'Windows' }}
         run: bun run --cwd packages/extension test
 
+  sdk-python-floor:
+    name: sdk-python-3.10
+    needs: classify
+    if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      # The oldest version packages/sdk-python/pyproject.toml accepts; the other jobs run 3.11.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Test the Python SDK on its oldest supported Python
+        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s packages/sdk-python/tests -v
+
   ipc-linux:
     needs: classify
     if: ${{ needs.classify.result == 'success' && needs.classify.outputs.lane == 'full' }}
@@ -244,6 +261,7 @@ jobs:
       - ci-policy
       - ci
       - adapters-portability
+      - sdk-python-floor
       - ipc-linux
       - ipc-windows
     runs-on: ubuntu-latest
@@ -254,6 +272,7 @@ jobs:
       POLICY_RESULT: ${{ needs.ci-policy.result }}
       CI_RESULT: ${{ needs.ci.result }}
       ADAPTERS_RESULT: ${{ needs.adapters-portability.result }}
+      SDK_PYTHON_FLOOR_RESULT: ${{ needs.sdk-python-floor.result }}
       IPC_LINUX_RESULT: ${{ needs.ipc-linux.result }}
       IPC_WINDOWS_RESULT: ${{ needs.ipc-windows.result }}
     steps:
@@ -270,6 +289,7 @@ jobs:
                 "$POLICY_RESULT" \
                 "$CI_RESULT" \
                 "$ADAPTERS_RESULT" \
+                "$SDK_PYTHON_FLOOR_RESULT" \
                 "$IPC_LINUX_RESULT" \
                 "$IPC_WINDOWS_RESULT"
               do
@@ -285,6 +305,7 @@ jobs:
                 "$POLICY_RESULT" \
                 "$CI_RESULT" \
                 "$ADAPTERS_RESULT" \
+                "$SDK_PYTHON_FLOOR_RESULT" \
                 "$IPC_LINUX_RESULT" \
                 "$IPC_WINDOWS_RESULT"
               do
