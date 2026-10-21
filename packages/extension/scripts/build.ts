@@ -56,8 +56,21 @@ const result = await Bun.build({
     AGENTTAB_NATIVE_HOST: JSON.stringify(identity.nativeHost),
   },
 });
-if (!result.success) {
-  for (const log of result.logs) console.error(log);
+// Injected with chrome.scripting.executeScript({ files }), which runs classic
+// scripts only, so the page agent is a separate self-contained IIFE.
+const pageAgent = await Bun.build({
+  entrypoints: [join(sourceRoot, "page-agent-entry.ts")],
+  outdir: outputRoot,
+  target: "browser",
+  format: "iife",
+  splitting: false,
+  sourcemap: "none",
+  minify: false,
+  naming: "page-agent.[ext]",
+});
+for (const build of [result, pageAgent]) {
+  if (build.success) continue;
+  for (const log of build.logs) console.error(log);
   process.exit(1);
 }
 
@@ -102,7 +115,7 @@ if (JSON.stringify(manifest.host_permissions) !== JSON.stringify(["<all_urls>"])
 }
 await writeFile(join(outputRoot, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
-for (const output of result.outputs) {
+for (const output of [...result.outputs, ...pageAgent.outputs]) {
   const source = await output.text();
   if (/\beval\s*\(|\bnew\s+Function\s*\(/.test(source)) {
     throw new Error(`Dynamic code execution found in ${basename(output.path)}`);

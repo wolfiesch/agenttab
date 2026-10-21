@@ -9,7 +9,7 @@ import {
   pageGestureActionDeclaration,
   validatePressChord,
 } from "./input-actions";
-import { automationRoute, restrictedOriginError } from "./routes";
+import { automationRoute, debuggerUnavailableError, restrictedOriginError } from "./routes";
 import { isRecord } from "./type-guards";
 import {
   mintTargetRef,
@@ -25,6 +25,14 @@ import {
   type StagedDialog,
 } from "./protocol";
 import { mutateState, readState } from "./storage";
+import { sensitiveFieldState } from "./sensitive-field";
+import {
+  PAGE_AGENT_FILE,
+  PAGE_AGENT_GLOBAL,
+  PAGE_AGENT_VERSION,
+  runPageAgentRequest,
+  type PageAgentRequest,
+} from "./page-agent-protocol";
 
 export async function removeTabIfPresent(tabId: number): Promise<void> {
   try {
@@ -37,6 +45,10 @@ export async function removeTabIfPresent(tabId: number): Promise<void> {
 
 const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
+// A refused debugger is retried after this interval or the tab's next navigation.
+const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
+// Scripting-route refs always name the tab's top document.
+const SCRIPTING_FRAME_ID = "scripting:top";
 // Leaves more than 16 KiB for the Core response envelope and task binding inside
 // the 1 MiB host-to-client frame. Screenshot base64 data is separately capped at
 // 1,000,000 characters (750,000 decoded bytes).
@@ -97,7 +109,7 @@ function batchStepFailure(
     ...(completedActions.length > 0 ? { outcome: "unknown" } : {}),
   });
 }
-const SENSITIVE_FIELD_CHECK = "const type=String(this.getAttribute&&this.getAttribute('type')||'').toLowerCase();const autocomplete=String(this.getAttribute&&this.getAttribute('autocomplete')||'').toLowerCase().split(/\\s+/);const text=node=>String(node&&((node.innerText??node.textContent)??'')||'').trim();const ids=String(this.getAttribute&&this.getAttribute('aria-labelledby')||'')+' '+String(this.getAttribute&&this.getAttribute('aria-describedby')||'');const associated=(this.labels?Array.from(this.labels):[]).map(text).filter(Boolean);const root=this.ownerDocument||document;const accessible=[this.getAttribute&&this.getAttribute('aria-label'),...ids.trim().split(/\\s+/).filter(Boolean).map(id=>text(root.getElementById(id)))].filter(value=>typeof value==='string'&&value.trim());const role=String(this.getAttribute&&this.getAttribute('role')||'').toLowerCase();const rawDescriptor=[this.getAttribute&&this.getAttribute('name'),this.id,this.getAttribute&&this.getAttribute('aria-label'),this.getAttribute&&this.getAttribute('title'),this.getAttribute&&this.getAttribute('placeholder'),...associated,...accessible].filter(Boolean).join(' ');const descriptor=rawDescriptor.replace(/([a-z])([A-Z])/g,'$1 $2').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();const compactDescriptor=descriptor.replace(/\\s+/g,'');const tag=String(this.tagName||'').toUpperCase();const editable=tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||this.isContentEditable===true||role==='textbox'||role==='combobox'||role==='spinbutton';const namedSecret=/\\b(password|otp|totp|mfa(?: code|token)?|2fa(?: code)?|(?:two|multi) factor (?:authentication )?(?:code|token)|one time (?:code|password)|verification code|authentication code|auth code|(?:re ?|h ?)?captcha|(?:cvv|cvc|cvn)\\d*|cid|security code|card security code|card verification (?:value|code|number)|card number|credit card number|cc number|card (?:expiration|expiry) (?:date|month|year)|bank account number|routing number|iban)\\b/.test(descriptor)||['password','onetimecode','onetimepassword','verificationcode','authenticationcode','authcode','totp','2fa','2facode','twofactorcode','twofactortoken','twofactorauthenticationcode','multifactorcode','multifactortoken','multifactorauthenticationcode','captcha','cid','securitycode','cardverificationvalue','cardverificationcode','cardverificationnumber','cardnumber','creditcardnumber','ccnumber','cardsecuritycode','cardexpirationdate','cardexpirationmonth','cardexpirationyear','cardexpirydate','cardexpirymonth','cardexpiryyear','bankaccountnumber','routingnumber'].some(term=>compactDescriptor.includes(term));const tokenSecret=/\\b(pin|passcode)\\b/.test(descriptor);const sensitiveField=type==='password'||autocomplete.some(token=>token==='current-password'||token==='new-password'||token==='one-time-code'||token==='webauthn'||token.startsWith('cc-'))||(editable&&(namedSecret||tokenSecret));";
+const SENSITIVE_FIELD_CHECK = `const {sensitiveField,associated,accessible}=(${sensitiveFieldState.toString()}).call(this);`;
 const DOM_SENSITIVE_ACTION_PRELUDE =
   `${SENSITIVE_FIELD_CHECK}if(sensitiveField){return {agenttab_sensitive_field:true}}`;
 const DOWNLOAD_CURSOR_RETENTION_MS = 120_000;
@@ -287,6 +299,166 @@ function base64ByteLength(value: string): number | null {
   return (value.length / 4) * 3 - padding;
 }
 
+function base64ToBytes(encoded: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function screenshotResult(
+  tabId: number,
+  pageRevision: number,
+  format: "png" | "jpeg" | "webp",
+  data: string,
+  params: Record<string, unknown>,
+): Record<string, unknown> {
+  const byteLength = base64ByteLength(data);
+  if (byteLength === null) {
+    throw Object.assign(new Error("Chrome returned malformed screenshot data"), { code: "snapshot_failed" });
+  }
+  const maxBytes = typeof params.max_bytes === "number"
+    ? Math.min(params.max_bytes, SCREENSHOT_MAX_BYTES)
+    : SCREENSHOT_MAX_BYTES;
+  if (byteLength > maxBytes) {
+    throw snapshotTooLarge(
+      `Screenshot is ${byteLength} bytes; the requested deliverable limit is ${maxBytes} bytes`,
+      "Use jpeg or webp, lower quality, set max_width/max_height, or capture a narrower selector.",
+    );
+  }
+  return {
+    tab_id: tabId,
+    page_revision: pageRevision,
+    mode: "screenshot",
+    data,
+    encoding: "base64",
+    media_type: `image/${format}`,
+    format,
+    byte_length: byteLength,
+  };
+}
+
+/**
+ * Crops a viewport capture to the selected element's box and scales it to the
+ * requested bounds in CSS pixels, matching the debugger route's clip.
+ */
+async function transformScreenshot(
+  encoded: string,
+  format: "png" | "jpeg" | "webp",
+  geometry: Record<string, unknown>,
+  rect: Record<string, unknown> | undefined,
+  params: Record<string, unknown>,
+): Promise<string> {
+  const bitmap = await createImageBitmap(new Blob([base64ToBytes(encoded)], { type: "image/png" }));
+  try {
+    const viewportWidth = typeof geometry.viewport_width === "number" && geometry.viewport_width > 0
+      ? geometry.viewport_width
+      : bitmap.width;
+    const ratio = bitmap.width / viewportWidth;
+    let left = 0;
+    let top = 0;
+    let right = bitmap.width;
+    let bottom = bitmap.height;
+    if (rect !== undefined) {
+      left = Math.max(0, Number(rect.x) * ratio);
+      top = Math.max(0, Number(rect.y) * ratio);
+      right = Math.min(bitmap.width, (Number(rect.x) + Number(rect.width)) * ratio);
+      bottom = Math.min(bitmap.height, (Number(rect.y) + Number(rect.height)) * ratio);
+      if (![left, top, right, bottom].every(Number.isFinite) || right <= left || bottom <= top) {
+        throw Object.assign(new Error("Selected element is outside the visible viewport"), { code: "snapshot_failed" });
+      }
+    }
+    const sourceWidth = right - left;
+    const sourceHeight = bottom - top;
+    const scale = Math.min(
+      1,
+      typeof params.max_width === "number" ? params.max_width / (sourceWidth / ratio) : 1,
+      typeof params.max_height === "number" ? params.max_height / (sourceHeight / ratio) : 1,
+    );
+    const width = Math.max(1, Math.round(sourceWidth * scale));
+    const height = Math.max(1, Math.round(sourceHeight * scale));
+    const canvas = new OffscreenCanvas(width, height);
+    const context = canvas.getContext("2d");
+    if (!context) throw Object.assign(new Error("Could not encode the screenshot"), { code: "snapshot_failed" });
+    context.drawImage(bitmap, left, top, sourceWidth, sourceHeight, 0, 0, width, height);
+    const blob = await canvas.convertToBlob({
+      type: `image/${format}`,
+      ...(typeof params.quality === "number" ? { quality: params.quality / 100 } : {}),
+    });
+    return bytesToBase64(new Uint8Array(await blob.arrayBuffer()));
+  } finally {
+    bitmap.close();
+  }
+}
+
+function sensitiveFieldError(): Error {
+  return Object.assign(new Error("Sensitive fields require a human Your Turn handoff"), {
+    code: "sensitive_field_requires_handoff",
+    recovery: "Start browser_handoff for this tab and let the human enter the sensitive value.",
+  });
+}
+
+function scriptingRouteFields(reason: string | undefined): Record<string, unknown> {
+  return { page_route: "scripting", ...(reason !== undefined ? { debugger_unavailable_reason: reason } : {}) };
+}
+
+/**
+ * Replaces the page's own `window.open` for one scripted gesture, recording
+ * new-window requests the way the debugger route's gesture capture does.
+ * Serialized into the page's main world, so it must not reference module scope.
+ */
+function trapPageWindowOpen(trapKey: string): void {
+  const nativeOpen = window.open;
+  const requests: Array<Record<string, unknown>> = [];
+  const replacement = function (url?: string | URL, name?: string, features?: string): WindowProxy | null {
+    // window.open treats an empty name as _blank; only explicit same-context names navigate in place.
+    const targetName = String(name ?? "").toLowerCase();
+    if (targetName === "_self" || targetName === "_top" || targetName === "_parent") {
+      return nativeOpen.call(window, url, name, features);
+    }
+    const raw = url === undefined ? "" : String(url);
+    if (raw === "" || raw === "about:blank") {
+      requests.push({ url: "about:blank", opener_severed: true, refused: "script_written_window" });
+      return null;
+    }
+    const featureList = String(features ?? "").toLowerCase().split(/[\s,]+/);
+    const openerSevered = !featureList.includes("noopener") && !featureList.includes("noreferrer");
+    let resolved: URL;
+    try {
+      resolved = new URL(raw, document.baseURI);
+    } catch {
+      requests.push({ url: raw.slice(0, 2048), opener_severed: openerSevered, refused: "invalid_url" });
+      return null;
+    }
+    requests.push({
+      url: resolved.href,
+      opener_severed: openerSevered,
+      ...(resolved.protocol === "http:" || resolved.protocol === "https:" ? {} : { refused: "unsupported_scheme" }),
+    });
+    return null;
+  };
+  Reflect.set(window, trapKey, { nativeOpen, replacement, requests });
+  window.open = replacement;
+}
+
+/** Restores the page's `window.open` and returns the requests the trap recorded. */
+function releasePageWindowOpen(trapKey: string): unknown[] {
+  const trap: unknown = Reflect.get(window, trapKey);
+  Reflect.deleteProperty(window, trapKey);
+  if (typeof trap !== "object" || trap === null) return [];
+  if (window.open === Reflect.get(trap, "replacement")) window.open = Reflect.get(trap, "nativeOpen");
+  const requests: unknown = Reflect.get(trap, "requests");
+  return Array.isArray(requests) ? requests : [];
+}
+
 type CloseTab = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 type AuthorizeDebuggerUse = (tabId: number) => Promise<void>;
@@ -325,6 +497,7 @@ export class StandardBrowserRuntime {
   private readonly downloadCursors = new Map<string, DownloadCursor>();
   private readonly expectedDetaches = new Map<number, number>();
   private readonly debuggerCandidates = new Set<number>();
+  private readonly debuggerRefusals = new Map<number, { reason: string; until: number }>();
 
   constructor(
     private readonly revisions: RevisionTracker,
@@ -417,7 +590,10 @@ export class StandardBrowserRuntime {
         }
       },
     );
-    this.revisions.onChange((tabId) => this.invalidateStagedDialogs(tabId));
+    this.revisions.onChange((tabId) => {
+      this.debuggerRefusals.delete(tabId);
+      return this.invalidateStagedDialogs(tabId);
+    });
   }
 
   debuggerTabIds(): number[] {
@@ -559,7 +735,13 @@ export class StandardBrowserRuntime {
     this.expectedDetaches.set(tabId, expected + 1);
     const detaching = (async () => {
       try {
-        await chrome.debugger.detach({ tabId });
+        try {
+          await chrome.debugger.detach({ tabId });
+        } catch (error) {
+          if (!(error instanceof Error && /debugger is not attached/i.test(error.message))) throw error;
+          // Chrome already ended the session, so no onDetach event will follow.
+          this.consumeExpectedDetach(tabId);
+        }
         if (this.sessions.get(tabId) === session) this.sessions.delete(tabId);
         this.invalidateDownloadTracking(tabId);
         await this.invalidateStagedDialogs(tabId);
@@ -600,6 +782,275 @@ export class StandardBrowserRuntime {
     if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") {
       throw restrictedOriginError(operation);
     }
+  }
+
+  /**
+   * Returns why this tab's page automation runs on the scripting route, or
+   * undefined while the debugger serves it. Probing holds a debugger lease
+   * only long enough to prove the session is usable.
+   */
+  private async scriptingRouteReason(tabId: number): Promise<string | undefined> {
+    try {
+      const session = await this.acquireDebuggerBusyLease(tabId);
+      this.releaseDebuggerBusyLease(tabId, session);
+      return undefined;
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "debugger_unavailable") throw error;
+      return typeof error.reason === "string" ? error.reason : "Chrome refused the debugger";
+    }
+  }
+
+  /**
+   * Records a debugger refusal so later commands use the scripting route
+   * without re-attaching, which would flash Chrome's debugging banner on every
+   * call. A navigation or the retry interval clears it.
+   */
+  private refuseDebugger(tabId: number, cause: unknown): Error {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    this.debuggerRefusals.set(tabId, { reason, until: Date.now() + DEBUGGER_REFUSAL_RETRY_MS });
+    return debuggerUnavailableError(reason);
+  }
+
+  /** Translates a pinned-document scripting failure into the stale-ref contract. */
+  private async inDocument<T>(documentId: string | undefined, run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (documentId !== undefined && /\bdocument\b|\bframe\b.*\bremoved\b/i.test(message)) {
+        throw Object.assign(new Error("Snapshot ref belongs to a document that is no longer loaded"), {
+          code: "stale_ref",
+          cause: error,
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Runs one request against the scripting page agent in the tab's top
+   * document, installing the agent on first use. `documentId` pins the request
+   * to the document a ref was minted in; Chrome refuses it once that document
+   * is gone.
+   */
+  private async runPageAgent(
+    tabId: number,
+    request: PageAgentRequest,
+    documentId?: string,
+  ): Promise<{ value: unknown; documentId: string }> {
+    const target = documentId === undefined ? { tabId } : { tabId, documentIds: [documentId] };
+    for (let attempt = 0; ; attempt += 1) {
+      // Matches send(): every page-agent request rechecks task authorization.
+      await this.authorizeDebuggerUse(tabId);
+      const [injected] = await this.inDocument(documentId, () => chrome.scripting.executeScript({
+        target,
+        func: runPageAgentRequest,
+        args: [request, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL],
+      }));
+      const value: unknown = injected?.result;
+      if (isRecord(value) && value.agenttab_page_agent_missing === true) {
+        if (attempt > 0) {
+          throw Object.assign(new Error("AgentTab's page agent did not install in this document"), {
+            code: "action_failed",
+          });
+        }
+        await this.inDocument(documentId, () => chrome.scripting.executeScript({ target, files: [PAGE_AGENT_FILE] }));
+        continue;
+      }
+      if (isRecord(value) && isRecord(value.agenttab_error)) {
+        const { code, message } = value.agenttab_error;
+        throw Object.assign(new Error(typeof message === "string" ? message : "Page agent request failed"), {
+          code: typeof code === "string" ? code : "action_failed",
+        });
+      }
+      if (isRecord(value) && value.agenttab_sensitive_field === true) throw sensitiveFieldError();
+      if (isRecord(value) && typeof value.agenttab_invalid_request === "string") {
+        throw Object.assign(new Error(value.agenttab_invalid_request), { code: "invalid_request" });
+      }
+      if (typeof injected?.documentId !== "string" || (documentId !== undefined && injected.documentId !== documentId)) {
+        throw Object.assign(new Error("Snapshot ref belongs to a document that is no longer loaded"), {
+          code: "stale_ref",
+        });
+      }
+      return { value, documentId: injected.documentId };
+    }
+  }
+
+  private async assertScriptingRevision(tabId: number, pageRevision: number, message: string): Promise<void> {
+    const currentPageRevision = await this.revisions.current(tabId);
+    if (currentPageRevision !== pageRevision) {
+      throw Object.assign(new Error(message), { code: "stale_revision", currentPageRevision });
+    }
+  }
+
+  /**
+   * Approximates Chrome's accessibility tree from the DOM, since only the
+   * debugger can read the real one. Refs bind to Chrome's document id.
+   */
+  private async scriptingAccessibilitySnapshot(
+    taskId: string,
+    tabId: number,
+    params: Record<string, unknown>,
+    reason: string | undefined,
+  ): Promise<Record<string, unknown>> {
+    const pageRevision = await this.revisions.current(tabId);
+    const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
+    const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
+    const root = typeof params.root_ref === "string"
+      ? await this.resolveTarget(tabId, { pageRevision, taskId, ref: params.root_ref })
+      : undefined;
+    const { value, documentId } = await this.runPageAgent(tabId, {
+      op: "snapshot",
+      max_nodes: maxNodes,
+      max_depth: maxDepth,
+      ...(root !== undefined ? { root_id: root.backendNodeId } : {}),
+    }, root?.documentId);
+    await this.assertScriptingRevision(tabId, pageRevision, "Page changed while the accessibility outline was captured");
+    const outline = isRecord(value) ? value : {};
+    const nodes = (Array.isArray(outline.nodes) ? outline.nodes.filter(isRecord) : []).map(({ id, ...node }) => ({
+      ...(typeof id === "number"
+        ? {
+          ref: mintTargetRef({
+            tabId,
+            backendNodeId: id,
+            documentId,
+            frameId: SCRIPTING_FRAME_ID,
+            pageRevision,
+            taskId,
+            route: "scripting",
+          }),
+        }
+        : {}),
+      ...node,
+    }));
+    return {
+      tab_id: tabId,
+      page_revision: pageRevision,
+      mode: "accessibility",
+      nodes,
+      truncated: outline.truncated === true,
+      ...scriptingRouteFields(reason),
+    };
+  }
+
+  /**
+   * Captures the visible viewport with `chrome.tabs.captureVisibleTab`, which
+   * only sees the active tab of a window, then crops and scales locally.
+   */
+  private async scriptingScreenshot(
+    tabId: number,
+    params: Record<string, unknown>,
+    reason: string,
+  ): Promise<Record<string, unknown>> {
+    if (params.full_page === true) throw debuggerUnavailableError(reason, "A full-page screenshot");
+    const pageRevision = await this.revisions.current(tabId);
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.active !== true) throw debuggerUnavailableError(reason, "A screenshot of a background tab");
+    const format = params.format === "jpeg" || params.format === "webp" ? params.format : "png";
+    const { value } = await this.runPageAgent(tabId, {
+      op: "geometry",
+      ...(typeof params.selector === "string" ? { selector: params.selector } : {}),
+    });
+    const geometry = isRecord(value) ? value : {};
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+    const after = await chrome.tabs.get(tabId);
+    if (after.active !== true || after.windowId !== tab.windowId) {
+      throw Object.assign(new Error("The task tab stopped being the visible tab while the screenshot was captured"), {
+        code: "snapshot_failed",
+      });
+    }
+    await this.assertScriptingRevision(tabId, pageRevision, "Page changed while the screenshot was captured");
+    const encoded = dataUrl.slice(dataUrl.indexOf(",") + 1);
+    const rect = isRecord(geometry.rect) ? geometry.rect : undefined;
+    const transform = rect !== undefined || format !== "png" ||
+      typeof params.max_width === "number" || typeof params.max_height === "number";
+    const data = transform
+      ? await transformScreenshot(encoded, format, geometry, rect, params)
+      : encoded;
+    return {
+      ...screenshotResult(tabId, pageRevision, format, data, params),
+      ...scriptingRouteFields(reason),
+    };
+  }
+
+  /**
+   * Dispatches a click or press through the page agent. The agent's isolated
+   * world sees anchor activations but not the page's own `window.open`, so a
+   * page-world trap collects those requests for the duration of the gesture.
+   */
+  private async scriptingGesture(
+    tabId: number,
+    target: ResolvedTarget,
+    action: Record<string, unknown>,
+  ): Promise<unknown[]> {
+    const trapKey = `__agenttabWindowOpen${randomToken(8)}`;
+    const pinned = { tabId, documentIds: [target.documentId] };
+    await this.inDocument(target.documentId, () => chrome.scripting.executeScript({
+      target: pinned, world: "MAIN", func: trapPageWindowOpen, args: [trapKey],
+    }));
+    let acted: unknown;
+    let pageRequests: unknown;
+    try {
+      ({ value: acted } = await this.runPageAgent(tabId, {
+        op: "act",
+        id: target.backendNodeId,
+        kind: action.kind === "press" ? "press" : "click",
+        ...(action.kind === "press"
+          ? {
+            key: String(action.key ?? ""),
+            modifiers: Array.isArray(action.modifiers) ? action.modifiers.map(String) : [],
+          }
+          : {}),
+      }, target.documentId));
+    } finally {
+      // A gesture that navigated the page leaves no document to restore.
+      const released = await chrome.scripting.executeScript({
+        target: pinned, world: "MAIN", func: releasePageWindowOpen, args: [trapKey],
+      }).catch(() => []);
+      pageRequests = released[0]?.result;
+    }
+    return [
+      ...(isRecord(acted) && Array.isArray(acted.agenttab_window_requests) ? acted.agenttab_window_requests : []),
+      ...(Array.isArray(pageRequests) ? pageRequests : []),
+    ];
+  }
+
+  private async scriptingConditionMatched(tabId: number, condition: Record<string, unknown>): Promise<boolean> {
+    const pageRevision = await this.revisions.current(tabId);
+    let matched: boolean;
+    if (condition.kind === "text") {
+      const [injected] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (value: string) => (document.documentElement.textContent ?? "").includes(value),
+        args: [String(condition.value ?? "")],
+      });
+      matched = injected?.result === true;
+    } else {
+      const selector = condition.kind === "selector" ? condition.value : condition.selector;
+      if (typeof selector !== "string") {
+        throw Object.assign(new Error(`Wait condition ${String(condition.kind)} requires a selector`), {
+          code: "invalid_request",
+        });
+      }
+      const { value } = await this.runPageAgent(tabId, { op: "inspect_selector", selector });
+      const inspected = isRecord(value) ? value : {};
+      const count = typeof inspected.count === "number" ? inspected.count : 0;
+      if (count > 1) {
+        throw Object.assign(new Error(`Selector matched ${count} elements: ${selector}`), {
+          code: "ambiguous_selector",
+        });
+      }
+      const observed = isRecord(inspected.state) ? inspected.state : undefined;
+      const state = condition.state;
+      if (observed === undefined) matched = condition.kind === "selector" && state === "detached";
+      else if (condition.kind === "value") matched = observed.value === String(condition.value ?? "");
+      else if (state === "detached") matched = false;
+      else if (state === "visible") matched = observed.visible === true;
+      else if (state === "hidden") matched = observed.visible === false;
+      else if (state === "enabled") matched = observed.enabled === true;
+      else matched = observed.connected === true;
+    }
+    return matched && (await this.revisions.current(tabId)) === pageRevision;
   }
 
   private trackDownloadWillBegin(
@@ -734,9 +1185,18 @@ export class StandardBrowserRuntime {
       if (frameId !== undefined) {
         throw Object.assign(new Error("Frame-scoped screenshots are not available"), { code: "frame_unavailable" });
       }
-      return assertDeliverableSnapshot(await this.screenshot(tabId, params));
+      const reason = await this.scriptingRouteReason(tabId);
+      return assertDeliverableSnapshot(
+        reason === undefined ? await this.screenshot(tabId, params) : await this.scriptingScreenshot(tabId, params, reason),
+      );
     }
     const rootBinding = parseTargetRef(params.root_ref);
+    if (frameId === undefined && (rootBinding === null || rootBinding.route === "scripting")) {
+      const reason = await this.scriptingRouteReason(tabId);
+      if (reason !== undefined || rootBinding?.route === "scripting") {
+        return assertDeliverableSnapshot(await this.scriptingAccessibilitySnapshot(taskId, tabId, params, reason));
+      }
+    }
     const requestedFrameId = frameId ?? rootBinding?.frameId;
     const frameDocument = await this.frameDocument(tabId, requestedFrameId);
     const topDocument = requestedFrameId === undefined
@@ -955,6 +1415,7 @@ export class StandardBrowserRuntime {
             actionKind: String(action.kind),
           })
           : undefined;
+        if (resolvedTarget?.route === "scripting") this.assertScriptingSupports(tabId, action.kind);
         const stagedConsequence = await this.consequence(tabId, action, resolvedTarget);
         if (stagedConsequence && !(await readState()).skipCommitReview) {
           const staged: StagedCommit = {
@@ -1034,6 +1495,7 @@ export class StandardBrowserRuntime {
         code: "invalid_request",
       });
     }
+    let scripted = false;
     for (const field of fields) {
       if (
         !isRecord(field) ||
@@ -1049,6 +1511,14 @@ export class StandardBrowserRuntime {
         pageRevision,
         ref: field.ref,
       });
+      if (target.route === "scripting") {
+        // Scripting refs always name the top document, so no frame-origin check applies.
+        scripted = true;
+        await this.runPageAgent(tabId, {
+          op: "fill_credential", id: target.backendNodeId, value: field.value, kind: field.kind,
+        }, target.documentId);
+        continue;
+      }
       const topFrame = await this.frameIdentity(tabId);
       if (target.frameId !== topFrame.frameId) {
         const targetFrame = await this.frameIdentity(tabId, target.frameId);
@@ -1100,6 +1570,7 @@ export class StandardBrowserRuntime {
       tab_id: tabId,
       page_revision: await this.revisions.current(tabId),
       filled_fields: fields.length,
+      ...(scripted ? { page_route: "scripting" } : {}),
     };
   }
 
@@ -1439,9 +1910,12 @@ export class StandardBrowserRuntime {
       ? Math.min(params.max_bytes, SNAPSHOT_TEXT_MAX_BYTES)
       : 256_000;
     const frameId = typeof params.frame_id === "string" ? params.frame_id : undefined;
-    const before = await this.pageIdentity(tabId, frameId);
+    const reason = frameId === undefined ? await this.scriptingRouteReason(tabId) : undefined;
+    const before = reason === undefined ? await this.pageIdentity(tabId, frameId) : undefined;
     const topBefore = frameId === undefined ? before : await this.pageIdentity(tabId);
-    const pageRevision = await this.revisions.observeDocument(tabId, topBefore.documentId, topBefore.loaderId);
+    const pageRevision = topBefore === undefined
+      ? await this.revisions.current(tabId)
+      : await this.revisions.observeDocument(tabId, topBefore.documentId, topBefore.loaderId);
     const readContent = (
       snapshotMode: "text" | "html",
       targetSelector: string | null,
@@ -1481,18 +1955,23 @@ export class StandardBrowserRuntime {
       }
       result = captured.result.value;
     }
-    const after = await this.pageIdentity(tabId, frameId);
-    const topAfter = frameId === undefined ? after : await this.pageIdentity(tabId);
-    const currentPageRevision = await this.revisions.observeDocument(tabId, topAfter.documentId, topAfter.loaderId);
-    if (
-      before.documentId !== after.documentId ||
-      before.loaderId !== after.loaderId ||
-      currentPageRevision !== pageRevision
-    ) {
-      throw Object.assign(new Error(`Page changed while the ${mode} snapshot was captured`), {
-        code: "stale_revision",
-        currentPageRevision,
-      });
+    if (reason !== undefined) {
+      await this.assertScriptingRevision(tabId, pageRevision, `Page changed while the ${mode} snapshot was captured`);
+    } else {
+      const after = await this.pageIdentity(tabId, frameId);
+      const topAfter = frameId === undefined ? after : await this.pageIdentity(tabId);
+      const currentPageRevision = await this.revisions.observeDocument(tabId, topAfter.documentId, topAfter.loaderId);
+      if (
+        before === undefined ||
+        before.documentId !== after.documentId ||
+        before.loaderId !== after.loaderId ||
+        currentPageRevision !== pageRevision
+      ) {
+        throw Object.assign(new Error(`Page changed while the ${mode} snapshot was captured`), {
+          code: "stale_revision",
+          currentPageRevision,
+        });
+      }
     }
     const bytes = utf8Encoder.encode(String(result ?? ""));
     const requestedBytes = Math.min(bytes.length, requestedMaxBytes);
@@ -1503,6 +1982,7 @@ export class StandardBrowserRuntime {
         tab_id: tabId,
         page_revision: pageRevision,
         ...(frameId !== undefined ? { frame_id: frameId } : {}),
+        ...(reason !== undefined ? scriptingRouteFields(reason) : {}),
         mode,
         content,
         truncated: contentBytes < bytes.length,
@@ -1613,29 +2093,7 @@ export class StandardBrowserRuntime {
     if (typeof result.data !== "string") {
       throw Object.assign(new Error("Chrome returned an invalid screenshot payload"), { code: "snapshot_failed" });
     }
-    const byteLength = base64ByteLength(result.data);
-    if (byteLength === null) {
-      throw Object.assign(new Error("Chrome returned malformed screenshot data"), { code: "snapshot_failed" });
-    }
-    const maxBytes = typeof params.max_bytes === "number"
-      ? Math.min(params.max_bytes, SCREENSHOT_MAX_BYTES)
-      : SCREENSHOT_MAX_BYTES;
-    if (byteLength > maxBytes) {
-      throw snapshotTooLarge(
-        `Screenshot is ${byteLength} bytes; the requested deliverable limit is ${maxBytes} bytes`,
-        "Use jpeg or webp, lower quality, set max_width/max_height, or capture a narrower selector.",
-      );
-    }
-    return {
-      tab_id: tabId,
-      page_revision: pageRevision,
-      mode: "screenshot",
-      data: result.data,
-      encoding: "base64",
-      media_type: `image/${format}`,
-      format,
-      byte_length: byteLength,
-    };
+    return screenshotResult(tabId, pageRevision, format, result.data, params);
   }
 
 
@@ -1841,6 +2299,13 @@ export class StandardBrowserRuntime {
         : action?.kind === "press"
           ? String(action.key ?? "")
           : null;
+    if (target?.route === "scripting") {
+      const { value } = await this.runPageAgent(tabId, {
+        op: "describe", id: backendNodeId, requested_value: requestedValue,
+      }, target.documentId);
+      if (!isRecord(value)) throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
+      return { ...value, backend_node_id: backendNodeId, frame_id: target.frameId, document_id: target.documentId };
+    }
     const resolved = await this.send(tabId, "DOM.resolveNode", {
       backendNodeId,
       ...(target?.contextId !== undefined ? { executionContextId: target.contextId } : {}),
@@ -1977,19 +2442,25 @@ export class StandardBrowserRuntime {
       };
       if (session) session.pendingWindowOpen = pendingWindowOpen;
       try {
-        const value = await this.callOnNode(
-          tabId,
-          backendNodeId,
-          kind === "click"
-            ? pageGestureActionDeclaration(dispatchDomClick)
-            : pageGestureActionDeclaration(dispatchDomPress, DOM_SENSITIVE_ACTION_PRELUDE),
-          kind === "click" ? [] : [{ value: action.key }, { value: action.modifiers ?? [] }],
-          true,
-          target,
-        );
-        if (isRecord(value) && Array.isArray(value.agenttab_window_requests)) {
-          windowRequests = await this.openWindowRequests(tabId, value.agenttab_window_requests);
+        let requested: unknown[] = [];
+        if (target.route === "scripting") {
+          requested = await this.scriptingGesture(tabId, target, action);
+        } else {
+          const value = await this.callOnNode(
+            tabId,
+            backendNodeId,
+            kind === "click"
+              ? pageGestureActionDeclaration(dispatchDomClick)
+              : pageGestureActionDeclaration(dispatchDomPress, DOM_SENSITIVE_ACTION_PRELUDE),
+            kind === "click" ? [] : [{ value: action.key }, { value: action.modifiers ?? [] }],
+            true,
+            target,
+          );
+          if (isRecord(value) && Array.isArray(value.agenttab_window_requests)) {
+            requested = value.agenttab_window_requests;
+          }
         }
+        if (requested.length > 0) windowRequests = await this.openWindowRequests(tabId, requested);
       } finally {
         const [currentActiveTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         const actionOwnsFocusChange =
@@ -2012,6 +2483,8 @@ export class StandardBrowserRuntime {
           }
         }, 1_000);
       }
+    } else if (target.route === "scripting") {
+      await this.performScriptingAction(tabId, target, action);
     } else if (kind === "type") {
       await this.callOnNode(
         tabId,
@@ -2061,22 +2534,26 @@ export class StandardBrowserRuntime {
         this.pointerTargetPoint(tabId, dropTarget),
       ]);
       await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...sourcePoint, button: "left", buttons: 1, clickCount: 1 }, false, target.sessionId);
-      try {
-        await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...dropPoint, button: "left", buttons: 1 }, false, target.sessionId);
-      } finally {
-        await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...dropPoint, button: "left", buttons: 0, clickCount: 1 }, false, target.sessionId);
-      }
+      await this.afterInputDispatched(async () => {
+        try {
+          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...dropPoint, button: "left", buttons: 1 }, false, target.sessionId);
+        } finally {
+          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...dropPoint, button: "left", buttons: 0, clickCount: 1 }, false, target.sessionId);
+        }
+      });
     } else if (kind === "hover" || kind === "double_click" || kind === "context_click") {
       const point = await this.pointerTargetPoint(tabId, target);
       await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "none", buttons: 0 }, false, target.sessionId);
       if (kind !== "hover") {
-        const button = kind === "context_click" ? "right" : "left";
-        const buttons = kind === "context_click" ? 2 : 1;
-        for (let clickCount = 1; clickCount <= (kind === "double_click" ? 2 : 1); clickCount += 1) {
-          await this.pointerTargetPoint(tabId, target, point);
-          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...point, button, buttons, clickCount }, false, target.sessionId);
-          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button, buttons: 0, clickCount }, false, target.sessionId);
-        }
+        await this.afterInputDispatched(async () => {
+          const button = kind === "context_click" ? "right" : "left";
+          const buttons = kind === "context_click" ? 2 : 1;
+          for (let clickCount = 1; clickCount <= (kind === "double_click" ? 2 : 1); clickCount += 1) {
+            await this.pointerTargetPoint(tabId, target, point);
+            await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...point, button, buttons, clickCount }, false, target.sessionId);
+            await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button, buttons: 0, clickCount }, false, target.sessionId);
+          }
+        });
       }
     } else if (kind === "upload_file") {
       if (!Array.isArray(action.files) || !action.files.every((file) => typeof file === "string")) {
@@ -2092,8 +2569,54 @@ export class StandardBrowserRuntime {
       kind,
       completed: true,
       ...(windowRequests.length > 0 ? { opened_tabs: windowRequests } : {}),
+      ...(target.route === "scripting" ? { page_route: "scripting" } : {}),
       ...downloadResult,
     };
+  }
+
+  /**
+   * Runs the rest of a multi-event gesture. A debugger refusal there follows
+   * input the page already received, so it cannot claim the action never started.
+   */
+  private async afterInputDispatched(run: () => Promise<void>): Promise<void> {
+    try {
+      await run();
+    } catch (error) {
+      if (isRecord(error) && error.code === "debugger_unavailable") error.outcome = "unknown";
+      throw error;
+    }
+  }
+
+  /** Refuses actions only Chrome's debugger can perform before a scripting-route target is used. */
+  private assertScriptingSupports(tabId: number, kind: unknown): void {
+    if (kind !== "drag" && kind !== "upload_file") return;
+    throw debuggerUnavailableError(
+      this.debuggerRefusals.get(tabId)?.reason ?? "Chrome refused the debugger for this tab",
+      kind === "drag" ? "Drag" : "File upload",
+    );
+  }
+
+  private async performScriptingAction(
+    tabId: number,
+    target: ResolvedTarget,
+    action: Record<string, unknown>,
+  ): Promise<void> {
+    this.assertScriptingSupports(tabId, action.kind);
+    const id = target.backendNodeId;
+    const kind = action.kind;
+    let request: PageAgentRequest;
+    if (kind === "type" || kind === "fill") {
+      request = { op: "act", id, kind, text: String(action.text ?? "") };
+    } else if (kind === "select") {
+      request = { op: "act", id, kind, text: String(action.value ?? "") };
+    } else if (kind === "scroll") {
+      request = { op: "scroll", id, delta_x: Number(action.delta_x ?? 0), delta_y: Number(action.delta_y ?? 0) };
+    } else if (kind === "hover" || kind === "double_click" || kind === "context_click") {
+      request = { op: "pointer", id, kind };
+    } else {
+      throw Object.assign(new Error(`Unsupported standard action: ${String(kind)}`), { code: "invalid_request" });
+    }
+    await this.runPageAgent(tabId, request, target.documentId);
   }
 
   /**
@@ -2109,8 +2632,12 @@ export class StandardBrowserRuntime {
     for (const request of requests.slice(0, MAX_WINDOW_REQUESTS_PER_ACTION)) {
       if (!isRecord(request) || typeof request.url !== "string") continue;
       const url = request.url;
-      if (typeof request.refused === "string") {
-        opened.push({ url, outcome: "refused", reason: request.refused });
+      // Main-world gesture traps are page-reachable, so recheck the scheme here.
+      const refused = typeof request.refused === "string"
+        ? request.refused
+        : URL.canParse(url) && ["http:", "https:"].includes(new URL(url).protocol) ? undefined : "unsupported_scheme";
+      if (refused !== undefined) {
+        opened.push({ url, outcome: "refused", reason: refused });
         continue;
       }
       try {
@@ -2142,6 +2669,13 @@ export class StandardBrowserRuntime {
     const kind = condition.kind;
     if (kind === "load") return (await chrome.tabs.get(tabId)).status === "complete";
     if (kind === "url") return (await chrome.tabs.get(tabId)).url === condition.value;
+    if (
+      (kind === "text" || kind === "selector" || kind === "value") &&
+      condition.frame_id === undefined &&
+      await this.scriptingRouteReason(tabId) !== undefined
+    ) {
+      return this.scriptingConditionMatched(tabId, condition);
+    }
     if (kind === "text") {
       const before = await this.pageIdentity(tabId);
       const matchedRevision = await this.revisions.observeDocument(
@@ -2331,6 +2865,22 @@ export class StandardBrowserRuntime {
       });
     }
     if (typeof selector === "string") {
+      const reason = request.frameId === undefined ? await this.scriptingRouteReason(tabId) : undefined;
+      if (reason !== undefined) {
+        const { value, documentId } = await this.runPageAgent(tabId, { op: "select", selector });
+        if (!isRecord(value) || typeof value.id !== "number") {
+          throw Object.assign(new Error("Selected target could not be resolved"), { code: "action_failed" });
+        }
+        return {
+          tabId,
+          backendNodeId: value.id,
+          documentId,
+          frameId: SCRIPTING_FRAME_ID,
+          pageRevision: request.pageRevision,
+          taskId: request.taskId ?? "",
+          route: "scripting",
+        };
+      }
       const document = await this.frameDocument(tabId, request.frameId);
       const backendNodeId = await this.backendNodeIdForDocument(tabId, document, selector);
       return {
@@ -2357,6 +2907,10 @@ export class StandardBrowserRuntime {
       throw Object.assign(new Error("Snapshot ref belongs to a different task, frame, or page revision"), {
         code: "stale_ref",
       });
+    }
+    if (binding.route === "scripting") {
+      await this.runPageAgent(tabId, { op: "probe", id: binding.backendNodeId }, binding.documentId);
+      return { ...binding };
     }
     const document = await this.frameDocument(tabId, binding.frameId);
     if (document.documentId !== binding.documentId) {
@@ -2768,6 +3322,11 @@ export class StandardBrowserRuntime {
 
   private async ensureAttached(tabId: number): Promise<void> {
     await this.authorizeDebuggerUse(tabId);
+    const refusal = this.debuggerRefusals.get(tabId);
+    if (refusal !== undefined) {
+      if (refusal.until > Date.now()) throw debuggerUnavailableError(refusal.reason);
+      this.debuggerRefusals.delete(tabId);
+    }
     let session = this.sessions.get(tabId);
     if (session?.detachPromise) {
       await session.detachPromise;
@@ -2801,7 +3360,14 @@ export class StandardBrowserRuntime {
       await this.authorizeDebuggerUse(tabId);
       this.debuggerCandidates.add(tabId);
       await this.recordDebuggerCandidate(tabId);
-      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+      try {
+        await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+      } catch (error) {
+        if (error instanceof Error && /no tab with given id/i.test(error.message)) throw error;
+        // Chrome refuses the debugger when another extension's frame is on the
+        // page or another client, such as open DevTools, holds the tab.
+        throw this.refuseDebugger(tabId, error);
+      }
       session.attached = true;
       try {
         for (const method of [
@@ -2843,7 +3409,9 @@ export class StandardBrowserRuntime {
             "Debugger initialization and cleanup both failed",
           );
         }
-        throw error;
+        // AgentTab's own coded failures, such as a revoked task binding, keep their meaning.
+        if (isRecord(error) && typeof error.code === "string") throw error;
+        throw this.refuseDebugger(tabId, error);
       }
     })();
     session.attachPromise = attaching;

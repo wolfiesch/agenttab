@@ -11,6 +11,12 @@ import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
 import { mintTargetRef } from "../src/target-resolution";
+import {
+  PAGE_AGENT_GLOBAL,
+  PAGE_AGENT_VERSION,
+  runPageAgentRequest,
+  type PageAgentRequest,
+} from "../src/page-agent-protocol";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
@@ -101,6 +107,11 @@ let debuggerCommandOverride:
   | ((method: string, params: Record<string, unknown>) => Record<string, unknown> | undefined)
   | null;
 let debuggerAttachGate: Promise<void> | null;
+let debuggerAttachError: string | null;
+let pageAgentRequests: PageAgentRequest[];
+let pageAgentReply: (request: PageAgentRequest) => unknown;
+let mainWorldResult: unknown;
+const PAGE_AGENT_DOCUMENT = "agent-document-1";
 let completedDownloads: Array<Record<string, unknown>>;
 let debuggerDetachFailures: number;
 let debuggerAttachedTabIds: Set<number>;
@@ -353,6 +364,11 @@ function installChromeMock(): void {
   callFunctionException = false;
   debuggerCommandOverride = null;
   debuggerAttachGate = null;
+  debuggerAttachError = null;
+  pageAgentRequests = [];
+  pageAgentReply = () => ({});
+  mainWorldResult = [];
+  Reflect.deleteProperty(globalThis, PAGE_AGENT_GLOBAL);
   completedDownloads = [];
   automationPermission = true;
   permissionRequests = [];
@@ -422,6 +438,7 @@ function installChromeMock(): void {
         async attach(target: { tabId: number }) {
           debuggerCalls.push("attach");
           if (debuggerAttachGate) await debuggerAttachGate;
+          if (debuggerAttachError !== null) throw new Error(debuggerAttachError);
           debuggerAttachedTabIds.add(target.tabId);
         },
         async detach(target: { tabId: number }) {
@@ -597,8 +614,28 @@ function installChromeMock(): void {
         async reload() { },
       },
       scripting: {
-        async executeScript() {
+        async executeScript(options: {
+          files?: string[];
+          func?: (...args: never[]) => unknown;
+          args?: unknown[];
+          world?: string;
+        }) {
           scriptingCallCount += 1;
+          if (Array.isArray(options.files)) {
+            Reflect.set(globalThis, PAGE_AGENT_GLOBAL, {
+              version: PAGE_AGENT_VERSION,
+              run(request: PageAgentRequest) {
+                pageAgentRequests.push(clone(request));
+                return pageAgentReply(request);
+              },
+            });
+            return [{ documentId: PAGE_AGENT_DOCUMENT }];
+          }
+          if (options.world === "MAIN") return [{ result: mainWorldResult, documentId: PAGE_AGENT_DOCUMENT }];
+          if (options.func === runPageAgentRequest) {
+            const [request, version, globalName] = options.args as [PageAgentRequest, number, string];
+            return [{ result: runPageAgentRequest(request, version, globalName), documentId: PAGE_AGENT_DOCUMENT }];
+          }
           return [{ result: scriptResult }];
         },
       },
@@ -6040,5 +6077,125 @@ describe("extension entrypoint admission boundaries", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("scripting route when Chrome refuses the debugger", () => {
+  const REFUSAL = "Cannot access a chrome-extension:// URL of different extension";
+
+  function refusedRuntime(): { runtime: StandardBrowserRuntime; revisions: RevisionTracker } {
+    debuggerAttachError = REFUSAL;
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    return { runtime, revisions };
+  }
+
+  test("snapshots and acts through the page agent without re-attaching", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: true });
+    pageAgentReply = (request) => {
+      if (request.op === "snapshot") return { nodes: [{ id: 3, role: "button", name: "Next" }], truncated: false };
+      if (request.op === "describe") return { tag: "BUTTON", type: "button", text: "Next" };
+      if (request.op === "act") return { agenttab_window_requests: [] };
+      return { id: 3 };
+    };
+    const revision = await revisions.ensure(7);
+    const snapshot = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(snapshot).toMatchObject({
+      page_revision: revision,
+      page_route: "scripting",
+      debugger_unavailable_reason: REFUSAL,
+      nodes: [{ role: "button", name: "Next" }],
+    });
+    const nodes = snapshot.nodes as Array<Record<string, unknown>>;
+    const ref = String(nodes[0]?.ref);
+    const acted = await runtime.act(TASK_A, 7, revision, [{ kind: "click", ref }]);
+    expect(acted.result?.actions).toEqual([{ kind: "click", completed: true, page_route: "scripting" }]);
+    expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([{ op: "act", id: 3, kind: "click" }]);
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+    expect(debuggerCalls).not.toContain("Runtime.callFunctionOn");
+  });
+
+  test("refuses debugger-only actions before touching the page", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = () => ({ id: 3 });
+    const revision = await revisions.ensure(7);
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{ kind: "upload_file", selector: "#file", paths: ["/tmp/a.txt"] }]),
+    ).rejects.toMatchObject({ code: "debugger_unavailable", outcome: "not_started", reason: REFUSAL });
+    expect(pageAgentRequests.map((request) => request.op)).toEqual(["select"]);
+  });
+
+  test("keeps the page agent's error codes", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = (request) =>
+      request.op === "select"
+        ? { agenttab_error: { code: "ambiguous_selector", message: "Selector matched 2 elements: input" } }
+        : {};
+    const revision = await revisions.ensure(7);
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{ kind: "fill", selector: "input", text: "hello" }]),
+    ).rejects.toMatchObject({ code: "ambiguous_selector" });
+  });
+
+  test("refuses sensitive fields on the scripting route", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = (request) => (request.op === "describe" ? { agenttab_sensitive_field: true } : { id: 4 });
+    const revision = await revisions.ensure(7);
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{ kind: "fill", selector: "#card", text: "4242" }]),
+    ).rejects.toMatchObject({ code: "sensitive_field_requires_handoff" });
+    expect(pageAgentRequests.some((request) => request.op === "act")).toBe(false);
+  });
+
+  test("evaluates selector waits through the page agent", async () => {
+    const { runtime } = refusedRuntime();
+    pageAgentReply = () => ({ count: 1, state: { connected: true, visible: true, enabled: true, value: "" } });
+    const result = await runtime.wait(7, {
+      condition: { kind: "selector", value: "#ready", state: "visible" },
+      timeout_ms: 1_000,
+    });
+    expect(result).toMatchObject({ condition: "selector", matched: true });
+    expect(pageAgentRequests).toEqual([{ op: "inspect_selector", selector: "#ready" }]);
+  });
+
+  test("refuses non-web window requests a page forges into the main-world trap", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = (request) =>
+      request.op === "describe" ? { tag: "BUTTON", type: "button", text: "Open" } : { id: 3 };
+    mainWorldResult = [{ url: "chrome://settings/" }, { url: "file:///etc/hosts" }];
+    const tabsBefore = tabStore.size;
+    const revision = await revisions.ensure(7);
+    const acted = await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "#open" }]);
+    expect(acted.result?.actions).toEqual([{
+      kind: "click",
+      completed: true,
+      page_route: "scripting",
+      opened_tabs: [
+        { url: "chrome://settings/", outcome: "refused", reason: "unsupported_scheme" },
+        { url: "file:///etc/hosts", outcome: "refused", reason: "unsupported_scheme" },
+      ],
+    }]);
+    expect(tabStore.size).toBe(tabsBefore);
+  });
+
+  test("reports a refusal after a gesture's first input event as unknown", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+        debuggerAttachError = REFUSAL;
+        throw new Error("Debugger is not attached to the tab with id: 7.");
+      }
+      if (method === "DOM.getNodeForLocation") return { backendNodeId: 22 };
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("isConnected")) {
+        return { result: { value: true } };
+      }
+      return undefined;
+    };
+    const revision = await revisions.ensure(7);
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{ kind: "double_click", ref: mintedRef(TASK_A, 7, revision) }]),
+    ).rejects.toMatchObject({ code: "debugger_unavailable", outcome: "unknown" });
   });
 });

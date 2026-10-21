@@ -44,7 +44,32 @@ export function restrictedOriginError(operation: string): Error {
   );
 }
 
+/**
+ * Chrome refused the debugger for a tab whose origin AgentTab can otherwise
+ * script, for example because another extension embedded a frame in the page
+ * or DevTools already holds the tab. The scripting route still serves it.
+ */
+export function debuggerUnavailableError(cause: unknown, operation?: string): Error {
+  const reason = cause instanceof Error ? cause.message : String(cause);
+  return Object.assign(
+    new Error(
+      operation === undefined
+        ? `Chrome refused AgentTab's debugger for this tab: ${reason}`
+        : `${operation} needs Chrome's debugger, which Chrome refused for this tab: ${reason}`,
+    ),
+    {
+      code: "debugger_unavailable",
+      outcome: "not_started",
+      reason,
+      cause,
+      recovery: "Snapshots, element actions, credential fills, and load, URL, text, selector, and value waits use AgentTab's scripting route on this tab. Frame-scoped control, drag, file upload, dialogs, downloads, network-idle waits, and full-page or background-tab screenshots need the debugger; they work again once the condition Chrome reports clears, such as another extension's frame on the page or open DevTools.",
+    },
+  );
+}
+
+/** Translates raw Chrome errors only; AgentTab's own coded errors pass through. */
 export function normalizeRestrictedOriginError(error: unknown, operation: string): unknown {
+  if (typeof error === "object" && error !== null && typeof Reflect.get(error, "code") === "string") return error;
   const message = error instanceof Error ? error.message : String(error);
   return RESTRICTED_ERROR_PATTERNS.some((pattern) => pattern.test(message))
     ? restrictedOriginError(operation)

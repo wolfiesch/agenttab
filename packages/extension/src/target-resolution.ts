@@ -1,11 +1,16 @@
 
 export interface TargetBinding {
+  /**
+   * Debugger backend node id, or the page agent's element id when `route` is
+   * `"scripting"`. Scripting refs bind to Chrome's `documentId`.
+   */
   backendNodeId: number;
   documentId: string;
   frameId: string;
   pageRevision: number;
   taskId: string;
   tabId: number;
+  route?: "scripting";
 }
 
 export interface ResolvedTarget extends TargetBinding {
