@@ -3,6 +3,8 @@ import { mutateState, readState, type HandoffNotice, type NoticeStatus } from ".
 import { RevisionTracker } from "./revisions";
 import { OwnershipLedger } from "./ownership";
 import { isRecord } from "./type-guards";
+import { CHALLENGE_ID_PATTERN, episodeEvent, findEpisode, type ChallengeEpisode, type ChallengeEvent } from "./challenge";
+import { bindChallengeNotice, challengeStoreAvailable, readTaskEpisodes } from "./challenge-store";
 
 const HANDOFF_ALARM = "agenttab-handoff-timeout";
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -10,7 +12,12 @@ const MAX_NOTICES = 100;
 type PrivacyScrubber = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 
-type NoticeCompletion = { kind: "url" | "selector"; value: string };
+type NoticeCompletion = { kind: "url" | "selector" | "challenge_cleared"; value: string };
+/** Rescans a task tab for challenges; undefined when the scan did not complete. */
+type ChallengeScanner = (
+  taskId: string,
+  tabId: number,
+) => Promise<{ event?: ChallengeEvent; episodes: ChallengeEpisode[] } | undefined>;
 
 function noticeResult(notice: HandoffNotice): Record<string, unknown> {
   return {
@@ -24,6 +31,12 @@ function noticeResult(notice: HandoffNotice): Record<string, unknown> {
   };
 }
 
+function isChallengeCompletion(
+  completion: NoticeCompletion | undefined | unknown,
+): completion is { kind: "challenge_cleared"; value: string } {
+  return isRecord(completion) && completion.kind === "challenge_cleared" && typeof completion.value === "string";
+}
+
 function terminal(status: NoticeStatus): boolean {
   return status !== "open";
 }
@@ -31,6 +44,7 @@ function terminal(status: NoticeStatus): boolean {
 export class HandoffController {
   private transitionTail: Promise<unknown> = Promise.resolve();
   private scrubber: PrivacyScrubber | null = null;
+  private challengeScanner: ChallengeScanner | null = null;
 
   constructor(
     private readonly scheduler: MutationScheduler,
@@ -41,6 +55,10 @@ export class HandoffController {
 
   setScrubber(scrubber: PrivacyScrubber): void {
     this.scrubber = scrubber;
+  }
+
+  setChallengeScanner(scanner: ChallengeScanner): void {
+    this.challengeScanner = scanner;
   }
 
   restore(): Promise<void> {
@@ -168,6 +186,7 @@ export class HandoffController {
     await this.ownership.assertOwned(taskId, numericTabId);
     await this.revisions.assertExpected(numericTabId, expectedRevision);
     if (originGuard) await originGuard();
+    if (isChallengeCompletion(completion)) await this.requireActiveEpisode(taskId, numericTabId, completion.value);
     // Detaching this exact tab prevents an existing passive debugger session from
     // remaining attached while the human interacts. It never pauses other tasks.
     await this.scrubber?.(numericTabId);
@@ -203,12 +222,16 @@ export class HandoffController {
       this.trimNotices(state.notices);
     });
     await this.scheduleExpiry();
+    if (isChallengeCompletion(completion)) {
+      await bindChallengeNotice(taskId, completion.value, notice.noticeId).catch(() => false);
+    }
     return noticeResult(notice);
   }
 
   private async resolveNow(taskId: string, noticeId: string): Promise<Record<string, unknown>> {
     await this.expireNow();
     const notice = await this.noticeForTask(taskId, noticeId);
+    if (isChallengeCompletion(notice.completion)) return this.resolveChallengeNow(notice, notice.completion.value);
     if (terminal(notice.status)) return noticeResult(notice);
     if (notice.completion && !(await this.completionMatched(notice))) {
       throw Object.assign(new Error("The handoff completion condition has not been met"), {
@@ -216,6 +239,53 @@ export class HandoffController {
       });
     }
     return this.setStatus(noticeId, "resolved");
+  }
+
+  /**
+   * A notice whose completion names a challenge episode. Resolution rescans the tab, then succeeds only
+   * when the episode has ended (`cleared` or `superseded`); the terminal event rides on the result.
+   * A notice that already ended keeps reporting the episode's stored state without rescanning.
+   */
+  private async resolveChallengeNow(notice: HandoffNotice, challengeId: string): Promise<Record<string, unknown>> {
+    let episode: ChallengeEpisode | undefined;
+    if (!terminal(notice.status)) {
+      await this.ownership.assertOwned(notice.taskId, notice.tabId);
+      const scanned = await this.challengeScanner?.(notice.taskId, notice.tabId).catch(() => undefined);
+      const episodes = scanned?.episodes ?? (await this.storedEpisodes(notice.taskId));
+      episode = findEpisode(episodes, notice.taskId, challengeId);
+      if (episode === undefined || episode.tab_id !== notice.tabId || episode.state === "active") {
+        throw Object.assign(new Error("The handoff completion condition has not been met"), {
+          code: "completion_not_met",
+          ...(episode !== undefined && episode.tab_id === notice.tabId
+            ? { challengeEvent: { ...episodeEvent(episode), notice_id: notice.noticeId } }
+            : {}),
+        });
+      }
+      const resolved = await this.setStatus(notice.noticeId, "resolved");
+      return { ...resolved, challenge: { ...episodeEvent(episode), notice_id: notice.noticeId } };
+    }
+    if (notice.status === "resolved") {
+      episode = findEpisode(await this.storedEpisodes(notice.taskId), notice.taskId, challengeId);
+    }
+    return {
+      ...noticeResult(notice),
+      ...(episode !== undefined ? { challenge: { ...episodeEvent(episode), notice_id: notice.noticeId } } : {}),
+    };
+  }
+
+  private async storedEpisodes(taskId: string): Promise<ChallengeEpisode[]> {
+    return challengeStoreAvailable() ? readTaskEpisodes(taskId).catch(() => []) : [];
+  }
+
+  /** The task's active episode with this id on this tab, or `challenge_not_found` before any side effect. */
+  private async requireActiveEpisode(taskId: string, tabId: number, challengeId: string): Promise<void> {
+    const episode = findEpisode(await this.storedEpisodes(taskId), taskId, challengeId);
+    if (episode === undefined || episode.tab_id !== tabId || episode.state !== "active") {
+      throw Object.assign(new Error("No active challenge with that id exists on this tab for this task"), {
+        code: "challenge_not_found",
+        outcome: "not_started",
+      });
+    }
   }
 
   private async dismissNow(taskId: string | undefined, noticeId: string): Promise<Record<string, unknown>> {
@@ -307,7 +377,8 @@ export class HandoffController {
 
   private validCompletion(value: unknown): value is NoticeCompletion {
     return isRecord(value) &&
-      (value.kind === "url" || value.kind === "selector") &&
+      (value.kind === "url" || value.kind === "selector" ||
+        (value.kind === "challenge_cleared" && typeof value.value === "string" && CHALLENGE_ID_PATTERN.test(value.value))) &&
       typeof value.value === "string";
   }
 

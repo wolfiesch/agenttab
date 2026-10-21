@@ -51,11 +51,13 @@ export interface OperationCard {
   steps: readonly OperationCardStep[];
   actions: readonly string[];
   notices: readonly string[];
+  /** One compact summary of the challenge event, when the result carries one. */
+  challenge?: string;
   evidence: readonly string[];
   details?: unknown;
 }
 
-const SENSITIVE_KEY = /(authorization|cookie|credential|password|secret|token)/i;
+const SENSITIVE_KEY = /(authorization|cookie|credential|password|secret|token(?!_present$))/i;
 const MAX_EXPANDED_LINES = 160;
 export const MAX_SELECTOR_LENGTH = 72;
 const STATUS_LABEL: Readonly<Record<OperationCardStatus, string>> = {
@@ -115,6 +117,7 @@ export function createResultCard(
     ...sensitiveInputNotices(callArgs),
     ...resultNotices(method, status, values),
   ];
+  const challenge = options.isPartial === true ? undefined : challengeLine(values);
   return {
     version: 1,
     method,
@@ -129,6 +132,7 @@ export function createResultCard(
     steps: operationSteps(status, method),
     actions: method === "browser_act" ? actionDescriptions(callArgs) : [],
     notices,
+    ...(challenge === undefined ? {} : { challenge }),
     evidence: extractEvidence(values),
     ...(options.isPartial === true ? {} : { details }),
   };
@@ -154,6 +158,9 @@ export function renderOperationCard(
     renderHeader(theme, `${statusLabel(card.status)} · ${card.title}`, meta, safeWidth, color),
   ];
   if (card.status === "running") return lines;
+  if (card.challenge !== undefined) {
+    lines.push(fg(theme, card.status === "awaiting_user" ? "warning" : "muted", truncate(`  ${card.challenge}`, Math.max(1, safeWidth - 2))));
+  }
   const showLifecycle = expanded || card.status === "planned" ||
     card.status === "awaiting_user" || card.status === "awaiting_approval" ||
     card.status === "uncertain" || card.status === "blocked";
@@ -426,7 +433,10 @@ function resultStatus(
 ): OperationCardStatus {
   const outcome = fieldString(toRecord(details._agenttab), "outcome") ?? fieldString(details, "outcome");
   if (outcome === "unknown") return "uncertain";
-  if (method === "browser_credentials" && outcome === "needs_user") return "awaiting_user";
+  if (
+    (method === "browser_credentials" || method === "browser_act" || method === "browser_wait") &&
+    outcome === "needs_user"
+  ) return "awaiting_user";
   if (options.isPartial === true) {
     return method === "browser_credentials" ? "awaiting_user" : "running";
   }
@@ -616,6 +626,51 @@ function resultNotices(method: ToolMethod, status: OperationCardStatus, details:
     notices.push("Privacy · Sensitive fields redacted below");
   }
   return notices;
+}
+
+const CHALLENGE_ID = /^chl_[0-9a-z]{20}$/;
+const CHALLENGE_NEXT = new Set(["wait", "handoff", "retry_later", "stop", "none"]);
+const CHALLENGE_STATE = new Set(["active", "cleared", "superseded"]);
+const CHALLENGE_TOKEN = /^[a-z][a-z0-9_]{0,47}$/;
+
+/**
+ * Compact line for a challenge event found at `challenge` (results) or
+ * `details.challenge` (error details). Reads only catalog identifiers, enums, and
+ * numbers from the event; malformed events render nothing.
+ */
+function challengeLine(details: Record<string, unknown>): string | undefined {
+  const event = toRecord(details.challenge ?? toRecord(details.details).challenge);
+  const id = fieldString(event, "challenge_id");
+  const vendor = fieldString(event, "vendor");
+  const product = fieldString(event, "product");
+  const kind = fieldString(event, "kind");
+  const state = fieldString(event, "state");
+  const next = fieldString(event, "next");
+  if (
+    id === undefined || !CHALLENGE_ID.test(id) ||
+    vendor === undefined || !CHALLENGE_TOKEN.test(vendor) ||
+    product === undefined || !CHALLENGE_TOKEN.test(product) ||
+    kind === undefined || !CHALLENGE_TOKEN.test(kind) ||
+    state === undefined || !CHALLENGE_STATE.has(state) ||
+    next === undefined || !CHALLENGE_NEXT.has(next)
+  ) return undefined;
+  const budget = fieldNumber(event, "wait_budget_ms");
+  const retryAfter = fieldNumber(event, "retry_after_ms");
+  return joinMeta(
+    `Challenge · ${vendor === "generic" ? product : `${vendor}/${product}`}`,
+    kind,
+    state,
+    state === "active" ? `next ${next}` : undefined,
+    state === "active" && budget !== undefined ? `wait ${formatMs(budget)}` : undefined,
+    state === "active" && retryAfter !== undefined ? `retry after ${formatMs(retryAfter)}` : undefined,
+    id,
+  );
+}
+
+function formatMs(value: number): string {
+  if (value < 1000) return `${value}ms`;
+  const seconds = value / 1000;
+  return Number.isInteger(seconds) ? `${seconds}s` : `${seconds.toFixed(1)}s`;
 }
 
 function containsSensitiveKey(value: unknown, seen = new WeakSet<object>()): boolean {

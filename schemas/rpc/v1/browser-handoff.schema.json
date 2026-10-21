@@ -14,10 +14,24 @@
         "completion": {
           "type": "object",
           "required": ["kind", "value"],
-          "description": "kind \"url\" matches the tab URL exactly; pass the full absolute URL. kind \"selector\" matches a CSS selector on the page.",
+          "description": "kind \"url\" matches the tab URL exactly; pass the full absolute URL. kind \"selector\" matches a CSS selector on the page. kind \"challenge_cleared\" takes a challenge id from a challenge event on the same tab and is met once that challenge has cleared or been superseded.",
+          "oneOf": [
+            {
+              "properties": {
+                "kind": { "enum": ["url", "selector"] },
+                "value": { "type": "string", "minLength": 1, "maxLength": 2048 }
+              }
+            },
+            {
+              "properties": {
+                "kind": { "const": "challenge_cleared" },
+                "value": { "type": "string", "pattern": "^chl_[0-9a-z]{20}$" }
+              }
+            }
+          ],
           "properties": {
-            "kind": { "enum": ["url", "selector"] },
-            "value": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            "kind": { "enum": ["url", "selector", "challenge_cleared"] },
+            "value": { "type": "string" }
           },
           "additionalProperties": false
         },

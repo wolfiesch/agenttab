@@ -674,6 +674,9 @@ pub enum WaitCondition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame_id: Option<String>,
     },
+    ChallengeCleared {
+        challenge_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -743,6 +746,7 @@ fn default_handoff_timeout() -> u64 {
 pub enum HandoffCompletion {
     Url { value: String },
     Selector { value: String },
+    ChallengeCleared { value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -947,17 +951,24 @@ impl MethodParams {
                     (1_000..=900_000).contains(timeout_ms),
                     "timeout_ms must be between 1000 and 900000",
                 )?;
-                if let Some(
-                    HandoffCompletion::Url { value } | HandoffCompletion::Selector { value },
-                ) = completion
-                {
-                    require_len(
+                match completion {
+                    Some(
+                        HandoffCompletion::Url { value } | HandoffCompletion::Selector { value },
+                    ) => {
+                        require_len(
+                            method,
+                            value,
+                            1,
+                            MAX_HANDOFF_COMPLETION_CHARS,
+                            "completion.value",
+                        )?;
+                    }
+                    Some(HandoffCompletion::ChallengeCleared { value }) => require(
                         method,
-                        value,
-                        1,
-                        MAX_HANDOFF_COMPLETION_CHARS,
-                        "completion.value",
-                    )?;
+                        is_challenge_id(value),
+                        "completion.value must match ^chl_[0-9a-z]{20}$",
+                    )?,
+                    None => {}
                 }
             }
             Self::Handoff(
@@ -1292,8 +1303,22 @@ fn validate_wait_condition(
             }
             Ok(())
         }
+        WaitCondition::ChallengeCleared { challenge_id } => require(
+            method,
+            is_challenge_id(challenge_id),
+            "condition.challenge_id must match ^chl_[0-9a-z]{20}$",
+        ),
         WaitCondition::Load | WaitCondition::NetworkIdle => Ok(()),
     }
+}
+
+fn is_challenge_id(value: &str) -> bool {
+    value.strip_prefix("chl_").is_some_and(|suffix| {
+        suffix.len() == 20
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+    })
 }
 
 fn validate_developer_params(
@@ -2403,6 +2428,27 @@ mod tests {
             json!({"tab_id": 7, "condition": {"kind": "value", "selector": "input", "value": "ready", "frame_id": "frame-1"}}),
             false,
         )).is_ok());
+        assert!(RpcRequest::parse(request(
+            "browser_wait",
+            json!({"tab_id": 7, "condition": {"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}, "timeout_ms": 60000}),
+            false,
+        )).is_ok());
+        for invalid_condition in [
+            json!({"kind": "challenge_cleared"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_short"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "xyz_3k9w2m7q8x1v5b0n4c6z"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3K9W2M7Q8X1V5B0N4C6Z"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6zz"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6é"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z", "value": "x"}),
+        ] {
+            assert!(RpcRequest::parse(request(
+                "browser_wait",
+                json!({"tab_id": 7, "condition": invalid_condition}),
+                false,
+            ))
+            .is_err());
+        }
         for (method, params, mutation) in [
             (
                 "browser_act",
@@ -2526,6 +2572,67 @@ mod tests {
                 ..
             }) if value == "body"
         ));
+
+        let (_, challenge_params) = RpcRequest::parse(request(
+            "browser_handoff",
+            json!({
+                "operation": "request",
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "prompt": "Complete the challenge",
+                "completion": {"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6z"},
+            }),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(
+            challenge_params,
+            MethodParams::Handoff(BrowserHandoffParams::Request {
+                completion: Some(HandoffCompletion::ChallengeCleared { value }),
+                ..
+            }) if value == "chl_3k9w2m7q8x1v5b0n4c6z"
+        ));
+        for invalid_completion in [
+            json!({"kind": "challenge_cleared", "value": "chl_short"}),
+            json!({"kind": "challenge_cleared", "value": "xyz_3k9w2m7q8x1v5b0n4c6z"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3K9W2M7Q8X1V5B0N4C6Z"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6zz"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6é"}),
+            json!({"kind": "challenge_cleared", "value": ""}),
+        ] {
+            assert!(matches!(
+                RpcRequest::parse(request(
+                    "browser_handoff",
+                    json!({
+                        "operation": "request",
+                        "tab_id": 1,
+                        "expected_page_revision": 2,
+                        "prompt": "Complete the challenge",
+                        "completion": invalid_completion,
+                    }),
+                    true,
+                )),
+                Err(ProtocolError::InvalidParamConstraint { .. })
+            ));
+        }
+        for invalid_completion in [
+            json!({"kind": "challenge_cleared"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6z", "extra": 1}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}),
+        ] {
+            assert!(RpcRequest::parse(request(
+                "browser_handoff",
+                json!({
+                    "operation": "request",
+                    "tab_id": 1,
+                    "expected_page_revision": 2,
+                    "prompt": "Complete the challenge",
+                    "completion": invalid_completion,
+                }),
+                true,
+            ))
+            .is_err());
+        }
 
         for operation in ["status", "resolve", "dismiss"] {
             let (_, params) = RpcRequest::parse(request(

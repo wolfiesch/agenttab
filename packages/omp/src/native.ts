@@ -100,6 +100,7 @@ export function describeResultView(
     const body: NativeNode[] = [];
     if (attention) body.push(flowNode(card.steps));
     body.push(...actionList(card), ...noticeNodes(card.notices));
+    if (card.challenge !== undefined) body.push(challengeNode(card.challenge, card.status === "awaiting_user"));
     if (card.evidence.length > 0) body.push(evidenceNode(card.evidence));
     const details = detailsNode(card, options.expanded === true);
     if (details !== undefined) body.push(details);
@@ -159,6 +160,16 @@ function noticeNodes(notices: readonly string[]): NativeNode[] {
       : [{ t: `${label}  `, s: `${style} strong` }, { t: rest.join(" · "), s: style }];
     return { k: "text", p: { spans, wrap: "word" }, key: `notice${index}` };
   });
+}
+
+function challengeNode(line: string, attention: boolean): NativeNode {
+  const [label, ...rest] = line.split(" · ");
+  const style = attention ? "warning" : "muted";
+  return {
+    k: "text",
+    p: { spans: [{ t: `${label}  `, s: `${style} strong` }, { t: rest.join(" · "), s: style }], wrap: "word" },
+    key: "challenge",
+  };
 }
 
 function evidenceNode(evidence: readonly string[]): NativeNode {

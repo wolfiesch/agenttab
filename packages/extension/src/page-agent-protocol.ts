@@ -6,7 +6,7 @@
  */
 
 /** Bump whenever a request or response shape changes, so a stale agent reinstalls. */
-export const PAGE_AGENT_VERSION = 1;
+export const PAGE_AGENT_VERSION = 2;
 /** Bundled agent script, injected with `chrome.scripting.executeScript({ files })`. */
 export const PAGE_AGENT_FILE = "page-agent.js";
 
@@ -23,7 +23,8 @@ export type PageAgentRequest =
   | { op: "scroll"; id: number; delta_x: number; delta_y: number }
   | { op: "inspect_selector"; selector: string }
   | { op: "geometry"; selector?: string }
-  | { op: "fill_credential"; id: number; value: string; kind: string };
+  | { op: "fill_credential"; id: number; value: string; kind: string }
+  | { op: "surface"; id: number; selectors: string[] };
 
 export interface PageAgentError {
   agenttab_error: { code: string; message: string };

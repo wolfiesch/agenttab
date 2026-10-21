@@ -71,6 +71,7 @@ const schemas: Record<ToolMethod, unknown> = {
     condition: Type.Union([
       object({ kind: stringEnum(["load", "network_idle"]) }),
       object({ kind: Type.Literal("download"), after: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })) }),
+      object({ kind: Type.Literal("challenge_cleared"), challenge_id: Type.String({ pattern: "^chl_[0-9a-z]{20}$" }) }),
       object({ kind: stringEnum(["url", "text"]), value: Type.String({ minLength: 1, maxLength: 2048 }) }),
       object({ kind: Type.Literal("selector"), value: Type.String({ minLength: 1, maxLength: 2048 }), state: Type.Optional(stringEnum(["attached", "detached", "visible", "hidden", "enabled"])), frame_id: Type.Optional(ref()) }),
       object({ kind: Type.Literal("value"), selector: selector(), value: Type.String({ maxLength: STANDARD_ACTION_VALUE_MAX_CHARS }), frame_id: Type.Optional(ref()) }),
@@ -84,10 +85,16 @@ const schemas: Record<ToolMethod, unknown> = {
       tab_id: Type.Integer({ minimum: 0 }),
       expected_page_revision: Type.Integer({ minimum: 0 }),
       prompt: Type.String({ minLength: 1, maxLength: 2000 }),
-      completion: Type.Optional(object({
-        kind: stringEnum(["url", "selector"]),
-        value: Type.String({ minLength: 1, maxLength: 65_536 }),
-      })),
+      completion: Type.Optional(Type.Union([
+        object({
+          kind: stringEnum(["url", "selector"]),
+          value: Type.String({ minLength: 1, maxLength: 65_536 }),
+        }),
+        object({
+          kind: Type.Literal("challenge_cleared"),
+          value: Type.String({ pattern: "^chl_[0-9a-z]{20}$" }),
+        }),
+      ])),
       timeout_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 900_000 })),
     }),
     object({

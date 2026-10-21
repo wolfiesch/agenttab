@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/challenge.schema.json",
+  "title": "AgentTab challenge event",
+  "description": "Proposed in ADR 0002. Describes one active or just-ended bot challenge episode on a task-owned tab. Returned as the optional `challenge` member of browser_open, browser_snapshot, browser_act, and browser_wait results, and in challenge error details. Contains no page text, URL path or query, sitekey, or response token.",
+  "type": "object",
+  "required": [
+    "spec_version",
+    "challenge_id",
+    "tab_id",
+    "page_revision",
+    "first_page_revision",
+    "first_detected_at_ms",
+    "detected_at_ms",
+    "page_origin",
+    "vendor",
+    "product",
+    "kind",
+    "interaction",
+    "state",
+    "confidence",
+    "surface",
+    "signals",
+    "next",
+    "detector"
+  ],
+  "properties": {
+    "spec_version": { "const": 1 },
+    "challenge_id": {
+      "type": "string",
+      "pattern": "^chl_[0-9a-z]{20}$",
+      "description": "Random episode identifier. Stable while the same signature stays active on the tab, including across interstitial self-reloads."
+    },
+    "tab_id": { "type": "integer", "minimum": 0 },
+    "page_revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Revision at which this observation was made."
+    },
+    "first_page_revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Revision at which the episode was first detected."
+    },
+    "first_detected_at_ms": { "type": "integer", "minimum": 0 },
+    "detected_at_ms": { "type": "integer", "minimum": 0 },
+    "page_origin": {
+      "type": "string",
+      "maxLength": 2048,
+      "pattern": "^https?://[^/?#\\s]+$",
+      "description": "Origin of the top-level document. Never includes a path, query, or fragment."
+    },
+    "vendor": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$",
+      "description": "Catalog vendor identifier, for example cloudflare, google_recaptcha, hcaptcha, aws_waf, or generic."
+    },
+    "product": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,47}$",
+      "description": "Catalog product identifier, for example challenge_page, turnstile, or recaptcha_v2."
+    },
+    "kind": {
+      "enum": ["interstitial", "widget", "puzzle", "block", "rate_limit"],
+      "description": "interstitial: the whole document is a challenge page. widget: an embedded gate inside an otherwise usable page. puzzle: an interactive task is displayed. block: a denial with no challenge path. rate_limit: a throttling response."
+    },
+    "interaction": {
+      "enum": ["automatic", "human", "none"],
+      "description": "automatic: expected to clear without input in a real profile. human: needs a person. none: no interaction can clear it."
+    },
+    "state": {
+      "enum": ["active", "cleared", "superseded"],
+      "description": "active: the gate is present and blocking. cleared: the gate passed on the same surface. superseded: the tab left the challenge without clearing it, for example by navigating elsewhere. Kind, product, and interaction may change within one active episode, such as a widget opening a puzzle."
+    },
+    "confidence": {
+      "enum": ["high", "medium", "low"],
+      "description": "high: a vendor-documented marker matched. medium: a catalog DOM or frame heuristic matched. low: a generic heuristic matched."
+    },
+    "surface": { "$ref": "#/$defs/surface" },
+    "token_present": {
+      "type": "boolean",
+      "description": "Widget only. True when the catalog-named response field is non-empty. The value itself is never read into a result."
+    },
+    "signals": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)+$", "maxLength": 96 },
+      "description": "Catalog signal identifiers that matched."
+    },
+    "next": {
+      "enum": ["wait", "handoff", "retry_later", "stop", "none"],
+      "description": "Detector-derived next step. none only when state is not active."
+    },
+    "wait_budget_ms": {
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 120000,
+      "description": "Remaining automatic-clear budget. Required when next is wait."
+    },
+    "retry_after_ms": { "type": "integer", "minimum": 0, "maximum": 86400000 },
+    "notice_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Open attention notice whose completion references this challenge, when one exists."
+    },
+    "detector": {
+      "type": "object",
+      "required": ["catalog_version", "probe"],
+      "properties": {
+        "catalog_version": { "type": "string", "pattern": "^[0-9]{4}\\.[0-9]{2}\\.[0-9]+$" },
+        "probe": {
+          "enum": ["debugger", "scripting"],
+          "description": "debugger: frame tree and main-document response metadata from an already attached task session. scripting: isolated-world read of the top document only."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "surface": {
+      "type": "object",
+      "required": ["scope", "visible"],
+      "properties": {
+        "scope": { "enum": ["document", "frame", "element"] },
+        "frame_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "frame_origin": { "type": "string", "maxLength": 2048, "pattern": "^https?://[^/?#\\s]+$" },
+        "visible": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "const": "frame" } } },
+          "then": { "required": ["frame_id", "frame_origin"] }
+        },
+        {
+          "if": { "properties": { "scope": { "const": "document" } } },
+          "then": { "not": { "required": ["frame_origin"] } }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "enum": ["interstitial", "block", "rate_limit"] } } },
+      "then": { "properties": { "surface": { "properties": { "scope": { "const": "document" } } } } }
+    },
+    {
+      "if": { "properties": { "kind": { "enum": ["block", "rate_limit"] } } },
+      "then": { "properties": { "interaction": { "const": "none" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "enum": ["widget", "puzzle", "interstitial"] } } },
+      "then": { "properties": { "interaction": { "enum": ["automatic", "human"] } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "puzzle" } } },
+      "then": { "properties": { "interaction": { "const": "human" } } }
+    },
+    {
+      "if": { "required": ["token_present"] },
+      "then": { "properties": { "kind": { "const": "widget" } } }
+    },
+    {
+      "if": { "properties": { "state": { "enum": ["cleared", "superseded"] } } },
+      "then": { "properties": { "next": { "const": "none" } } }
+    },
+    {
+      "if": {
+        "properties": { "state": { "const": "active" }, "interaction": { "const": "automatic" } }
+      },
+      "then": { "properties": { "next": { "enum": ["wait", "handoff"] } } }
+    },
+    {
+      "if": {
+        "properties": { "state": { "const": "active" }, "interaction": { "const": "human" } }
+      },
+      "then": { "properties": { "next": { "const": "handoff" } } }
+    },
+    {
+      "if": {
+        "properties": { "state": { "const": "active" }, "kind": { "const": "block" } }
+      },
+      "then": { "properties": { "next": { "const": "stop" } } }
+    },
+    {
+      "if": {
+        "properties": { "state": { "const": "active" }, "kind": { "const": "rate_limit" } }
+      },
+      "then": { "properties": { "next": { "const": "retry_later" } } }
+    },
+    {
+      "if": { "properties": { "next": { "const": "wait" } } },
+      "then": { "required": ["wait_budget_ms"] }
+    },
+    {
+      "if": { "required": ["retry_after_ms"] },
+      "then": { "properties": { "kind": { "const": "rate_limit" } } }
+    }
+  ],
+  "additionalProperties": false
+}

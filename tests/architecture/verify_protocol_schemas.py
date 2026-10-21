@@ -179,6 +179,11 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         ),
         core_request(
             "browser_wait",
+            {"tab_id": 1, "condition": {"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}, "timeout_ms": 60000},
+            mutation=False,
+        ),
+        core_request(
+            "browser_wait",
             {"tab_id": 1, "condition": {"kind": "download", "after": "cursor-1"}},
             mutation=False,
         ),
@@ -195,6 +200,17 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
                 "tab_id": 1,
                 "expected_page_revision": 2,
                 "prompt": "Complete sign-in, then tell the agent in chat.",
+            },
+            mutation=True,
+        ),
+        core_request(
+            "browser_handoff",
+            {
+                "operation": "request",
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "prompt": "Complete the challenge, then tell the agent in chat.",
+                "completion": {"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6z"},
             },
             mutation=True,
         ),
@@ -312,10 +328,39 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         ({"kind": "download", "after": ""}, "empty download cursor"),
         ({"kind": "value", "selector": "input", "value": "ok", "state": "visible"}, "value wait state"),
         ({"kind": "selector", "value": "input", "frame_id": ""}, "empty wait frame"),
+        ({"kind": "challenge_cleared"}, "challenge wait without id"),
+        ({"kind": "challenge_cleared", "challenge_id": "chl_short"}, "challenge wait short id"),
+        ({"kind": "challenge_cleared", "challenge_id": "xyz_3k9w2m7q8x1v5b0n4c6z"}, "challenge wait bad prefix"),
+        ({"kind": "challenge_cleared", "challenge_id": "chl_3K9W2M7Q8X1V5B0N4C6Z"}, "challenge wait uppercase id"),
+        ({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z", "value": "x"}, "challenge wait extra key"),
     ]:
         expect_invalid(
             request_validator,
             core_request("browser_wait", {"tab_id": 1, "condition": invalid_condition}, mutation=False),
+            label,
+        )
+    for invalid_completion, label in [
+        ({"kind": "challenge_cleared"}, "challenge handoff without value"),
+        ({"kind": "challenge_cleared", "value": "chl_short"}, "challenge handoff short id"),
+        ({"kind": "challenge_cleared", "value": "xyz_3k9w2m7q8x1v5b0n4c6z"}, "challenge handoff bad prefix"),
+        ({"kind": "challenge_cleared", "value": "chl_3K9W2M7Q8X1V5B0N4C6Z"}, "challenge handoff uppercase id"),
+        ({"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6z", "extra": 1}, "challenge handoff extra key"),
+        ({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}, "challenge handoff wrong key"),
+        ({"kind": "url", "value": "chl_3k9w2m7q8x1v5b0n4c6z", "extra": 1}, "url handoff extra key"),
+    ]:
+        expect_invalid(
+            request_validator,
+            core_request(
+                "browser_handoff",
+                {
+                    "operation": "request",
+                    "tab_id": 1,
+                    "expected_page_revision": 2,
+                    "prompt": "Complete the challenge.",
+                    "completion": invalid_completion,
+                },
+                mutation=True,
+            ),
             label,
         )
     unknown = dict(requests[0], unexpected=True)

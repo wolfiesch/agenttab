@@ -5974,6 +5974,24 @@ describe("extension entrypoint admission boundaries", () => {
     });
     expect(Object.values((await readState()).notices)).toEqual([]);
     expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e63a0",
+      TASK_C,
+      "browser_handoff",
+      {
+        operation: "request",
+        tab_id: 102,
+        expected_page_revision: restrictedPageRevision,
+        prompt: "Complete the challenge",
+        completion: { kind: "challenge_cleared", value: "chl_3k9w2m7q8x1v5b0n4c6z" },
+        timeout_ms: 1_000,
+      },
+    )).toMatchObject({
+      outcome: "not_started",
+      error: { code: "browser_restricted_origin" },
+    });
+    expect(Object.values((await readState()).notices)).toEqual([]);
+    expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
     const restrictedTab = tabStore.get(102);
     if (!restrictedTab) throw new Error("restricted task tab is unavailable");
     restrictedTab.url = "chrome://settings/";
@@ -6031,6 +6049,27 @@ describe("extension entrypoint admission boundaries", () => {
     expect(await loadingOpen).toMatchObject({
       outcome: "completed",
       result: { tab_id: 103, page_revision: 2, url: "https://example.test/slow/landed" },
+    });
+
+    // A batch that ends in a navigation reports the page it reached once that page's load settles,
+    // not the revision of the document it left. Chrome reports the tab `loading` as soon as
+    // `tabs.update` starts the navigation; the mock's update leaves status alone, so set it here.
+    const navigationRequestId = "018f47b8-2f80-7c20-9c77-f8a38c9e6320";
+    loadingTab.status = "loading";
+    const navigated = sendNativeCommand(navigationRequestId, TASK_C, "browser_act", {
+      tab_id: 103,
+      expected_page_revision: 2,
+      actions: [{ kind: "navigate", url: "https://example.test/next" }],
+    });
+    await waitForCondition(() => tabStore.get(103)?.url === "https://example.test/next");
+    for (const listener of tabUpdatedListeners) listener(103, { status: "loading" });
+    await flushPromiseQueue();
+    expect(JSON.stringify(port.posted)).not.toContain(navigationRequestId);
+    loadingTab.status = "complete";
+    for (const listener of tabUpdatedListeners) listener(103, { status: "complete" });
+    expect(await navigated).toMatchObject({
+      outcome: "completed",
+      result: { tab_id: 103, page_revision: 3, actions: [{ kind: "navigate", started: true }] },
     });
 
     // A tab closed while its first load is pending fails the open instead of reporting a dead tab.

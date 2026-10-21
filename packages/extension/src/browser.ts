@@ -24,6 +24,37 @@ import {
   type StagedCommit,
   type StagedDialog,
 } from "./protocol";
+import {
+  activeEpisodeForTab,
+  advance,
+  catalogSelectors,
+  catalogTokenSelectors,
+  collectChallengeFacts,
+  detect,
+  episodeEvent,
+  findEpisode,
+  frameOfInterest,
+  newChallengeId,
+  sanitizeOrigin,
+  type ChallengeEpisode,
+  type ChallengeEvent,
+  type ChallengePageFacts,
+  type FrameFact,
+  type ProbeFacts,
+} from "./challenge";
+import { CHALLENGE_CATALOG } from "./challenge-catalog";
+import {
+  classifyGuardedAction,
+  decideContainment,
+  parseSurfaceEvidence,
+  probeSurfaceEvidence,
+  surfaceMatchers,
+  SURFACE_PROBE_DECLARATION,
+  type Containment,
+  type SurfaceEvidence,
+  type SurfaceMatchers,
+} from "./challenge-guard";
+import { challengeStoreAvailable, readTaskEpisodes, updateTaskEpisodes } from "./challenge-store";
 import { mutateState, readState } from "./storage";
 import { sensitiveFieldState } from "./sensitive-field";
 import {
@@ -49,6 +80,16 @@ const DEBUGGER_IDLE_MS = 30_000;
 const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
 // Scripting-route refs always name the tab's top document.
 const SCRIPTING_FRAME_ID = "scripting:top";
+/** Overall time a challenge scan may add to one result; an overrun omits `challenge`. */
+const CHALLENGE_SCAN_BUDGET_MS = 250;
+/** Minimum spacing between the starts of two scans inside a `challenge_cleared` wait. */
+const CHALLENGE_POLL_MS = 500;
+/** Response headers the detector may keep from a main-document response, lowercase. */
+const CHALLENGE_RESPONSE_HEADERS: readonly string[] = ["cf-mitigated", "x-amzn-waf-action", "retry-after"];
+const DOCUMENT_RESPONSE_LIMIT = 8;
+const CHALLENGE_FRAME_LIMIT = 256;
+const CHALLENGE_SELECTORS = catalogSelectors(CHALLENGE_CATALOG);
+const CHALLENGE_TOKEN_SELECTORS = catalogTokenSelectors(CHALLENGE_CATALOG);
 // Leaves more than 16 KiB for the Core response envelope and task binding inside
 // the 1 MiB host-to-client frame. Screenshot base64 data is separately capped at
 // 1,000,000 characters (750,000 decoded bytes).
@@ -72,6 +113,7 @@ const SUPPORTED_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   value: true,
   network_idle: true,
   download: true,
+  challenge_cleared: true,
 };
 function validateKeyboardAction(action: Record<string, unknown>): void {
   if (action.kind !== "press") return;
@@ -160,6 +202,13 @@ interface TrackedDownload {
   cursor?: DownloadCursor;
 }
 
+interface DocumentResponse {
+  frameId: string;
+  loaderId: string;
+  status: number;
+  headers: Record<string, string>;
+}
+
 interface DebugSession {
   attached: boolean;
   attachPromise?: Promise<void>;
@@ -175,6 +224,7 @@ interface DebugSession {
   pendingWindowOpen?: PendingWindowOpen;
   frameContexts: Map<string, number>;
   frameSessions: Map<string, string>;
+  documentResponses: DocumentResponse[];
 }
 
 interface AxValue {
@@ -469,6 +519,16 @@ type OpenRequestedChild = (parentTabId: number, url: string) => Promise<number>;
 export interface ActionExecution {
   result?: Record<string, unknown>;
   staged?: StagedCommit;
+  /** The batch stopped before an action the challenge guard refused; `result` carries the active challenge. */
+  needsUser?: true;
+  /** Terminal event of an episode a guard rescan ended during the batch and no result has reported yet. */
+  endedChallenge?: ChallengeEvent;
+}
+
+/** Per-batch state of the browser_act challenge guard. */
+interface ChallengeGuardState {
+  first: boolean;
+  ended?: ChallengeEvent;
 }
 export interface TargetResolutionRequest {
   pageRevision: number;
@@ -498,6 +558,8 @@ export class StandardBrowserRuntime {
   private readonly expectedDetaches = new Map<number, number>();
   private readonly debuggerCandidates = new Set<number>();
   private readonly debuggerRefusals = new Map<number, { reason: string; until: number }>();
+  /** Page revision of the last completed challenge scan, per tab. */
+  private readonly challengeScanRevisions = new Map<number, number>();
 
   constructor(
     private readonly revisions: RevisionTracker,
@@ -545,6 +607,31 @@ export class StandardBrowserRuntime {
             session.frameSessions.delete(frameId);
             session.frameContexts.delete(frameId);
           }
+        } else if (
+          method === "Network.responseReceived" &&
+          source.sessionId === undefined &&
+          params.type === "Document" &&
+          typeof params.frameId === "string" &&
+          typeof params.loaderId === "string" &&
+          isRecord(params.response) &&
+          typeof params.response.status === "number"
+        ) {
+          const headers: Record<string, string> = {};
+          if (isRecord(params.response.headers)) {
+            for (const [name, value] of Object.entries(params.response.headers)) {
+              const lower = name.toLowerCase();
+              if (CHALLENGE_RESPONSE_HEADERS.includes(lower) && typeof value === "string") {
+                headers[lower] = value.slice(0, 256);
+              }
+            }
+          }
+          session.documentResponses.push({
+            frameId: params.frameId,
+            loaderId: params.loaderId,
+            status: params.response.status,
+            headers,
+          });
+          if (session.documentResponses.length > DOCUMENT_RESPONSE_LIMIT) session.documentResponses.shift();
         } else if (method === "Network.requestWillBeSent" && typeof params.requestId === "string") {
           session.inflight.add(params.requestId);
           session.lastNetworkActivity = Date.now();
@@ -1370,6 +1457,17 @@ export class StandardBrowserRuntime {
     }
     const completedActions: Array<Record<string, unknown>> = [];
     let stepIndex = 0;
+    const guard: ChallengeGuardState = { first: true };
+    const refuse = async (episode: ChallengeEpisode): Promise<ActionExecution> => ({
+      needsUser: true,
+      result: {
+        tab_id: tabId,
+        page_revision: await this.revisions.current(tabId),
+        actions: completedActions,
+        status: "challenge_active",
+        challenge: episodeEvent(episode),
+      },
+    });
     try {
       for (const [index, action] of validated.entries()) {
         stepIndex = index;
@@ -1406,6 +1504,17 @@ export class StandardBrowserRuntime {
           }
         }
         validateKeyboardAction(action);
+        const guardClass = classifyGuardedAction(action);
+        const challenge = guardClass === "none"
+          ? undefined
+          : await this.guardEpisode(taskId, tabId, pageRevision, guard);
+        if (
+          challenge !== undefined &&
+          (challenge.scope_class === "document" ||
+            (guardClass === "targetless" && (await this.focusInsideChallenge(tabId, challenge))))
+        ) {
+          return refuse(challenge);
+        }
         const resolvedTarget = hasSelector || hasRef
           ? await this.resolveTarget(tabId, {
             taskId,
@@ -1416,6 +1525,13 @@ export class StandardBrowserRuntime {
           })
           : undefined;
         if (resolvedTarget?.route === "scripting") this.assertScriptingSupports(tabId, action.kind);
+        if (
+          challenge !== undefined &&
+          guardClass === "targeted" &&
+          (await this.targetInsideChallenge(taskId, tabId, pageRevision, challenge, action, resolvedTarget))
+        ) {
+          return refuse(challenge);
+        }
         const stagedConsequence = await this.consequence(tabId, action, resolvedTarget);
         if (stagedConsequence && !(await readState()).skipCommitReview) {
           const staged: StagedCommit = {
@@ -1459,6 +1575,7 @@ export class StandardBrowserRuntime {
           });
           return {
             staged,
+            ...(guard.ended !== undefined ? { endedChallenge: guard.ended } : {}),
             result: {
               tab_id: tabId,
               page_revision: await this.revisions.current(tabId),
@@ -1473,6 +1590,7 @@ export class StandardBrowserRuntime {
       throw batchStepFailure(error, stepIndex, validated, completedActions);
     }
     return {
+      ...(guard.ended !== undefined ? { endedChallenge: guard.ended } : {}),
       result: {
         tab_id: tabId,
         page_revision: await this.revisions.current(tabId),
@@ -1816,6 +1934,9 @@ export class StandardBrowserRuntime {
       await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
     }
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30_000;
+    if (conditionKind === "challenge_cleared") {
+      return this.waitForChallengeCleared(tabId, condition, timeoutMs, revalidate, taskId);
+    }
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     const retainedDownload = conditionKind === "download"
@@ -1884,6 +2005,60 @@ export class StandardBrowserRuntime {
     } finally {
       if (debuggerSession) this.releaseDebuggerBusyLease(tabId, debuggerSession);
     }
+  }
+
+  /**
+   * Polls until a challenge episode ends, asks for a human, or the timeout passes. Scans start at
+   * most every `CHALLENGE_POLL_MS`; a scan that fails or overruns its budget just leaves the next
+   * poll to try again. It never attaches the debugger.
+   */
+  private async waitForChallengeCleared(
+    tabId: number,
+    condition: Record<string, unknown>,
+    timeoutMs: number,
+    revalidate: (() => Promise<void>) | undefined,
+    taskId: string | undefined,
+  ): Promise<Record<string, unknown>> {
+    const challengeId = condition.challenge_id;
+    const notFound = () =>
+      Object.assign(new Error("No active challenge with that id exists on this tab for this task"), {
+        code: "challenge_not_found",
+        outcome: "not_started",
+      });
+    if (taskId === undefined || typeof challengeId !== "string" || !challengeStoreAvailable()) throw notFound();
+    const initial = findEpisode(await readTaskEpisodes(taskId), taskId, challengeId);
+    if (initial === undefined || initial.tab_id !== tabId || initial.state !== "active") throw notFound();
+    const deadline = Date.now() + timeoutMs;
+    let latest = episodeEvent(initial);
+    do {
+      const startedAt = Date.now();
+      await this.authorizeDebuggerUse(tabId);
+      if (revalidate) await revalidate();
+      await this.requireFullAutomationRoute(tabId, "wait for page challenge_cleared");
+      const scanned = await this.scanChallengeEpisodes(taskId, tabId);
+      if (revalidate) await revalidate();
+      if (scanned !== undefined) {
+        const episode = findEpisode(scanned.episodes, taskId, challengeId);
+        if (episode === undefined) throw notFound();
+        latest = episodeEvent(episode);
+        const base = {
+          tab_id: tabId,
+          page_revision: await this.revisions.current(tabId),
+          condition: "challenge_cleared",
+        };
+        if (episode.state !== "active") return { ...base, matched: true, challenge: latest };
+        if (episode.next !== "wait") {
+          return { ...base, matched: false, status: "challenge_needs_user", challenge: latest };
+        }
+      }
+      const pause = Math.min(CHALLENGE_POLL_MS - (Date.now() - startedAt), deadline - Date.now());
+      if (pause > 0) await new Promise<void>((resolve) => setTimeout(resolve, pause));
+    } while (Date.now() < deadline);
+    throw Object.assign(new Error("Timed out waiting for challenge_cleared"), {
+      code: "wait_timeout",
+      outcome: "unknown",
+      challengeEvent: latest,
+    });
   }
 
   async developer(tabId: number, action: string, params: Record<string, unknown>): Promise<unknown> {
@@ -3343,6 +3518,7 @@ export class StandardBrowserRuntime {
         dialogGeneration: 0,
         frameContexts: new Map(),
         frameSessions: new Map(),
+        documentResponses: [],
       };
       this.sessions.set(tabId, session);
     }
@@ -3455,6 +3631,393 @@ export class StandardBrowserRuntime {
         if (this.sessions.get(tabId) === session) this.scheduleIdleDetach(tabId, session);
       });
     }, DEBUGGER_IDLE_MS);
+  }
+
+  /**
+   * The tab's active challenge episode for the act guard. Before the batch's first guarded action it
+   * rescans when a stored episode is still active or the page revision moved since the last scan;
+   * afterwards it rescans only when the revision moved. A failed scan leaves the stored view in place.
+   */
+  private async guardEpisode(
+    taskId: string,
+    tabId: number,
+    pageRevision: number,
+    guard: ChallengeGuardState,
+  ): Promise<ChallengeEpisode | undefined> {
+    if (!challengeStoreAvailable()) return undefined;
+    let episodes = await readTaskEpisodes(taskId).catch((): ChallengeEpisode[] => []);
+    const moved = this.challengeScanRevisions.get(tabId) !== pageRevision;
+    const rescan = moved || (guard.first && activeEpisodeForTab(episodes, taskId, tabId) !== undefined);
+    guard.first = false;
+    if (rescan) {
+      const scanned = await this.scanChallengeEpisodes(taskId, tabId);
+      if (scanned !== undefined) {
+        episodes = scanned.episodes;
+        if (scanned.event !== undefined && scanned.event.state !== "active") guard.ended = scanned.event;
+      }
+    }
+    return activeEpisodeForTab(episodes, taskId, tabId);
+  }
+
+  private surfaceOf(episode: ChallengeEpisode): SurfaceMatchers {
+    return surfaceMatchers(CHALLENGE_CATALOG.signatures.find((signature) => signature.id === episode.signature_id));
+  }
+
+  /**
+   * Decides, after the action's targets are resolved and before any input, whether an element action
+   * lands inside an embedded challenge surface. Unknown containment counts as inside.
+   */
+  private async targetInsideChallenge(
+    taskId: string,
+    tabId: number,
+    pageRevision: number,
+    episode: ChallengeEpisode,
+    action: Record<string, unknown>,
+    resolvedTarget: ResolvedTarget | undefined,
+  ): Promise<boolean> {
+    const matchers = this.surfaceOf(episode);
+    const frameId = typeof action.frame_id === "string" ? action.frame_id : undefined;
+    // A frame-level scroll acts on the frame's root element; an unreachable frame cannot be shown to be outside.
+    const source = resolvedTarget ?? (frameId === undefined
+      ? undefined
+      : await this.resolveTarget(tabId, {
+        taskId,
+        pageRevision,
+        selector: "html",
+        frameId,
+        actionKind: "scroll",
+      }).catch(() => undefined));
+    if (source === undefined || (await this.targetContainment(tabId, matchers, source)) !== "outside") return true;
+    if (action.kind === "drag" && typeof action.target_ref === "string") {
+      const dropTarget = await this.resolveTarget(tabId, {
+        taskId,
+        pageRevision,
+        ref: action.target_ref,
+        actionKind: "drag",
+        ...(frameId !== undefined ? { frameId } : {}),
+      });
+      return (await this.targetContainment(tabId, matchers, dropTarget)) !== "outside";
+    }
+    return false;
+  }
+
+  private async targetContainment(
+    tabId: number,
+    matchers: SurfaceMatchers,
+    target: ResolvedTarget,
+  ): Promise<Containment> {
+    if (target.route === "scripting") {
+      // Scripting refs always name the top document, so the target has no frame ancestry, and the
+      // page agent probes the element without the debugger Chrome refused.
+      const page = await this.runPageAgent(
+        tabId,
+        { op: "surface", id: target.backendNodeId, selectors: matchers.selectors },
+        target.documentId,
+      ).then(({ value }) => parseSurfaceEvidence(value), () => undefined);
+      return decideContainment(matchers, [], page);
+    }
+    const ancestry = await this.frameAncestryUrls(tabId, target.frameId).catch(() => undefined);
+    let page: SurfaceEvidence | undefined;
+    try {
+      page = parseSurfaceEvidence(
+        await this.callOnNode(
+          tabId,
+          target.backendNodeId,
+          SURFACE_PROBE_DECLARATION,
+          [{ value: matchers.selectors }],
+          false,
+          target,
+        ),
+      );
+    } catch {
+      page = undefined;
+    }
+    return decideContainment(matchers, ancestry, page);
+  }
+
+  /** True when the focused element (or what a targetless key or scroll would reach) is inside the surface. */
+  private async focusInsideChallenge(tabId: number, episode: ChallengeEpisode): Promise<boolean> {
+    const matchers = this.surfaceOf(episode);
+    let page: SurfaceEvidence | undefined;
+    try {
+      const injected = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: probeSurfaceEvidence,
+        args: [null, matchers.selectors, true],
+      });
+      page = parseSurfaceEvidence(injected[0]?.result);
+    } catch {
+      page = undefined;
+    }
+    return decideContainment(matchers, [], page) !== "outside";
+  }
+
+  /**
+   * URLs of a frame and its ancestors below the top document, innermost first, from the debugger's
+   * frame trees. Undefined when the chain cannot be followed to the top document.
+   */
+  private async frameAncestryUrls(
+    tabId: number,
+    frameId: string,
+  ): Promise<Array<string | undefined> | undefined> {
+    const main = await this.send(tabId, "Page.getFrameTree", {});
+    if (!isRecord(main.frameTree)) return undefined;
+    const frames = new Map<string, { url?: string; parentId?: string }>();
+    const rootFrame = isRecord(main.frameTree.frame) ? main.frameTree.frame : undefined;
+    const rootId = typeof rootFrame?.id === "string" ? rootFrame.id : "top";
+    const pending: unknown[] = [main.frameTree, ...(await this.attachedFrameTrees(tabId))];
+    while (pending.length > 0 && frames.size < CHALLENGE_FRAME_LIMIT) {
+      const node = pending.pop();
+      if (!isRecord(node) || !isRecord(node.frame)) continue;
+      const id = typeof node.frame.id === "string" ? node.frame.id : node.frame === rootFrame ? rootId : undefined;
+      if (id !== undefined) {
+        frames.set(id, {
+          ...(typeof node.frame.url === "string" ? { url: node.frame.url } : {}),
+          ...(typeof node.frame.parentId === "string" ? { parentId: node.frame.parentId } : {}),
+        });
+      }
+      if (Array.isArray(node.childFrames)) pending.push(...node.childFrames);
+    }
+    const urls: Array<string | undefined> = [];
+    let current: string | undefined = frameId;
+    for (let hops = 0; current !== undefined && current !== rootId && hops < 64; hops += 1) {
+      const entry = frames.get(current);
+      if (entry === undefined) return undefined;
+      urls.push(entry.url);
+      current = entry.parentId;
+    }
+    return current === rootId ? urls : undefined;
+  }
+
+  /**
+   * Scans a task tab for a bot challenge and folds the result into the task's episodes.
+   * Read-only and best-effort: restricted routes, probe errors, and overruns of the scan budget
+   * return undefined and never fail the host operation.
+   */
+  async scanChallenge(taskId: string, tabId: number): Promise<ChallengeEvent | undefined> {
+    return (await this.scanChallengeEpisodes(taskId, tabId))?.event;
+  }
+
+  /** `scanChallenge` plus the task's advanced episode list; undefined when the scan did not complete. */
+  async scanChallengeEpisodes(
+    taskId: string,
+    tabId: number,
+  ): Promise<{ event?: ChallengeEvent; episodes: ChallengeEpisode[] } | undefined> {
+    if (!challengeStoreAvailable()) return undefined;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") return undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const budget = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), CHALLENGE_SCAN_BUDGET_MS);
+      });
+      const deadline = Date.now() + CHALLENGE_SCAN_BUDGET_MS;
+      let facts: ProbeFacts | undefined;
+      try {
+        facts = await Promise.race([this.probeChallengeFacts(tabId, deadline), budget]);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (facts === undefined) return undefined;
+      const detected = detect(CHALLENGE_CATALOG, facts);
+      const pageRevision = await this.revisions.current(tabId);
+      const now = Date.now();
+      const { event, episodes } = await updateTaskEpisodes(taskId, (stored) =>
+        advance(stored, detected, {
+          taskId,
+          tabId,
+          pageRevision,
+          pageOrigin: facts.page_origin,
+          now,
+          probe: facts.probe,
+          ...(facts.document_status !== undefined ? { documentStatus: facts.document_status } : {}),
+          catalogVersion: CHALLENGE_CATALOG.catalog_version,
+          newId: newChallengeId,
+        }),
+      );
+      this.challengeScanRevisions.set(tabId, pageRevision);
+      return { ...(event !== undefined ? { event } : {}), episodes };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async probeChallengeFacts(tabId: number, deadline: number): Promise<ProbeFacts | undefined> {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: collectChallengeFacts,
+      args: [CHALLENGE_SELECTORS, CHALLENGE_TOKEN_SELECTORS],
+    });
+    const raw: unknown = injected[0]?.result;
+    if (
+      !isRecord(raw) ||
+      sanitizeOrigin(raw.page_origin) === undefined ||
+      !Array.isArray(raw.scripts) ||
+      !Array.isArray(raw.frames) ||
+      !Array.isArray(raw.elements) ||
+      !Array.isArray(raw.tokens)
+    ) {
+      return undefined;
+    }
+    const page = raw as unknown as ChallengePageFacts;
+    const augmented = await this.augmentChallengeFacts(tabId, page.frames, deadline).catch(() => null);
+    return {
+      probe: augmented === null ? "scripting" : "debugger",
+      page_origin: page.page_origin,
+      ...(Number.isInteger(page.document_status) ? { document_status: page.document_status } : {}),
+      ...(augmented?.status !== undefined ? { status: augmented.status } : {}),
+      ...(augmented?.headers !== undefined ? { headers: augmented.headers } : {}),
+      scripts: page.scripts,
+      frames: augmented?.frames ?? page.frames,
+      elements: page.elements,
+      tokens: page.tokens,
+    };
+  }
+
+  /**
+   * Enriches scripting facts from a debugger session that is ALREADY attached: frame ids, cross-process
+   * frame visibility, and the main-document response. Returns null (never attaches) when no usable
+   * session exists.
+   */
+  private async augmentChallengeFacts(
+    tabId: number,
+    pageFrames: FrameFact[],
+    deadline: number,
+  ): Promise<{ frames: FrameFact[]; status?: number; headers?: Record<string, string> } | null> {
+    const session = this.sessions.get(tabId);
+    const rootResult = await this.sendIfAttached(tabId, "Page.getFrameTree", {});
+    if (!session || rootResult === null || !isRecord(rootResult.frameTree)) return null;
+
+    interface TreeFrame {
+      id: string;
+      parentId?: string;
+      loaderId?: string;
+      url: string;
+      sessionId?: string;
+    }
+    const tree = new Map<string, TreeFrame>();
+    const collect = (start: unknown, sessionId: string | undefined): void => {
+      const pending: unknown[] = [start];
+      while (pending.length > 0 && tree.size < CHALLENGE_FRAME_LIMIT) {
+        const node = pending.pop();
+        if (!isRecord(node) || !isRecord(node.frame) || typeof node.frame.id !== "string") continue;
+        const parentId = typeof node.frame.parentId === "string" ? node.frame.parentId : tree.get(node.frame.id)?.parentId;
+        tree.set(node.frame.id, {
+          id: node.frame.id,
+          ...(parentId !== undefined ? { parentId } : {}),
+          ...(typeof node.frame.loaderId === "string" ? { loaderId: node.frame.loaderId } : {}),
+          url: typeof node.frame.url === "string" ? node.frame.url : "",
+          ...(sessionId !== undefined ? { sessionId } : {}),
+        });
+        if (Array.isArray(node.childFrames)) pending.push(...node.childFrames);
+      }
+    };
+    collect(rootResult.frameTree, undefined);
+    const root = isRecord(rootResult.frameTree.frame) && typeof rootResult.frameTree.frame.id === "string"
+      ? tree.get(rootResult.frameTree.frame.id)
+      : undefined;
+    if (root === undefined) return null;
+    for (const sessionId of new Set(session.frameSessions.values())) {
+      if (Date.now() > deadline) break;
+      const child = await this.sendIfAttached(tabId, "Page.getFrameTree", {}, sessionId);
+      if (child !== null) collect(child.frameTree, sessionId);
+    }
+
+    const response = root.loaderId === undefined
+      ? undefined
+      : session.documentResponses.findLast(
+        (candidate) => candidate.frameId === root.id && candidate.loaderId === root.loaderId,
+      );
+
+    const frames = pageFrames.map((frame) => ({ ...frame }));
+    const tagged = new Set<FrameFact>();
+    for (const entry of tree.values()) {
+      if (entry.id === root.id || Date.now() > deadline) continue;
+      let url: URL;
+      try {
+        url = new URL(entry.url);
+      } catch {
+        continue;
+      }
+      if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+      const host = url.hostname.toLowerCase();
+      const mate = frames.find(
+        (frame) =>
+          !tagged.has(frame) && frame.frame_id === undefined && frame.host === host && frame.path === url.pathname,
+      );
+      if (mate !== undefined) {
+        mate.frame_id = entry.id;
+        tagged.add(mate);
+        continue;
+      }
+      if (!frameOfInterest(CHALLENGE_CATALOG, host)) continue;
+      const parent = entry.parentId === undefined ? undefined : tree.get(entry.parentId);
+      if (parent === undefined) continue;
+      try {
+        const owner = await this.sendIfAttached(tabId, "DOM.getFrameOwner", { frameId: entry.id }, parent.sessionId);
+        if (owner === null || typeof owner.backendNodeId !== "number") continue;
+        const query: Record<string, string> = Object.create(null);
+        url.searchParams.forEach((value, key) => {
+          if (!(key in query)) query[key] = value.slice(0, 64);
+        });
+        let width = 0;
+        let height = 0;
+        let visible = false;
+        try {
+          const box = await this.sendIfAttached(tabId, "DOM.getBoxModel", { backendNodeId: owner.backendNodeId }, parent.sessionId);
+          const model = isRecord(box?.model) ? box.model : undefined;
+          if (model !== undefined && Array.isArray(model.content) && typeof model.width === "number" && typeof model.height === "number") {
+            const xs = [model.content[0], model.content[2], model.content[4], model.content[6]].map(Number);
+            width = model.width;
+            height = model.height;
+            visible = width >= 1 && height >= 1 && Math.max(...xs) > 0;
+          }
+        } catch {
+          // DOM.getBoxModel fails for frames without a box (display:none); they are hidden.
+        }
+        frames.push({
+          host,
+          path: url.pathname,
+          query: { ...query },
+          frame_id: entry.id,
+          origin: url.origin,
+          visible,
+          width,
+          height,
+        });
+      } catch {
+        // The frame detached between the tree read and the owner lookup.
+      }
+    }
+    return {
+      frames,
+      ...(response !== undefined ? { status: response.status, headers: response.headers } : {}),
+    };
+  }
+
+  /**
+   * Sends one CDP command on a session that is already attached. Unlike `send`, it never attaches,
+   * never re-attaches after a detach, and returns null when no live session exists.
+   */
+  private async sendIfAttached(
+    tabId: number,
+    method: string,
+    params: Record<string, unknown>,
+    sessionId?: string,
+  ): Promise<Record<string, unknown> | null> {
+    const session = this.sessions.get(tabId);
+    if (!session?.attached || session.detachPromise || session.attachPromise) return null;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
+    session.busyCount += 1;
+    try {
+      await this.authorizeDebuggerUse(tabId);
+      const target: chrome.debugger.DebuggerSession = sessionId === undefined ? { tabId } : { tabId, sessionId };
+      const result: unknown = await chrome.debugger.sendCommand(target, method, params);
+      return isRecord(result) ? result : {};
+    } finally {
+      this.releaseDebuggerBusyLease(tabId, session);
+    }
   }
 
   private async send(

@@ -50,6 +50,15 @@
             "frame_id": { "type": "string", "minLength": 1, "maxLength": 256 }
           },
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "challenge_id"],
+          "properties": {
+            "kind": { "const": "challenge_cleared" },
+            "challenge_id": { "type": "string", "pattern": "^chl_[0-9a-z]{20}$" }
+          },
+          "additionalProperties": false
         }
       ]
     }

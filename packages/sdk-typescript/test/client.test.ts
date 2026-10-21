@@ -16,7 +16,11 @@ import {
   createResumeCapabilityStore,
   encodeFrame,
   resolveTransportTimeoutMs,
+  CHALLENGE_GUIDANCE,
   type BrowserAction,
+  type BrowserHandoffParams,
+  type ChallengeBearingResult,
+  type ChallengeEvent,
 } from "../src/index";
 
 const servers: Server[] = [];
@@ -1073,4 +1077,43 @@ test("does not replay connect after reset or close once handshake write is dispa
     capabilityStore: store,
   })).rejects.toThrow();
   expect(connectAttempts).toBe(1);
+});
+
+describe("challenge types", () => {
+  test("handoff accepts a challenge_cleared completion and results carry a typed challenge event", () => {
+    const request: BrowserHandoffParams = {
+      operation: "request",
+      tab_id: 1,
+      expected_page_revision: 1,
+      prompt: "Complete the verification",
+      completion: { kind: "challenge_cleared", value: "chl_3k9w2m7q8x1v5b0n4c6z" },
+    };
+    expect(resolveTransportTimeoutMs("browser_handoff", request)).toBe(
+      DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS,
+    );
+    const challenge: ChallengeEvent = {
+      spec_version: 1,
+      challenge_id: "chl_3k9w2m7q8x1v5b0n4c6z",
+      tab_id: 1,
+      page_revision: 1,
+      first_page_revision: 1,
+      first_detected_at_ms: 1,
+      detected_at_ms: 2,
+      page_origin: "https://example.test",
+      vendor: "cloudflare",
+      product: "challenge_page",
+      kind: "interstitial",
+      interaction: "automatic",
+      state: "active",
+      confidence: "high",
+      surface: { scope: "document", visible: true },
+      signals: ["cloudflare.challenge_page.title"],
+      next: "wait",
+      wait_budget_ms: 15_000,
+      detector: { catalog_version: "2026.10.1", probe: "debugger" },
+    };
+    const result: ChallengeBearingResult = { status: "challenge_active", challenge };
+    expect(result.challenge?.next).toBe("wait");
+    expect(CHALLENGE_GUIDANCE.summary).toContain("challenge.next");
+  });
 });
