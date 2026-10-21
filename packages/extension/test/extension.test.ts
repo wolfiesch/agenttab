@@ -6051,6 +6051,27 @@ describe("extension entrypoint admission boundaries", () => {
       result: { tab_id: 103, page_revision: 2, url: "https://example.test/slow/landed" },
     });
 
+    // A batch that ends in a navigation reports the page it reached once that page's load settles,
+    // not the revision of the document it left. Chrome reports the tab `loading` as soon as
+    // `tabs.update` starts the navigation; the mock's update leaves status alone, so set it here.
+    const navigationRequestId = "018f47b8-2f80-7c20-9c77-f8a38c9e6320";
+    loadingTab.status = "loading";
+    const navigated = sendNativeCommand(navigationRequestId, TASK_C, "browser_act", {
+      tab_id: 103,
+      expected_page_revision: 2,
+      actions: [{ kind: "navigate", url: "https://example.test/next" }],
+    });
+    await waitForCondition(() => tabStore.get(103)?.url === "https://example.test/next");
+    for (const listener of tabUpdatedListeners) listener(103, { status: "loading" });
+    await flushPromiseQueue();
+    expect(JSON.stringify(port.posted)).not.toContain(navigationRequestId);
+    loadingTab.status = "complete";
+    for (const listener of tabUpdatedListeners) listener(103, { status: "complete" });
+    expect(await navigated).toMatchObject({
+      outcome: "completed",
+      result: { tab_id: 103, page_revision: 3, actions: [{ kind: "navigate", started: true }] },
+    });
+
     // A tab closed while its first load is pending fails the open instead of reporting a dead tab.
     const closedOpen = sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6312",

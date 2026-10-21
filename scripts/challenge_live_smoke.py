@@ -379,15 +379,6 @@ class Rpc:
         return body
 
 
-def first_event(*bodies: tuple[str, dict[str, Any]]) -> tuple[dict[str, Any], str | None]:
-    """The first challenge event among results, in order. A navigation act returns `started` before the
-    new document commits, so its own scan can precede the page; the load wait then carries the event."""
-    for name, body in bodies:
-        if isinstance(body.get("challenge"), dict):
-            return body["challenge"], name
-    return {}, None
-
-
 def revision(body: dict[str, Any], default: int) -> int:
     value = body.get("result", {}).get("page_revision")
     return value if isinstance(value, int) else default
@@ -565,16 +556,20 @@ class Smoke:
     def scenario_hcaptcha(self, s: Scenario) -> None:
         self.scenario_widget(s, "/hcaptcha", "hcaptcha", "hcaptcha", False)
 
-    def navigate(self, tab_id: int, rev: int, path: str) -> tuple[dict[str, Any], dict[str, Any], int]:
-        """Navigate through act, then wait for load. Act reports `started` before the page revision
-        advances, so the load wait supplies the new revision. Returns (act, wait, new_revision)."""
+    def navigate(self, s: Scenario, tab_id: int, rev: int, path: str) -> tuple[dict[str, Any], dict[str, Any], int]:
+        """Navigate through act, then wait for load. Act returns once the navigated page's load settles,
+        so its result must already carry that page's revision, which the load wait then confirms.
+        Returns (act, wait, new_revision)."""
         acted = self.rpc.call(
             "browser_act",
             {"tab_id": tab_id, "expected_page_revision": rev,
              "actions": [{"kind": "navigate", "url": self.fixtures.url(path)}]},
         )
         settled = self.rpc.call("browser_wait", {"tab_id": tab_id, "condition": {"kind": "load"}})
-        return acted, settled, revision(settled, rev)
+        new_rev = revision(acted, rev)
+        s.check(f"act {path} reports the navigated revision", new_rev > rev and new_rev == revision(settled, -1),
+                {"before": rev, "act": new_rev, "wait": revision(settled, -1)})
+        return acted, settled, new_rev
 
     def scenario_headers(self, s: Scenario) -> None:
         tab_id, rev, _ = self.open_tab("/clean")
@@ -582,10 +577,10 @@ class Smoke:
         s.check("clean snapshot has no challenge", "challenge" not in clean.get("result", {}))
         rev = revision(clean, rev)
 
-        cf, cf_wait, rev = self.navigate(tab_id, rev, "/cf")
+        cf, cf_wait, rev = self.navigate(s, tab_id, rev, "/cf")
         s.check("navigate /cf ok", cf["ok"], error_code(cf))
-        event, via = first_event(("act", cf), ("wait", cf_wait))
-        s.observed["cf_reported_by"] = via
+        event = cf.get("challenge", {})
+        s.check("act result carries the /cf challenge", bool(event))
         s.observed["cf"] = event_fields(event)
         s.check("cloudflare interstitial", event.get("vendor") == "cloudflare" and event.get("kind") == "interstitial",
                 {"vendor": event.get("vendor"), "kind": event.get("kind")})
@@ -608,17 +603,17 @@ class Smoke:
         s.check("refused click did not reach the page", self.fixtures.clicked("blocked") == clicked_before)
         rev = revision(click, rev)
 
-        limited, limited_wait, rev = self.navigate(tab_id, rev, "/limited")
+        limited, _, rev = self.navigate(s, tab_id, rev, "/limited")
         s.check("navigate /limited ok", limited["ok"], error_code(limited))
-        lev, via = first_event(("act", limited), ("wait", limited_wait))
-        s.observed["limited_reported_by"] = via
+        lev = limited.get("challenge", {})
+        s.check("act result carries the /limited challenge", bool(lev))
         s.observed["limited"] = event_fields(lev)
         s.check("rate_limit kind", lev.get("kind") == "rate_limit", lev.get("kind"))
         s.check("next retry_later", lev.get("next") == "retry_later", lev.get("next"))
         retry = lev.get("retry_after_ms")
         s.check("retry_after_ms about 30000", isinstance(retry, int) and 20000 <= retry <= 30000, retry)
 
-        back, back_wait, rev = self.navigate(tab_id, rev, "/clean")
+        back, back_wait, rev = self.navigate(s, tab_id, rev, "/clean")
         after = self.snapshot(tab_id)
         s.check("navigate /clean ok", back["ok"], error_code(back))
         reports = [
@@ -634,6 +629,8 @@ class Smoke:
             if body.get("challenge", {}).get("challenge_id") == lev.get("challenge_id")
         ]
         s.check("terminal event reported exactly once", len(reports) == 1, len(reports))
+        s.check("terminal event on the act result", s.observed["terminal_reported_by"] == ["act"],
+                s.observed["terminal_reported_by"])
         s.check("terminal state cleared", terminal.get("state") == "cleared", terminal.get("state"))
         s.check("terminal next none", terminal.get("next") == "none", terminal.get("next"))
         s.check("no event after the terminal", after.get("challenge") is None or after["challenge"] in reports)

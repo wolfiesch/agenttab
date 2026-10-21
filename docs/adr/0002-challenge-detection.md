@@ -108,7 +108,7 @@ The detector lives in a new extension module, `packages/extension/src/challenge.
 | --- | --- |
 | `browser_open` | Before returning the result that carries `page_revision` |
 | `browser_snapshot` | Every mode, before returning |
-| `browser_act` | After the batch completes, stops at a staged action, or fails. A `navigate` step returns once navigation starts, so its scan can see the previous document; the following load wait or snapshot reports the new page's challenge |
+| `browser_act` | After the batch completes, stops at a staged action, or fails. A batch that ends in a navigation (`navigate`, `reload`, `go_back`, `go_forward`) returns after the navigated page's load settles, up to 10 seconds, so its scan and `page_revision` describe the new page |
 | `browser_wait` | After `load`, `url`, `network_idle`, and `challenge_cleared` conditions |
 
 On a `tab_only` route, `challenge` is always absent and the absence means "unscanned"; `automation_route` already states this. A probe error or overrun omits `challenge` and never fails the host operation.

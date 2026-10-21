@@ -36,10 +36,27 @@ let automationCleanupPending = false;
 let automationCleanupDelayMs = AUTOMATION_CLEANUP_RETRY_BASE_MS;
 let automationCleanupTimer: ReturnType<typeof setTimeout> | undefined;
 let automationCleanupQueue = Promise.resolve();
-const OPEN_SETTLE_TIMEOUT_MS = 10_000;
+/** Longest a `browser_open` or a batch's final navigation waits for the page's load to finish. */
+const LOAD_SETTLE_TIMEOUT_MS = 10_000;
+const NAVIGATION_ACTION_KINDS: Readonly<Record<string, true>> = {
+  navigate: true,
+  go_back: true,
+  go_forward: true,
+  reload: true,
+};
 const tabLoadWaiters = new Map<number, Set<() => void>>();
 /** Tabs whose `complete` event the tab-event queue has processed; removal prunes it to open tabs. */
 const processedTabLoads = new Set<number>();
+
+/** Tab events a batch's final navigation waits on; the queue reports them after processing them. */
+interface NavigationWatch {
+  /** The queue processed a `loading` event since the watch began. */
+  started: boolean;
+  /** Resolves once the queue processes a `complete` event, or the tab closes. */
+  loaded: Promise<void>;
+  markLoaded(): void;
+}
+const navigationWatches = new Map<number, Set<NavigationWatch>>();
 
 const PRE_DISPATCH_ERRORS: Record<string, true> = {
   invalid_request: true,
@@ -533,28 +550,49 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         : completed(command.request_id, result);
     }
     if (command.method === "browser_act") {
-      const execution = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
-        await ownership.assertOwned(command.task_id, targetTabId);
-        assertHistoryOriginKnown(params.actions, command.origin_policy);
-        await assertCurrentOrigin(targetTabId, command.origin_policy);
-        const execution = await browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
-        return {
-          ...execution,
-          result: await withChallenge(
+      const actions: unknown[] = Array.isArray(params.actions) ? params.actions : [];
+      const finalAction = actions.at(-1);
+      const endsInNavigation = isRecord(finalAction) && NAVIGATION_ACTION_KINDS[String(finalAction.kind)] === true;
+      let watch: NavigationWatch | undefined;
+      try {
+        const execution = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
+          await ownership.assertOwned(command.task_id, targetTabId);
+          assertHistoryOriginKnown(params.actions, command.origin_policy);
+          await assertCurrentOrigin(targetTabId, command.origin_policy);
+          // Registered before the action runs, so a fast load cannot finish unobserved.
+          if (endsInNavigation) watch = watchNavigation(targetTabId);
+          const execution = await browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
+          // The navigated page is scanned once its load settles, outside this tab slot.
+          if (watch !== undefined && navigationStarted(execution.result)) return execution;
+          return {
+            ...execution,
+            result: await withChallenge(
+              command.task_id,
+              targetTabId,
+              execution.result ?? {},
+              execution.endedChallenge,
+            ),
+          };
+        });
+        if (watch !== undefined && navigationStarted(execution.result)) {
+          await settleNavigation(watch, targetTabId);
+          execution.result = await observeNavigatedPage(
             command.task_id,
             targetTabId,
             execution.result ?? {},
             execution.endedChallenge,
-          ),
-        };
-      });
-      if (execution.staged) {
-        return commitRequired(command.request_id, execution.result ?? {}, execution.staged);
+          );
+        }
+        if (execution.staged) {
+          return commitRequired(command.request_id, execution.result ?? {}, execution.staged);
+        }
+        if (execution.needsUser) {
+          return needsUser(command.request_id, execution.result ?? {});
+        }
+        return completed(command.request_id, execution.result ?? {});
+      } finally {
+        if (watch !== undefined) unwatchNavigation(targetTabId, watch);
       }
-      if (execution.needsUser) {
-        return needsUser(command.request_id, execution.result ?? {});
-      }
-      return completed(command.request_id, execution.result ?? {});
     }
     throw Object.assign(new Error(`Unsupported Core method: ${command.method}`), {
       code: "unsupported_method",
@@ -676,7 +714,7 @@ async function settleOpenedTab(
   tabLoadWaiters.set(tabId, waiters);
   let cancelDeadline: () => void = () => undefined;
   const deadline = new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, OPEN_SETTLE_TIMEOUT_MS);
+    const timer = setTimeout(resolve, LOAD_SETTLE_TIMEOUT_MS);
     cancelDeadline = () => clearTimeout(timer);
   });
   try {
@@ -702,6 +740,80 @@ async function settleOpenedTab(
   }
 }
 
+function watchNavigation(tabId: number): NavigationWatch {
+  let markLoaded!: () => void;
+  const loaded = new Promise<void>((resolve) => {
+    markLoaded = resolve;
+  });
+  const watch: NavigationWatch = { started: false, loaded, markLoaded };
+  const watches = navigationWatches.get(tabId) ?? new Set<NavigationWatch>();
+  watches.add(watch);
+  navigationWatches.set(tabId, watches);
+  return watch;
+}
+
+function unwatchNavigation(tabId: number, watch: NavigationWatch): void {
+  const watches = navigationWatches.get(tabId);
+  watches?.delete(watch);
+  if (watches?.size === 0) navigationWatches.delete(tabId);
+}
+
+/** True when the batch's last completed action started a navigation. */
+function navigationStarted(result: Record<string, unknown> | undefined): boolean {
+  const last = Array.isArray(result?.actions) ? result.actions.at(-1) : undefined;
+  return isRecord(last) && NAVIGATION_ACTION_KINDS[String(last.kind)] === true && last.started === true;
+}
+
+/**
+ * Waits for the navigation a batch's final action started, so the result can describe the page it
+ * reached. `navigate`, history, and `reload` return once Chrome accepts the navigation, while the
+ * previous document is often still current; a revision and challenge scan taken then describe the old
+ * page. Chrome marks a tab `loading` when a cross-document navigation starts, so when the tab is loading
+ * or the queue already processed its `loading` event, this waits until the queue has processed the
+ * `complete` event, bounded like `browser_open`. A same-document navigation never starts a load and
+ * returns at once. The wait runs outside the scheduler for the reason `settleOpenedTab` does.
+ */
+async function settleNavigation(watch: NavigationWatch, tabId: number): Promise<void> {
+  let cancelDeadline: () => void = () => undefined;
+  const deadline = new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, LOAD_SETTLE_TIMEOUT_MS);
+    cancelDeadline = () => clearTimeout(timer);
+  });
+  // Tab events drain serially, so these barriers run after every event Chrome already dispatched.
+  const drained = () => Promise.race([new Promise<void>((resolve) => runAfterStart(resolve)), deadline]);
+  try {
+    await drained();
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab?.status !== "loading" && !watch.started) return;
+    await Promise.race([watch.loaded, deadline]);
+    await drained();
+  } finally {
+    cancelDeadline();
+  }
+}
+
+/**
+ * The act result for the page a final navigation reached: its current revision and challenge scan.
+ * The navigation already ran, so an observation that cannot complete returns the result unchanged
+ * instead of failing the act.
+ */
+async function observeNavigatedPage(
+  taskId: string,
+  tabId: number,
+  result: Record<string, unknown>,
+  observed?: ChallengeEvent,
+): Promise<Record<string, unknown>> {
+  try {
+    return await scheduler.readAfterWrites(tabId, async () => {
+      if ((await ownership.taskIdForTab(tabId)) !== taskId) return result;
+      const current = { ...result, page_revision: await revisions.current(tabId) };
+      return withChallenge(taskId, tabId, current, observed);
+    });
+  } catch {
+    return result;
+  }
+}
+
 async function reconcileOwnership(): Promise<void> {
   const revokedTabIds = await ownership.reconcile();
   await Promise.all(revokedTabIds.map((tabId) => handoff.cancelForTab(tabId)));
@@ -714,6 +826,7 @@ chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) =
 });
 chrome.tabs.onRemoved.addListener((removedTabId: number) => {
   for (const releaseWaiter of tabLoadWaiters.get(removedTabId) ?? []) releaseWaiter();
+  for (const watch of navigationWatches.get(removedTabId) ?? []) watch.markLoaded();
   runAfterStart(async () => {
     // Queued after any `complete` handler for this tab, so a late handler cannot re-add it.
     processedTabLoads.delete(removedTabId);
@@ -752,9 +865,13 @@ chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {
         await ownership.publishInventory();
       }
     } finally {
+      if (changeInfo.status === "loading") {
+        for (const watch of navigationWatches.get(updatedTabId) ?? []) watch.started = true;
+      }
       if (changeInfo.status === "complete") {
         processedTabLoads.add(updatedTabId);
         for (const releaseWaiter of tabLoadWaiters.get(updatedTabId) ?? []) releaseWaiter();
+        for (const watch of navigationWatches.get(updatedTabId) ?? []) watch.markLoaded();
       }
     }
   });
