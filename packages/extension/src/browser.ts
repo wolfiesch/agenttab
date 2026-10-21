@@ -817,7 +817,7 @@ export class StandardBrowserRuntime {
       return await run();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (documentId !== undefined && /\bdocument\b/i.test(message)) {
+      if (documentId !== undefined && /\bdocument\b|\bframe\b.*\bremoved\b/i.test(message)) {
         throw Object.assign(new Error("Snapshot ref belongs to a document that is no longer loaded"), {
           code: "stale_ref",
           cause: error,
@@ -840,6 +840,8 @@ export class StandardBrowserRuntime {
   ): Promise<{ value: unknown; documentId: string }> {
     const target = documentId === undefined ? { tabId } : { tabId, documentIds: [documentId] };
     for (let attempt = 0; ; attempt += 1) {
+      // Matches send(): every page-agent request rechecks task authorization.
+      await this.authorizeDebuggerUse(tabId);
       const [injected] = await this.inDocument(documentId, () => chrome.scripting.executeScript({
         target,
         func: runPageAgentRequest,
@@ -2532,22 +2534,26 @@ export class StandardBrowserRuntime {
         this.pointerTargetPoint(tabId, dropTarget),
       ]);
       await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...sourcePoint, button: "left", buttons: 1, clickCount: 1 }, false, target.sessionId);
-      try {
-        await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...dropPoint, button: "left", buttons: 1 }, false, target.sessionId);
-      } finally {
-        await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...dropPoint, button: "left", buttons: 0, clickCount: 1 }, false, target.sessionId);
-      }
+      await this.afterInputDispatched(async () => {
+        try {
+          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...dropPoint, button: "left", buttons: 1 }, false, target.sessionId);
+        } finally {
+          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...dropPoint, button: "left", buttons: 0, clickCount: 1 }, false, target.sessionId);
+        }
+      });
     } else if (kind === "hover" || kind === "double_click" || kind === "context_click") {
       const point = await this.pointerTargetPoint(tabId, target);
       await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "none", buttons: 0 }, false, target.sessionId);
       if (kind !== "hover") {
-        const button = kind === "context_click" ? "right" : "left";
-        const buttons = kind === "context_click" ? 2 : 1;
-        for (let clickCount = 1; clickCount <= (kind === "double_click" ? 2 : 1); clickCount += 1) {
-          await this.pointerTargetPoint(tabId, target, point);
-          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...point, button, buttons, clickCount }, false, target.sessionId);
-          await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button, buttons: 0, clickCount }, false, target.sessionId);
-        }
+        await this.afterInputDispatched(async () => {
+          const button = kind === "context_click" ? "right" : "left";
+          const buttons = kind === "context_click" ? 2 : 1;
+          for (let clickCount = 1; clickCount <= (kind === "double_click" ? 2 : 1); clickCount += 1) {
+            await this.pointerTargetPoint(tabId, target, point);
+            await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...point, button, buttons, clickCount }, false, target.sessionId);
+            await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button, buttons: 0, clickCount }, false, target.sessionId);
+          }
+        });
       }
     } else if (kind === "upload_file") {
       if (!Array.isArray(action.files) || !action.files.every((file) => typeof file === "string")) {
@@ -2566,6 +2572,19 @@ export class StandardBrowserRuntime {
       ...(target.route === "scripting" ? { page_route: "scripting" } : {}),
       ...downloadResult,
     };
+  }
+
+  /**
+   * Runs the rest of a multi-event gesture. A debugger refusal there follows
+   * input the page already received, so it cannot claim the action never started.
+   */
+  private async afterInputDispatched(run: () => Promise<void>): Promise<void> {
+    try {
+      await run();
+    } catch (error) {
+      if (isRecord(error) && error.code === "debugger_unavailable") error.outcome = "unknown";
+      throw error;
+    }
   }
 
   /** Refuses actions only Chrome's debugger can perform before a scripting-route target is used. */
@@ -2613,8 +2632,12 @@ export class StandardBrowserRuntime {
     for (const request of requests.slice(0, MAX_WINDOW_REQUESTS_PER_ACTION)) {
       if (!isRecord(request) || typeof request.url !== "string") continue;
       const url = request.url;
-      if (typeof request.refused === "string") {
-        opened.push({ url, outcome: "refused", reason: request.refused });
+      // Main-world gesture traps are page-reachable, so recheck the scheme here.
+      const refused = typeof request.refused === "string"
+        ? request.refused
+        : URL.canParse(url) && ["http:", "https:"].includes(new URL(url).protocol) ? undefined : "unsupported_scheme";
+      if (refused !== undefined) {
+        opened.push({ url, outcome: "refused", reason: refused });
         continue;
       }
       try {

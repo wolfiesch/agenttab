@@ -110,6 +110,7 @@ let debuggerAttachGate: Promise<void> | null;
 let debuggerAttachError: string | null;
 let pageAgentRequests: PageAgentRequest[];
 let pageAgentReply: (request: PageAgentRequest) => unknown;
+let mainWorldResult: unknown;
 const PAGE_AGENT_DOCUMENT = "agent-document-1";
 let completedDownloads: Array<Record<string, unknown>>;
 let debuggerDetachFailures: number;
@@ -366,6 +367,7 @@ function installChromeMock(): void {
   debuggerAttachError = null;
   pageAgentRequests = [];
   pageAgentReply = () => ({});
+  mainWorldResult = [];
   Reflect.deleteProperty(globalThis, PAGE_AGENT_GLOBAL);
   completedDownloads = [];
   automationPermission = true;
@@ -629,7 +631,7 @@ function installChromeMock(): void {
             });
             return [{ documentId: PAGE_AGENT_DOCUMENT }];
           }
-          if (options.world === "MAIN") return [{ result: [], documentId: PAGE_AGENT_DOCUMENT }];
+          if (options.world === "MAIN") return [{ result: mainWorldResult, documentId: PAGE_AGENT_DOCUMENT }];
           if (options.func === runPageAgentRequest) {
             const [request, version, globalName] = options.args as [PageAgentRequest, number, string];
             return [{ result: runPageAgentRequest(request, version, globalName), documentId: PAGE_AGENT_DOCUMENT }];
@@ -6155,5 +6157,45 @@ describe("scripting route when Chrome refuses the debugger", () => {
     });
     expect(result).toMatchObject({ condition: "selector", matched: true });
     expect(pageAgentRequests).toEqual([{ op: "inspect_selector", selector: "#ready" }]);
+  });
+
+  test("refuses non-web window requests a page forges into the main-world trap", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = (request) =>
+      request.op === "describe" ? { tag: "BUTTON", type: "button", text: "Open" } : { id: 3 };
+    mainWorldResult = [{ url: "chrome://settings/" }, { url: "file:///etc/hosts" }];
+    const tabsBefore = tabStore.size;
+    const revision = await revisions.ensure(7);
+    const acted = await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "#open" }]);
+    expect(acted.result?.actions).toEqual([{
+      kind: "click",
+      completed: true,
+      page_route: "scripting",
+      opened_tabs: [
+        { url: "chrome://settings/", outcome: "refused", reason: "unsupported_scheme" },
+        { url: "file:///etc/hosts", outcome: "refused", reason: "unsupported_scheme" },
+      ],
+    }]);
+    expect(tabStore.size).toBe(tabsBefore);
+  });
+
+  test("reports a refusal after a gesture's first input event as unknown", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Input.dispatchMouseEvent" && params.type === "mousePressed") {
+        debuggerAttachError = REFUSAL;
+        throw new Error("Debugger is not attached to the tab with id: 7.");
+      }
+      if (method === "DOM.getNodeForLocation") return { backendNodeId: 22 };
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("isConnected")) {
+        return { result: { value: true } };
+      }
+      return undefined;
+    };
+    const revision = await revisions.ensure(7);
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{ kind: "double_click", ref: mintedRef(TASK_A, 7, revision) }]),
+    ).rejects.toMatchObject({ code: "debugger_unavailable", outcome: "unknown" });
   });
 });
