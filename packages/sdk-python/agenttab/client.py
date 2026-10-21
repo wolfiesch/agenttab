@@ -13,7 +13,7 @@ import time
 import uuid
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, Mapping, NotRequired, Protocol, Sequence, TypedDict
+from typing import Any, BinaryIO, Literal, Mapping, Protocol, Sequence, TypedDict
 
 RPC_PROTOCOL = "agenttab.rpc"
 RPC_VERSION = 1
@@ -45,75 +45,95 @@ BrowserPressModifier = Literal["Alt", "Control", "Meta", "Shift"]
 SelectorWaitState = Literal["attached", "detached", "visible", "hidden", "enabled"]
 
 
-class BrowserGestureAction(TypedDict):
+# Optional keys live in `total=False` base classes because `typing.NotRequired` needs Python 3.11
+# and this package supports 3.10. Each public class adds its required keys to those bases.
+
+
+class _ElementTarget(TypedDict, total=False):
+    ref: str
+    selector: str
+    frame_id: str
+
+
+class BrowserGestureAction(_ElementTarget):
     kind: Literal["click", "hover", "double_click", "context_click"]
-    ref: NotRequired[str]
-    selector: NotRequired[str]
-    frame_id: NotRequired[str]
 
-class BrowserDownloadGestureAction(TypedDict):
+
+class _DownloadGestureOptions(_ElementTarget, total=False):
+    expect_download: bool
+
+
+class BrowserDownloadGestureAction(_DownloadGestureOptions):
     kind: Literal["click", "double_click", "context_click"]
-    expect_download: NotRequired[bool]
-    ref: NotRequired[str]
-    selector: NotRequired[str]
-    frame_id: NotRequired[str]
 
 
-class BrowserPressAction(TypedDict):
+class _PressOptions(_ElementTarget, total=False):
+    modifiers: list[BrowserPressModifier]
+    expect_download: bool
+
+
+class BrowserPressAction(_PressOptions):
     kind: Literal["press"]
     key: BrowserPressKey
-    ref: NotRequired[str]
-    selector: NotRequired[str]
-    frame_id: NotRequired[str]
-    modifiers: NotRequired[list[BrowserPressModifier]]
-    expect_download: NotRequired[bool]
 
 
-class BrowserTextAction(TypedDict):
+class _TextOptions(_ElementTarget, total=False):
+    text: str
+    value: str
+    files: list[str]
+
+
+class BrowserTextAction(_TextOptions):
     kind: Literal["type", "fill", "select", "upload_file"]
-    ref: NotRequired[str]
-    selector: NotRequired[str]
-    frame_id: NotRequired[str]
-    text: NotRequired[str]
-    value: NotRequired[str]
-    files: NotRequired[list[str]]
 
 
-class BrowserDialogAction(TypedDict):
+class _DialogOptions(TypedDict, total=False):
+    prompt_text: str
+
+
+class BrowserDialogAction(_DialogOptions):
     kind: Literal["dialog"]
     decision: Literal["accept", "dismiss"]
-    prompt_text: NotRequired[str]
 
 
-class BrowserNavigationAction(TypedDict):
+class _NavigationOptions(TypedDict, total=False):
+    url: str
+    bypass_cache: bool
+    ref: str
+    target_ref: str
+    frame_id: str
+    delta_x: int
+    delta_y: int
+
+
+class BrowserNavigationAction(_NavigationOptions):
     kind: Literal["close", "scroll", "drag"]
-    url: NotRequired[str]
-    bypass_cache: NotRequired[bool]
-    ref: NotRequired[str]
-    target_ref: NotRequired[str]
-    frame_id: NotRequired[str]
-    delta_x: NotRequired[int]
-    delta_y: NotRequired[int]
 
 
-class BrowserDownloadNavigationAction(TypedDict):
+class _DownloadNavigationOptions(TypedDict, total=False):
+    expect_download: bool
+    url: str
+    bypass_cache: bool
+
+
+class BrowserDownloadNavigationAction(_DownloadNavigationOptions):
     kind: Literal["navigate", "go_back", "go_forward", "reload"]
-    expect_download: NotRequired[bool]
-    url: NotRequired[str]
-    bypass_cache: NotRequired[bool]
 
 
 BrowserAction = BrowserGestureAction | BrowserDownloadGestureAction | BrowserPressAction | BrowserTextAction | BrowserDialogAction | BrowserNavigationAction | BrowserDownloadNavigationAction
 
 
-class BrowserWaitCondition(TypedDict):
+class _WaitConditionOptions(TypedDict, total=False):
+    value: str
+    selector: str
+    state: SelectorWaitState
+    frame_id: str
+    after: str
+    challenge_id: str
+
+
+class BrowserWaitCondition(_WaitConditionOptions):
     kind: Literal["load", "network_idle", "download", "url", "text", "selector", "value", "challenge_cleared"]
-    value: NotRequired[str]
-    selector: NotRequired[str]
-    state: NotRequired[SelectorWaitState]
-    frame_id: NotRequired[str]
-    after: NotRequired[str]
-    challenge_id: NotRequired[str]
 
 
 class BrowserHandoffCompletion(TypedDict):
@@ -121,11 +141,14 @@ class BrowserHandoffCompletion(TypedDict):
     value: str
 
 
-class ChallengeSurface(TypedDict):
+class _SurfaceOptions(TypedDict, total=False):
+    frame_id: str
+    frame_origin: str
+
+
+class ChallengeSurface(_SurfaceOptions):
     scope: Literal["document", "frame", "element"]
     visible: bool
-    frame_id: NotRequired[str]
-    frame_origin: NotRequired[str]
 
 
 class ChallengeDetector(TypedDict):
@@ -133,7 +156,14 @@ class ChallengeDetector(TypedDict):
     probe: Literal["debugger", "scripting"]
 
 
-class ChallengeEvent(TypedDict):
+class _ChallengeEventOptions(TypedDict, total=False):
+    token_present: bool
+    wait_budget_ms: int
+    retry_after_ms: int
+    notice_id: str
+
+
+class ChallengeEvent(_ChallengeEventOptions):
     """One bot challenge episode (schemas/rpc/v1/challenge.schema.json).
 
     Carries no page text, URL path or query, sitekey, or response token.
@@ -157,19 +187,15 @@ class ChallengeEvent(TypedDict):
     signals: list[str]
     next: Literal["wait", "handoff", "retry_later", "stop", "none"]
     detector: ChallengeDetector
-    token_present: NotRequired[bool]
-    wait_budget_ms: NotRequired[int]
-    retry_after_ms: NotRequired[int]
-    notice_id: NotRequired[str]
 
 
-class ChallengeBearingResult(TypedDict):
+class ChallengeBearingResult(TypedDict, total=False):
     """Optional members added to browser_open, browser_snapshot, browser_act,
     browser_wait, and browser_handoff resolve results when a challenge is present.
     """
 
-    challenge: NotRequired[ChallengeEvent]
-    status: NotRequired[str]
+    challenge: ChallengeEvent
+    status: str
 
 
 def resolve_transport_timeout(

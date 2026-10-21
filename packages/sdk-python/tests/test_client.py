@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 import socket
 import sys
@@ -22,7 +23,9 @@ from agenttab import (
     DEFAULT_BROWSER_WAIT_TIMEOUT,
     BrowserHandoffCompletion,
     ChallengeBearingResult,
+    ChallengeDetector,
     ChallengeEvent,
+    ChallengeSurface,
     LONG_OPERATION_TRANSPORT_GRACE,
     encode_frame,
     read_frame,
@@ -65,6 +68,19 @@ class ChallengeTypeTests(unittest.TestCase):
             ),
             DEFAULT_BROWSER_HANDOFF_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
         )
+
+    def test_challenge_types_mark_the_same_keys_optional_as_the_schema(self) -> None:
+        schema_path = Path(__file__).resolve().parents[3] / "schemas" / "rpc" / "v1" / "challenge.schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        for typed, shape in (
+            (ChallengeEvent, schema),
+            (ChallengeSurface, schema["$defs"]["surface"]),
+            (ChallengeDetector, schema["properties"]["detector"]),
+        ):
+            with self.subTest(typed=typed.__name__):
+                required = set(shape["required"])
+                self.assertEqual(typed.__required_keys__, required)
+                self.assertEqual(typed.__optional_keys__, set(shape["properties"]) - required)
 
 
 class FramingTests(unittest.TestCase):
