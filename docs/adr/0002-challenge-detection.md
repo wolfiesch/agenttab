@@ -264,9 +264,10 @@ A request with this completion binds its `notice_id` to the episode. `resolve` s
 In Standard mode, while an episode is active on the tab:
 
 - An element action (`click`, `double_click`, `context_click`, `hover`, `type`, `fill`, `press`, `select`, `drag`, targeted `scroll`, `upload_file`) whose resolved target lies inside the challenge surface performs no input. It returns `ok: true`, `outcome: "needs_user"`, `result.status: "challenge_active"`, and the `challenge`. The surface is the whole top document for `document` scope, the frame and its descendants for `frame` scope, and the matched element subtree for `element` scope.
-- Targetless `press` and `scroll` are refused under `document` scope, or when the focused element is inside the surface.
+- Targetless `scroll` is refused under `document` scope, or when the focused element is inside the surface. `press` always carries a target in the action schema, so it follows the element rule.
 - `navigate`, `reload`, history movement, `close`, `dialog`, and actions outside the surface proceed.
 - In a batch, the guard stops before the refused action and returns the completed prefix, matching staged-Commit batch semantics.
+- The guard rescans before the batch's first guarded action when the tab has an active episode or its `page_revision` moved since the last scan, and before later guarded actions only when the revision moved. Containment that cannot be determined while an episode is active counts as inside.
 
 This makes the ADR 0001 rule "CAPTCHA routes to an attention notice" enforceable instead of advisory.
 

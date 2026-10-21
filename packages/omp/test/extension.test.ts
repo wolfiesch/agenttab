@@ -1022,6 +1022,21 @@ test("Pi mode registers the same tools with TypeBox schemas and Pi metadata", ()
   expect(schema).toContain('"maximum":750000');
 });
 
+test("Pi browser_wait schema carries the challenge_cleared condition with its id pattern", () => {
+  const wait = register(false, "pi").tools.find((tool) => tool.name === "browser_wait");
+  const schema = JSON.stringify(wait?.parameters);
+  expect(schema).toContain('"challenge_cleared"');
+  expect(schema).toContain('"challenge_id"');
+  expect(schema).toContain("^chl_[0-9a-z]{20}$");
+});
+
+test("OMP forwards a challenge_cleared wait unchanged", async () => {
+  const { tools, calls } = register(false);
+  const condition = { kind: "challenge_cleared", challenge_id: "chl_3k9w2m7q8x1v5b0n4c6z" };
+  await executeTool(tools.find((tool) => tool.name === "browser_wait"), { tab_id: 7, condition });
+  expect(calls).toEqual([{ method: "browser_wait", params: { tab_id: 7, condition } }]);
+});
+
 test("Pi tools call the same Core RPC client", async () => {
   const { tools, calls } = register(false, "pi");
   await executeTool(tools.find((tool) => tool.name === "browser_tabs"));

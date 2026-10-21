@@ -1,3 +1,4 @@
+import { CHALLENGE_ID_PATTERN } from "./challenge";
 import { hasOnlyKeys, isBoundedString, isIntegerInRange, isRecord } from "./type-guards";
 
 export const NATIVE_PROTOCOL = "agenttab.native";
@@ -64,6 +65,7 @@ export type Outcome =
   | "completed"
   | "not_started"
   | "unknown"
+  | "needs_user"
   | "commit_required";
 
 export interface NativeOriginPolicy {
@@ -481,6 +483,13 @@ function assertWaitParams(value: unknown): Record<string, unknown> {
     assertFrameId(condition.frame_id, "condition.frame_id");
     return params;
   }
+  if (condition.kind === "challenge_cleared") {
+    assertExactObject(condition, ["kind", "challenge_id"], [], "challenge_cleared wait condition");
+    if (typeof condition.challenge_id !== "string" || !CHALLENGE_ID_PATTERN.test(condition.challenge_id)) {
+      commandError("condition.challenge_id must be a challenge id");
+    }
+    return params;
+  }
   commandError(`Unsupported wait condition: ${condition.kind}`);
 }
 
@@ -794,6 +803,16 @@ export function completed(requestId: string, result: unknown): NativeResponse {
   };
 }
 
+export function needsUser(requestId: string, result: unknown): NativeResponse {
+  return {
+    protocol: NATIVE_PROTOCOL,
+    version: PROTOCOL_VERSION,
+    kind: "response",
+    request_id: requestId,
+    outcome: "needs_user",
+    result,
+  };
+}
 
 export function commitRequired(
   requestId: string,

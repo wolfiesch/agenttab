@@ -25,21 +25,36 @@ import {
   type StagedDialog,
 } from "./protocol";
 import {
+  activeEpisodeForTab,
   advance,
   catalogSelectors,
   catalogTokenSelectors,
   collectChallengeFacts,
   detect,
+  episodeEvent,
+  findEpisode,
   frameOfInterest,
   newChallengeId,
   sanitizeOrigin,
+  type ChallengeEpisode,
   type ChallengeEvent,
   type ChallengePageFacts,
   type FrameFact,
   type ProbeFacts,
 } from "./challenge";
 import { CHALLENGE_CATALOG } from "./challenge-catalog";
-import { challengeStoreAvailable, updateTaskEpisodes } from "./challenge-store";
+import {
+  classifyGuardedAction,
+  decideContainment,
+  parseSurfaceEvidence,
+  probeSurfaceEvidence,
+  surfaceMatchers,
+  SURFACE_PROBE_DECLARATION,
+  type Containment,
+  type SurfaceEvidence,
+  type SurfaceMatchers,
+} from "./challenge-guard";
+import { challengeStoreAvailable, readTaskEpisodes, updateTaskEpisodes } from "./challenge-store";
 import { mutateState, readState } from "./storage";
 import { sensitiveFieldState } from "./sensitive-field";
 import {
@@ -67,6 +82,8 @@ const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
 const SCRIPTING_FRAME_ID = "scripting:top";
 /** Overall time a challenge scan may add to one result; an overrun omits `challenge`. */
 const CHALLENGE_SCAN_BUDGET_MS = 250;
+/** Minimum spacing between the starts of two scans inside a `challenge_cleared` wait. */
+const CHALLENGE_POLL_MS = 500;
 /** Response headers the detector may keep from a main-document response, lowercase. */
 const CHALLENGE_RESPONSE_HEADERS: readonly string[] = ["cf-mitigated", "x-amzn-waf-action", "retry-after"];
 const DOCUMENT_RESPONSE_LIMIT = 8;
@@ -96,6 +113,7 @@ const SUPPORTED_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   value: true,
   network_idle: true,
   download: true,
+  challenge_cleared: true,
 };
 function validateKeyboardAction(action: Record<string, unknown>): void {
   if (action.kind !== "press") return;
@@ -501,6 +519,16 @@ type OpenRequestedChild = (parentTabId: number, url: string) => Promise<number>;
 export interface ActionExecution {
   result?: Record<string, unknown>;
   staged?: StagedCommit;
+  /** The batch stopped before an action the challenge guard refused; `result` carries the active challenge. */
+  needsUser?: true;
+  /** Terminal event of an episode a guard rescan ended during the batch and no result has reported yet. */
+  endedChallenge?: ChallengeEvent;
+}
+
+/** Per-batch state of the browser_act challenge guard. */
+interface ChallengeGuardState {
+  first: boolean;
+  ended?: ChallengeEvent;
 }
 export interface TargetResolutionRequest {
   pageRevision: number;
@@ -530,6 +558,8 @@ export class StandardBrowserRuntime {
   private readonly expectedDetaches = new Map<number, number>();
   private readonly debuggerCandidates = new Set<number>();
   private readonly debuggerRefusals = new Map<number, { reason: string; until: number }>();
+  /** Page revision of the last completed challenge scan, per tab. */
+  private readonly challengeScanRevisions = new Map<number, number>();
 
   constructor(
     private readonly revisions: RevisionTracker,
@@ -1427,6 +1457,17 @@ export class StandardBrowserRuntime {
     }
     const completedActions: Array<Record<string, unknown>> = [];
     let stepIndex = 0;
+    const guard: ChallengeGuardState = { first: true };
+    const refuse = async (episode: ChallengeEpisode): Promise<ActionExecution> => ({
+      needsUser: true,
+      result: {
+        tab_id: tabId,
+        page_revision: await this.revisions.current(tabId),
+        actions: completedActions,
+        status: "challenge_active",
+        challenge: episodeEvent(episode),
+      },
+    });
     try {
       for (const [index, action] of validated.entries()) {
         stepIndex = index;
@@ -1463,6 +1504,17 @@ export class StandardBrowserRuntime {
           }
         }
         validateKeyboardAction(action);
+        const guardClass = classifyGuardedAction(action);
+        const challenge = guardClass === "none"
+          ? undefined
+          : await this.guardEpisode(taskId, tabId, pageRevision, guard);
+        if (
+          challenge !== undefined &&
+          (challenge.scope_class === "document" ||
+            (guardClass === "targetless" && (await this.focusInsideChallenge(tabId, challenge))))
+        ) {
+          return refuse(challenge);
+        }
         const resolvedTarget = hasSelector || hasRef
           ? await this.resolveTarget(tabId, {
             taskId,
@@ -1473,6 +1525,13 @@ export class StandardBrowserRuntime {
           })
           : undefined;
         if (resolvedTarget?.route === "scripting") this.assertScriptingSupports(tabId, action.kind);
+        if (
+          challenge !== undefined &&
+          guardClass === "targeted" &&
+          (await this.targetInsideChallenge(taskId, tabId, pageRevision, challenge, action, resolvedTarget))
+        ) {
+          return refuse(challenge);
+        }
         const stagedConsequence = await this.consequence(tabId, action, resolvedTarget);
         if (stagedConsequence && !(await readState()).skipCommitReview) {
           const staged: StagedCommit = {
@@ -1516,6 +1575,7 @@ export class StandardBrowserRuntime {
           });
           return {
             staged,
+            ...(guard.ended !== undefined ? { endedChallenge: guard.ended } : {}),
             result: {
               tab_id: tabId,
               page_revision: await this.revisions.current(tabId),
@@ -1530,6 +1590,7 @@ export class StandardBrowserRuntime {
       throw batchStepFailure(error, stepIndex, validated, completedActions);
     }
     return {
+      ...(guard.ended !== undefined ? { endedChallenge: guard.ended } : {}),
       result: {
         tab_id: tabId,
         page_revision: await this.revisions.current(tabId),
@@ -1873,6 +1934,9 @@ export class StandardBrowserRuntime {
       await this.requireFullAutomationRoute(tabId, `wait for page ${conditionKind}`);
     }
     const timeoutMs = typeof params.timeout_ms === "number" ? params.timeout_ms : 30_000;
+    if (conditionKind === "challenge_cleared") {
+      return this.waitForChallengeCleared(tabId, condition, timeoutMs, revalidate, taskId);
+    }
     const waitStartedAtMs = Date.now();
     const deadline = waitStartedAtMs + timeoutMs;
     const retainedDownload = conditionKind === "download"
@@ -1941,6 +2005,60 @@ export class StandardBrowserRuntime {
     } finally {
       if (debuggerSession) this.releaseDebuggerBusyLease(tabId, debuggerSession);
     }
+  }
+
+  /**
+   * Polls until a challenge episode ends, asks for a human, or the timeout passes. Scans start at
+   * most every `CHALLENGE_POLL_MS`; a scan that fails or overruns its budget just leaves the next
+   * poll to try again. It never attaches the debugger.
+   */
+  private async waitForChallengeCleared(
+    tabId: number,
+    condition: Record<string, unknown>,
+    timeoutMs: number,
+    revalidate: (() => Promise<void>) | undefined,
+    taskId: string | undefined,
+  ): Promise<Record<string, unknown>> {
+    const challengeId = condition.challenge_id;
+    const notFound = () =>
+      Object.assign(new Error("No active challenge with that id exists on this tab for this task"), {
+        code: "challenge_not_found",
+        outcome: "not_started",
+      });
+    if (taskId === undefined || typeof challengeId !== "string" || !challengeStoreAvailable()) throw notFound();
+    const initial = findEpisode(await readTaskEpisodes(taskId), taskId, challengeId);
+    if (initial === undefined || initial.tab_id !== tabId || initial.state !== "active") throw notFound();
+    const deadline = Date.now() + timeoutMs;
+    let latest = episodeEvent(initial);
+    do {
+      const startedAt = Date.now();
+      await this.authorizeDebuggerUse(tabId);
+      if (revalidate) await revalidate();
+      await this.requireFullAutomationRoute(tabId, "wait for page challenge_cleared");
+      const scanned = await this.scanChallengeEpisodes(taskId, tabId);
+      if (revalidate) await revalidate();
+      if (scanned !== undefined) {
+        const episode = findEpisode(scanned.episodes, taskId, challengeId);
+        if (episode === undefined) throw notFound();
+        latest = episodeEvent(episode);
+        const base = {
+          tab_id: tabId,
+          page_revision: await this.revisions.current(tabId),
+          condition: "challenge_cleared",
+        };
+        if (episode.state !== "active") return { ...base, matched: true, challenge: latest };
+        if (episode.next !== "wait") {
+          return { ...base, matched: false, status: "challenge_needs_user", challenge: latest };
+        }
+      }
+      const pause = Math.min(CHALLENGE_POLL_MS - (Date.now() - startedAt), deadline - Date.now());
+      if (pause > 0) await new Promise<void>((resolve) => setTimeout(resolve, pause));
+    } while (Date.now() < deadline);
+    throw Object.assign(new Error("Timed out waiting for challenge_cleared"), {
+      code: "wait_timeout",
+      outcome: "unknown",
+      challengeEvent: latest,
+    });
   }
 
   async developer(tabId: number, action: string, params: Record<string, unknown>): Promise<unknown> {
@@ -3516,11 +3634,165 @@ export class StandardBrowserRuntime {
   }
 
   /**
+   * The tab's active challenge episode for the act guard. Before the batch's first guarded action it
+   * rescans when a stored episode is still active or the page revision moved since the last scan;
+   * afterwards it rescans only when the revision moved. A failed scan leaves the stored view in place.
+   */
+  private async guardEpisode(
+    taskId: string,
+    tabId: number,
+    pageRevision: number,
+    guard: ChallengeGuardState,
+  ): Promise<ChallengeEpisode | undefined> {
+    if (!challengeStoreAvailable()) return undefined;
+    let episodes = await readTaskEpisodes(taskId).catch((): ChallengeEpisode[] => []);
+    const moved = this.challengeScanRevisions.get(tabId) !== pageRevision;
+    const rescan = moved || (guard.first && activeEpisodeForTab(episodes, taskId, tabId) !== undefined);
+    guard.first = false;
+    if (rescan) {
+      const scanned = await this.scanChallengeEpisodes(taskId, tabId);
+      if (scanned !== undefined) {
+        episodes = scanned.episodes;
+        if (scanned.event !== undefined && scanned.event.state !== "active") guard.ended = scanned.event;
+      }
+    }
+    return activeEpisodeForTab(episodes, taskId, tabId);
+  }
+
+  private surfaceOf(episode: ChallengeEpisode): SurfaceMatchers {
+    return surfaceMatchers(CHALLENGE_CATALOG.signatures.find((signature) => signature.id === episode.signature_id));
+  }
+
+  /**
+   * Decides, after the action's targets are resolved and before any input, whether an element action
+   * lands inside an embedded challenge surface. Unknown containment counts as inside.
+   */
+  private async targetInsideChallenge(
+    taskId: string,
+    tabId: number,
+    pageRevision: number,
+    episode: ChallengeEpisode,
+    action: Record<string, unknown>,
+    resolvedTarget: ResolvedTarget | undefined,
+  ): Promise<boolean> {
+    const matchers = this.surfaceOf(episode);
+    const frameId = typeof action.frame_id === "string" ? action.frame_id : undefined;
+    // A frame-level scroll acts on the frame's root element; an unreachable frame cannot be shown to be outside.
+    const source = resolvedTarget ?? (frameId === undefined
+      ? undefined
+      : await this.resolveTarget(tabId, {
+        taskId,
+        pageRevision,
+        selector: "html",
+        frameId,
+        actionKind: "scroll",
+      }).catch(() => undefined));
+    if (source === undefined || (await this.targetContainment(tabId, matchers, source)) !== "outside") return true;
+    if (action.kind === "drag" && typeof action.target_ref === "string") {
+      const dropTarget = await this.resolveTarget(tabId, {
+        taskId,
+        pageRevision,
+        ref: action.target_ref,
+        actionKind: "drag",
+        ...(frameId !== undefined ? { frameId } : {}),
+      });
+      return (await this.targetContainment(tabId, matchers, dropTarget)) !== "outside";
+    }
+    return false;
+  }
+
+  private async targetContainment(
+    tabId: number,
+    matchers: SurfaceMatchers,
+    target: ResolvedTarget,
+  ): Promise<Containment> {
+    const ancestry = await this.frameAncestryUrls(tabId, target.frameId).catch(() => undefined);
+    let page: SurfaceEvidence | undefined;
+    try {
+      page = parseSurfaceEvidence(
+        await this.callOnNode(
+          tabId,
+          target.backendNodeId,
+          SURFACE_PROBE_DECLARATION,
+          [{ value: matchers.selectors }],
+          false,
+          target,
+        ),
+      );
+    } catch {
+      page = undefined;
+    }
+    return decideContainment(matchers, ancestry, page);
+  }
+
+  /** True when the focused element (or what a targetless key or scroll would reach) is inside the surface. */
+  private async focusInsideChallenge(tabId: number, episode: ChallengeEpisode): Promise<boolean> {
+    const matchers = this.surfaceOf(episode);
+    let page: SurfaceEvidence | undefined;
+    try {
+      const injected = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: probeSurfaceEvidence,
+        args: [null, matchers.selectors, true],
+      });
+      page = parseSurfaceEvidence(injected[0]?.result);
+    } catch {
+      page = undefined;
+    }
+    return decideContainment(matchers, [], page) !== "outside";
+  }
+
+  /**
+   * URLs of a frame and its ancestors below the top document, innermost first, from the debugger's
+   * frame trees. Undefined when the chain cannot be followed to the top document.
+   */
+  private async frameAncestryUrls(
+    tabId: number,
+    frameId: string,
+  ): Promise<Array<string | undefined> | undefined> {
+    const main = await this.send(tabId, "Page.getFrameTree", {});
+    if (!isRecord(main.frameTree)) return undefined;
+    const frames = new Map<string, { url?: string; parentId?: string }>();
+    const rootFrame = isRecord(main.frameTree.frame) ? main.frameTree.frame : undefined;
+    const rootId = typeof rootFrame?.id === "string" ? rootFrame.id : "top";
+    const pending: unknown[] = [main.frameTree, ...(await this.attachedFrameTrees(tabId))];
+    while (pending.length > 0 && frames.size < CHALLENGE_FRAME_LIMIT) {
+      const node = pending.pop();
+      if (!isRecord(node) || !isRecord(node.frame)) continue;
+      const id = typeof node.frame.id === "string" ? node.frame.id : node.frame === rootFrame ? rootId : undefined;
+      if (id !== undefined) {
+        frames.set(id, {
+          ...(typeof node.frame.url === "string" ? { url: node.frame.url } : {}),
+          ...(typeof node.frame.parentId === "string" ? { parentId: node.frame.parentId } : {}),
+        });
+      }
+      if (Array.isArray(node.childFrames)) pending.push(...node.childFrames);
+    }
+    const urls: Array<string | undefined> = [];
+    let current: string | undefined = frameId;
+    for (let hops = 0; current !== undefined && current !== rootId && hops < 64; hops += 1) {
+      const entry = frames.get(current);
+      if (entry === undefined) return undefined;
+      urls.push(entry.url);
+      current = entry.parentId;
+    }
+    return current === rootId ? urls : undefined;
+  }
+
+  /**
    * Scans a task tab for a bot challenge and folds the result into the task's episodes.
    * Read-only and best-effort: restricted routes, probe errors, and overruns of the scan budget
    * return undefined and never fail the host operation.
    */
   async scanChallenge(taskId: string, tabId: number): Promise<ChallengeEvent | undefined> {
+    return (await this.scanChallengeEpisodes(taskId, tabId))?.event;
+  }
+
+  /** `scanChallenge` plus the task's advanced episode list; undefined when the scan did not complete. */
+  async scanChallengeEpisodes(
+    taskId: string,
+    tabId: number,
+  ): Promise<{ event?: ChallengeEvent; episodes: ChallengeEpisode[] } | undefined> {
     if (!challengeStoreAvailable()) return undefined;
     try {
       const tab = await chrome.tabs.get(tabId);
@@ -3540,8 +3812,8 @@ export class StandardBrowserRuntime {
       const detected = detect(CHALLENGE_CATALOG, facts);
       const pageRevision = await this.revisions.current(tabId);
       const now = Date.now();
-      const { event } = await updateTaskEpisodes(taskId, (episodes) =>
-        advance(episodes, detected, {
+      const { event, episodes } = await updateTaskEpisodes(taskId, (stored) =>
+        advance(stored, detected, {
           taskId,
           tabId,
           pageRevision,
@@ -3552,7 +3824,8 @@ export class StandardBrowserRuntime {
           newId: newChallengeId,
         }),
       );
-      return event;
+      this.challengeScanRevisions.set(tabId, pageRevision);
+      return { ...(event !== undefined ? { event } : {}), episodes };
     } catch {
       return undefined;
     }

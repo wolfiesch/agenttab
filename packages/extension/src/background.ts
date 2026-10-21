@@ -1,3 +1,4 @@
+import type { ChallengeEvent } from "./challenge";
 import { clearChallengeTask } from "./challenge-store";
 import { removeTabIfPresent, StandardBrowserRuntime } from "./browser";
 import { HandoffController, HANDOFF_ALARM } from "./handoff";
@@ -7,6 +8,7 @@ import {
   commitRequired,
   completed,
   failed,
+  needsUser,
   type NativeDispatchCommand,
   type NativeOriginPolicy,
   type NativeResponse,
@@ -346,13 +348,20 @@ function errorOutcome(error: unknown, mutating: boolean, code: string): Outcome 
   return mutating && !PRE_DISPATCH_ERRORS[code] ? "unknown" : "not_started";
 }
 
-/** Adds the detector's `challenge` member to a result when the tab has an active or just-ended episode. */
+/**
+ * Adds the detector's `challenge` member to a result when the tab has an active or just-ended episode.
+ * A result whose operation already attached one (a wait, or an act the guard refused) is returned as is,
+ * without a second scan. `observed` is an ended-episode event an earlier scan in the same operation
+ * consumed; it is reported only when this scan has nothing newer to say.
+ */
 async function withChallenge(
   taskId: string,
   tabId: number,
   result: Record<string, unknown>,
+  observed?: ChallengeEvent,
 ): Promise<Record<string, unknown>> {
-  const challenge = await browser.scanChallenge(taskId, tabId);
+  if (result.challenge !== undefined) return result;
+  const challenge = (await browser.scanChallenge(taskId, tabId)) ?? observed;
   return challenge === undefined ? result : { ...result, challenge };
 }
 
@@ -516,7 +525,9 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         const waited = await browser.wait(targetTabId, params, revalidate, command.task_id);
         return withChallenge(command.task_id, targetTabId, waited);
       });
-      return completed(command.request_id, result);
+      return command.method === "browser_wait" && result.status === "challenge_needs_user"
+        ? needsUser(command.request_id, result)
+        : completed(command.request_id, result);
     }
     if (command.method === "browser_act") {
       const execution = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
@@ -526,11 +537,19 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         const execution = await browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
         return {
           ...execution,
-          result: await withChallenge(command.task_id, targetTabId, execution.result ?? {}),
+          result: await withChallenge(
+            command.task_id,
+            targetTabId,
+            execution.result ?? {},
+            execution.endedChallenge,
+          ),
         };
       });
       if (execution.staged) {
         return commitRequired(command.request_id, execution.result ?? {}, execution.staged);
+      }
+      if (execution.needsUser) {
+        return needsUser(command.request_id, execution.result ?? {});
       }
       return completed(command.request_id, execution.result ?? {});
     }
@@ -623,6 +642,7 @@ function errorDetails(error: unknown): Record<string, unknown> | undefined {
     ...(typeof error.currentPageRevision === "number" ? { current_page_revision: error.currentPageRevision } : {}),
     ...(typeof error.failedActionIndex === "number" ? { failed_action_index: error.failedActionIndex } : {}),
     ...(Array.isArray(error.completedActions) ? { completed_actions: error.completedActions } : {}),
+    ...(isRecord(error.challengeEvent) ? { challenge: error.challengeEvent } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
 }

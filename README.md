@@ -51,7 +51,7 @@ Standard mode exposes exactly nine tools:
 | `browser_open` | Create a task tab, create an unfocused window for a new task, or explicitly adopt the active tab. Reports whether the resulting tab supports `full` or `tab_only` automation. |
 | `browser_snapshot` | Read an accessibility tree, bounded text or HTML, or a screenshot from a full-route task tab. |
 | `browser_act` | Run typed actions against one task tab and expected page revision. Restricted-origin task tabs retain only navigation, history, reload, and close actions. |
-| `browser_wait` | Wait for load, URL, text, selector, network-idle, or task-attributed download conditions supported by the tab's route. |
+| `browser_wait` | Wait for load, URL, text, selector, network-idle, task-attributed download, or challenge-cleared conditions supported by the tab's route. |
 | `browser_tabs` | List only tabs owned by the current task, including each tab's automation route. |
 | `browser_handoff` | Post a non-blocking attention notice asking the user to complete human-only input, then verify the page and resolve or dismiss it by notice ID. |
 | `browser_commit` | Execute one staged consequential action. |

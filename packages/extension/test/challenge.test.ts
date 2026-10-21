@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+  activeEpisodeForTab,
   advance,
   catalogSelectors,
   catalogTokenSelectors,
   collectChallengeFacts,
   detect,
   episodeEvent,
+  findEpisode,
   frameOfInterest,
   newChallengeId,
   parseChallengeEpisode,
@@ -928,6 +930,7 @@ describe("episodes: embedded", () => {
     const puzzleFrame = frame("acme.example", "/puzzle", { width: 400, height: 500 });
     const first = scan([], facts({ frames: [widgetFrame] }), {}, acme);
     expect(first.event).toMatchObject({ kind: "widget", interaction: "automatic", next: "wait", token_present: false });
+    expect(first.episodes[0]!.signature_id).toBe("acme.widget");
     const opened = scan(first.episodes, facts({ frames: [widgetFrame, puzzleFrame] }), { now: T0 + 2_000, pageRevision: 4 }, acme);
     expect(opened.event).toMatchObject({
       kind: "puzzle", interaction: "human", next: "handoff", product: "puzzle",
@@ -935,6 +938,7 @@ describe("episodes: embedded", () => {
     });
     expect(opened.event?.token_present).toBeUndefined();
     expect(opened.event?.wait_budget_ms).toBeUndefined();
+    expect(opened.episodes[0]!.signature_id).toBe("acme.puzzle");
     const hidden = scan(
       opened.episodes,
       facts({ frames: [widgetFrame, { ...puzzleFrame, visible: false }] }),
@@ -1074,6 +1078,30 @@ describe("episode persistence", () => {
     expect(parsed).toBeDefined();
     expect(Object.keys(parsed!)).not.toContain("cookie");
     expect(Object.keys(parsed!)).not.toContain("url");
+  });
+
+  test("the signature id persists, is required on read, and is never emitted", () => {
+    const step = scan([], turnstileActive());
+    const stored = JSON.parse(JSON.stringify(step.episodes[0]));
+    expect(stored.signature_id).toBe("cloudflare.turnstile");
+    expect(parseChallengeEpisode(stored)?.signature_id).toBe("cloudflare.turnstile");
+    const { signature_id: _dropped, ...withoutSignature } = stored;
+    expect(parseChallengeEpisode(withoutSignature)).toBeUndefined();
+    expect(parseChallengeEpisode({ ...stored, signature_id: "" })).toBeUndefined();
+    expect(Object.keys(step.event!)).not.toContain("signature_id");
+  });
+
+  test("lookup helpers find episodes by id and prefer document scope", () => {
+    const widget = scan([], turnstileActive());
+    const document = scan([], cloudflareInterstitial(), { now: T0 + 1_000 });
+    const merged = [...widget.episodes, ...document.episodes];
+    const documentEpisode = merged.find((episode) => episode.scope_class === "document")!;
+    expect(findEpisode(merged, "task-1", documentEpisode.challenge_id)).toBe(documentEpisode);
+    expect(findEpisode(merged, "other-task", documentEpisode.challenge_id)).toBeUndefined();
+    expect(activeEpisodeForTab(merged, "task-1", 7)).toBe(documentEpisode);
+    expect(activeEpisodeForTab(widget.episodes, "task-1", 7)).toBe(widget.episodes[0]);
+    expect(activeEpisodeForTab(merged, "task-1", 8)).toBeUndefined();
+    expect(activeEpisodeForTab(merged, "other-task", 7)).toBeUndefined();
   });
 });
 

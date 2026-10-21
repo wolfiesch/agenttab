@@ -107,12 +107,13 @@ BrowserAction = BrowserGestureAction | BrowserDownloadGestureAction | BrowserPre
 
 
 class BrowserWaitCondition(TypedDict):
-    kind: Literal["load", "network_idle", "download", "url", "text", "selector", "value"]
+    kind: Literal["load", "network_idle", "download", "url", "text", "selector", "value", "challenge_cleared"]
     value: NotRequired[str]
     selector: NotRequired[str]
     state: NotRequired[SelectorWaitState]
     frame_id: NotRequired[str]
     after: NotRequired[str]
+    challenge_id: NotRequired[str]
 
 
 def resolve_transport_timeout(

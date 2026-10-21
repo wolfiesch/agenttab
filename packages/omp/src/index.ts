@@ -247,13 +247,14 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_wait",
       label: "Browser Wait",
-      description: "Wait for one schema-defined load, URL, text, selector, network-idle, or download condition.",
+      description: "Wait for one schema-defined load, URL, text, selector, network-idle, download, or challenge_cleared condition.",
       approval: "read",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
         condition: z.union([
           z.object({ kind: z.enum(["load", "network_idle"]) }).strict(),
           z.object({ kind: z.literal("download"), after: z.string().min(1).max(256).optional() }).strict(),
+          z.object({ kind: z.literal("challenge_cleared"), challenge_id: z.string().regex(/^chl_[0-9a-z]{20}$/) }).strict(),
           z.object({ kind: z.enum(["url", "text"]), value: z.string().min(1).max(2048) }).strict(),
           z.object({
             kind: z.literal("selector"),

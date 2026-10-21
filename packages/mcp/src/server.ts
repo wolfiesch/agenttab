@@ -170,7 +170,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_wait",
-    description: "Wait for one schema-defined load, URL, text, selector, network-idle, or download condition.",
+    description: "Wait for one schema-defined load, URL, text, selector, network-idle, download, or challenge_cleared condition.",
     inputSchema: schema(waitSchema),
   },
   {

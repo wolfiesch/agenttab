@@ -179,6 +179,11 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         ),
         core_request(
             "browser_wait",
+            {"tab_id": 1, "condition": {"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}, "timeout_ms": 60000},
+            mutation=False,
+        ),
+        core_request(
+            "browser_wait",
             {"tab_id": 1, "condition": {"kind": "download", "after": "cursor-1"}},
             mutation=False,
         ),
@@ -312,6 +317,11 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         ({"kind": "download", "after": ""}, "empty download cursor"),
         ({"kind": "value", "selector": "input", "value": "ok", "state": "visible"}, "value wait state"),
         ({"kind": "selector", "value": "input", "frame_id": ""}, "empty wait frame"),
+        ({"kind": "challenge_cleared"}, "challenge wait without id"),
+        ({"kind": "challenge_cleared", "challenge_id": "chl_short"}, "challenge wait short id"),
+        ({"kind": "challenge_cleared", "challenge_id": "xyz_3k9w2m7q8x1v5b0n4c6z"}, "challenge wait bad prefix"),
+        ({"kind": "challenge_cleared", "challenge_id": "chl_3K9W2M7Q8X1V5B0N4C6Z"}, "challenge wait uppercase id"),
+        ({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z", "value": "x"}, "challenge wait extra key"),
     ]:
         expect_invalid(
             request_validator,

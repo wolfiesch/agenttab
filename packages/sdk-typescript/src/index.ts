@@ -94,6 +94,7 @@ export interface BrowserActParams {
 export type BrowserWaitCondition =
   | { kind: "load" | "network_idle" }
   | { kind: "download"; after?: string }
+  | { kind: "challenge_cleared"; challenge_id: string }
   | { kind: "url" | "text"; value: string }
   | { kind: "selector"; value: string; state?: "attached" | "detached" | "visible" | "hidden" | "enabled"; frame_id?: string }
   | { kind: "value"; selector: string; value: string; frame_id?: string };

@@ -183,6 +183,24 @@ describe("AgentTab operation card rendering", () => {
     expect(rendered).not.toContain("Blocked ·");
   });
 
+  test("needs_user act and wait outcomes render as awaiting the user", () => {
+    for (const [method, args, status] of [
+      ["browser_act", { tab_id: 18, expected_page_revision: 4, actions: [{ kind: "click", ref: "ref=e3" }] }, "challenge_active"],
+      ["browser_wait", { tab_id: 18, condition: { kind: "challenge_cleared", challenge_id: "chl_3k9w2m7q8x1v5b0n4c6z" } }, "challenge_needs_user"],
+    ] as const) {
+      const rendered = createResultComponent(
+        method,
+        { details: { status, outcome: "needs_user" } },
+        { expanded: false },
+        theme,
+        args,
+      ).render(120).join("\n");
+      expect(rendered).toContain("👤 Needs you");
+      expect(rendered).not.toContain("Executed ·");
+      expect(rendered).not.toContain("Observed ·");
+    }
+  });
+
   test("handoff cards never treat notice creation as completed human work", () => {
     const args = {
       operation: "request",

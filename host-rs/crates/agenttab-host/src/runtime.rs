@@ -2157,6 +2157,41 @@ mod tests {
         }
     }
 
+    /// Replays one scripted native response for every dispatch and counts calls.
+    #[derive(Debug)]
+    struct ScriptedNative {
+        calls: AtomicUsize,
+        last_params: Mutex<Option<Value>>,
+        outcome: Outcome,
+        result: Option<Value>,
+        error: Option<RpcError>,
+    }
+
+    impl NativeTransport for ScriptedNative {
+        fn dispatch(
+            &self,
+            _connection_id: Uuid,
+            _task_id: Uuid,
+            _method: &str,
+            params: Value,
+            _origin_policy: Option<NativeOriginPolicy>,
+            _timeout: Duration,
+        ) -> Result<NativeResponse, NativeError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            *self.last_params.lock() = Some(params);
+            Ok(NativeResponse {
+                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: NativeResponseKind::Response,
+                request_id: Uuid::new_v4(),
+                outcome: self.outcome,
+                result: self.result.clone(),
+                error: self.error.clone(),
+                staged: None,
+            })
+        }
+    }
+
     fn connected_runtime(
         native: Arc<dyn NativeTransport>,
     ) -> (tempfile::TempDir, Arc<Runtime>, Arc<ConnectionContext>) {
@@ -2479,6 +2514,130 @@ mod tests {
             .write()
             .insert(3, "https://allowed.test/".into());
         task_id
+    }
+
+    fn challenge_event() -> Value {
+        json!({
+            "spec_version": 1,
+            "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z",
+            "tab_id": 3,
+            "state": "waiting",
+            "next": "ask_user",
+            "token_present": false,
+        })
+    }
+
+    #[test]
+    fn challenge_needs_user_results_pass_through_and_replay_unchanged() {
+        let native = Arc::new(ScriptedNative {
+            calls: AtomicUsize::new(0),
+            last_params: Mutex::new(None),
+            outcome: Outcome::NeedsUser,
+            result: Some(json!({
+                "tab_id": 3,
+                "page_revision": 7,
+                "status": "challenge_active",
+                "challenge": challenge_event(),
+            })),
+            error: None,
+        });
+        let (temp, runtime, connection) = connected_runtime(native.clone());
+        own_tab(&runtime, &connection, 7);
+        let act = |request_id: &str, key: Uuid| {
+            runtime.handle(
+                &connection,
+                json!({
+                    "protocol": RPC_PROTOCOL,
+                    "version": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "idempotency_key": key,
+                    "method": "browser_act",
+                    "params": {
+                        "tab_id": 3,
+                        "expected_page_revision": 7,
+                        "actions": [{"kind": "click", "ref": "e9"}]
+                    }
+                }),
+            )
+        };
+        let key = Uuid::now_v7();
+        let first = act("act", key);
+        assert_eq!(first["ok"], true, "{first}");
+        assert_eq!(first["outcome"], "needs_user");
+        assert_eq!(first["result"]["status"], "challenge_active");
+        assert_eq!(first["result"]["challenge"], challenge_event());
+        let replay = act("act-replay", key);
+        assert_eq!(replay["outcome"], "needs_user");
+        assert_eq!(replay["result"], first["result"]);
+        assert_eq!(native.calls.load(Ordering::Relaxed), 1);
+
+        let wait = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "wait",
+                "method": "browser_wait",
+                "params": {
+                    "tab_id": 3,
+                    "condition": {"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"},
+                    "timeout_ms": 1000
+                }
+            }),
+        );
+        assert_eq!(wait["outcome"], "needs_user");
+        assert_eq!(wait["result"]["challenge"], challenge_event());
+        assert_eq!(
+            native.last_params.lock().as_ref().unwrap()["condition"],
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}),
+        );
+        let audit = std::fs::read_to_string(temp.path().join("agenttab/audit.jsonl")).unwrap();
+        assert!(audit.contains("\"outcome\":\"needs_user\""));
+    }
+
+    #[test]
+    fn challenge_error_details_and_not_found_pass_through() {
+        for (outcome, code, details) in [
+            (
+                Outcome::Unknown,
+                "wait_timeout",
+                Some(json!({"challenge": challenge_event()})),
+            ),
+            (Outcome::NotStarted, "challenge_not_found", None),
+        ] {
+            let mut error = RpcError::new(code, "scripted");
+            error.details = details.as_ref().and_then(Value::as_object).cloned();
+            let native = Arc::new(ScriptedNative {
+                calls: AtomicUsize::new(0),
+                last_params: Mutex::new(None),
+                outcome,
+                result: None,
+                error: Some(error),
+            });
+            let (_temp, runtime, connection) = connected_runtime(native);
+            own_tab(&runtime, &connection, 7);
+            let response = runtime.handle(
+                &connection,
+                json!({
+                    "protocol": RPC_PROTOCOL,
+                    "version": PROTOCOL_VERSION,
+                    "request_id": "wait",
+                    "method": "browser_wait",
+                    "params": {
+                        "tab_id": 3,
+                        "condition": {"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"},
+                        "timeout_ms": 1000
+                    }
+                }),
+            );
+            assert_eq!(response["ok"], false, "{response}");
+            assert_eq!(response["error"]["code"], code);
+            assert_eq!(
+                response["outcome"],
+                serde_json::to_value(outcome).unwrap()
+            );
+            assert_eq!(response["error"].get("details").cloned(), details);
+        }
     }
 
     #[test]

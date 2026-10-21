@@ -426,7 +426,10 @@ function resultStatus(
 ): OperationCardStatus {
   const outcome = fieldString(toRecord(details._agenttab), "outcome") ?? fieldString(details, "outcome");
   if (outcome === "unknown") return "uncertain";
-  if (method === "browser_credentials" && outcome === "needs_user") return "awaiting_user";
+  if (
+    (method === "browser_credentials" || method === "browser_act" || method === "browser_wait") &&
+    outcome === "needs_user"
+  ) return "awaiting_user";
   if (options.isPartial === true) {
     return method === "browser_credentials" ? "awaiting_user" : "running";
   }

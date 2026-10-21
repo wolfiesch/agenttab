@@ -674,6 +674,9 @@ pub enum WaitCondition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame_id: Option<String>,
     },
+    ChallengeCleared {
+        challenge_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1292,8 +1295,22 @@ fn validate_wait_condition(
             }
             Ok(())
         }
+        WaitCondition::ChallengeCleared { challenge_id } => require(
+            method,
+            is_challenge_id(challenge_id),
+            "condition.challenge_id must match ^chl_[0-9a-z]{20}$",
+        ),
         WaitCondition::Load | WaitCondition::NetworkIdle => Ok(()),
     }
+}
+
+fn is_challenge_id(value: &str) -> bool {
+    value.strip_prefix("chl_").is_some_and(|suffix| {
+        suffix.len() == 20
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+    })
 }
 
 fn validate_developer_params(
@@ -2403,6 +2420,26 @@ mod tests {
             json!({"tab_id": 7, "condition": {"kind": "value", "selector": "input", "value": "ready", "frame_id": "frame-1"}}),
             false,
         )).is_ok());
+        assert!(RpcRequest::parse(request(
+            "browser_wait",
+            json!({"tab_id": 7, "condition": {"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}, "timeout_ms": 60000}),
+            false,
+        )).is_ok());
+        for invalid_condition in [
+            json!({"kind": "challenge_cleared"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_short"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "xyz_3k9w2m7q8x1v5b0n4c6z"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3K9W2M7Q8X1V5B0N4C6Z"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6zz"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6é"}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z", "value": "x"}),
+        ] {
+            assert!(RpcRequest::parse(request(
+                "browser_wait",
+                json!({"tab_id": 7, "condition": invalid_condition}),
+                false,
+            )).is_err());
+        }
         for (method, params, mutation) in [
             (
                 "browser_act",

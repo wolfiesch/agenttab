@@ -161,6 +161,8 @@ export type ScopeClass = "document" | "embedded";
 export interface ChallengeEpisode extends ChallengeEvent {
   task_id: string;
   scope_class: ScopeClass;
+  /** Catalog id of the signature that last matched. Internal; never emitted. */
+  signature_id: string;
   /** Catalog automatic-clear budget of the signature that last matched. */
   budget_ms?: number;
   /** False when every matched rule was header/status-only, so a scripting scan cannot observe its absence. Never emitted. */
@@ -177,7 +179,7 @@ export const CHALLENGE_MAX_RETRY_AFTER_MS = 86_400_000;
 const MAX_SIGNALS = 16;
 const ORIGIN_PATTERN = /^https?:\/\/[^/?#\s]+$/;
 const ID_ALPHABET = "0123456789abcdefghijklmnopqrstuv";
-const ID_PATTERN = /^chl_[0-9a-z]{20}$/;
+export const CHALLENGE_ID_PATTERN = /^chl_[0-9a-z]{20}$/;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -310,7 +312,7 @@ function evaluation(ok: boolean, frames: FrameFact[] = [], elements: ElementFact
   return { ok, frames, elements };
 }
 
-function frameMatches(frame: FrameFact, leaf: FrameLeaf): boolean {
+export function frameMatches(frame: UrlFact, leaf: FrameLeaf): boolean {
   if (!hostMatchesLeaf(frame.host, leaf)) return false;
   if (leaf.path_prefix !== undefined && !leaf.path_prefix.some((prefix) => frame.path.startsWith(prefix))) {
     return false;
@@ -596,6 +598,7 @@ function applyDetection(
   const { signature } = detection;
   episode.page_revision = ctx.pageRevision;
   episode.detected_at_ms = ctx.now;
+  episode.signature_id = signature.id;
   episode.page_origin = ctx.pageOrigin;
   episode.vendor = signature.vendor;
   episode.product = signature.product;
@@ -691,6 +694,27 @@ export function episodeEvent(episode: ChallengeEpisode): ChallengeEvent {
       probe: episode.detector.probe,
     },
   };
+}
+
+/** The task's episode with this id, if the list still holds it. */
+export function findEpisode(
+  episodes: readonly ChallengeEpisode[],
+  taskId: string,
+  challengeId: string,
+): ChallengeEpisode | undefined {
+  return episodes.find((episode) => episode.task_id === taskId && episode.challenge_id === challengeId);
+}
+
+/** The tab's active episode that governs input: document scope outranks embedded scope. */
+export function activeEpisodeForTab(
+  episodes: readonly ChallengeEpisode[],
+  taskId: string,
+  tabId: number,
+): ChallengeEpisode | undefined {
+  const active = episodes.filter(
+    (episode) => episode.task_id === taskId && episode.tab_id === tabId && episode.state === "active",
+  );
+  return active.find((episode) => episode.scope_class === "document") ?? active[0];
 }
 
 function enforceCap(episodes: ChallengeEpisode[], taskId: string): ChallengeEpisode[] {
@@ -837,7 +861,8 @@ export function parseChallengeEpisode(value: unknown): ChallengeEpisode | undefi
   const detectorRaw = record(raw.detector);
   if (
     raw.spec_version !== 1 ||
-    typeof raw.challenge_id !== "string" || !ID_PATTERN.test(raw.challenge_id) ||
+    typeof raw.challenge_id !== "string" || !CHALLENGE_ID_PATTERN.test(raw.challenge_id) ||
+    typeof raw.signature_id !== "string" || raw.signature_id.length === 0 || raw.signature_id.length > 128 ||
     typeof raw.task_id !== "string" || raw.task_id.length === 0 ||
     !nonNegativeInt(raw.tab_id) ||
     !nonNegativeInt(raw.page_revision) ||
@@ -894,6 +919,7 @@ export function parseChallengeEpisode(value: unknown): ChallengeEpisode | undefi
     detector: { catalog_version: detectorRaw.catalog_version, probe: detectorRaw.probe },
     task_id: raw.task_id,
     scope_class: raw.scope_class,
+    signature_id: raw.signature_id,
     ...(typeof raw.budget_ms === "number" ? { budget_ms: raw.budget_ms } : {}),
     observable_by_scripting: raw.observable_by_scripting !== false,
     terminal_reported: raw.terminal_reported,
