@@ -6,6 +6,7 @@ import {
   dispatchDomSelect,
   dispatchDomType,
 } from "./input-actions";
+import { probeSurfaceEvidence } from "./challenge-guard";
 import {
   PAGE_AGENT_GLOBAL,
   PAGE_AGENT_VERSION,
@@ -455,6 +456,10 @@ async function run(registry: Registry, request: PageAgentRequest): Promise<unkno
     case "fill_credential": {
       const element = lookup(registry, request.id);
       return isAgentError(element) ? element : fillCredential(element, request.value, request.kind);
+    }
+    case "surface": {
+      const element = lookup(registry, request.id);
+      return isAgentError(element) ? element : probeSurfaceEvidence(element, request.selectors, false);
     }
   }
 }

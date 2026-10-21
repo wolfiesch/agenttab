@@ -268,6 +268,7 @@ In Standard mode, while an episode is active on the tab:
 - `navigate`, `reload`, history movement, `close`, `dialog`, and actions outside the surface proceed.
 - In a batch, the guard stops before the refused action and returns the completed prefix, matching staged-Commit batch semantics.
 - The guard rescans before the batch's first guarded action when the tab has an active episode or its `page_revision` moved since the last scan, and before later guarded actions only when the revision moved. Containment that cannot be determined while an episode is active counts as inside.
+- On tabs where Chrome refuses the debugger and page work runs on the scripting route, the page agent probes the target element for surface evidence. Scripting refs always name the top document, so the target has no frame ancestry to check.
 
 This makes the ADR 0001 rule "CAPTCHA routes to an attention notice" enforceable instead of advisory.
 
@@ -362,6 +363,7 @@ jq -s '
 | `packages/extension/src/challenge.ts`, `challenge-catalog.ts`, `challenge-store.ts`, `challenge-guard.ts` | Matcher, activity gate, episode transitions, catalog, episode store, and act-guard surface containment |
 | `packages/extension/src/browser.ts` | Scan hooks in open, snapshot, act, and wait; `challenge_cleared` wait; act guard; main-frame `Network.responseReceived` capture while attached |
 | `packages/extension/src/handoff.ts`, `protocol.ts`, `storage.ts` | Completion kind, notice binding, and parameter validation |
+| `packages/extension/src/page-agent.ts`, `page-agent-protocol.ts` | `surface` request that probes a scripting-route target for act-guard containment |
 | `packages/omp/src/index.ts`, `pi-schema.ts`, `render.ts`, `native.ts`; `packages/mcp/src/server.ts`; SDKs | Advertise the schema changes, render `challenge`, add tool guidance |
 | `scripts/challenge_live_smoke.py` | Live end-to-end smoke and latency measurement against the built extension and host |
 | `docs/security.md`, `docs/telemetry.md`, `docs/mcp.md`, `docs/verification.md`, `CHANGELOG.md` | Document the behavior, the agent contract, the audit field, and the smoke |

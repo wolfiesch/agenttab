@@ -3706,6 +3706,16 @@ export class StandardBrowserRuntime {
     matchers: SurfaceMatchers,
     target: ResolvedTarget,
   ): Promise<Containment> {
+    if (target.route === "scripting") {
+      // Scripting refs always name the top document, so the target has no frame ancestry, and the
+      // page agent probes the element without the debugger Chrome refused.
+      const page = await this.runPageAgent(
+        tabId,
+        { op: "surface", id: target.backendNodeId, selectors: matchers.selectors },
+        target.documentId,
+      ).then(({ value }) => parseSurfaceEvidence(value), () => undefined);
+      return decideContainment(matchers, [], page);
+    }
     const ancestry = await this.frameAncestryUrls(tabId, target.frameId).catch(() => undefined);
     let page: SurfaceEvidence | undefined;
     try {

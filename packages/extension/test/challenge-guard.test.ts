@@ -72,6 +72,9 @@ let nodeEvidence: (objectId: string) => unknown;
 let commands: Command[];
 let frameTree: unknown;
 let tabUpdates: Array<Record<string, unknown>>;
+let debuggerRefused: boolean;
+let pageAgentRequests: Array<Record<string, unknown>>;
+let agentSurface: (id: number) => unknown;
 const eventListeners: Array<(...args: unknown[]) => void> = [];
 
 function defaultFrameTree(): unknown {
@@ -100,6 +103,9 @@ function installChromeMock(): void {
   commands = [];
   frameTree = defaultFrameTree();
   tabUpdates = [];
+  debuggerRefused = false;
+  pageAgentRequests = [];
+  agentSurface = () => ({ hit: false, frames: [] });
   eventListeners.length = 0;
   const storageArea = (store: () => Record<string, unknown>) => ({
     async get(keys: string | string[] | null) {
@@ -125,7 +131,9 @@ function installChromeMock(): void {
         onDetach: { addListener() {} },
         onEvent: { addListener(listener: (...args: unknown[]) => void) { eventListeners.push(listener); } },
         async getTargets() { return []; },
-        async attach() {},
+        async attach() {
+          if (debuggerRefused) throw new Error("Cannot access a chrome-extension:// URL of different extension");
+        },
         async detach() {},
         async sendCommand(target: { tabId: number }, method: string, params: Record<string, unknown>) {
           commands.push({ method, params: structuredClone(params) });
@@ -183,7 +191,19 @@ function installChromeMock(): void {
       action: { async setBadgeText() {}, async setBadgeBackgroundColor() {} },
       windows: { async update() { return {}; } },
       scripting: {
-        async executeScript(details: { func: { name: string } }) {
+        async executeScript(details: { func: { name: string }; args?: unknown[] }) {
+          if (details.func.name === "runPageAgentRequest") {
+            const request = details.args?.[0] as Record<string, unknown>;
+            pageAgentRequests.push(structuredClone(request));
+            const result = request.op === "select"
+              ? { id: request.selector === "#widget-host" ? 9 : 3 }
+              : request.op === "surface"
+              ? agentSurface(Number(request.id))
+              : request.op === "describe"
+              ? { tag: "BUTTON", text: "Buy" }
+              : undefined;
+            return [{ result: structuredClone(result), documentId: "doc-1" }];
+          }
           if (details.func.name === "collectChallengeFacts") {
             factsScans += 1;
             scanTimes.push(Date.now());
@@ -498,6 +518,27 @@ describe("browser_act challenge guard", () => {
     const unrelatedFrame = await runtime.act(TASK, TAB, 1, [{ kind: "click", selector: "a", frame_id: "plain-frame" }]);
     expect(unrelatedFrame.needsUser).toBeUndefined();
     expect(userGestureCalls()).toHaveLength(2);
+  });
+
+  test("on the scripting route, the page agent decides containment without the debugger", async () => {
+    debuggerRefused = true;
+    const runtime = newRuntime();
+    await openEpisode(runtime, turnstileActive());
+    agentSurface = (id) => ({ hit: id === 9, frames: [] });
+
+    const inside = await runtime.act(TASK, TAB, 1, [{ kind: "click", selector: "#widget-host" }]);
+    expect(inside).toMatchObject({ needsUser: true, result: { status: "challenge_active", actions: [] } });
+    expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([]);
+
+    const outside = await runtime.act(TASK, TAB, 1, [{ kind: "click", selector: "#buy" }]);
+    expect(outside.needsUser).toBeUndefined();
+    expect(outside.result).toMatchObject({ actions: [{ kind: "click", completed: true, page_route: "scripting" }] });
+    expect(pageAgentRequests.filter((request) => request.op === "surface")).toEqual([
+      { op: "surface", id: 9, selectors: expect.any(Array) },
+      { op: "surface", id: 3, selectors: expect.any(Array) },
+    ]);
+    expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([{ op: "act", id: 3, kind: "click" }]);
+    expect(commands.map((command) => command.method)).not.toContain("Page.getFrameTree");
   });
 
   test("a batch runs its prefix, stops before the refused action, and dispatches no input for it", async () => {
