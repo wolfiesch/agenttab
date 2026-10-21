@@ -15,6 +15,7 @@ from pathlib import Path
 EXTENSION_FILES = (
     "manifest.json",
     "background.js",
+    "page-agent.js",
     "popup.html",
     "popup.css",
     "popup.js",
@@ -130,7 +131,7 @@ def check_javascript(source: Path) -> None:
     node = shutil.which("node")
     if node is None:
         raise PackagingError("--check-js requires node on PATH")
-    for name in ("background.js", "popup.js", "wake.js"):
+    for name in ("background.js", "page-agent.js", "popup.js", "wake.js"):
         result = subprocess.run(
             [node, "--check", str(source / name)],
             capture_output=True,

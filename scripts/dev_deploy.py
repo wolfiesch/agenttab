@@ -28,6 +28,7 @@ from typing import Any, Callable
 REQUIRED_EXTENSION_FILES: tuple[str, ...] = (
     "manifest.json",
     "background.js",
+    "page-agent.js",
     "popup.html",
     "popup.css",
     "popup.js",

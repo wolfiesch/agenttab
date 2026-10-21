@@ -74,6 +74,7 @@ def create_mock_extension_bundle(
 
     (bundle_dir / "manifest.json").write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
     (bundle_dir / "background.js").write_text("console.log('bg');\n", encoding="utf-8")
+    (bundle_dir / "page-agent.js").write_text("console.log('agent');\n", encoding="utf-8")
     (bundle_dir / "popup.html").write_text("<!DOCTYPE html><html><body>popup</body></html>\n", encoding="utf-8")
     (bundle_dir / "popup.css").write_text("body { margin: 0; }\n", encoding="utf-8")
     (bundle_dir / "popup.js").write_text("console.log('pop');\n", encoding="utf-8")
