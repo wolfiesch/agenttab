@@ -24,6 +24,22 @@ import {
   type StagedCommit,
   type StagedDialog,
 } from "./protocol";
+import {
+  advance,
+  catalogSelectors,
+  catalogTokenSelectors,
+  collectChallengeFacts,
+  detect,
+  frameOfInterest,
+  newChallengeId,
+  sanitizeOrigin,
+  type ChallengeEvent,
+  type ChallengePageFacts,
+  type FrameFact,
+  type ProbeFacts,
+} from "./challenge";
+import { CHALLENGE_CATALOG } from "./challenge-catalog";
+import { challengeStoreAvailable, updateTaskEpisodes } from "./challenge-store";
 import { mutateState, readState } from "./storage";
 import { sensitiveFieldState } from "./sensitive-field";
 import {
@@ -49,6 +65,14 @@ const DEBUGGER_IDLE_MS = 30_000;
 const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
 // Scripting-route refs always name the tab's top document.
 const SCRIPTING_FRAME_ID = "scripting:top";
+/** Overall time a challenge scan may add to one result; an overrun omits `challenge`. */
+const CHALLENGE_SCAN_BUDGET_MS = 250;
+/** Response headers the detector may keep from a main-document response, lowercase. */
+const CHALLENGE_RESPONSE_HEADERS: readonly string[] = ["cf-mitigated", "x-amzn-waf-action", "retry-after"];
+const DOCUMENT_RESPONSE_LIMIT = 8;
+const CHALLENGE_FRAME_LIMIT = 256;
+const CHALLENGE_SELECTORS = catalogSelectors(CHALLENGE_CATALOG);
+const CHALLENGE_TOKEN_SELECTORS = catalogTokenSelectors(CHALLENGE_CATALOG);
 // Leaves more than 16 KiB for the Core response envelope and task binding inside
 // the 1 MiB host-to-client frame. Screenshot base64 data is separately capped at
 // 1,000,000 characters (750,000 decoded bytes).
@@ -160,6 +184,13 @@ interface TrackedDownload {
   cursor?: DownloadCursor;
 }
 
+interface DocumentResponse {
+  frameId: string;
+  loaderId: string;
+  status: number;
+  headers: Record<string, string>;
+}
+
 interface DebugSession {
   attached: boolean;
   attachPromise?: Promise<void>;
@@ -175,6 +206,7 @@ interface DebugSession {
   pendingWindowOpen?: PendingWindowOpen;
   frameContexts: Map<string, number>;
   frameSessions: Map<string, string>;
+  documentResponses: DocumentResponse[];
 }
 
 interface AxValue {
@@ -545,6 +577,31 @@ export class StandardBrowserRuntime {
             session.frameSessions.delete(frameId);
             session.frameContexts.delete(frameId);
           }
+        } else if (
+          method === "Network.responseReceived" &&
+          source.sessionId === undefined &&
+          params.type === "Document" &&
+          typeof params.frameId === "string" &&
+          typeof params.loaderId === "string" &&
+          isRecord(params.response) &&
+          typeof params.response.status === "number"
+        ) {
+          const headers: Record<string, string> = {};
+          if (isRecord(params.response.headers)) {
+            for (const [name, value] of Object.entries(params.response.headers)) {
+              const lower = name.toLowerCase();
+              if (CHALLENGE_RESPONSE_HEADERS.includes(lower) && typeof value === "string") {
+                headers[lower] = value.slice(0, 256);
+              }
+            }
+          }
+          session.documentResponses.push({
+            frameId: params.frameId,
+            loaderId: params.loaderId,
+            status: params.response.status,
+            headers,
+          });
+          if (session.documentResponses.length > DOCUMENT_RESPONSE_LIMIT) session.documentResponses.shift();
         } else if (method === "Network.requestWillBeSent" && typeof params.requestId === "string") {
           session.inflight.add(params.requestId);
           session.lastNetworkActivity = Date.now();
@@ -3343,6 +3400,7 @@ export class StandardBrowserRuntime {
         dialogGeneration: 0,
         frameContexts: new Map(),
         frameSessions: new Map(),
+        documentResponses: [],
       };
       this.sessions.set(tabId, session);
     }
@@ -3455,6 +3513,226 @@ export class StandardBrowserRuntime {
         if (this.sessions.get(tabId) === session) this.scheduleIdleDetach(tabId, session);
       });
     }, DEBUGGER_IDLE_MS);
+  }
+
+  /**
+   * Scans a task tab for a bot challenge and folds the result into the task's episodes.
+   * Read-only and best-effort: restricted routes, probe errors, and overruns of the scan budget
+   * return undefined and never fail the host operation.
+   */
+  async scanChallenge(taskId: string, tabId: number): Promise<ChallengeEvent | undefined> {
+    if (!challengeStoreAvailable()) return undefined;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") return undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const budget = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), CHALLENGE_SCAN_BUDGET_MS);
+      });
+      const deadline = Date.now() + CHALLENGE_SCAN_BUDGET_MS;
+      let facts: ProbeFacts | undefined;
+      try {
+        facts = await Promise.race([this.probeChallengeFacts(tabId, deadline), budget]);
+      } finally {
+        clearTimeout(timer);
+      }
+      if (facts === undefined) return undefined;
+      const detected = detect(CHALLENGE_CATALOG, facts);
+      const pageRevision = await this.revisions.current(tabId);
+      const now = Date.now();
+      const { event } = await updateTaskEpisodes(taskId, (episodes) =>
+        advance(episodes, detected, {
+          taskId,
+          tabId,
+          pageRevision,
+          pageOrigin: facts.page_origin,
+          now,
+          probe: facts.probe,
+          catalogVersion: CHALLENGE_CATALOG.catalog_version,
+          newId: newChallengeId,
+        }),
+      );
+      return event;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async probeChallengeFacts(tabId: number, deadline: number): Promise<ProbeFacts | undefined> {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: collectChallengeFacts,
+      args: [CHALLENGE_SELECTORS, CHALLENGE_TOKEN_SELECTORS],
+    });
+    const raw: unknown = injected[0]?.result;
+    if (
+      !isRecord(raw) ||
+      sanitizeOrigin(raw.page_origin) === undefined ||
+      !Array.isArray(raw.scripts) ||
+      !Array.isArray(raw.frames) ||
+      !Array.isArray(raw.elements) ||
+      !Array.isArray(raw.tokens)
+    ) {
+      return undefined;
+    }
+    const page = raw as unknown as ChallengePageFacts;
+    const augmented = await this.augmentChallengeFacts(tabId, page.frames, deadline).catch(() => null);
+    return {
+      probe: augmented === null ? "scripting" : "debugger",
+      page_origin: page.page_origin,
+      ...(augmented?.status !== undefined ? { status: augmented.status } : {}),
+      ...(augmented?.headers !== undefined ? { headers: augmented.headers } : {}),
+      scripts: page.scripts,
+      frames: augmented?.frames ?? page.frames,
+      elements: page.elements,
+      tokens: page.tokens,
+    };
+  }
+
+  /**
+   * Enriches scripting facts from a debugger session that is ALREADY attached: frame ids, cross-process
+   * frame visibility, and the main-document response. Returns null (never attaches) when no usable
+   * session exists.
+   */
+  private async augmentChallengeFacts(
+    tabId: number,
+    pageFrames: FrameFact[],
+    deadline: number,
+  ): Promise<{ frames: FrameFact[]; status?: number; headers?: Record<string, string> } | null> {
+    const session = this.sessions.get(tabId);
+    const rootResult = await this.sendIfAttached(tabId, "Page.getFrameTree", {});
+    if (!session || rootResult === null || !isRecord(rootResult.frameTree)) return null;
+
+    interface TreeFrame {
+      id: string;
+      parentId?: string;
+      loaderId?: string;
+      url: string;
+      sessionId?: string;
+    }
+    const tree = new Map<string, TreeFrame>();
+    const collect = (start: unknown, sessionId: string | undefined): void => {
+      const pending: unknown[] = [start];
+      while (pending.length > 0 && tree.size < CHALLENGE_FRAME_LIMIT) {
+        const node = pending.pop();
+        if (!isRecord(node) || !isRecord(node.frame) || typeof node.frame.id !== "string") continue;
+        const parentId = typeof node.frame.parentId === "string" ? node.frame.parentId : tree.get(node.frame.id)?.parentId;
+        tree.set(node.frame.id, {
+          id: node.frame.id,
+          ...(parentId !== undefined ? { parentId } : {}),
+          ...(typeof node.frame.loaderId === "string" ? { loaderId: node.frame.loaderId } : {}),
+          url: typeof node.frame.url === "string" ? node.frame.url : "",
+          ...(sessionId !== undefined ? { sessionId } : {}),
+        });
+        if (Array.isArray(node.childFrames)) pending.push(...node.childFrames);
+      }
+    };
+    collect(rootResult.frameTree, undefined);
+    const root = isRecord(rootResult.frameTree.frame) && typeof rootResult.frameTree.frame.id === "string"
+      ? tree.get(rootResult.frameTree.frame.id)
+      : undefined;
+    if (root === undefined) return null;
+    for (const sessionId of new Set(session.frameSessions.values())) {
+      if (Date.now() > deadline) break;
+      const child = await this.sendIfAttached(tabId, "Page.getFrameTree", {}, sessionId);
+      if (child !== null) collect(child.frameTree, sessionId);
+    }
+
+    const response = root.loaderId === undefined
+      ? undefined
+      : session.documentResponses.findLast(
+        (candidate) => candidate.frameId === root.id && candidate.loaderId === root.loaderId,
+      );
+
+    const frames = pageFrames.map((frame) => ({ ...frame }));
+    const tagged = new Set<FrameFact>();
+    for (const entry of tree.values()) {
+      if (entry.id === root.id || Date.now() > deadline) continue;
+      let url: URL;
+      try {
+        url = new URL(entry.url);
+      } catch {
+        continue;
+      }
+      if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+      const host = url.hostname.toLowerCase();
+      const mate = frames.find(
+        (frame) =>
+          !tagged.has(frame) && frame.frame_id === undefined && frame.host === host && frame.path === url.pathname,
+      );
+      if (mate !== undefined) {
+        mate.frame_id = entry.id;
+        tagged.add(mate);
+        continue;
+      }
+      if (!frameOfInterest(CHALLENGE_CATALOG, host)) continue;
+      const parent = entry.parentId === undefined ? undefined : tree.get(entry.parentId);
+      if (parent === undefined) continue;
+      try {
+        const owner = await this.sendIfAttached(tabId, "DOM.getFrameOwner", { frameId: entry.id }, parent.sessionId);
+        if (owner === null || typeof owner.backendNodeId !== "number") continue;
+        const query: Record<string, string> = Object.create(null);
+        url.searchParams.forEach((value, key) => {
+          if (!(key in query)) query[key] = value.slice(0, 64);
+        });
+        let width = 0;
+        let height = 0;
+        let visible = false;
+        try {
+          const box = await this.sendIfAttached(tabId, "DOM.getBoxModel", { backendNodeId: owner.backendNodeId }, parent.sessionId);
+          const model = isRecord(box?.model) ? box.model : undefined;
+          if (model !== undefined && Array.isArray(model.content) && typeof model.width === "number" && typeof model.height === "number") {
+            const xs = [model.content[0], model.content[2], model.content[4], model.content[6]].map(Number);
+            width = model.width;
+            height = model.height;
+            visible = width >= 1 && height >= 1 && Math.max(...xs) > 0;
+          }
+        } catch {
+          // DOM.getBoxModel fails for frames without a box (display:none); they are hidden.
+        }
+        frames.push({
+          host,
+          path: url.pathname,
+          query: { ...query },
+          frame_id: entry.id,
+          origin: url.origin,
+          visible,
+          width,
+          height,
+        });
+      } catch {
+        // The frame detached between the tree read and the owner lookup.
+      }
+    }
+    return {
+      frames,
+      ...(response !== undefined ? { status: response.status, headers: response.headers } : {}),
+    };
+  }
+
+  /**
+   * Sends one CDP command on a session that is already attached. Unlike `send`, it never attaches,
+   * never re-attaches after a detach, and returns null when no live session exists.
+   */
+  private async sendIfAttached(
+    tabId: number,
+    method: string,
+    params: Record<string, unknown>,
+    sessionId?: string,
+  ): Promise<Record<string, unknown> | null> {
+    const session = this.sessions.get(tabId);
+    if (!session?.attached || session.detachPromise || session.attachPromise) return null;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
+    session.busyCount += 1;
+    try {
+      await this.authorizeDebuggerUse(tabId);
+      const target: chrome.debugger.DebuggerSession = sessionId === undefined ? { tabId } : { tabId, sessionId };
+      const result: unknown = await chrome.debugger.sendCommand(target, method, params);
+      return isRecord(result) ? result : {};
+    } finally {
+      this.releaseDebuggerBusyLease(tabId, session);
+    }
   }
 
   private async send(

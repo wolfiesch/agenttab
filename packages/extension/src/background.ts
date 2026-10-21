@@ -1,3 +1,4 @@
+import { clearChallengeTask } from "./challenge-store";
 import { removeTabIfPresent, StandardBrowserRuntime } from "./browser";
 import { HandoffController, HANDOFF_ALARM } from "./handoff";
 import { NativeBridge, RECONNECT_ALARM } from "./native";
@@ -345,6 +346,16 @@ function errorOutcome(error: unknown, mutating: boolean, code: string): Outcome 
   return mutating && !PRE_DISPATCH_ERRORS[code] ? "unknown" : "not_started";
 }
 
+/** Adds the detector's `challenge` member to a result when the tab has an active or just-ended episode. */
+async function withChallenge(
+  taskId: string,
+  tabId: number,
+  result: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const challenge = await browser.scanChallenge(taskId, tabId);
+  return challenge === undefined ? result : { ...result, challenge };
+}
+
 async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse> {
   if (command.kind === "close_task" || command.kind === "finish_task") {
     try {
@@ -360,6 +371,9 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         );
       if (command.kind === "close_task" || result.finished === true) {
         await handoff.clearForTask(command.task_id);
+        await clearChallengeTask(command.task_id).catch((error) => {
+          console.warn("AgentTab challenge episode cleanup failed", error);
+        });
       }
       return completed(command.request_id, result);
     } catch (error) {
@@ -393,9 +407,12 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     }
     if (command.method === "browser_open") {
       const opened = await scheduler.enqueueGlobal(() => ownership.open(command.task_id, params));
+      const settled = await settleOpenedTab(command.task_id, opened, params.mode === "create");
       return completed(
         command.request_id,
-        await settleOpenedTab(command.task_id, opened, params.mode === "create"),
+        typeof settled.tab_id === "number"
+          ? await withChallenge(command.task_id, settled.tab_id, settled)
+          : settled,
       );
     }
     if (command.method === "browser_tabs") {
@@ -483,7 +500,8 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         if (command.method === "browser_snapshot") {
           await ownership.assertOwned(command.task_id, targetTabId);
           await assertCurrentOrigin(targetTabId, command.origin_policy);
-          return browser.snapshot(command.task_id, targetTabId, params);
+          const snapshot = await browser.snapshot(command.task_id, targetTabId, params);
+          return withChallenge(command.task_id, targetTabId, snapshot);
         }
         const revalidate = async () => {
           if (!scheduler.isAccepting()) {
@@ -495,7 +513,8 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
             throw scheduler.notStarted("AgentTab stopped the active browser wait");
           }
         };
-        return browser.wait(targetTabId, params, revalidate, command.task_id);
+        const waited = await browser.wait(targetTabId, params, revalidate, command.task_id);
+        return withChallenge(command.task_id, targetTabId, waited);
       });
       return completed(command.request_id, result);
     }
@@ -504,7 +523,11 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await ownership.assertOwned(command.task_id, targetTabId);
         assertHistoryOriginKnown(params.actions, command.origin_policy);
         await assertCurrentOrigin(targetTabId, command.origin_policy);
-        return browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
+        const execution = await browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
+        return {
+          ...execution,
+          result: await withChallenge(command.task_id, targetTabId, execution.result ?? {}),
+        };
       });
       if (execution.staged) {
         return commitRequired(command.request_id, execution.result ?? {}, execution.staged);
@@ -890,7 +913,12 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
   ) {
     const disposition = message.kind === "close_task" ? "close" : "keep";
     const result = await ownership.finishTask(message.task_id, disposition);
-    if (result.finished === true) await handoff.clearForTask(message.task_id);
+    if (result.finished === true) {
+      await handoff.clearForTask(message.task_id);
+      await clearChallengeTask(message.task_id).catch((error) => {
+        console.warn("AgentTab challenge episode cleanup failed", error);
+      });
+    }
     return result;
   }
   throw new Error("Unsupported popup message");

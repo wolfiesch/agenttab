@@ -1,6 +1,6 @@
 # ADR 0002: Challenge Detection
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-10-21
 - Decision owners: AgentTab maintainers
 - Applies to: extension detector, Core RPC v1 result and parameter schemas, host audit, OMP, MCP, and SDK adapters
@@ -124,7 +124,7 @@ The detector uses the richest probe available without changing debugger attachme
 
 Rules:
 
-1. The detector MUST NOT attach the debugger, enable a CDP domain, or extend the idle timer. ADR 0001 requires lazy attachment, and detection alone never justifies one. Header and status signals are therefore opportunistic, and every signature that matters MUST also have a DOM or frame signal.
+1. The detector MUST NOT attach or re-attach the debugger. ADR 0001 requires lazy attachment, and detection alone never justifies one. The `debugger` probe runs only when the tab's session is already attached and not detaching; it uses that session inside the operation that triggered the scan, holding the same busy lease as other operations and rescheduling the idle timer on release exactly as they do. Header and status signals are therefore opportunistic, and every signature that matters MUST also have a DOM or frame signal.
 2. DOM facts come from an isolated world. Page-script globals such as `window._cf_chl_opt` are unreachable and are never signals.
 3. Probes are read-only: no input, focus, scroll, or DOM writes. Cross-origin frames are classified by URL, owner size, and owner visibility; their DOM is never read.
 4. Matching runs inside the extension. Only signal identifiers, origins, booleans, and sizes leave the probe. URLs, header values, and text never reach a result or the host.
@@ -145,7 +145,7 @@ Visible means a non-empty box, computed `display` other than `none`, `visibility
 
 ### Matching and precedence
 
-1. Evaluate every enabled signature. A signature matches when its `match` tree holds. Its confidence is the highest `confidence` among matched leaves.
+1. Evaluate every enabled signature. A signature matches when any of its `signals` rules holds. Its confidence is the highest `confidence` among matched rules.
 2. Discard matches whose activity gate fails.
 3. If any vendor signature matched a surface, including a `never` signature, discard `generic.*` matches on that surface.
 4. Choose one primary by `kind` (`block` > `rate_limit` > `interstitial` > `puzzle` > `widget`), then confidence (`high` > `medium` > `low`), then catalog order.
@@ -157,39 +157,37 @@ Acceptance targets: at most 15 ms p95 added per scanned result with the `scripti
 
 ## Signature catalog
 
-The catalog is bundled JSON at `packages/extension/src/challenge-catalog.json`, versioned `YYYY.MM.N`, and schema-validated at build time. Catalog changes ship only in extension releases. AgentTab never fetches signatures remotely.
+The catalog is a typed module at `packages/extension/src/challenge-catalog.ts`, versioned `YYYY.MM.N` and checked against the catalog types by the TypeScript compiler. Catalog changes ship only in extension releases. AgentTab never fetches signatures remotely.
 
-```json
+```ts
 {
-  "catalog_version": "2026.10.0",
-  "signatures": [
+  catalog_version: "2026.10.0",
+  signatures: [
     {
-      "id": "cloudflare.turnstile",
-      "enabled": true,
-      "vendor": "cloudflare",
-      "product": "turnstile",
-      "kind": "widget",
-      "interaction": "automatic",
-      "wait_budget_ms": 15000,
-      "active_when": "widget_unsolved",
-      "token_field": "input[name=\"cf-turnstile-response\"]",
-      "min_size": { "width": 100, "height": 40 },
-      "match": {
-        "any": [
-          {
-            "signal": "cloudflare.frame.challenges_host",
-            "confidence": "high",
-            "frame": { "host": "challenges.cloudflare.com" }
-          },
-          {
-            "signal": "cloudflare.dom.turnstile_container",
-            "confidence": "medium",
-            "element": { "selector": ".cf-turnstile" }
-          }
-        ]
-      }
-    }
-  ]
+      id: "cloudflare.turnstile",
+      enabled: true,
+      vendor: "cloudflare",
+      product: "turnstile",
+      kind: "widget",
+      interaction: "automatic",
+      wait_budget_ms: 15000,
+      active_when: "widget_unsolved",
+      token_field: 'input[name="cf-turnstile-response"]',
+      min_size: { width: 100, height: 40 },
+      signals: [
+        {
+          signal: "cloudflare.frame.challenges_host",
+          confidence: "high",
+          when: { frame: { host: ["challenges.cloudflare.com"] } },
+        },
+        {
+          signal: "cloudflare.dom.turnstile_container",
+          confidence: "medium",
+          when: { element: { selector: ".cf-turnstile" } },
+        },
+      ],
+    },
+  ],
 }
 ```
 
@@ -199,9 +197,8 @@ Predicate leaves compare a lowercase host exactly or by suffix, a path by prefix
 | --- | --- | --- |
 | `header` | `debugger` | `{ "name": "cf-mitigated", "equals": "challenge" }` |
 | `status` | `debugger` | `{ "in": [429] }` |
-| `frame` | both; `scripting` sees light-DOM iframes only | `{ "host_suffix": ".hcaptcha.com" }`, `{ "host": "www.google.com", "path_prefix": "/recaptcha/api2/anchor" }` |
-| `frame_query` | both | `{ "name": "size", "equals": "invisible" }` |
-| `script` | both | `{ "path_contains": "/orchestrate/chl_page/" }` |
+| `frame` | both; `scripting` sees light-DOM iframes only | `{ "host_suffix": ["hcaptcha.com"] }`, `{ "host": ["www.google.com"], "path_prefix": ["/recaptcha/api2/anchor"], "query_absent": { "name": "size", "equals": "invisible" } }`; `query_equals` takes the same shape and requires the parameter |
+| `script` | both | `{ "path_contains": ["/cdn-cgi/challenge-platform/", "/scripts/jsd/"] }` (every substring must occur) |
 | `element` | both | `{ "selector": "#px-captcha" }` |
 | `all`, `any`, `not` | n/a | combinators |
 
@@ -211,10 +208,10 @@ Every signature needs a recorded positive fixture and a look-alike negative fixt
 
 | Signature | `kind` / `interaction` | Key signals | Confidence | Evidence |
 | --- | --- | --- | --- | --- |
-| `cloudflare.challenge_page` | `interstitial` / `automatic`, 15 s | header `cf-mitigated: challenge`; top-document script path containing `/orchestrate/chl_page/` or `/orchestrate/jsch/` with a `challenges.cloudflare.com` frame | high (header), medium (DOM) | Header [documented by Cloudflare](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/detect-response/) for all challenge page types; script paths need a fixture |
+| `cloudflare.challenge_page` | `interstitial` / `automatic`, 15 s | header `cf-mitigated: challenge`; top-document script path containing `/cdn-cgi/challenge-platform/` and either `/orchestrate/chl_page/` or `/orchestrate/jsch/` | high (header), medium (DOM) | Header [documented by Cloudflare](https://developers.cloudflare.com/cloudflare-challenges/challenge-types/challenge-pages/detect-response/) for all challenge page types; script paths need a fixture. The challenge frame sits in a closed shadow root, so no frame signal is required |
 | `cloudflare.jsd` | passive (`never`) | script path containing `/cdn-cgi/challenge-platform/` and `/scripts/jsd/` | n/a | Fixture needed. Cloudflare JavaScript Detections load from this path on ordinary pages, so `/cdn-cgi/challenge-platform/` alone is a false positive |
-| `cloudflare.turnstile` | `widget` / `automatic`, 15 s | frame host `challenges.cloudflare.com`; `.cf-turnstile`; token field `cf-turnstile-response` | high (frame), medium (DOM) | Turnstile test sitekeys |
-| `google_recaptcha.checkbox` | `widget` / `human` | frame host `www.google.com` or `www.recaptcha.net`, path prefix `/recaptcha/api2/anchor` or `/recaptcha/enterprise/anchor`, `not` `frame_query` `size=invisible`; token field `g-recaptcha-response` | medium | reCAPTCHA v2 test sitekey |
+| `cloudflare.turnstile` | `widget` / `automatic`, 15 s | frame host `challenges.cloudflare.com`; `.cf-turnstile`; token field `cf-turnstile-response` | high (frame), medium (DOM) | Turnstile test sitekeys. The widget iframe sits in a closed shadow root, so the `scripting` probe sees only the container; the `debugger` probe resolves the iframe owner |
+| `google_recaptcha.checkbox` | `widget` / `human` | frame host `www.google.com` or `www.recaptcha.net`, path prefix `/recaptcha/api2/anchor` or `/recaptcha/enterprise/anchor`, `query_absent` `size=invisible`; token field `g-recaptcha-response` | medium | reCAPTCHA v2 test sitekey |
 | `google_recaptcha.image_puzzle` | `puzzle` / `human` | frame path prefix `/recaptcha/api2/bframe` or `/recaptcha/enterprise/bframe`, visible, `min_size` 300 by 300 | medium | Fixture needed. The test sitekey never shows a puzzle, so this requires a live capture |
 | `google_recaptcha.v3` | passive (`never`) | `.grecaptcha-badge`; anchor frame with `size=invisible` | n/a | Prevents the invisible badge from matching the checkbox signature |
 | `hcaptcha.checkbox` | `widget` / `human` | frame host suffix `hcaptcha.com`, visible, height under 150; token field `h-captcha-response` | medium | hCaptcha test sitekey. hCaptcha documents that its asset subdomains can change, so only the registrable domain is matched |
@@ -349,7 +346,7 @@ jq -s '
 | Episodes | An interstitial self-reload keeps the ID; widget to puzzle keeps the ID; a same-origin clean scan clears; a cross-origin navigation supersedes; retention limits and `browser_finish` cleanup hold |
 | Offline fixtures | Local pages with a test catalog that maps vendor hosts to fixture hosts, driven through the real extension: result members, `challenge_cleared` wait, handoff completion, and the act guard |
 | Live vendor smoke (nightly, network) | Real widgets embedded in a local page with vendor test sitekeys: Turnstile `3x00000000000000000000FF` (forces an interactive challenge) and `1x00000000000000000000BB` (invisible pass, which must not emit once cleared), reCAPTCHA v2 `6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI`, and hCaptcha `10000000-ffff-ffff-ffff-000000000001` |
-| Attachment | A `scripting`-probe scan leaves zero AgentTab debugger attachments and does not extend an existing idle timer |
+| Attachment | A scan on a detached tab leaves zero AgentTab debugger attachments; a scan on an attached tab never re-attaches after a detach |
 | Latency | Fixture measurements recorded under `docs/benchmarks.md` rules before default enablement |
 
 ## Implementation map
@@ -361,7 +358,7 @@ jq -s '
 | `schemas/rpc/v1/browser-handoff.schema.json` | `challenge_cleared` completion kind |
 | `host-rs/crates/agenttab-protocol/src/lib.rs` | Wait condition and `HandoffCompletion` variants with validation |
 | `host-rs/crates/agenttab-host/src/audit.rs` | Explicit `challenge` audit field |
-| `packages/extension/src/challenge.ts`, `challenge-catalog.json` | Probes, matcher, catalog, and episode store |
+| `packages/extension/src/challenge.ts`, `challenge-catalog.ts`, `challenge-store.ts` | Matcher, activity gate, episode transitions, catalog, and episode store |
 | `packages/extension/src/browser.ts` | Scan hooks in open, snapshot, act, and wait; act guard; main-frame `Network.responseReceived` capture while attached |
 | `packages/extension/src/handoff.ts`, `protocol.ts` | Completion kind and parameter validation |
 | `packages/omp/src/index.ts`, `pi-schema.ts`, `render.ts`; `packages/mcp/src/server.ts`; SDKs | Advertise the schema changes, render `challenge`, add tool guidance |
@@ -380,7 +377,7 @@ The event separates a harness-neutral core from an AgentTab binding. Core: `vend
 
 ## Open questions
 
-1. Should `google_recaptcha.checkbox` be `automatic`? A real profile often passes on a single click, but that click is human input under ADR 0001. Proposed: `human`.
-2. Should Developer mode be able to lift the act guard? Proposed: no, until a concrete use case exists.
+1. Decided: `google_recaptcha.checkbox` is `human`. A real profile often passes on a single click, but that click is human input under ADR 0001.
+2. Decided: Developer mode cannot lift the act guard. Revisit only with a concrete use case.
 3. Are the 10 to 20 second automatic budgets right? Proposed: start there and tune from the audit report.
 4. Should Developer mode keep raw probe facts in a separate local debug sink to speed up catalog work? This would be the only place URLs and paths are retained.
