@@ -2632,10 +2632,7 @@ mod tests {
             );
             assert_eq!(response["ok"], false, "{response}");
             assert_eq!(response["error"]["code"], code);
-            assert_eq!(
-                response["outcome"],
-                serde_json::to_value(outcome).unwrap()
-            );
+            assert_eq!(response["outcome"], serde_json::to_value(outcome).unwrap());
             assert_eq!(response["error"].get("details").cloned(), details);
         }
     }

@@ -5974,6 +5974,24 @@ describe("extension entrypoint admission boundaries", () => {
     });
     expect(Object.values((await readState()).notices)).toEqual([]);
     expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
+    expect(await sendNativeCommand(
+      "018f47b8-2f80-7c20-9c77-f8a38c9e63a0",
+      TASK_C,
+      "browser_handoff",
+      {
+        operation: "request",
+        tab_id: 102,
+        expected_page_revision: restrictedPageRevision,
+        prompt: "Complete the challenge",
+        completion: { kind: "challenge_cleared", value: "chl_3k9w2m7q8x1v5b0n4c6z" },
+        timeout_ms: 1_000,
+      },
+    )).toMatchObject({
+      outcome: "not_started",
+      error: { code: "browser_restricted_origin" },
+    });
+    expect(Object.values((await readState()).notices)).toEqual([]);
+    expect(scriptingCallCount).toBe(scriptingCallsBeforeRestrictedSnapshot);
     const restrictedTab = tabStore.get(102);
     if (!restrictedTab) throw new Error("restricted task tab is unavailable");
     restrictedTab.url = "chrome://settings/";

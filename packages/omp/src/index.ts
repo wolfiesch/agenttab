@@ -5,6 +5,7 @@ import {
   AgentTabTransportError,
   SCREENSHOT_MAX_BYTES,
   SCREENSHOT_MAX_DIMENSION,
+  CHALLENGE_GUIDANCE,
   SNAPSHOT_TEXT_MAX_BYTES,
   STANDARD_ACTION_VALUE_MAX_CHARS,
   STANDARD_PRESS_KEYS,
@@ -144,7 +145,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_open",
       label: "Browser Open",
-      description: "Create a task tab, create an unfocused task-owned window, or explicitly adopt the active tab.",
+      description: `Create a task tab, create an unfocused task-owned window, or explicitly adopt the active tab. ${CHALLENGE_GUIDANCE.summary}`,
       approval: "write",
       schema: (z) => z.object({
         mode: z.enum(["create", "adopt_active"]),
@@ -156,7 +157,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_snapshot",
       label: "Browser Snapshot",
-      description: "Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab.",
+      description: `Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab. ${CHALLENGE_GUIDANCE.summary}`,
       approval: "read",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
@@ -179,7 +180,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_act",
       label: "Browser Act",
-      description: "Run an ordered batch of typed actions against one task-owned tab and page revision.",
+      description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${CHALLENGE_GUIDANCE.summary}`,
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);
@@ -247,7 +248,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_wait",
       label: "Browser Wait",
-      description: "Wait for one schema-defined load, URL, text, selector, network-idle, download, or challenge_cleared condition.",
+      description: `Wait for one schema-defined load, URL, text, selector, network-idle, download, or challenge_cleared condition. ${CHALLENGE_GUIDANCE.wait}`,
       approval: "read",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
@@ -282,7 +283,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_handoff",
       label: "Browser Handoff",
-      description: "Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id.",
+      description: `Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id. ${CHALLENGE_GUIDANCE.handoff}`,
       approval: "write",
       // One flat object covers every operation: OpenAI-compatible providers reject a root union.
       // Core enforces which fields each operation requires.
@@ -291,10 +292,10 @@ const DEFINITIONS: ReadonlyArray<{
         tab_id: z.number().int().min(0).optional(),
         expected_page_revision: z.number().int().min(0).optional(),
         prompt: z.string().min(1).max(2000).optional(),
-        completion: z.object({
-          kind: z.enum(["url", "selector"]),
-          value: z.string().min(1).max(65_536),
-        }).strict().optional(),
+        completion: z.union([
+          z.object({ kind: z.enum(["url", "selector"]), value: z.string().min(1).max(65_536) }).strict(),
+          z.object({ kind: z.literal("challenge_cleared"), value: z.string().regex(/^chl_[0-9a-z]{20}$/) }).strict(),
+        ]).optional(),
         timeout_ms: z.number().int().min(1000).max(900_000).optional(),
         notice_id: z.string().min(1).max(256).optional(),
       }).strict(),

@@ -78,6 +78,16 @@ A `browser_handoff` request records an advisory attention notice for one task ta
 
 This keeps human-only input out of agent requests. It cannot protect secrets from a compromised device, a malicious webpage, or browser extensions with their own access.
 
+## Bot-challenge detection
+
+The extension reports a `challenge` member when a task-owned tab shows a recognized bot-challenge page or widget. Detection is advisory and bounded by these points:
+
+- **Spoofed challenges.** A page can imitate catalog markers to provoke a handoff or trip the act guard. A handoff only shows a notice bound to the real tab and origin, and the guard only refuses input, which is a denial of service the page could already cause. Treat page content as untrusted regardless.
+- **Hidden challenges.** Absence of `challenge` is not proof that a page is usable.
+- **No page text.** The event contains only catalog identifiers, enums, integers, and an origin. No page-controlled text, URL path or query, or sitekey enters it, so it adds no prompt-injection surface.
+- **Tokens never read.** A response token is never read out, copied, or written. `token_present` is a boolean computed inside the page.
+- **Bundled catalog.** The catalog ships with the extension and is reviewed like code. Nothing is fetched at runtime.
+
 ## Upload guardrails
 
 `upload_file` is available only for regular files below a configured `dlp_allowed_roots` path and under the configured size limit. The host canonicalizes the path, rejects symlink races and Unix hard-linked files, verifies the opened file, copies it into a private staging directory, and uses the staged copy for the action. Each copy keeps the source file name inside its own per-upload directory, because pages derive the uploaded file's name and type from it. On Unix, staging directories are mode `0700` and staging files are mode `0600`. Chrome reads a file input's bytes only when the page reads or submits the file, so an upload that reached the page stays on disk for 10 minutes before the host removes it. Uploads that never reach the page are removed immediately, and a starting host removes per-upload directories older than 15 minutes that an exited host left behind.
@@ -94,7 +104,7 @@ The host stores task state, ownership, revision floors, staged Commit records, e
 
 ## Local audit data and operational records
 
-Audit is local, enabled by default, and written to `audit.jsonl` under the AgentTab state directory. On Unix the file is mode `0600`. Each record contains timestamps, connection ID, task ID when assigned, request ID, method, outcome, duration, replay flag, target origins, a structural argument summary, an argument digest, structural result summary, error code, and recovery text. It does not intentionally store raw argument or result values, but origins, object keys, string lengths, error text, and digests can still be sensitive operational metadata. Restrict access to the state directory.
+Audit is local, enabled by default, and written to `audit.jsonl` under the AgentTab state directory. On Unix the file is mode `0600`. Each record contains timestamps, connection ID, task ID when assigned, request ID, method, outcome, duration, replay flag, target origins, a structural argument summary, an argument digest, structural result summary, error code, recovery text, and, when a result or error carries a bot-challenge event, a fixed `challenge` summary. The summary holds catalog vendor and product identifiers, enum values (`kind`, `interaction`, `state`, `confidence`, and `resolved_by` of `wait`, `handoff`, `navigation`, or `observed`), the challenge ID, the page origin, and an elapsed time in milliseconds. It carries no page text, URL path, or token, and it stays in the local audit file like the other fields. It does not intentionally store raw argument or result values, but origins, object keys, string lengths, error text, and digests can still be sensitive operational metadata. Restrict access to the state directory.
 
 SQLite event receipts and idempotency records are local reliability data, not user-visible proof that an external side effect occurred. Audit can be disabled only through the local managed policy. Neither record type is a replacement for reviewing the website or its own receipt.
 

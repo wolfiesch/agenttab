@@ -746,6 +746,7 @@ fn default_handoff_timeout() -> u64 {
 pub enum HandoffCompletion {
     Url { value: String },
     Selector { value: String },
+    ChallengeCleared { value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -950,17 +951,24 @@ impl MethodParams {
                     (1_000..=900_000).contains(timeout_ms),
                     "timeout_ms must be between 1000 and 900000",
                 )?;
-                if let Some(
-                    HandoffCompletion::Url { value } | HandoffCompletion::Selector { value },
-                ) = completion
-                {
-                    require_len(
+                match completion {
+                    Some(
+                        HandoffCompletion::Url { value } | HandoffCompletion::Selector { value },
+                    ) => {
+                        require_len(
+                            method,
+                            value,
+                            1,
+                            MAX_HANDOFF_COMPLETION_CHARS,
+                            "completion.value",
+                        )?;
+                    }
+                    Some(HandoffCompletion::ChallengeCleared { value }) => require(
                         method,
-                        value,
-                        1,
-                        MAX_HANDOFF_COMPLETION_CHARS,
-                        "completion.value",
-                    )?;
+                        is_challenge_id(value),
+                        "completion.value must match ^chl_[0-9a-z]{20}$",
+                    )?,
+                    None => {}
                 }
             }
             Self::Handoff(
@@ -2438,7 +2446,8 @@ mod tests {
                 "browser_wait",
                 json!({"tab_id": 7, "condition": invalid_condition}),
                 false,
-            )).is_err());
+            ))
+            .is_err());
         }
         for (method, params, mutation) in [
             (
@@ -2563,6 +2572,67 @@ mod tests {
                 ..
             }) if value == "body"
         ));
+
+        let (_, challenge_params) = RpcRequest::parse(request(
+            "browser_handoff",
+            json!({
+                "operation": "request",
+                "tab_id": 1,
+                "expected_page_revision": 2,
+                "prompt": "Complete the challenge",
+                "completion": {"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6z"},
+            }),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(
+            challenge_params,
+            MethodParams::Handoff(BrowserHandoffParams::Request {
+                completion: Some(HandoffCompletion::ChallengeCleared { value }),
+                ..
+            }) if value == "chl_3k9w2m7q8x1v5b0n4c6z"
+        ));
+        for invalid_completion in [
+            json!({"kind": "challenge_cleared", "value": "chl_short"}),
+            json!({"kind": "challenge_cleared", "value": "xyz_3k9w2m7q8x1v5b0n4c6z"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3K9W2M7Q8X1V5B0N4C6Z"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6zz"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6é"}),
+            json!({"kind": "challenge_cleared", "value": ""}),
+        ] {
+            assert!(matches!(
+                RpcRequest::parse(request(
+                    "browser_handoff",
+                    json!({
+                        "operation": "request",
+                        "tab_id": 1,
+                        "expected_page_revision": 2,
+                        "prompt": "Complete the challenge",
+                        "completion": invalid_completion,
+                    }),
+                    true,
+                )),
+                Err(ProtocolError::InvalidParamConstraint { .. })
+            ));
+        }
+        for invalid_completion in [
+            json!({"kind": "challenge_cleared"}),
+            json!({"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6z", "extra": 1}),
+            json!({"kind": "challenge_cleared", "challenge_id": "chl_3k9w2m7q8x1v5b0n4c6z"}),
+        ] {
+            assert!(RpcRequest::parse(request(
+                "browser_handoff",
+                json!({
+                    "operation": "request",
+                    "tab_id": 1,
+                    "expected_page_revision": 2,
+                    "prompt": "Complete the challenge",
+                    "completion": invalid_completion,
+                }),
+                true,
+            ))
+            .is_err());
+        }
 
         for operation in ["status", "resolve", "dismiss"] {
             let (_, params) = RpcRequest::parse(request(

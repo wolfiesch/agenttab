@@ -116,6 +116,62 @@ class BrowserWaitCondition(TypedDict):
     challenge_id: NotRequired[str]
 
 
+class BrowserHandoffCompletion(TypedDict):
+    kind: Literal["url", "selector", "challenge_cleared"]
+    value: str
+
+
+class ChallengeSurface(TypedDict):
+    scope: Literal["document", "frame", "element"]
+    visible: bool
+    frame_id: NotRequired[str]
+    frame_origin: NotRequired[str]
+
+
+class ChallengeDetector(TypedDict):
+    catalog_version: str
+    probe: Literal["debugger", "scripting"]
+
+
+class ChallengeEvent(TypedDict):
+    """One bot challenge episode (schemas/rpc/v1/challenge.schema.json).
+
+    Carries no page text, URL path or query, sitekey, or response token.
+    """
+
+    spec_version: Literal[1]
+    challenge_id: str
+    tab_id: int
+    page_revision: int
+    first_page_revision: int
+    first_detected_at_ms: int
+    detected_at_ms: int
+    page_origin: str
+    vendor: str
+    product: str
+    kind: Literal["interstitial", "widget", "puzzle", "block", "rate_limit"]
+    interaction: Literal["automatic", "human", "none"]
+    state: Literal["active", "cleared", "superseded"]
+    confidence: Literal["high", "medium", "low"]
+    surface: ChallengeSurface
+    signals: list[str]
+    next: Literal["wait", "handoff", "retry_later", "stop", "none"]
+    detector: ChallengeDetector
+    token_present: NotRequired[bool]
+    wait_budget_ms: NotRequired[int]
+    retry_after_ms: NotRequired[int]
+    notice_id: NotRequired[str]
+
+
+class ChallengeBearingResult(TypedDict):
+    """Optional members added to browser_open, browser_snapshot, browser_act,
+    browser_wait, and browser_handoff resolve results when a challenge is present.
+    """
+
+    challenge: NotRequired[ChallengeEvent]
+    status: NotRequired[str]
+
+
 def resolve_transport_timeout(
     method: str,
     params: Mapping[str, Any],

@@ -421,6 +421,30 @@ test("OMP forwards long-operation timeouts for SDK deadline selection", async ()
   ]);
 });
 
+test("OMP forwards challenge_cleared handoff completions and documents the challenge contract", async () => {
+  const { tools, calls } = register(false);
+  const handoff = tools.find((tool) => tool.name === "browser_handoff");
+  const completion = { kind: "challenge_cleared", value: "chl_3k9w2m7q8x1v5b0n4c6z" };
+  await executeTool(handoff, {
+    operation: "request",
+    tab_id: 7,
+    expected_page_revision: 3,
+    prompt: "Complete the verification",
+    completion,
+  });
+  expect(calls).toEqual([{
+    method: "browser_handoff",
+    params: { operation: "request", tab_id: 7, expected_page_revision: 3, prompt: "Complete the verification", completion },
+  }]);
+  for (const name of ["browser_open", "browser_snapshot", "browser_act"]) {
+    const description = String(tools.find((tool) => tool.name === name)?.description);
+    expect(description).toContain("challenge.next");
+    expect(description).toContain("Never act inside the challenge surface");
+  }
+  expect(String(tools.find((tool) => tool.name === "browser_wait")?.description)).toContain("wait_budget_ms");
+  expect(String(handoff?.description)).toContain("completion_not_met");
+});
+
 test("OMP forwards handoff notice status, resolve, and dismiss operations", async () => {
   const { tools, calls } = register(false);
   const handoff = tools.find((tool) => tool.name === "browser_handoff");

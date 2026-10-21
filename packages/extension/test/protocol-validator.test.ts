@@ -51,3 +51,33 @@ describe("native protocol reliability contracts", () => {
     }))).toThrow();
   });
 });
+
+describe("browser_handoff challenge_cleared completion", () => {
+  const request = (completion: unknown) =>
+    command("browser_handoff", {
+      operation: "request",
+      tab_id: 1,
+      expected_page_revision: 2,
+      prompt: "Complete the challenge",
+      completion,
+    });
+
+  test("accepts a challenge id value", () => {
+    const completion = { kind: "challenge_cleared", value: "chl_3k9w2m7q8x1v5b0n4c6z" };
+    expect(parseCommand(request(completion)).params.completion).toEqual(completion);
+  });
+
+  test("rejects malformed ids, missing values, and extra keys", () => {
+    for (const completion of [
+      { kind: "challenge_cleared" },
+      { kind: "challenge_cleared", value: "chl_short" },
+      { kind: "challenge_cleared", value: "xyz_3k9w2m7q8x1v5b0n4c6z" },
+      { kind: "challenge_cleared", value: "chl_3K9W2M7Q8X1V5B0N4C6Z" },
+      { kind: "challenge_cleared", value: "chl_3k9w2m7q8x1v5b0n4c6zz" },
+      { kind: "challenge_cleared", value: "chl_3k9w2m7q8x1v5b0n4c6z", extra: true },
+      { kind: "challenge_cleared", challenge_id: "chl_3k9w2m7q8x1v5b0n4c6z" },
+    ]) {
+      expect(() => parseCommand(request(completion))).toThrow();
+    }
+  });
+});

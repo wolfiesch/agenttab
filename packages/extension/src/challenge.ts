@@ -153,6 +153,8 @@ export interface ChallengeEvent {
   next: ChallengeNext;
   wait_budget_ms?: number;
   retry_after_ms?: number;
+  /** Set once a `browser_handoff` request with a `challenge_cleared` completion names this episode. */
+  notice_id?: string;
   detector: { catalog_version: string; probe: ChallengeProbe };
 }
 
@@ -689,6 +691,7 @@ export function episodeEvent(episode: ChallengeEpisode): ChallengeEvent {
     ...(episode.kind === "rate_limit" && episode.retry_after_ms !== undefined
       ? { retry_after_ms: episode.retry_after_ms }
       : {}),
+    ...(episode.notice_id !== undefined ? { notice_id: episode.notice_id } : {}),
     detector: {
       catalog_version: episode.detector.catalog_version,
       probe: episode.detector.probe,
@@ -885,6 +888,7 @@ export function parseChallengeEpisode(value: unknown): ChallengeEpisode | undefi
     (raw.token_present !== undefined && typeof raw.token_present !== "boolean") ||
     (raw.wait_budget_ms !== undefined && !nonNegativeInt(raw.wait_budget_ms)) ||
     (raw.retry_after_ms !== undefined && !nonNegativeInt(raw.retry_after_ms)) ||
+    (raw.notice_id !== undefined && (typeof raw.notice_id !== "string" || raw.notice_id.length === 0)) ||
     (raw.budget_ms !== undefined && !nonNegativeInt(raw.budget_ms)) ||
     (raw.observable_by_scripting !== undefined && typeof raw.observable_by_scripting !== "boolean")
   ) {
@@ -916,6 +920,7 @@ export function parseChallengeEpisode(value: unknown): ChallengeEpisode | undefi
     next: raw.next,
     ...(typeof raw.wait_budget_ms === "number" ? { wait_budget_ms: raw.wait_budget_ms } : {}),
     ...(typeof raw.retry_after_ms === "number" ? { retry_after_ms: raw.retry_after_ms } : {}),
+    ...(typeof raw.notice_id === "string" ? { notice_id: raw.notice_id } : {}),
     detector: { catalog_version: detectorRaw.catalog_version, probe: detectorRaw.probe },
     task_id: raw.task_id,
     scope_class: raw.scope_class,

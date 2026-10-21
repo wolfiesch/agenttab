@@ -108,10 +108,10 @@ The detector lives in a new extension module, `packages/extension/src/challenge.
 | --- | --- |
 | `browser_open` | Before returning the result that carries `page_revision` |
 | `browser_snapshot` | Every mode, before returning |
-| `browser_act` | After the batch completes, stops at a staged action, or fails |
+| `browser_act` | After the batch completes, stops at a staged action, or fails. A `navigate` step returns once navigation starts, so its scan can see the previous document; the following load wait or snapshot reports the new page's challenge |
 | `browser_wait` | After `load`, `url`, `network_idle`, and `challenge_cleared` conditions |
 
-On a `tab_only` route, `challenge` is always absent and the absence means "unscanned"; `automation_route` already states this. A probe error or overrun omits `challenge`, records a local audit error code, and never fails the host operation.
+On a `tab_only` route, `challenge` is always absent and the absence means "unscanned"; `automation_route` already states this. A probe error or overrun omits `challenge` and never fails the host operation.
 
 ### Probes
 
@@ -153,7 +153,7 @@ Visible means a non-empty box, computed `display` other than `none`, `visibility
 
 ### Budget
 
-Acceptance targets: at most 15 ms p95 added per scanned result with the `scripting` probe and 30 ms p95 with the `debugger` probe, on controlled fixtures. These are targets, not measurements. Record measured values under `docs/benchmarks.md` rules before enabling detection by default. A probe that exceeds 250 ms is abandoned for that result.
+Acceptance targets: at most 15 ms p95 added per scanned result with the `scripting` probe and 30 ms p95 with the `debugger` probe, on controlled fixtures. `scripts/challenge_live_smoke.py --measure N` times the `scripting` probe and the episode-store round trip from the extension service worker, plus the end-to-end `browser_snapshot` round trip that includes a full scan, and writes raw samples with source and build identity as `docs/benchmarks.md` requires. A probe that exceeds 250 ms is abandoned for that result.
 
 ## Signature catalog
 
@@ -345,10 +345,10 @@ jq -s '
 | Schema | `tests/architecture/verify_protocol_schemas.py` validates the event schema, with positive examples and negatives for scope and kind conflicts, `next` invariants, and origins carrying a path |
 | Matcher | Table-driven tests from probe facts to events, per signature, including look-alike negatives: a Cloudflare JavaScript Detections page, the invisible reCAPTCHA badge, a reCAPTCHA v3 page, and a hidden Turnstile container |
 | Episodes | An interstitial self-reload keeps the ID; widget to puzzle keeps the ID; a same-origin clean scan clears; a cross-origin navigation supersedes; retention limits and `browser_finish` cleanup hold |
-| Offline fixtures | Local pages with a test catalog that maps vendor hosts to fixture hosts, driven through the real extension: result members, `challenge_cleared` wait, handoff completion, and the act guard |
-| Live vendor smoke (nightly, network) | Real widgets embedded in a local page with vendor test sitekeys: Turnstile `3x00000000000000000000FF` (forces an interactive challenge) and `1x00000000000000000000BB` (invisible pass, which must not emit once cleared), reCAPTCHA v2 `6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI`, and hCaptcha `10000000-ffff-ffff-ffff-000000000001` |
+| Offline fixtures | `scripts/challenge_live_smoke.py` drives the built extension and host through the Python SDK against local fixtures: a `cf-mitigated: challenge` response, an HTTP 429 with `Retry-After`, and a clean page, covering result members, document-scope act refusal, episode clearing, and schema validation of every captured event |
+| Live vendor smoke (network) | The same script embeds vendor test sitekeys for reCAPTCHA v2 `6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI` and hCaptcha `10000000-ffff-ffff-ffff-000000000001`: detection, widget-surface act refusal beside an allowed outside click, `challenge_cleared` wait returning `needs_user`, and handoff binding with `completion_not_met`. Turnstile test sitekeys do not render under Chrome for Testing automation, so Turnstile surface behavior is covered by unit tests and the closed-shadow-root containment check |
 | Attachment | A scan on a detached tab leaves zero AgentTab debugger attachments; a scan on an attached tab never re-attaches after a detach |
-| Latency | Fixture measurements recorded under `docs/benchmarks.md` rules before default enablement |
+| Latency | `scripts/challenge_live_smoke.py --measure N` on controlled fixtures |
 
 ## Implementation map
 
@@ -359,11 +359,12 @@ jq -s '
 | `schemas/rpc/v1/browser-handoff.schema.json` | `challenge_cleared` completion kind |
 | `host-rs/crates/agenttab-protocol/src/lib.rs` | Wait condition and `HandoffCompletion` variants with validation |
 | `host-rs/crates/agenttab-host/src/audit.rs` | Explicit `challenge` audit field |
-| `packages/extension/src/challenge.ts`, `challenge-catalog.ts`, `challenge-store.ts` | Matcher, activity gate, episode transitions, catalog, and episode store |
-| `packages/extension/src/browser.ts` | Scan hooks in open, snapshot, act, and wait; act guard; main-frame `Network.responseReceived` capture while attached |
-| `packages/extension/src/handoff.ts`, `protocol.ts` | Completion kind and parameter validation |
-| `packages/omp/src/index.ts`, `pi-schema.ts`, `render.ts`; `packages/mcp/src/server.ts`; SDKs | Advertise the schema changes, render `challenge`, add tool guidance |
-| `docs/security.md`, `docs/telemetry.md`, `CHANGELOG.md` | Document the behavior and the audit field |
+| `packages/extension/src/challenge.ts`, `challenge-catalog.ts`, `challenge-store.ts`, `challenge-guard.ts` | Matcher, activity gate, episode transitions, catalog, episode store, and act-guard surface containment |
+| `packages/extension/src/browser.ts` | Scan hooks in open, snapshot, act, and wait; `challenge_cleared` wait; act guard; main-frame `Network.responseReceived` capture while attached |
+| `packages/extension/src/handoff.ts`, `protocol.ts`, `storage.ts` | Completion kind, notice binding, and parameter validation |
+| `packages/omp/src/index.ts`, `pi-schema.ts`, `render.ts`, `native.ts`; `packages/mcp/src/server.ts`; SDKs | Advertise the schema changes, render `challenge`, add tool guidance |
+| `scripts/challenge_live_smoke.py` | Live end-to-end smoke and latency measurement against the built extension and host |
+| `docs/security.md`, `docs/telemetry.md`, `docs/mcp.md`, `docs/verification.md`, `CHANGELOG.md` | Document the behavior, the agent contract, the audit field, and the smoke |
 
 ## Non-goals
 

@@ -34,7 +34,7 @@ export interface RevisionRecord {
 export type NoticeStatus = "open" | "resolved" | "dismissed" | "expired";
 
 export interface NoticeCompletion {
-  kind: "url" | "selector";
+  kind: "url" | "selector" | "challenge_cleared";
   value: string;
 }
 
@@ -144,7 +144,7 @@ function parseNotice(value: unknown, noticeId: string): HandoffNotice | null {
     !finiteInteger(notice.expiresAtMs, notice.startedAtMs as number) ||
     (completion !== undefined &&
       completion !== null &&
-      ((completion.kind !== "url" && completion.kind !== "selector") ||
+      ((completion.kind !== "url" && completion.kind !== "selector" && completion.kind !== "challenge_cleared") ||
         typeof completion.value !== "string"))
   ) {
     return null;

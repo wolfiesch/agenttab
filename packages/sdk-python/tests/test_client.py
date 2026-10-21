@@ -20,6 +20,9 @@ from agenttab import (
     DEFAULT_BROWSER_CREDENTIALS_TIMEOUT,
     DEFAULT_BROWSER_HANDOFF_TIMEOUT,
     DEFAULT_BROWSER_WAIT_TIMEOUT,
+    BrowserHandoffCompletion,
+    ChallengeBearingResult,
+    ChallengeEvent,
     LONG_OPERATION_TRANSPORT_GRACE,
     encode_frame,
     read_frame,
@@ -27,6 +30,41 @@ from agenttab import (
     uuid7,
 )
 from agenttab.client import create_resume_capability_store
+
+
+class ChallengeTypeTests(unittest.TestCase):
+    def test_challenge_types_and_handoff_completion_are_exported(self) -> None:
+        completion: BrowserHandoffCompletion = {"kind": "challenge_cleared", "value": "chl_3k9w2m7q8x1v5b0n4c6z"}
+        event: ChallengeEvent = {
+            "spec_version": 1,
+            "challenge_id": completion["value"],
+            "tab_id": 1,
+            "page_revision": 1,
+            "first_page_revision": 1,
+            "first_detected_at_ms": 1,
+            "detected_at_ms": 2,
+            "page_origin": "https://example.test",
+            "vendor": "cloudflare",
+            "product": "challenge_page",
+            "kind": "interstitial",
+            "interaction": "automatic",
+            "state": "active",
+            "confidence": "high",
+            "surface": {"scope": "document", "visible": True},
+            "signals": ["cloudflare.challenge_page.title"],
+            "next": "wait",
+            "wait_budget_ms": 15_000,
+            "detector": {"catalog_version": "2026.10.1", "probe": "debugger"},
+        }
+        result: ChallengeBearingResult = {"status": "challenge_active", "challenge": event}
+        self.assertEqual(result["challenge"]["next"], "wait")
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_handoff",
+                {"operation": "request", "completion": completion},
+            ),
+            DEFAULT_BROWSER_HANDOFF_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
+        )
 
 
 class FramingTests(unittest.TestCase):

@@ -66,6 +66,77 @@ export type BrowserSnapshotParams =
     max_bytes?: number;
   } & FrameScoped);
 
+export type ChallengeKind = "interstitial" | "widget" | "puzzle" | "block" | "rate_limit";
+export type ChallengeInteraction = "automatic" | "human" | "none";
+export type ChallengeState = "active" | "cleared" | "superseded";
+export type ChallengeNext = "wait" | "handoff" | "retry_later" | "stop" | "none";
+
+export interface ChallengeSurface {
+  scope: "document" | "frame" | "element";
+  frame_id?: string;
+  frame_origin?: string;
+  visible: boolean;
+}
+
+/**
+ * One active or just-ended bot challenge episode on a task-owned tab, as defined by
+ * schemas/rpc/v1/challenge.schema.json. Carries no page text, URL path or query,
+ * sitekey, or response token.
+ */
+export interface ChallengeEvent {
+  spec_version: 1;
+  challenge_id: string;
+  tab_id: number;
+  page_revision: number;
+  first_page_revision: number;
+  first_detected_at_ms: number;
+  detected_at_ms: number;
+  page_origin: string;
+  vendor: string;
+  product: string;
+  kind: ChallengeKind;
+  interaction: ChallengeInteraction;
+  state: ChallengeState;
+  confidence: "high" | "medium" | "low";
+  surface: ChallengeSurface;
+  token_present?: boolean;
+  signals: string[];
+  next: ChallengeNext;
+  wait_budget_ms?: number;
+  retry_after_ms?: number;
+  notice_id?: string;
+  detector: { catalog_version: string; probe: "debugger" | "scripting" };
+}
+
+/**
+ * Optional members that browser_open, browser_snapshot, browser_act, browser_wait,
+ * and a browser_handoff resolve result add when a challenge is present. `status` is
+ * "challenge_active" (act) or "challenge_needs_user" (wait) with outcome needs_user.
+ */
+export interface ChallengeBearingResult {
+  challenge?: ChallengeEvent;
+  status?: string;
+}
+
+/** Agent guidance for results that carry `challenge`; adapters add it to tool descriptions. */
+export const CHALLENGE_GUIDANCE = {
+  summary:
+    "A result may carry `challenge`. While challenge.state is active, follow challenge.next: " +
+    "wait (browser_wait with a challenge_cleared condition; no reload or clicks meanwhile), " +
+    "handoff (tell the user in chat, then browser_handoff with a challenge_cleared completion), " +
+    "retry_later (pause work on that origin until retry_after_ms passes), " +
+    "stop (report the block and its origin; no handoff, reload, or retry). " +
+    "Never act inside the challenge surface; reload at most once per episode.",
+  wait:
+    "When a result has `challenge` with state active and next wait, call this with " +
+    "{ kind: \"challenge_cleared\", challenge_id } and timeout_ms = challenge.wait_budget_ms; " +
+    "do not reload or click meanwhile.",
+  handoff:
+    "For a `challenge` with state active and next handoff, tell the user in chat what to complete, " +
+    "then request with completion { kind: \"challenge_cleared\", value: challenge_id }. " +
+    "After the user replies, call resolve; completion_not_met means it has not cleared.",
+} as const;
+
 export type BrowserPressKey = typeof STANDARD_PRESS_KEYS[number];
 export type BrowserPressModifier = "Alt" | "Control" | "Meta" | "Shift";
 
@@ -105,7 +176,9 @@ export interface BrowserWaitParams {
   timeout_ms?: number;
 }
 
-export type BrowserHandoffCompletion = { kind: "url" | "selector"; value: string };
+export type BrowserHandoffCompletion =
+  | { kind: "url" | "selector"; value: string }
+  | { kind: "challenge_cleared"; value: string };
 
 export type BrowserHandoffParams =
   | {

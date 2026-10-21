@@ -51,6 +51,22 @@ The nightly workflow runs `scripts/background_reliability.py --launch-chrome` on
 
 The profile at `~/Library/Application Support/agenttab-ci/nightly-profile` persists between runs because the optional `scripting` grant needs a user gesture. Provision it once on the runner: open Chrome for Testing with `--user-data-dir` set to that directory and `--load-extension` set to the runner checkout's `packages/extension/dist`, choose **Enable automation** in the AgentTab popup, and quit. If the grant is missing, the probe fails with `AgentTab automation permissions have not been enabled`.
 
+### Challenge detection live smoke
+
+Run `scripts/challenge_live_smoke.py` to check the challenge detector against the real built extension and host through the Python SDK. It needs Python 3.11 or later, `uv`, and `bun`, on macOS. Build the extension and host first, then pass a Chrome for Testing executable:
+
+```sh
+bun run --cwd packages/extension build
+cargo build --manifest-path host-rs/Cargo.toml -p agenttab-host
+uv run --python 3.12 python scripts/challenge_live_smoke.py \
+  --chrome-binary "/path/to/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" \
+  --measure 50
+```
+
+Chrome starts in the background with a disposable profile (override with `--profile-dir`) and a temporary host state directory. The optional `scripting` permission is granted by clicking the popup's enable control with trusted DevTools mouse input, so no manual provisioning is needed. Fixtures are served from a loopback HTTP server: clean, reCAPTCHA, hCaptcha, Cloudflare-header, and rate-limit pages. The reCAPTCHA and hCaptcha widgets load from the vendors' CDNs, and their scenarios report `skipped` when the vendor script cannot load. The scenarios cover a clean page, widget detection with the act guard and the `challenge_cleared` wait, header detection across navigations, the handoff completion, and schema validation of every captured event against `schemas/rpc/v1/challenge.schema.json`.
+
+The JSON report at `--output` (default `/tmp/agenttab-challenge-live-smoke.json`) holds per-scenario checks, the key event fields, and every captured event. The exit status is nonzero when any scenario fails. With `--measure N`, the run also times the scan probe, a session-storage round trip, and a text snapshot on a clean page and a reCAPTCHA page. Three warmup iterations are discarded, and the raw samples are stored alongside p50, p95, and max.
+
 ## Platform evidence
 
 Linux and Windows IPC behavior requires the platform-specific jobs in CI:

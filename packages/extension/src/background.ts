@@ -109,6 +109,7 @@ browser = new StandardBrowserRuntime(
 );
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber((tabId) => browser.discardHumanInteractionCapture(tabId));
+handoff.setChallengeScanner((taskId, tabId) => browser.scanChallengeEpisodes(taskId, tabId));
 
 async function automationEnabled(): Promise<boolean> {
   if (automationCleanupPending) return false;
@@ -325,10 +326,12 @@ async function assertHandoffRoute(
 ): Promise<void> {
   await assertCurrentOrigin(targetTabId, policy);
   const completion = params.completion;
-  if (!isRecord(completion) || completion.kind !== "selector") return;
+  if (!isRecord(completion) || (completion.kind !== "selector" && completion.kind !== "challenge_cleared")) return;
   const tab = await chrome.tabs.get(targetTabId);
   if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") {
-    throw restrictedOriginError("wait for a handoff selector");
+    throw restrictedOriginError(
+      completion.kind === "selector" ? "wait for a handoff selector" : "wait for a handoff challenge",
+    );
   }
 }
 

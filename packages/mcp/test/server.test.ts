@@ -35,6 +35,18 @@ describe("AgentTab MCP surface", () => {
     expect(listedTools(false).some((tool) => tool.name === DEVELOPER_TOOL.name)).toBe(false);
   });
 
+  test("tool descriptions carry the challenge agent contract", () => {
+    const description = (name: string) => STANDARD_TOOLS.find((tool) => tool.name === name)!.description;
+    for (const name of ["browser_open", "browser_snapshot", "browser_act"]) {
+      expect(description(name)).toContain("challenge.next");
+      expect(description(name)).toContain("Never act inside the challenge surface");
+    }
+    expect(description("browser_wait")).toContain("timeout_ms = challenge.wait_budget_ms");
+    expect(description("browser_handoff")).toContain("{ kind: \"challenge_cleared\", value: challenge_id }");
+    expect(description("browser_handoff")).toContain("completion_not_met");
+    expect(JSON.stringify(STANDARD_TOOLS.find((tool) => tool.name === "browser_handoff")!.inputSchema)).toContain("challenge_cleared");
+  });
+
   test("browser_open advertises task-owned background window creation", () => {
     const openTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_open")!;
     expect(JSON.stringify(openTool.inputSchema)).toContain("\"new_window\"");

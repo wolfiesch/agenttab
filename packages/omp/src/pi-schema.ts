@@ -85,10 +85,16 @@ const schemas: Record<ToolMethod, unknown> = {
       tab_id: Type.Integer({ minimum: 0 }),
       expected_page_revision: Type.Integer({ minimum: 0 }),
       prompt: Type.String({ minLength: 1, maxLength: 2000 }),
-      completion: Type.Optional(object({
-        kind: stringEnum(["url", "selector"]),
-        value: Type.String({ minLength: 1, maxLength: 65_536 }),
-      })),
+      completion: Type.Optional(Type.Union([
+        object({
+          kind: stringEnum(["url", "selector"]),
+          value: Type.String({ minLength: 1, maxLength: 65_536 }),
+        }),
+        object({
+          kind: Type.Literal("challenge_cleared"),
+          value: Type.String({ pattern: "^chl_[0-9a-z]{20}$" }),
+        }),
+      ])),
       timeout_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 900_000 })),
     }),
     object({

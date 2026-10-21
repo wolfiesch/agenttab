@@ -66,6 +66,23 @@ export function readTaskEpisodes(taskId: string): Promise<ChallengeEpisode[]> {
   return serialized(async () => (await readTable())[taskId] ?? []);
 }
 
+/**
+ * Binds an attention notice to a task's episode, so every later event of that episode carries `notice_id`.
+ * Returns false when the task no longer holds the episode.
+ */
+export async function bindChallengeNotice(taskId: string, challengeId: string, noticeId: string): Promise<boolean> {
+  const { bound } = await updateTaskEpisodes(taskId, (episodes) => {
+    let found = false;
+    const next = episodes.map((episode) => {
+      if (episode.challenge_id !== challengeId) return episode;
+      found = true;
+      return { ...episode, notice_id: noticeId };
+    });
+    return { episodes: next, bound: found };
+  });
+  return bound;
+}
+
 /** Deletes every episode of a task. A no-op when the store is unavailable or the task has none. */
 export function clearChallengeTask(taskId: string): Promise<void> {
   if (!challengeStoreAvailable()) return Promise.resolve();

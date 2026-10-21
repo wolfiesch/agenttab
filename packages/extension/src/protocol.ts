@@ -512,10 +512,13 @@ function assertHandoffParams(value: unknown): Record<string, unknown> {
     }
     if (params.completion !== undefined) {
       const completion = assertExactObject(params.completion, ["kind", "value"], [], "handoff completion");
-      if (completion.kind !== "url" && completion.kind !== "selector") {
+      if (completion.kind !== "url" && completion.kind !== "selector" && completion.kind !== "challenge_cleared") {
         commandError(`Unsupported handoff completion: ${String(completion.kind)}`);
       }
       assertBoundedString(completion.value, "completion.value", 1, 65_536);
+      if (completion.kind === "challenge_cleared" && !CHALLENGE_ID_PATTERN.test(completion.value as string)) {
+        commandError("completion.value must be a challenge id");
+      }
     }
     return params;
   }

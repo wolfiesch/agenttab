@@ -444,3 +444,72 @@ describe("AgentTab operation card rendering", () => {
     expect(emptyRefCard.render(120)[0]).toBe("🧭 Plan · Click · tab 10 · task-owned");
   });
 });
+
+describe("AgentTab challenge rendering", () => {
+  const id = "chl_3k9w2m7q8x1v5b0n4c6z";
+  const event = {
+    spec_version: 1,
+    challenge_id: id,
+    tab_id: 18,
+    page_revision: 4,
+    first_page_revision: 4,
+    first_detected_at_ms: 1_000,
+    detected_at_ms: 2_000,
+    page_origin: "https://example.test",
+    vendor: "cloudflare",
+    product: "turnstile",
+    kind: "widget",
+    interaction: "automatic",
+    state: "active",
+    confidence: "high",
+    surface: { scope: "frame", frame_id: "f1", frame_origin: "https://challenges.example.test", visible: true },
+    signals: ["cloudflare.turnstile.iframe"],
+    next: "wait",
+    wait_budget_ms: 15_000,
+    detector: { catalog_version: "2026.10.1", probe: "debugger" },
+  };
+  const waitArgs = { tab_id: 18, condition: { kind: "challenge_cleared", challenge_id: id } };
+
+  function lines(method: Parameters<typeof createResultComponent>[0], details: unknown, args: unknown, isError = false) {
+    return createResultComponent(method, { details, isError }, { expanded: false }, theme, args).render(160);
+  }
+
+  test("wait needs_user shows vendor, kind, state, next, budget, and the challenge id", () => {
+    const rendered = lines("browser_wait", { status: "challenge_needs_user", outcome: "needs_user", challenge: event }, waitArgs);
+    expect(rendered[0]).toStartWith("👤 Needs you · ");
+    expect(rendered).toContain(
+      `  Challenge · cloudflare/turnstile · widget · active · next wait · wait 15s · ${id}`,
+    );
+  });
+
+  test("act challenge_active and a clean snapshot observation both carry the line", () => {
+    const actArgs = { tab_id: 18, expected_page_revision: 4, actions: [{ kind: "click", ref: "ref=e3" }] };
+    const act = lines("browser_act", { status: "challenge_active", outcome: "needs_user", challenge: event }, actArgs);
+    expect(act[0]).toStartWith("👤 Needs you · ");
+    expect(act.some((line) => line.startsWith("  Challenge · cloudflare/turnstile"))).toBe(true);
+    const snapshot = lines("browser_snapshot", { content: "x", challenge: { ...event, vendor: "generic", product: "rate_limited", kind: "rate_limit", interaction: "none", next: "retry_later", wait_budget_ms: undefined, retry_after_ms: 60_000 } }, { tab_id: 18, mode: "text" });
+    expect(snapshot[0]).toStartWith("🔎 Observed · ");
+    expect(snapshot).toContain(`  Challenge · rate_limited · rate_limit · active · next retry_later · retry after 60s · ${id}`);
+  });
+
+  test("terminal events omit next and budget; handoff completion_not_met reads error details", () => {
+    const cleared = lines("browser_handoff", { status: "resolved", challenge: { ...event, state: "cleared", next: "none", notice_id: "n1" } }, { operation: "resolve", notice_id: "n1" });
+    expect(cleared).toContain(`  Challenge · cloudflare/turnstile · widget · cleared · ${id}`);
+    const pending = lines(
+      "browser_handoff",
+      { code: "completion_not_met", outcome: "not_started", details: { challenge: { ...event, kind: "puzzle", interaction: "human", next: "handoff", wait_budget_ms: undefined } } },
+      { operation: "resolve", notice_id: "n1" },
+      true,
+    );
+    expect(pending.some((line) => line.includes(`puzzle · active · next handoff · ${id}`))).toBe(true);
+  });
+
+  test("malformed events render nothing and no page content or token flag is surfaced", () => {
+    const bad = lines("browser_wait", { status: "challenge_needs_user", outcome: "needs_user", challenge: { ...event, challenge_id: "bad", page_origin: "https://example.test/secret?q=1" } }, waitArgs);
+    expect(bad.join("\n")).not.toContain("Challenge ·");
+    const widget = createResultComponent("browser_wait", { details: { challenge: { ...event, token_present: true } } }, { expanded: true }, theme, waitArgs).render(160).join("\n");
+    expect(widget).toContain("token_present");
+    expect(widget).not.toContain("[redacted]");
+    expect(widget).not.toContain("Sensitive fields redacted");
+  });
+});
