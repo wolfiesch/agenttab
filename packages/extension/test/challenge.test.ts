@@ -1112,7 +1112,7 @@ describe("episode persistence", () => {
 interface FakeBox { width: number; height: number; left?: number; top?: number }
 
 describe("collectChallengeFacts", () => {
-  const SECRET = "tok_SECRET_VALUE_123";
+  const TOKEN_VALUE = "example-response-token-123";
 
   function run(selectors: string[], tokenSelectors: string[]): unknown {
     const node = (box: FakeBox, extra: Record<string, unknown> = {}, shown = true) => ({
@@ -1125,7 +1125,7 @@ describe("collectChallengeFacts", () => {
       ".grecaptcha-badge": [node({ width: 256, height: 60 }, {}, false)],
       "#px-captcha": [node({ width: 300, height: 100, left: -9999 })],
       "altcha-widget": [node({ width: 0, height: 0 })],
-      [TURNSTILE_TOKEN]: [node({ width: 0, height: 0 }, { value: SECRET })],
+      [TURNSTILE_TOKEN]: [node({ width: 0, height: 0 }, { value: TOKEN_VALUE })],
       [RECAPTCHA_TOKEN]: [node({ width: 10, height: 10 }, { value: "" })],
     };
     const iframes = [
@@ -1206,7 +1206,7 @@ describe("collectChallengeFacts", () => {
 
   test("never returns token values or sitekeys through detection", () => {
     const page = run([".cf-turnstile"], [TURNSTILE_TOKEN]) as ProbeFactsPage;
-    expect(JSON.stringify(page)).not.toContain(SECRET);
+    expect(JSON.stringify(page)).not.toContain(TOKEN_VALUE);
     const probe = facts({ ...page, probe: "scripting" });
     const result = detect(CATALOG, probe);
     // The Turnstile container is visible but its token is non-empty: present, not active. The
@@ -1217,7 +1217,7 @@ describe("collectChallengeFacts", () => {
     expect(step.event?.kind).toBe("interstitial");
     const serialized = JSON.stringify([step.event, step.episodes]);
     expect(serialized).not.toContain("SITEKEY");
-    expect(serialized).not.toContain(SECRET);
+    expect(serialized).not.toContain(TOKEN_VALUE);
   });
 });
 
