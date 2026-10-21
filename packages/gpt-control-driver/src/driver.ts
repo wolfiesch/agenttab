@@ -545,6 +545,8 @@ async function captureScreenshot(session: DriverSession, outputPath: string): Pr
       tab_id: session.pageId,
       mode: "screenshot",
       format: "png",
+      max_width: 1024,
+      max_height: 768,
       max_bytes: 750_000,
     });
     await mkdir(dirname(outputPath), { recursive: true });
