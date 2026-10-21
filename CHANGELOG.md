@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Fixed accessibility snapshots missing controls a page added after AgentTab first read it. Chrome kept serving its cached accessibility tree for those pages, so a control that replaced a loading placeholder could still appear as the old text. Full and `root_ref`-scoped snapshots now rebuild the tree before reading it.
 - Fixed multi-event gestures reporting `outcome: "not_started"` after the page had already received input. `drag`, `double_click`, and `context_click` send several mouse events, and task authorization is rechecked before each one. If ownership was revoked or permissions were withdrawn after the first event, a single-action batch reported the action as not started. Any failure after a gesture's first input event now reports `outcome: "unknown"` and keeps its original error code.
 - Fixed the GPT-Control driver missing a reply when it polled before the new answer appeared. A poll that still saw the previous answer cleared the driver's awaiting-reply state, so the reply that followed was not counted as new.
 - Fixed the Python SDK failing to import on Python 3.10, the oldest version its package metadata accepts. The SDK imported `typing.NotRequired`, which Python added in 3.11. Optional keys now live in `total=False` TypedDict bases, so at runtime each type's `__required_keys__` and `__optional_keys__` match the protocol on every supported version. Before, every key reported as required, even on Python 3.11 and later.

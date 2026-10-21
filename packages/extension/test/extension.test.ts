@@ -1964,6 +1964,45 @@ describe("page revision monotonicity", () => {
     await runtime.detach(66);
   });
 
+  test.each([false, true])("rebuilds Chrome's cached accessibility tree before each snapshot (root_ref %p)", async (scoped) => {
+    tabStore.set(66, {
+      id: 66,
+      windowId: 1,
+      groupId: -1,
+      url: "https://example.test/",
+      status: "complete",
+    });
+    let currentNodes = [{ backendDOMNodeId: 42, role: { value: "StaticText" }, name: { value: "Loading..." } }];
+    let cachedNodes: typeof currentNodes | undefined;
+    debuggerCommandOverride = (method) => {
+      if (method === "Accessibility.disable") cachedNodes = undefined;
+      if (method === "Accessibility.getFullAXTree" || method === "Accessibility.getPartialAXTree") {
+        cachedNodes ??= currentNodes;
+        return { nodes: cachedNodes };
+      }
+      if (method === "DOM.querySelectorAll") return { nodeIds: [] };
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+    try {
+      const initial = await runtime.snapshot(TASK_A, 66, { mode: "accessibility" });
+      expect(initial.nodes).toMatchObject([{ role: "StaticText", name: "Loading..." }]);
+      const ref = (initial.nodes as Array<{ ref: string }>)[0].ref;
+      const params = { mode: "accessibility", ...(scoped ? { root_ref: ref } : {}) };
+      currentNodes = [{ backendDOMNodeId: 42, role: { value: "textbox" }, name: { value: "Name" } }];
+      const updated = await runtime.snapshot(TASK_A, 66, params);
+      expect(updated.page_revision).toBe(initial.page_revision);
+      expect(updated.nodes).toMatchObject([{ role: "textbox", name: "Name", ref: expect.any(String) }]);
+    } finally {
+      await runtime.detach(66);
+    }
+  });
+
   test("keeps scanning DOM matches for eligible editables beyond filtered ones", async () => {
     tabStore.set(68, {
       id: 68,

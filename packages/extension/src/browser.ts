@@ -1303,15 +1303,21 @@ export class StandardBrowserRuntime {
         ...(frameId !== undefined ? { frameId } : {}),
       })
       : undefined;
+    const axSessionId = rootTarget !== undefined ? rootTarget.sessionId : frameDocument.sessionId;
+    // Chrome can serve a stale accessibility tree for controls a background page added after
+    // the domain was enabled. Re-enabling rebuilds it. Refs carry backend DOM node ids, so the
+    // reset AX node ids do not invalidate refs already handed out for this document.
+    await this.send(tabId, "Accessibility.disable", {}, false, axSessionId);
+    await this.send(tabId, "Accessibility.enable", {}, false, axSessionId);
     const result = rootTarget !== undefined
       ? await this.send(tabId, "Accessibility.getPartialAXTree", {
         backendNodeId: rootTarget.backendNodeId,
         fetchRelatives: true,
-      }, false, rootTarget.sessionId)
+      }, false, axSessionId)
       : await this.send(tabId, "Accessibility.getFullAXTree", {
         depth: maxDepth,
         ...(frameId !== undefined ? { frameId } : {}),
-      }, false, frameDocument.sessionId);
+      }, false, axSessionId);
     const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
     const axBackendIds = new Set<number>();
     for (const node of nodes) {
