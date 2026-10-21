@@ -2750,14 +2750,16 @@ export class StandardBrowserRuntime {
   }
 
   /**
-   * Runs the rest of a multi-event gesture. A debugger refusal there follows
-   * input the page already received, so it cannot claim the action never started.
+   * Runs the rest of a multi-event gesture. Any failure there, such as a debugger
+   * refusal or authorization revoked mid-gesture, follows input the page already
+   * received, so it cannot claim the action never started. The original error
+   * code stays so callers still see why the gesture stopped.
    */
   private async afterInputDispatched(run: () => Promise<void>): Promise<void> {
     try {
       await run();
     } catch (error) {
-      if (isRecord(error) && error.code === "debugger_unavailable") error.outcome = "unknown";
+      if (isRecord(error)) error.outcome = "unknown";
       throw error;
     }
   }
