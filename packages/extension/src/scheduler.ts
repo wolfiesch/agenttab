@@ -15,6 +15,8 @@ export class MutationScheduler {
   private lifecycleAccepting = true;
   private permissionsAvailable = true;
   private admissionEpoch = 0;
+  /** Advances only on pause and disconnect, so a permission change never fails queued profile work. */
+  private lifecycleEpoch = 0;
   private admissionFailure = {
     code: "paused",
     message: "AgentTab is paused",
@@ -35,6 +37,7 @@ export class MutationScheduler {
     this.accepting = false;
     this.lifecycleAccepting = false;
     this.admissionEpoch += 1;
+    this.lifecycleEpoch += 1;
     this.admissionFailure = {
       code: "paused",
       message: "AgentTab is paused",
@@ -91,6 +94,35 @@ export class MutationScheduler {
     const result = priorGlobal.then(() => Promise.all(priorTabs)).then(async () => {
       if (!this.accepting || this.admissionEpoch !== admissionEpoch) {
         throw this.notStarted("AgentTab paused before this global mutation was dispatched");
+      }
+      return work();
+    });
+    this.globalTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.track(result);
+    return result;
+  }
+
+  /**
+   * Admits profile-scoped work (bookmarks, history, sessions, downloads) in global order.
+   * It needs no site access, so only pause and disconnect refuse it, never revoked automation
+   * permissions. Writes also wait for queued tab work; reads only for earlier global work.
+   */
+  enqueueProfile<T>(mutating: boolean, work: Work<T>): Promise<T> {
+    if (!this.lifecycleAccepting) {
+      return Promise.reject(new NotStartedError(this.admissionFailure.code, this.admissionFailure.message));
+    }
+    const lifecycleEpoch = this.lifecycleEpoch;
+    const priorGlobal = this.globalTail;
+    const priorTabs = mutating ? [...this.tabTails.values()] : [];
+    const result = priorGlobal.then(() => Promise.all(priorTabs)).then(async () => {
+      if (!this.lifecycleAccepting || this.lifecycleEpoch !== lifecycleEpoch) {
+        throw new NotStartedError(
+          this.admissionFailure.code,
+          "AgentTab paused before this profile operation was dispatched",
+        );
       }
       return work();
     });
@@ -168,6 +200,7 @@ export class MutationScheduler {
     this.accepting = false;
     this.lifecycleAccepting = false;
     this.admissionEpoch += 1;
+    this.lifecycleEpoch += 1;
     this.admissionFailure = {
       code: "paused",
       message: "AgentTab connection is unavailable",
@@ -178,6 +211,7 @@ export class MutationScheduler {
     this.accepting = false;
     this.lifecycleAccepting = false;
     this.admissionEpoch += 1;
+    this.lifecycleEpoch += 1;
     this.admissionFailure = {
       code: "paused",
       message: "AgentTab is paused",

@@ -212,6 +212,7 @@ input[type="checkbox"] { flex: none; width: 17px; height: 17px; margin: 0; accen
 }
 .review:first-child { padding-top: 0; border-top: 0; }
 .review-actions { display: flex; justify-content: flex-end; gap: var(--step-1); }
+.review-detail { overflow-wrap: anywhere; color: var(--text-quiet); }
 
 /* tasks */
 .tasks {

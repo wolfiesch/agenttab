@@ -21,6 +21,7 @@
         "browser_tabs",
         "browser_handoff",
         "browser_commit",
+        "browser_profile",
         "browser_developer",
         "agenttab.status",
         "agenttab.finish",
@@ -40,6 +41,40 @@
         "required": ["method"]
       },
       "then": { "required": ["idempotency_key"] }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": { "const": "browser_profile" },
+          "params": {
+            "properties": {
+              "operation": {
+                "enum": [
+                  "bookmarks_update",
+                  "bookmarks_create",
+                  "bookmarks_move",
+                  "bookmarks_remove",
+                  "sessions_restore",
+                  "downloads_cancel",
+                  "downloads_pause",
+                  "downloads_resume"
+                ]
+              }
+            },
+            "required": ["operation"]
+          }
+        },
+        "required": ["method", "params"]
+      },
+      "then": { "required": ["idempotency_key"] },
+      "else": {
+        "if": { "properties": { "method": { "const": "browser_profile" } }, "required": ["method"] },
+        "then": { "not": { "required": ["idempotency_key"] } }
+      }
+    },
+    {
+      "if": { "properties": { "method": { "const": "browser_profile" } }, "required": ["method"] },
+      "then": { "properties": { "params": { "$ref": "browser-profile.schema.json" } } }
     },
     {
       "if": { "properties": { "method": { "const": "browser_open" } }, "required": ["method"] },

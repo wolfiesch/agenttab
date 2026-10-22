@@ -9,7 +9,9 @@ import {
   encodeFrame,
   type AgentTabClient,
 } from "../../sdk-typescript/src/index";
+import { Value } from "typebox/value";
 import { makeExtension, type AgentApi } from "../src/index";
+import { piSchema } from "../src/pi-schema";
 
 const originalDeveloper = process.env.AGENTTAB_DEVELOPER;
 afterEach(() => {
@@ -65,6 +67,7 @@ interface StubState {
   vocabulary: Vocabulary;
   max?: number;
   refined?: boolean;
+  strict?: boolean;
 }
 
 function stubSchema(kind: string, state: StubState): Record<string, unknown> {
@@ -75,6 +78,7 @@ function stubSchema(kind: string, state: StubState): Record<string, unknown> {
         ...state,
         ...(property === "max" ? { max: Number(args[0]) } : {}),
         ...(property === "refine" ? { refined: true } : {}),
+        ...(property === "strict" ? { strict: true } : {}),
       }),
   });
 }
@@ -175,6 +179,7 @@ test("Standard OMP mode registers the complete Core RPC tool surface", () => {
     "browser_tabs",
     "browser_handoff",
     "browser_credentials",
+    "browser_profile",
     "browser_commit",
     "browser_finish",
   ]);
@@ -214,6 +219,7 @@ test("developer mode adds only browser_developer", () => {
     "browser_tabs",
     "browser_handoff",
     "browser_credentials",
+    "browser_profile",
     "browser_commit",
     "browser_finish",
     "browser_developer",
@@ -843,6 +849,93 @@ test("OMP reuses one UUIDv7 idempotency key for retries of a mutation invocation
   expect(keys[2]).not.toBe(keys[0]);
 });
 
+const PROFILE_OPERATION_PARAMS: ReadonlyArray<Record<string, unknown>> = [
+  { operation: "bookmarks_search", query: "docs", limit: 10 },
+  { operation: "bookmarks_tree", folder_id: "1", depth: 2 },
+  { operation: "bookmarks_update", id: "42", title: "Renamed" },
+  { operation: "bookmarks_create", parent_id: "1", title: "New", url: "https://example.com/", index: 0 },
+  { operation: "bookmarks_move", id: "42", parent_id: "2" },
+  { operation: "bookmarks_remove", id: "42" },
+  { operation: "history_search", text: "", start_time: 0, limit: 5 },
+  { operation: "sessions_recent", limit: 3 },
+  { operation: "sessions_devices" },
+  { operation: "sessions_restore", session_id: "s-1" },
+  { operation: "downloads_search", state: "complete" },
+  { operation: "downloads_cancel", id: 7 },
+  { operation: "downloads_pause", id: 7 },
+  { operation: "downloads_resume", id: 7 },
+];
+
+test("OMP registers browser_profile as one strict flat object covering every operation", () => {
+  const profile = register(false).tools.find((tool) => tool.name === "browser_profile");
+  expect(profile).toMatchObject({ label: "Browser Profile", approval: "write", parameters: { kind: "object" } });
+  const state = stubState(profile?.parameters);
+  expect(state.strict).toBe(true);
+  for (const params of PROFILE_OPERATION_PARAMS) {
+    expect(state.vocabulary.values).toContain(String(params.operation));
+    for (const field of Object.keys(params)) expect(state.vocabulary.names).toContain(field);
+  }
+  expect(state.vocabulary.limits.get("limit")).toBe(100);
+  expect(state.vocabulary.limits.get("depth")).toBe(5);
+});
+
+test("Pi browser_profile schema accepts each operation and rejects unknown fields", () => {
+  // piSchema returns the TypeBox schema typed as unknown so the Pi registration map stays uniform.
+  const schema = piSchema("browser_profile") as Parameters<typeof Value.Check>[0];
+  for (const params of PROFILE_OPERATION_PARAMS) {
+    expect({ params, valid: Value.Check(schema, params) }).toEqual({ params, valid: true });
+  }
+  expect(Value.Check(schema, { operation: "bookmarks_remove", id: "42", tab_id: 1 })).toBe(false);
+  expect(Value.Check(schema, { operation: "sessions_recent", limit: 26 })).toBe(false);
+  expect(Value.Check(schema, { operation: "bookmarks_update", id: "42" })).toBe(false);
+  expect(Value.Check(schema, { operation: "downloads_pause", id: "7" })).toBe(false);
+  expect(Value.Check(schema, { operation: "bookmarks_wipe" })).toBe(false);
+});
+
+test("OMP sends an invocation idempotency key for browser_profile writes only", async () => {
+  const tools: Array<Record<string, unknown>> = [];
+  const requests: Array<{ operation: unknown; key: unknown }> = [];
+  const client = {
+    connection: { task_id: "task-profile" },
+    get closed() {
+      return false;
+    },
+    request: async (_method: string, params: Record<string, unknown>, options: { idempotencyKey?: string }) => {
+      requests.push({ operation: params.operation, key: options.idempotencyKey });
+      return { ok: true, outcome: "completed", request_id: "request-profile", result: { operation: params.operation } };
+    },
+  } as unknown as AgentTabClient;
+  makeExtension(async () => client)({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+  } as unknown as AgentApi);
+  const tool = tools.find((candidate) => candidate.name === "browser_profile");
+  for (const [index, params] of PROFILE_OPERATION_PARAMS.entries()) {
+    await executeTool(tool, params, `profile-call-${index}`);
+  }
+  const writes = [
+    "bookmarks_update",
+    "bookmarks_create",
+    "bookmarks_move",
+    "bookmarks_remove",
+    "sessions_restore",
+    "downloads_cancel",
+    "downloads_pause",
+    "downloads_resume",
+  ];
+  expect(requests).toHaveLength(PROFILE_OPERATION_PARAMS.length);
+  for (const { operation, key } of requests) {
+    if (writes.includes(String(operation))) {
+      expect({ operation, key }).toEqual({
+        operation,
+        key: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
+      });
+    } else {
+      expect({ operation, key }).toEqual({ operation, key: undefined });
+    }
+  }
+});
+
 test("OMP returns screenshots as one native image payload", async () => {
   const tools: Array<Record<string, unknown>> = [];
   const client = {
@@ -1028,6 +1121,7 @@ test("Pi mode registers the same tools with TypeBox schemas and Pi metadata", ()
     "browser_tabs",
     "browser_handoff",
     "browser_credentials",
+    "browser_profile",
     "browser_commit",
     "browser_finish",
   ]);

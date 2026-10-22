@@ -1,3 +1,4 @@
+import { PROFILE_WRITE_OPERATIONS } from "../../sdk-typescript/src/index";
 import type { ToolMethod } from "./tool-method";
 
 export interface RenderTheme {
@@ -69,6 +70,23 @@ const STATUS_LABEL: Readonly<Record<OperationCardStatus, string>> = {
   observed: "🔎 Observed",
   uncertain: "🤔 Uncertain",
   blocked: "🛑 Blocked",
+};
+
+const PROFILE_TITLE: Readonly<Record<string, string>> = {
+  bookmarks_search: "Bookmarks search",
+  bookmarks_tree: "Bookmarks tree",
+  bookmarks_update: "Bookmark update",
+  bookmarks_create: "Bookmark create",
+  bookmarks_move: "Bookmark move",
+  bookmarks_remove: "Bookmark remove",
+  history_search: "History search",
+  sessions_recent: "Recent sessions",
+  sessions_devices: "Synced devices",
+  sessions_restore: "Session restore",
+  downloads_search: "Downloads search",
+  downloads_cancel: "Download cancel",
+  downloads_pause: "Download pause",
+  downloads_resume: "Download resume",
 };
 
 export function createCallComponent(method: ToolMethod, args: unknown, theme: RenderTheme): RenderComponent {
@@ -267,6 +285,8 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
         title: "Finish browser task",
         meta: fieldString(args, "disposition") ?? "automatic cleanup",
       };
+    case "browser_profile":
+      return describeProfileCall(args);
     case "browser_developer":
       return { title: "Developer action", meta: fieldString(args, "action") };
   }
@@ -277,6 +297,98 @@ function describeActions(args: Record<string, unknown>): { title: string; meta?:
   return actions.length === 1
     ? splitActionDescription(actions[0])
     : { title: `Run ${actions.length} browser actions` };
+}
+
+/**
+ * Profile cards name the operation and carry only ids, counts, and limits: queries, titles,
+ * URLs, and filenames stay out of the collapsed card.
+ */
+function describeProfileCall(args: Record<string, unknown>): { title: string; meta?: string } {
+  const operation = fieldString(args, "operation") ?? "profile";
+  const id = fieldString(args, "id") ?? fieldNumber(args, "id")?.toString();
+  const depth = fieldNumber(args, "depth");
+  const limit = fieldNumber(args, "limit");
+  const state = fieldString(args, "state");
+  const changed = operation === "bookmarks_update"
+    ? present("title" in args ? "title" : undefined, "url" in args ? "url" : undefined).join(", ")
+    : undefined;
+  const folder = fieldString(args, "parent_id") ?? fieldString(args, "folder_id");
+  return {
+    title: PROFILE_TITLE[operation] ?? humanize(operation),
+    meta: joinMeta(
+      id === undefined ? undefined : `${operation.startsWith("downloads_") ? "download" : "bookmark"} ${id}`,
+      changed,
+      folder === undefined ? undefined : `folder ${folder}`,
+      depth === undefined ? undefined : `depth ${depth}`,
+      fieldString(args, "session_id") === undefined ? undefined : `session ${shortId(fieldString(args, "session_id"))}`,
+      state === undefined ? undefined : humanize(state),
+      limit === undefined ? undefined : `limit ${limit}`,
+      "profile-scoped",
+    ),
+  };
+}
+
+function summarizeProfileResult(args: Record<string, unknown>, result: Record<string, unknown>): string {
+  const operation = fieldString(result, "operation") ?? fieldString(args, "operation") ?? "profile";
+  const title = PROFILE_TITLE[operation] ?? humanize(operation);
+  const id = fieldString(result, "id") ?? fieldNumber(result, "id")?.toString();
+  const bookmark = id === undefined ? "Bookmark" : `Bookmark ${id}`;
+  // Large results are compacted to `<field>_count`; `count` survives either way.
+  const count = (field: string) => fieldNumber(result, "count") ??
+    (Array.isArray(result[field]) ? result[field].length : fieldNumber(result, `${field}_count`)) ?? 0;
+  const truncated = fieldBoolean(result, "truncated") === true ? "truncated" : undefined;
+  const parent = fieldString(result, "parent_id");
+  const index = fieldNumber(result, "index");
+  const state = fieldString(result, "state");
+  switch (operation) {
+    case "bookmarks_search":
+      return present(title, countLabel(count("bookmarks"), "bookmark"), truncated).join(" · ");
+    case "bookmarks_tree":
+      return present(title, countLabel(fieldNumber(result, "node_count") ?? 0, "node"), truncated).join(" · ");
+    case "history_search":
+      return `${title} · ${countLabel(count("items"), "item")}`;
+    case "sessions_recent":
+      return `${title} · ${countLabel(count("sessions"), "session")}`;
+    case "sessions_devices":
+      return `${title} · ${countLabel(count("devices"), "device")}`;
+    case "downloads_search":
+      return `${title} · ${countLabel(count("downloads"), "download")}`;
+    case "bookmarks_update":
+      return present(
+        `${bookmark} updated`,
+        Array.isArray(result.updated)
+          ? result.updated.filter((field): field is string => typeof field === "string").join(", ")
+          : undefined,
+      ).join(" · ");
+    case "bookmarks_create":
+    case "bookmarks_move":
+      return present(
+        `${bookmark} ${operation === "bookmarks_create" ? "created" : "moved"}`,
+        parent === undefined ? undefined : `folder ${parent}`,
+        index === undefined ? undefined : `index ${index}`,
+      ).join(" · ");
+    case "bookmarks_remove":
+      return `${bookmark} removed`;
+    case "sessions_restore": {
+      const opened = Array.isArray(result.opened) ? result.opened.length : 0;
+      const skipped = fieldNumber(result, "skipped") ?? 0;
+      return present(
+        "Session restored",
+        `${countLabel(opened, "tab")} opened`,
+        skipped > 0 ? `${skipped.toLocaleString()} skipped` : undefined,
+      ).join(" · ");
+    }
+    case "downloads_cancel":
+    case "downloads_pause":
+    case "downloads_resume":
+      return present(
+        id === undefined ? "Download" : `Download ${id}`,
+        state === undefined ? undefined : humanize(state),
+        fieldBoolean(result, "paused") === true ? "paused" : undefined,
+      ).join(" · ");
+    default:
+      return `${title} completed`;
+  }
 }
 
 function actionDescriptions(args: Record<string, unknown>): string[] {
@@ -411,7 +523,11 @@ function summarizeResult(
       return credentialStatus ? humanize(credentialStatus) : "Credential action completed";
     }
     case "browser_commit":
-      return "Staged action executed";
+      return fieldString(result, "operation") === "bookmarks_remove" && result.removed === true
+        ? summarizeProfileResult(args, result)
+        : "Staged action executed";
+    case "browser_profile":
+      return summarizeProfileResult(args, result);
     case "browser_finish": {
       if (result.finished === false) {
         return `Task finalization deferred · ${humanize(fieldString(result, "deferred") ?? "not ready")}`;
@@ -450,6 +566,10 @@ function resultStatus(
   if (method === "browser_snapshot" || method === "browser_wait" || method === "browser_tabs") {
     return "observed";
   }
+  if (method === "browser_profile") {
+    const operation = fieldString(details, "operation");
+    return operation !== undefined && PROFILE_WRITE_OPERATIONS.has(operation) ? "executed" : "observed";
+  }
   return "executed";
 }
 
@@ -466,6 +586,10 @@ function operationContext(
   const commonTaskId = taskIds.length > 0 && taskIds.every((taskId) => taskId === taskIds[0])
     ? taskIds[0]
     : undefined;
+  if (method === "browser_profile") {
+    // Profile operations are not tab-scoped; staged results carry placeholder tab and revision zeros.
+    return { taskId: fieldString(presentation, "task_id"), owned: false };
+  }
   return {
     taskId: fieldString(presentation, "task_id") ??
       fieldString(details, "task_id") ??

@@ -216,6 +216,132 @@ export interface BrowserDeveloperParams {
   params: Record<string, unknown>;
 }
 
+export type BrowserProfileReadOperation =
+  | "bookmarks_search"
+  | "bookmarks_tree"
+  | "history_search"
+  | "sessions_recent"
+  | "sessions_devices"
+  | "downloads_search";
+
+export type BrowserProfileWriteOperation =
+  | "bookmarks_update"
+  | "bookmarks_create"
+  | "bookmarks_move"
+  | "bookmarks_remove"
+  | "sessions_restore"
+  | "downloads_cancel"
+  | "downloads_pause"
+  | "downloads_resume";
+
+export type BrowserProfileOperation = BrowserProfileReadOperation | BrowserProfileWriteOperation;
+
+/** Bookmark ids are decimal strings; download ids are non-negative integers. */
+export type BrowserProfileParams =
+  | { operation: "bookmarks_search"; query: string; limit?: number }
+  | { operation: "bookmarks_tree"; folder_id?: string; depth?: number }
+  | { operation: "bookmarks_update"; id: string; title: string; url?: string }
+  | { operation: "bookmarks_update"; id: string; title?: string; url: string }
+  | { operation: "bookmarks_create"; parent_id: string; title: string; url?: string; index?: number }
+  | { operation: "bookmarks_move"; id: string; parent_id: string; index?: number }
+  | { operation: "bookmarks_remove"; id: string }
+  | { operation: "history_search"; text: string; start_time?: number; end_time?: number; limit: number }
+  | { operation: "sessions_recent" | "sessions_devices"; limit?: number }
+  | { operation: "sessions_restore"; session_id: string }
+  | {
+    operation: "downloads_search";
+    query?: string;
+    state?: "in_progress" | "interrupted" | "complete";
+    limit?: number;
+  }
+  | { operation: "downloads_cancel" | "downloads_pause" | "downloads_resume"; id: number };
+
+export interface BrowserProfileBookmark {
+  id: string;
+  parent_id?: string;
+  index?: number;
+  title: string;
+  url?: string;
+  kind: "bookmark" | "folder";
+  date_added_ms?: number;
+}
+
+export interface BrowserProfileBookmarkNode extends BrowserProfileBookmark {
+  child_count?: number;
+  children?: BrowserProfileBookmarkNode[];
+}
+
+export interface BrowserProfileSessionTab {
+  session_id?: string;
+  title: string;
+  url: string;
+}
+
+export interface BrowserProfileSessionEntry {
+  kind: "tab" | "window";
+  session_id?: string;
+  last_modified_ms: number;
+  title?: string;
+  url?: string;
+  tab_count?: number;
+  tabs?: BrowserProfileSessionTab[];
+}
+
+export interface BrowserProfileDownload {
+  id: number;
+  filename: string;
+  url: string;
+  final_url?: string;
+  state: string;
+  paused: boolean;
+  bytes_received: number;
+  total_bytes: number;
+  error?: string;
+  mime?: string;
+  start_time_ms?: number;
+  end_time_ms?: number;
+}
+
+/** Completed `browser_profile` results, discriminated by `operation`. */
+export type BrowserProfileResult =
+  | { operation: "bookmarks_search"; bookmarks: BrowserProfileBookmark[]; count: number; truncated: boolean }
+  | { operation: "bookmarks_tree"; root: BrowserProfileBookmarkNode; node_count: number; truncated: boolean }
+  | { operation: "bookmarks_update"; id: string; updated: ("title" | "url")[] }
+  | { operation: "bookmarks_create" | "bookmarks_move"; id: string; parent_id: string; index: number }
+  | { operation: "bookmarks_remove"; id: string; removed: true }
+  | {
+    operation: "history_search";
+    items: {
+      id: string;
+      url: string;
+      title: string;
+      last_visit_time_ms?: number;
+      visit_count: number;
+      typed_count: number;
+    }[];
+    count: number;
+  }
+  | { operation: "sessions_recent"; sessions: BrowserProfileSessionEntry[]; count: number }
+  | {
+    operation: "sessions_devices";
+    devices: { device_name: string; sessions: BrowserProfileSessionEntry[] }[];
+    count: number;
+  }
+  | {
+    operation: "sessions_restore";
+    session_id: string;
+    kind: "tab" | "window";
+    opened: { tab_id: number; page_revision: number }[];
+    skipped: number;
+  }
+  | { operation: "downloads_search"; downloads: BrowserProfileDownload[]; count: number }
+  | {
+    operation: "downloads_cancel" | "downloads_pause" | "downloads_resume";
+    id: number;
+    state: string;
+    paused: boolean;
+  };
+
 export interface AgenttabFinishParams {
   disposition?: "auto" | "close" | "keep";
   keep_tab_ids?: number[];
@@ -239,6 +365,7 @@ export interface MethodParams {
   browser_credentials: BrowserCredentialsParams;
   browser_commit: BrowserCommitParams;
   browser_developer: BrowserDeveloperParams;
+  browser_profile: BrowserProfileParams;
   "agenttab.status": Record<string, never>;
   "agenttab.finish": AgenttabFinishParams;
   "agenttab.close": Record<string, never>;
@@ -538,7 +665,7 @@ export interface ClientOptions {
   capabilityStore?: ResumeCapabilityStore;
 }
 
-const MUTATIONS = new Set<RpcMethod>([
+const MUTATIONS: ReadonlySet<string> = new Set<MutationMethod>([
   "browser_open",
   "browser_act",
   "browser_handoff",
@@ -546,6 +673,30 @@ const MUTATIONS = new Set<RpcMethod>([
   "browser_commit",
   "browser_developer",
 ]);
+
+/** browser_profile operations that change the profile and therefore carry an idempotency key. */
+export const PROFILE_WRITE_OPERATIONS: ReadonlySet<string> = new Set<BrowserProfileWriteOperation>([
+  "bookmarks_update",
+  "bookmarks_create",
+  "bookmarks_move",
+  "bookmarks_remove",
+  "sessions_restore",
+  "downloads_cancel",
+  "downloads_pause",
+  "downloads_resume",
+]);
+
+/**
+ * True when a request must carry an idempotency key: every method-level mutation, plus
+ * browser_profile write operations. browser_profile reads must be sent without a key.
+ */
+export function requiresIdempotencyKey(method: string, params: unknown): boolean {
+  if (MUTATIONS.has(method)) return true;
+  if (method !== "browser_profile") return false;
+  if (typeof params !== "object" || params === null || !("operation" in params)) return false;
+  const operation = params.operation;
+  return typeof operation === "string" && PROFILE_WRITE_OPERATIONS.has(operation);
+}
 
 function longOperationTimeoutMs(
   method: RpcMethod,
@@ -946,7 +1097,7 @@ export class AgentTabClient {
       params,
       this.#requestTimeoutMs,
     );
-    const idempotencyKey = MUTATIONS.has(method)
+    const idempotencyKey = requiresIdempotencyKey(method, params)
       ? options.idempotencyKey ?? createUuidV7()
       : undefined;
     const request = {

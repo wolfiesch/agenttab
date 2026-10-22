@@ -13,11 +13,11 @@ use crate::paths::AgentTabPaths;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
     AgenttabFinishParams, BrowserAction, BrowserCommitParams, BrowserCredentialsParams,
-    BrowserHandoffParams, BrowserSnapshotParams, BrowserWaitParams, ConnectionAck, ConnectionInit,
-    MethodParams, NativeEventPayload, NativePopupCommitEvent, NativeResponse, NativeStagedCommit,
-    NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod,
-    RpcRequest, RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES,
-    PROTOCOL_VERSION,
+    BrowserHandoffParams, BrowserProfileParams, BrowserSnapshotParams, BrowserWaitParams,
+    ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload, NativePopupCommitEvent,
+    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ResumeCapabilityConfirm,
+    ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest, RpcResponse, TaskBinding,
+    WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -1153,7 +1153,9 @@ impl Runtime {
                             )
                         }
                     };
-                if staged_commit_requires_verified_current_tab(&staged.effect) {
+                if !staged.is_profile_scoped()
+                    && staged_commit_requires_verified_current_tab(&staged.effect)
+                {
                     let tab_url = self.tab_urls.read().get(&staged.tab_id).cloned();
                     if let Err(error) = self.guardrails.authorize_current_tab(tab_url.as_deref()) {
                         let cleanup = Guardrails::cleanup_staged_uploads(&staged.upload_paths);
@@ -1173,7 +1175,11 @@ impl Runtime {
                         };
                     }
                 }
-                let origin_policy = self.guardrails.native_origin_policy(staged.tab_id);
+                let origin_policy = if staged.is_profile_scoped() {
+                    None
+                } else {
+                    self.guardrails.native_origin_policy(staged.tab_id)
+                };
                 committed_native_token = Some(staged.native_token.clone());
                 params_value = json!({"native_token": staged.native_token});
                 committed_uploads = staged.upload_paths;
@@ -1240,13 +1246,16 @@ impl Runtime {
                     "invalid_commit_stage",
                     "Extension returned commit_required without a staged operation",
                 )),
+                Some(staged) if staged.task_id != task_id => Some(RpcError::new(
+                    "commit_binding_mismatch",
+                    "Extension staged an operation outside the requested task, tab, or page revision",
+                )),
+                Some(staged) if staged_matches_profile_remove(params, staged) => None,
                 Some(_) if method != RpcMethod::BrowserAct => Some(RpcError::new(
                     "invalid_commit_stage",
-                    "Only browser_act may return a staged Standard operation",
+                    "Only browser_act or browser_profile bookmarks_remove may return a staged Standard operation",
                 )),
-                Some(staged)
-                    if staged.task_id != task_id || !staged_matches_act(params, staged) =>
-                {
+                Some(staged) if !staged_matches_act(params, staged) => {
                     Some(RpcError::new(
                         "commit_binding_mismatch",
                         "Extension staged an operation outside the requested task, tab, or page revision",
@@ -1337,6 +1346,21 @@ impl Runtime {
                 RpcError::new(
                     "unexpected_commit_stage",
                     "Extension returned staged commit data without commit_required",
+                ),
+            );
+        }
+        if native.outcome == Outcome::Completed
+            && matches!(
+                params,
+                MethodParams::Profile(BrowserProfileParams::BookmarksRemove { .. })
+            )
+        {
+            return RpcResponse::failure(
+                request_id,
+                Outcome::Unknown,
+                RpcError::new(
+                    "invalid_commit_stage",
+                    "bookmarks_remove completed without the required Commit review",
                 ),
             );
         }
@@ -1657,7 +1681,8 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
         | MethodParams::Status(_)
         | MethodParams::Finish(_)
         | MethodParams::Close(_)
-        | MethodParams::Developer(_) => None,
+        | MethodParams::Developer(_)
+        | MethodParams::Profile(_) => None,
     }
 }
 fn is_tab_only_request(params: &MethodParams) -> bool {
@@ -1691,6 +1716,14 @@ fn staged_matches_act(params: &MethodParams, staged: &NativeStagedCommit) -> boo
             if action.tab_id == staged.tab_id
                 && action.expected_page_revision == staged.page_revision
     )
+}
+
+fn staged_matches_profile_remove(params: &MethodParams, staged: &NativeStagedCommit) -> bool {
+    staged.is_profile_scoped()
+        && matches!(
+            params,
+            MethodParams::Profile(BrowserProfileParams::BookmarksRemove { .. })
+        )
 }
 
 fn dispatch_timeout(params: &MethodParams) -> Duration {
@@ -2513,6 +2546,17 @@ mod tests {
             .tab_urls
             .write()
             .insert(3, "https://allowed.test/".into());
+        task_id
+    }
+
+    /// Starts a task with a confirmed resume capability and no owned tabs.
+    fn start_task(runtime: &Runtime, connection: &ConnectionContext) -> Uuid {
+        let task_id = connection.ensure_task(&runtime.journal).unwrap();
+        let capability = connection
+            .reserve_new_capability()
+            .unwrap()
+            .expect("new task capability must be delivered before browser work");
+        confirm_new_capability(runtime, connection, capability.resume_capability);
         task_id
     }
 
@@ -3872,6 +3916,297 @@ mod tests {
             .abandon_popup_staged_commit(task_id, 3, &failure_handle)
             .is_err());
     }
+
+    const PRIVATE_TITLE: &str = "Private Northwind Ledger";
+    const PRIVATE_URL: &str = "https://private-ledger.example.net/accounts/42";
+
+    /// Models the extension's browser_profile route: reads return profile data,
+    /// bookmarks_remove stages a task-bound review, and commits execute it.
+    #[derive(Debug, Default)]
+    struct ProfileNative {
+        methods: Mutex<Vec<String>>,
+        origin_policies: Mutex<Vec<Option<NativeOriginPolicy>>>,
+        removed: AtomicUsize,
+        review_handles: Mutex<Vec<String>>,
+        complete_remove_without_stage: bool,
+    }
+
+    impl NativeTransport for ProfileNative {
+        fn dispatch(
+            &self,
+            _connection_id: Uuid,
+            task_id: Uuid,
+            method: &str,
+            params: Value,
+            origin_policy: Option<NativeOriginPolicy>,
+            _timeout: Duration,
+        ) -> Result<NativeResponse, NativeError> {
+            self.methods.lock().push(method.to_string());
+            self.origin_policies.lock().push(origin_policy);
+            if method == "commit_review_bind" {
+                if let Some(handle) = params["review_handle"].as_str() {
+                    self.review_handles.lock().push(handle.to_string());
+                }
+            }
+            let response = |outcome, result, staged| NativeResponse {
+                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: NativeResponseKind::Response,
+                request_id: Uuid::new_v4(),
+                outcome,
+                result: Some(result),
+                error: None,
+                staged,
+            };
+            let operation = params["operation"].as_str().unwrap_or_default();
+            Ok(match (method, operation) {
+                ("browser_profile", "bookmarks_remove") if !self.complete_remove_without_stage => {
+                    response(
+                        Outcome::CommitRequired,
+                        json!({"operation": "bookmarks_remove"}),
+                        Some(NativeStagedCommit {
+                            native_token: "profile-native-token".into(),
+                            task_id,
+                            tab_id: 0,
+                            page_revision: 0,
+                            effect: agenttab_protocol::PROFILE_BOOKMARK_REMOVE_EFFECT.into(),
+                            fingerprint: "p".repeat(64),
+                            expires_at_ms: current_time_ms() + 60_000,
+                        }),
+                    )
+                }
+                ("browser_profile", "bookmarks_remove") => response(
+                    Outcome::Completed,
+                    json!({"operation": "bookmarks_remove", "id": "12", "removed": true}),
+                    None,
+                ),
+                ("browser_profile", "bookmarks_update") => response(
+                    Outcome::Completed,
+                    json!({"operation": "bookmarks_update", "id": "12", "updated": ["url"]}),
+                    None,
+                ),
+                ("browser_profile", operation) => response(
+                    Outcome::Completed,
+                    json!({
+                        "operation": operation,
+                        "bookmarks": [{"id": "12", "kind": "bookmark", "title": PRIVATE_TITLE, "url": PRIVATE_URL}],
+                        "count": 1,
+                        "truncated": false,
+                    }),
+                    None,
+                ),
+                ("browser_commit", _) => {
+                    self.removed.fetch_add(1, Ordering::Relaxed);
+                    response(
+                        Outcome::Completed,
+                        json!({"operation": "bookmarks_remove", "id": "12", "removed": true}),
+                        None,
+                    )
+                }
+                _ => response(Outcome::Completed, json!({}), None),
+            })
+        }
+    }
+
+    fn profile_request(request_id: &str, key: Option<Uuid>, params: Value) -> Value {
+        let mut request = json!({
+            "protocol": RPC_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "method": "browser_profile",
+            "params": params,
+        });
+        if let Some(key) = key {
+            request["idempotency_key"] = json!(key);
+        }
+        request
+    }
+
+    #[test]
+    fn profile_reads_run_without_tab_ownership_or_key() {
+        let native = Arc::new(ProfileNative::default());
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        start_task(&runtime, &connection);
+        let response = runtime.handle(
+            &connection,
+            profile_request(
+                "search",
+                None,
+                json!({"operation": "bookmarks_search", "query": "Northwind"}),
+            ),
+        );
+        assert_eq!(response["outcome"], "completed", "{response}");
+        assert_eq!(response["result"]["bookmarks"][0]["id"], "12");
+        assert_eq!(native.origin_policies.lock().as_slice(), &[None]);
+
+        let keyed_read = runtime.handle(
+            &connection,
+            profile_request(
+                "keyed-read",
+                Some(Uuid::now_v7()),
+                json!({"operation": "history_search", "text": "", "limit": 5}),
+            ),
+        );
+        assert_eq!(keyed_read["error"]["code"], "invalid_request");
+        let unkeyed_write = runtime.handle(
+            &connection,
+            profile_request(
+                "unkeyed-write",
+                None,
+                json!({"operation": "bookmarks_update", "id": "12", "url": "https://example.com/"}),
+            ),
+        );
+        assert_eq!(unkeyed_write["error"]["code"], "invalid_request");
+        assert_eq!(native.methods.lock().len(), 1);
+    }
+
+    #[test]
+    fn profile_bookmark_remove_requires_popup_review_then_commit() {
+        let native = Arc::new(ProfileNative::default());
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let task_id = start_task(&runtime, &connection);
+        let stage = runtime.handle(
+            &connection,
+            profile_request(
+                "remove",
+                Some(Uuid::now_v7()),
+                json!({"operation": "bookmarks_remove", "id": "12"}),
+            ),
+        );
+        assert_eq!(stage["outcome"], "commit_required", "{stage}");
+        assert_eq!(stage["result"]["tab_id"], 0);
+        assert_eq!(native.removed.load(Ordering::Relaxed), 0);
+        let staged_token = stage["result"]["staged_token"].as_str().unwrap().to_owned();
+        let commit = |request_id: &str| {
+            runtime.handle(
+                &connection,
+                json!({
+                    "protocol": RPC_PROTOCOL,
+                    "version": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "idempotency_key": Uuid::now_v7(),
+                    "method": "browser_commit",
+                    "params": {"staged_token": staged_token}
+                }),
+            )
+        };
+        let waiting = commit("before-approval");
+        assert_eq!(waiting["result"]["awaiting_human_approval"], true);
+        assert_eq!(native.removed.load(Ordering::Relaxed), 0);
+
+        let review_handle = native.review_handles.lock().last().cloned().unwrap();
+        let event = NativePopupCommitEvent {
+            review_handle,
+            task_id,
+            tab_id: 0,
+        };
+        let approved = runtime.commit_popup_review(&event, &Uuid::now_v7().to_string());
+        assert_eq!(approved.outcome, Outcome::Completed, "{:?}", approved.error);
+        let second = commit("after-approval");
+        assert_eq!(second["outcome"], "completed", "{second}");
+        assert_eq!(second["result"]["removed"], true);
+        assert_eq!(native.removed.load(Ordering::Relaxed), 1);
+        // Profile-scoped commits carry no tab origin policy.
+        assert_eq!(native.origin_policies.lock().last(), Some(&None));
+    }
+
+    #[test]
+    fn profile_bookmark_remove_that_skips_review_is_rejected() {
+        let native = Arc::new(ProfileNative {
+            complete_remove_without_stage: true,
+            ..ProfileNative::default()
+        });
+        let (_temp, runtime, connection) = connected_runtime(native);
+        start_task(&runtime, &connection);
+        let response = runtime.handle(
+            &connection,
+            profile_request(
+                "remove",
+                Some(Uuid::now_v7()),
+                json!({"operation": "bookmarks_remove", "id": "12"}),
+            ),
+        );
+        assert_eq!(response["outcome"], "unknown");
+        assert_eq!(response["error"]["code"], "invalid_commit_stage");
+    }
+
+    #[test]
+    fn profile_sessions_restore_is_refused_under_origin_policy() {
+        let native = Arc::new(ProfileNative::default());
+        let (_temp, runtime, connection) = connected_runtime_with_policy(
+            native.clone(),
+            r#"{"allowed_origins":["https://allowed.test"]}"#,
+        );
+        start_task(&runtime, &connection);
+        let response = runtime.handle(
+            &connection,
+            profile_request(
+                "restore",
+                Some(Uuid::now_v7()),
+                json!({"operation": "sessions_restore", "session_id": "17"}),
+            ),
+        );
+        assert_eq!(response["outcome"], "not_started");
+        assert_eq!(response["error"]["code"], "origin_policy_unverifiable");
+        assert!(native.methods.lock().is_empty());
+    }
+
+    #[test]
+    fn profile_titles_and_urls_never_reach_audit_or_journal() {
+        let native = Arc::new(ProfileNative::default());
+        let (temp, runtime, connection) = connected_runtime(native);
+        start_task(&runtime, &connection);
+        let search = runtime.handle(
+            &connection,
+            profile_request(
+                "search",
+                None,
+                json!({"operation": "bookmarks_search", "query": PRIVATE_TITLE}),
+            ),
+        );
+        assert_eq!(search["result"]["bookmarks"][0]["title"], PRIVATE_TITLE);
+        let update = runtime.handle(
+            &connection,
+            profile_request(
+                "update",
+                Some(Uuid::now_v7()),
+                json!({
+                    "operation": "bookmarks_update",
+                    "id": "12",
+                    "title": PRIVATE_TITLE,
+                    "url": PRIVATE_URL,
+                }),
+            ),
+        );
+        assert_eq!(update["outcome"], "completed", "{update}");
+        let audit = std::fs::read_to_string(temp.path().join("agenttab/audit.jsonl")).unwrap();
+        assert!(audit.contains("\"operation\":\"bookmarks_search\""));
+        assert!(audit.contains("\"operation\":\"bookmarks_update\""));
+        for private in [
+            PRIVATE_TITLE,
+            PRIVATE_URL,
+            "private-ledger.example.net",
+            "Northwind",
+        ] {
+            assert!(!audit.contains(private), "audit leaked {private}");
+        }
+        let mut stored = Vec::new();
+        for entry in std::fs::read_dir(temp.path().join("agenttab")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                stored.extend(std::fs::read(&path).unwrap());
+            }
+        }
+        for private in [PRIVATE_TITLE, PRIVATE_URL] {
+            assert!(
+                !stored
+                    .windows(private.len())
+                    .any(|window| window == private.as_bytes()),
+                "host state leaked {private}"
+            );
+        }
+    }
+
     fn current_time_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

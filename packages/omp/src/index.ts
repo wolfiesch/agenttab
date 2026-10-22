@@ -11,6 +11,7 @@ import {
   STANDARD_PRESS_KEYS,
   createUuidV7,
   createResumeCapabilityStore,
+  requiresIdempotencyKey,
   type MethodParams,
   type MutationMethod,
 } from "../../sdk-typescript/src/index";
@@ -317,6 +318,52 @@ const DEFINITIONS: ReadonlyArray<{
       }).strict(),
     },
     {
+      name: "browser_profile",
+      label: "Browser Profile",
+      description: "Search and edit Chrome bookmarks, search history, list recent or synced sessions, and inspect downloads for this Chrome profile. Not tab-scoped. Reads need no key; writes are idempotent; bookmarks_remove stages a Commit review. Never focuses Chrome.",
+      approval: "write",
+      // One flat object covers every operation: OpenAI-compatible providers reject a root union.
+      // Core enforces which fields each operation requires and the per-operation limit cap.
+      schema: (z) => {
+        const bookmarkId = z.string().regex(/^[0-9]{1,20}$/);
+        const query = z.string().min(1).max(256);
+        return z.object({
+          operation: z.enum([
+            "bookmarks_search",
+            "bookmarks_tree",
+            "bookmarks_update",
+            "bookmarks_create",
+            "bookmarks_move",
+            "bookmarks_remove",
+            "history_search",
+            "sessions_recent",
+            "sessions_devices",
+            "sessions_restore",
+            "downloads_search",
+            "downloads_cancel",
+            "downloads_pause",
+            "downloads_resume",
+          ]),
+          // Bookmark ids are decimal strings; download ids are non-negative integers.
+          id: z.union([bookmarkId, z.number().int().min(0)]).optional(),
+          parent_id: bookmarkId.optional(),
+          folder_id: bookmarkId.optional(),
+          depth: z.number().int().min(1).max(5).optional(),
+          title: z.string().max(1024).optional(),
+          url: z.string().min(1).max(2048).regex(/^(https?:\/\/|file:\/\/|chrome:\/\/)[^\s]+$/).optional(),
+          index: z.number().int().min(0).max(100_000).optional(),
+          query: query.optional(),
+          text: z.string().max(256).optional(),
+          start_time: z.number().min(0).optional(),
+          end_time: z.number().min(0).optional(),
+          // Sessions cap at 25; every other operation caps at 100.
+          limit: z.number().int().min(1).max(100).optional(),
+          session_id: z.string().min(1).max(256).regex(/^[^\s]+$/).optional(),
+          state: z.enum(["in_progress", "interrupted", "complete"]).optional(),
+        }).strict();
+      },
+    },
+    {
       name: "browser_commit",
       label: "Browser Commit",
       description: "Execute one previously staged consequential action after semantic review.",
@@ -577,7 +624,10 @@ export function makeExtension(clientFactory?: ClientFactory) {
             const response = await invocationClient.request(
               definition.name,
               params as MethodParams[Exclude<ToolMethod, "browser_finish">],
-              isMutation(definition.name)
+              // browser_profile keys only its write operations; reads must reach Core without a key.
+              (definition.name === "browser_profile"
+                ? requiresIdempotencyKey(definition.name, params)
+                : isMutation(definition.name))
                 ? { idempotencyKey: invocationKeys.for(invocationId) }
                 : {},
             );

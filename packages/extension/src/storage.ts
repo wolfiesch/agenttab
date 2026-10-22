@@ -307,7 +307,8 @@ function parseState(value: unknown): ExtensionState | null {
       token.length < 16 ||
       typeof commit.task_id !== "string" ||
       !finiteInteger(commit.tab_id) ||
-      !finiteInteger(commit.page_revision, 1) ||
+      // Profile-scoped stages (bookmark removal) bind to the task at tab 0, revision 0.
+      !(commit.tab_id === 0 ? commit.page_revision === 0 : finiteInteger(commit.page_revision, 1)) ||
       typeof commit.effect !== "string" ||
       typeof commit.fingerprint !== "string" ||
       commit.fingerprint.length < 32 ||

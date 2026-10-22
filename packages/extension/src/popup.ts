@@ -17,6 +17,8 @@ interface ReviewView {
   tabId: number;
   effect: string;
   expiresAtMs: number;
+  /** What a profile-scoped stage would change, e.g. the bookmark a removal targets. */
+  detail?: string;
 }
 
 interface NoticeView {
@@ -177,6 +179,7 @@ function parseReview(value: Record<string, unknown>): ReviewView | null {
     tabId: value.tab_id,
     effect: value.effect,
     expiresAtMs: value.expires_at_ms,
+    ...(typeof value.detail === "string" ? { detail: value.detail } : {}),
   };
 }
 
@@ -373,7 +376,14 @@ function renderReview(review: ReviewView): HTMLLIElement {
     });
   });
   actions.append(abandon, approve);
-  row.append(effect, expiry, actions);
+  row.append(effect);
+  if (review.detail !== undefined) {
+    const detail = document.createElement("span");
+    detail.className = "review-detail";
+    detail.textContent = review.detail;
+    row.append(detail);
+  }
+  row.append(expiry, actions);
   return row;
 }
 

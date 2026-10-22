@@ -115,6 +115,28 @@ const SUPPORTED_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   download: true,
   challenge_cleared: true,
 };
+/** Top-frame navigation facts one `load` or `url` wait has seen since it started. */
+interface NavigationObservation {
+  /** A top-frame load completed and no newer top-frame document has committed since. */
+  loaded: boolean;
+  /** Latest top-frame URL from a commit, completion, history-state update, or fragment update. */
+  url?: string;
+  /** Chrome's net error name when the latest top-frame navigation failed. */
+  error?: string;
+  /** Ends the current poll delay early. */
+  wake?: () => void;
+}
+type TopFrameNavigationEvent = "committed" | "completed" | "error" | "same_document";
+interface TopFrameNavigationDetails {
+  tabId: number;
+  frameId: number;
+  url: string;
+  error?: string;
+  documentLifecycle?: string;
+}
+/** A navigation another navigation replaced, or one Chrome turned into a download. */
+const SUPERSEDED_NAVIGATION_ERROR = "net::ERR_ABORTED";
+const NET_ERROR_NAME = /^net::ERR_[A-Z0-9_]{1,64}$/;
 function validateKeyboardAction(action: Record<string, unknown>): void {
   if (action.kind !== "press") return;
   const modifiers = action.modifiers;
@@ -560,6 +582,8 @@ export class StandardBrowserRuntime {
   private readonly debuggerRefusals = new Map<number, { reason: string; until: number }>();
   /** Page revision of the last completed challenge scan, per tab. */
   private readonly challengeScanRevisions = new Map<number, number>();
+  /** Live `load`/`url` waits per tab; navigation events are recorded only for these tabs. */
+  private readonly navigationObservations = new Map<number, Set<NavigationObservation>>();
 
   constructor(
     private readonly revisions: RevisionTracker,
@@ -681,6 +705,56 @@ export class StandardBrowserRuntime {
       this.debuggerRefusals.delete(tabId);
       return this.invalidateStagedDialogs(tabId);
     });
+    // The runtime is built synchronously at service-worker start, so these registrations stay
+    // top-level for MV3 event wake-ups.
+    const webNavigation = chrome.webNavigation;
+    if (webNavigation) {
+      const record = (event: TopFrameNavigationEvent) => (details: TopFrameNavigationDetails) =>
+        this.recordTopFrameNavigation(event, details);
+      webNavigation.onCommitted.addListener(record("committed"));
+      webNavigation.onCompleted.addListener(record("completed"));
+      webNavigation.onErrorOccurred.addListener(record("error"));
+      webNavigation.onHistoryStateUpdated.addListener(record("same_document"));
+      webNavigation.onReferenceFragmentUpdated.addListener(record("same_document"));
+    }
+  }
+
+  private recordTopFrameNavigation(event: TopFrameNavigationEvent, details: TopFrameNavigationDetails): void {
+    if (details.frameId !== 0 || details.documentLifecycle === "prerender") return;
+    const observations = this.navigationObservations.get(details.tabId);
+    if (!observations) return;
+    if (event === "error" && details.error === SUPERSEDED_NAVIGATION_ERROR) return;
+    for (const observation of observations) {
+      if (event === "error") {
+        observation.loaded = false;
+        observation.error = details.error !== undefined && NET_ERROR_NAME.test(details.error)
+          ? details.error
+          : "unknown network error";
+      } else {
+        observation.url = details.url;
+        if (event === "committed") {
+          observation.loaded = false;
+          delete observation.error;
+        } else if (event === "completed") {
+          observation.loaded = true;
+        }
+      }
+      observation.wake?.();
+    }
+  }
+
+  private observeNavigation(tabId: number): NavigationObservation {
+    const observation: NavigationObservation = { loaded: false };
+    const observations = this.navigationObservations.get(tabId) ?? new Set<NavigationObservation>();
+    observations.add(observation);
+    this.navigationObservations.set(tabId, observations);
+    return observation;
+  }
+
+  private stopObservingNavigation(tabId: number, observation: NavigationObservation): void {
+    const observations = this.navigationObservations.get(tabId);
+    observations?.delete(observation);
+    if (observations?.size === 0) this.navigationObservations.delete(tabId);
   }
 
   debuggerTabIds(): number[] {
@@ -1946,6 +2020,9 @@ export class StandardBrowserRuntime {
       (conditionKind === "network_idle" || (conditionKind === "download" && !retainedDownload))
         ? await this.acquireDebuggerBusyLease(tabId)
         : undefined;
+    // Top-frame navigation events make load/url waits see loads that finish between polls,
+    // SPA history-state URL changes, and failed navigations; tab polling stays the fallback.
+    const observation = TAB_ONLY_WAIT_CONDITIONS[conditionKind] === true ? this.observeNavigation(tabId) : undefined;
     try {
       do {
         await this.authorizeDebuggerUse(tabId);
@@ -1959,10 +2036,16 @@ export class StandardBrowserRuntime {
         ) {
           debuggerSession = await this.acquireDebuggerBusyLease(tabId, debuggerSession);
         }
+        if (observation?.error !== undefined) break;
+        const observed = observation !== undefined && (conditionKind === "load"
+          ? observation.loaded
+          : observation.url !== undefined && observation.url === condition.value);
         const matched = retainedDownload ??
-          await this.conditionMatched(tabId, condition, waitStartedAtMs, debuggerSession, taskId);
+          (observed ||
+            await this.conditionMatched(tabId, condition, waitStartedAtMs, debuggerSession, taskId));
         if (revalidate) await revalidate();
-        if (matched) {
+        // Events land while polling awaits; a failure seen meanwhile beats a polled match on the error page.
+        if (matched && observation?.error === undefined) {
           return {
             tab_id: tabId,
             page_revision: await this.revisions.current(tabId),
@@ -1984,8 +2067,15 @@ export class StandardBrowserRuntime {
         }
         const delay = Promise.withResolvers<void>();
         setTimeout(delay.resolve, 100);
+        if (observation) observation.wake = delay.resolve;
         await delay.promise;
-      } while (Date.now() < deadline);
+      } while (Date.now() < deadline && observation?.error === undefined);
+      if (observation?.error !== undefined) {
+        throw Object.assign(
+          new Error(`Top-frame navigation failed with ${observation.error} while waiting for ${conditionKind}`),
+          { code: "navigation_failed", outcome: "unknown" },
+        );
+      }
       if (conditionKind === "download" && typeof condition.after === "string") {
         const cursor = this.downloadCursors.get(String(condition.after));
         const session = this.sessions.get(tabId);
@@ -2004,6 +2094,7 @@ export class StandardBrowserRuntime {
       });
     } finally {
       if (debuggerSession) this.releaseDebuggerBusyLease(tabId, debuggerSession);
+      if (observation) this.stopObservingNavigation(tabId, observation);
     }
   }
 

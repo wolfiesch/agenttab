@@ -9,6 +9,8 @@ import { bindChallengeNotice, challengeStoreAvailable, readTaskEpisodes } from "
 const HANDOFF_ALARM = "agenttab-handoff-timeout";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_NOTICES = 100;
+/** Seconds without input before Chrome reports the user as idle. */
+const IDLE_DETECTION_SECONDS = 60;
 type PrivacyScrubber = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 
@@ -81,10 +83,13 @@ export class HandoffController {
     );
   }
 
+  /** Notice status plus whether the user is at the machine, so agents can judge if waiting longer helps. */
   status(taskId: string, noticeId: string): Promise<Record<string, unknown>> {
     return this.serialize(async () => {
       await this.expireNow();
-      return noticeResult(await this.noticeForTask(taskId, noticeId));
+      const result = noticeResult(await this.noticeForTask(taskId, noticeId));
+      const userIdleState = await chrome.idle?.queryState(IDLE_DETECTION_SECONDS).catch(() => undefined);
+      return userIdleState === undefined ? result : { ...result, user_idle_state: userIdleState };
     });
   }
 

@@ -4,11 +4,13 @@ import { removeTabIfPresent, StandardBrowserRuntime } from "./browser";
 import { HandoffController, HANDOFF_ALARM } from "./handoff";
 import { NativeBridge, RECONNECT_ALARM } from "./native";
 import { OwnershipLedger } from "./ownership";
+import { ProfileRuntime, profileReviewDetail } from "./profile";
 import {
   commitRequired,
   completed,
   failed,
   needsUser,
+  PROFILE_STAGE_TAB_ID,
   type NativeDispatchCommand,
   type NativeOriginPolicy,
   type NativeResponse,
@@ -72,6 +74,12 @@ const PRE_DISPATCH_ERRORS: Record<string, true> = {
   invalid_staged_token: true,
   staged_commit_expired: true,
   staged_commit_mismatch: true,
+  bookmark_not_found: true,
+  bookmark_root_immutable: true,
+  bookmark_folder_not_empty: true,
+  session_not_found: true,
+  download_not_found: true,
+  origin_policy_unverifiable: true,
 
   origin_denied: true,
   origin_not_allowed: true,
@@ -127,6 +135,19 @@ browser = new StandardBrowserRuntime(
 const handoff = new HandoffController(scheduler, revisions, ownership, emit);
 handoff.setScrubber((tabId) => browser.discardHumanInteractionCapture(tabId));
 handoff.setChallengeScanner((taskId, tabId) => browser.scanChallengeEpisodes(taskId, tabId));
+// Runs inside a global scheduler slot, so it opens through the ledger directly rather than re-entering the queue.
+const profile = new ProfileRuntime(async (taskId, url) => {
+  const opened = await ownership.open(taskId, { mode: "create", url, background: true });
+  return { tab_id: Number(opened.tab_id), page_revision: Number(opened.page_revision) };
+});
+const PROFILE_READ_OPERATIONS: Readonly<Record<string, true>> = {
+  bookmarks_search: true,
+  bookmarks_tree: true,
+  history_search: true,
+  sessions_recent: true,
+  sessions_devices: true,
+  downloads_search: true,
+};
 
 async function automationEnabled(): Promise<boolean> {
   if (automationCleanupPending) return false;
@@ -415,7 +436,8 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     }
   }
   const params = command.params;
-  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer" || command.method === "browser_credentials_fill";
+  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer" || command.method === "browser_credentials_fill" ||
+    (command.method === "browser_profile" && PROFILE_READ_OPERATIONS[String(params.operation)] !== true);
   try {
     if (command.method === "commit_review_bind") {
       return completed(command.request_id, await browser.bindReview(command.task_id, params));
@@ -425,6 +447,36 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         command.request_id,
         await browser.abandonNativeStage(command.task_id, params.native_token, params.tab_id),
       );
+    }
+    // Profile operations need no site access, so they bypass the automation gate and revoked
+    // automation permissions; pause and disconnect still refuse them. sessions_restore opens
+    // tabs, so it keeps the same permission admission as browser_open.
+    if (command.method === "browser_profile") {
+      if ((await readState()).paused) throw new NotStartedError("paused", "AgentTab is paused");
+      if (
+        params.operation === "sessions_restore" &&
+        command.origin_policy !== undefined &&
+        (command.origin_policy.allowed_origins.length > 0 || command.origin_policy.denied_origins.length > 0)
+      ) {
+        throw Object.assign(new Error("AgentTab cannot verify a restored session against the managed origin policy"), {
+          code: "origin_policy_unverifiable",
+        });
+      }
+      const execution = params.operation === "sessions_restore"
+        ? await scheduler.enqueueGlobal(() => profile.run(command.task_id, params))
+        : await scheduler.enqueueProfile(mutating, () => profile.run(command.task_id, params));
+      return execution.staged
+        ? commitRequired(command.request_id, execution.result, execution.staged)
+        : completed(command.request_id, execution.result);
+    }
+    if (
+      command.method === "browser_commit" &&
+      typeof params.native_token === "string" &&
+      (await readState()).stagedCommits[params.native_token]?.tab_id === PROFILE_STAGE_TAB_ID
+    ) {
+      const nativeToken = params.native_token;
+      const result = await scheduler.enqueueProfile(true, () => profile.commit(command.task_id, nativeToken));
+      return completed(command.request_id, result);
     }
     if (
       command.method !== "browser_open" &&
@@ -966,13 +1018,17 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
       })),
       reviews: Object.values(state.stagedCommits)
         .filter((staged) => typeof staged.review_handle === "string" && staged.approved !== true)
-        .map((staged) => ({
-          review_handle: staged.review_handle,
-          task_id: staged.task_id,
-          tab_id: staged.tab_id,
-          effect: staged.effect,
-          expires_at_ms: staged.expires_at_ms,
-        })),
+        .map((staged) => {
+          const detail = profileReviewDetail(staged);
+          return {
+            review_handle: staged.review_handle,
+            task_id: staged.task_id,
+            tab_id: staged.tab_id,
+            effect: staged.effect,
+            expires_at_ms: staged.expires_at_ms,
+            ...(detail !== undefined ? { detail } : {}),
+          };
+        }),
     };
   }
   if (message.kind === "set_pointer" && typeof message.enabled === "boolean") {

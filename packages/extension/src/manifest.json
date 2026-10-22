@@ -12,7 +12,13 @@
     "tabs",
     "tabGroups",
     "storage",
-    "alarms"
+    "alarms",
+    "bookmarks",
+    "history",
+    "sessions",
+    "downloads",
+    "webNavigation",
+    "idle"
   ],
   "optional_permissions": [
     "scripting"

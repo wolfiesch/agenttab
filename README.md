@@ -37,14 +37,14 @@ Commit is a two-party, best-effort semantic barrier, not proof that a page has n
 
 ## Trust contract
 
-- **Task ownership is an execution and coordination boundary, not profile isolation.** AgentTab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or a generic browser-global mutation API. Its one window-level operation creates an unfocused normal window for the first tab of an otherwise empty task.
+- **Task ownership is an execution and coordination boundary, not profile isolation.** AgentTab can use the signed-in session in the browser profile, but Standard mode does not expose raw cookies, storage, passwords, arbitrary JavaScript, raw CDP, coordinate actions, network interception, or a generic browser-global mutation API. Its one window-level operation creates an unfocused normal window for the first tab of an otherwise empty task. Its one profile-level tool, `browser_profile`, offers a fixed list of bookmark, history, session, and download operations, and it lets a connected agent read the profile's bookmarks, history, recently closed and synced tabs, and download list.
 - **Attention requests never take over.** Routine task work stays in task-owned tabs, and a handoff request never focuses a tab or pauses work; the popup's Open tab is the only routine focus transition and requires the user's click. Human-only input stays out of agent requests because the human types it directly in Chrome.
 - **Consequential actions run directly by default; Commit review is available.** YOLO mode skips the staging step but not task ownership, origin policy, expected page revisions, restricted-origin routing, credential isolation, or action validation. Turning YOLO mode off binds each staged action to its task, tab, page revision, element fingerprint, effect, and short expiry. Popup approval records consent but does not execute it; the agent must call `browser_commit`.
 - **Local by default.** Policy, task state, audit records, and IPC stay on the machine. AgentTab has no telemetry. See [Telemetry](docs/telemetry.md) and [Security](docs/security.md).
 
 ## Tool surface
 
-Standard mode exposes exactly nine tools:
+Standard mode exposes exactly ten tools:
 
 | Tool | Purpose |
 |---|---|
@@ -54,8 +54,9 @@ Standard mode exposes exactly nine tools:
 | `browser_wait` | Wait for load, URL, text, selector, network-idle, task-attributed download, or challenge-cleared conditions supported by the tab's route. |
 | `browser_tabs` | List only tabs owned by the current task, including each tab's automation route. |
 | `browser_handoff` | Post a non-blocking attention notice asking the user to complete human-only input, then verify the page and resolve or dismiss it by notice ID. A `challenge_cleared` completion ties the notice to a detected bot challenge. |
-| `browser_commit` | Execute one staged consequential action. |
+| `browser_commit` | Execute one staged consequential action, including an approved bookmark removal. |
 | `browser_credentials` | Prepare and fill an origin-matching 1Password login through opaque, short-lived host tokens. Available by default when the local `op` CLI is usable; owner-only policy can disable or constrain it. |
+| `browser_profile` | Search and organize bookmarks, search history, list recently closed or synced sessions and reopen one as background task tabs, and find, cancel, pause, or resume downloads. Works on the Chrome profile rather than a task tab and never focuses Chrome. Bookmark removal always stages for popup review; history is read-only. |
 | `browser_finish` | Finish the task, apply its cleanup policy, return closed and retained tab receipts, and release ownership. |
 
 Developer mode adds one tool, `browser_developer`. It is absent from Standard discovery. It requires both the persistent Developer mode control in the AgentTab popup and `AGENTTAB_DEVELOPER=1` in the adapter environment. Treat it as an explicit expansion of the normal boundary.

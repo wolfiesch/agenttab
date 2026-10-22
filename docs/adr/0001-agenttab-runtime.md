@@ -80,7 +80,7 @@ TCP and bearer-token access are not Standard transport. They exist only behind t
 
 AgentTab Core RPC and the host-to-extension native protocol are separately versioned. They MUST NOT silently downgrade across an incompatible version.
 
-MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not alternate hosts. The public Standard surface has exactly nine tools:
+MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not alternate hosts. The public Standard surface has exactly ten tools:
 
 1. `browser_open`
 2. `browser_snapshot`
@@ -90,15 +90,18 @@ MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not a
 6. `browser_handoff`
 7. `browser_commit`
 8. `browser_credentials`
-9. `browser_finish`
+9. `browser_profile`
+10. `browser_finish`
 
 `browser_credentials` is enabled by default. Managed policy MAY disable or constrain it. It MUST derive the page origin and task ownership in the host, enforce a candidate and attempt limit no greater than three, use one-use short-lived tokens, and keep credential values out of Core RPC, adapters, responses, and audit output.
 
+`browser_profile` operates on the Chrome profile rather than a task tab. Its read operations MUST NOT carry an idempotency key and its write operations MUST. Bookmark removal MUST always stage for popup review regardless of YOLO mode, session restore MUST open owned background tabs instead of calling `chrome.sessions.restore`, and the host MUST refuse session restore while origin policy is constrained. Audit MUST NOT record its titles, URLs, or query text.
+
 `browser_finish` applies the task's cleanup policy, closes task-created tabs unless retained, preserves adopted tabs by default, ungroups retained tabs, and releases task ownership while clearing that task's open notices. Staged Commit review or another in-flight task operation MUST defer finalization rather than destroy resumability; an open attention notice MUST NOT defer it.
 
-`browser_developer` is the tenth tool and is absent unless Developer mode is enabled.
+`browser_developer` is the eleventh tool and is absent unless Developer mode is enabled.
 
-Core RPC schemas are normative. Unknown fields and methods fail closed. Every mutation requires a UUIDv7 `idempotency_key`. Existing-page mutations also require the authoritative `tab_id` and expected `page_revision`. `browser_commit` is bound by its staged record rather than caller-supplied tab or revision.
+Core RPC schemas are normative. Unknown fields and methods fail closed. Every mutation requires a UUIDv7 `idempotency_key`; for `browser_profile`, only its write operations are mutations. Existing-page mutations also require the authoritative `tab_id` and expected `page_revision`. `browser_commit` is bound by its staged record rather than caller-supplied tab or revision.
 
 The server derives IPC peer identity, connection identity, and task ownership. A client-supplied owner, origin, or `conversation_id` MUST NOT authorize access.
 
@@ -157,6 +160,8 @@ Top-document target resolution MUST pin an explicit main-frame isolated executio
 Debugger attachment MUST be lazy and limited to task-owned tabs, and the task connection is reused only until its idle timeout. The installed debugger grant is not an attachment grant: Standard mode exposes no raw CDP escape hatch and no attachment may remain while optional scripting is off. The Chrome Web Store rationale MUST disclose this exact limited use.
 
 The stable target requires `nativeMessaging`, `tabs`, `tabGroups`, `storage`, `alarms`, and `debugger`, with exactly `scripting` optional and `<all_urls>` host access. `cookies`, `history`, `bookmarks`, `contentSettings`, `activeTab`, and browser-global `downloads` access are absent from that target. PR1 locks and statically verifies this transformation without changing or reloading the installed v1 extension.
+
+Amendment (profile capabilities): the owner approved six further required permissions for the profile-scoped `browser_profile` method and two internal signals: `bookmarks`, `history`, `sessions`, `downloads`, `webNavigation`, and `idle`. History is read-only (no delete calls), downloads expose search, cancel, pause, and resume only (no open, show, file removal, or erase), session restore never calls `chrome.sessions.restore` because it activates the restored tab or window, and bookmark removal always passes the popup Commit review. `webNavigation` hardens `browser_wait` load and URL conditions, and `idle` lets handoff status report whether the human is at the machine. `cookies`, `contentSettings`, and `activeTab` remain absent.
 
 Permission evidence follows the implementation boundary. PR1 proves the deterministic required/optional manifest split, the installed-debugger versus live-attachment boundary, and the platform IPC security primitives. Its three-run live matrix varies optional scripting while requiring debugger to remain granted; it verifies zero AgentTab debugger attachments when scripting is off or revoked, then preserves denial, re-grant, Pause, reload, disable, and cleanup checks. PR2 verifies the production host lifecycle and IPC implementation. PR3 implements the full ownership/UI lifecycle. A failed `activeTab` matrix run records the exact Chrome API call before retention. The live probe never changes Chrome permissions itself, rejects raw CDP at the non-configurable Standard boundary, and cleans only task-owned tabs plus its exact fixture download.
 

@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agenttab.dev/schemas/rpc/v1/browser-profile.schema.json",
+  "title": "browser_profile parameters",
+  "description": "Profile-scoped Chrome bookmarks, history, sessions, and downloads. Operations are not tab-scoped and never focus Chrome. Write operations require an idempotency_key; bookmarks_remove always returns commit_required and executes only through browser_commit after popup approval.",
+  "$defs": {
+    "bookmark_id": { "type": "string", "pattern": "^[0-9]{1,20}$" },
+    "bookmark_url": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^(https?://|file://|chrome://)[^\\s]+$"
+    },
+    "bookmark_title": { "type": "string", "maxLength": 1024 },
+    "index": { "type": "integer", "minimum": 0, "maximum": 100000 },
+    "download_id": { "type": "integer", "minimum": 0 },
+    "session_limit": { "type": "integer", "minimum": 1, "maximum": 25 },
+    "result_limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "time_ms": { "type": "number", "minimum": 0 }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["operation", "query"],
+      "properties": {
+        "operation": { "const": "bookmarks_search" },
+        "query": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "limit": { "$ref": "#/$defs/result_limit", "default": 25 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation"],
+      "properties": {
+        "operation": { "const": "bookmarks_tree" },
+        "folder_id": { "$ref": "#/$defs/bookmark_id" },
+        "depth": { "type": "integer", "minimum": 1, "maximum": 5, "default": 1 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation", "id"],
+      "anyOf": [{ "required": ["title"] }, { "required": ["url"] }],
+      "properties": {
+        "operation": { "const": "bookmarks_update" },
+        "id": { "$ref": "#/$defs/bookmark_id" },
+        "title": { "$ref": "#/$defs/bookmark_title" },
+        "url": { "$ref": "#/$defs/bookmark_url" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation", "parent_id", "title"],
+      "properties": {
+        "operation": { "const": "bookmarks_create" },
+        "parent_id": { "$ref": "#/$defs/bookmark_id" },
+        "title": { "$ref": "#/$defs/bookmark_title" },
+        "url": { "$ref": "#/$defs/bookmark_url" },
+        "index": { "$ref": "#/$defs/index" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation", "id", "parent_id"],
+      "properties": {
+        "operation": { "const": "bookmarks_move" },
+        "id": { "$ref": "#/$defs/bookmark_id" },
+        "parent_id": { "$ref": "#/$defs/bookmark_id" },
+        "index": { "$ref": "#/$defs/index" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation", "id"],
+      "properties": {
+        "operation": { "const": "bookmarks_remove" },
+        "id": { "$ref": "#/$defs/bookmark_id" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation", "text", "limit"],
+      "properties": {
+        "operation": { "const": "history_search" },
+        "text": { "type": "string", "maxLength": 256 },
+        "start_time": { "$ref": "#/$defs/time_ms" },
+        "end_time": { "$ref": "#/$defs/time_ms" },
+        "limit": { "$ref": "#/$defs/result_limit" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation"],
+      "properties": {
+        "operation": { "enum": ["sessions_recent", "sessions_devices"] },
+        "limit": { "$ref": "#/$defs/session_limit", "default": 10 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation", "session_id"],
+      "properties": {
+        "operation": { "const": "sessions_restore" },
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\s]+$" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation"],
+      "properties": {
+        "operation": { "const": "downloads_search" },
+        "query": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "state": { "enum": ["in_progress", "interrupted", "complete"] },
+        "limit": { "$ref": "#/$defs/result_limit", "default": 25 }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["operation", "id"],
+      "properties": {
+        "operation": { "enum": ["downloads_cancel", "downloads_pause", "downloads_resume"] },
+        "id": { "$ref": "#/$defs/download_id" }
+      },
+      "additionalProperties": false
+    }
+  ]
+}
