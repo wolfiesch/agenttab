@@ -6,7 +6,7 @@ import {
   type BrowserAction,
 } from "../../sdk-typescript/src/index.js";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { parse } from "node-html-parser";
@@ -15,10 +15,20 @@ const COMMIT_REVIEW_TIMEOUT_MS = 300_000;
 const COMMIT_REVIEW_POLL_MS = 500;
 const STATE_DIRECTORY = join(process.env.AGENTTAB_STATE_DIR ?? join(homedir(), ".agenttab"), "gpt-control");
 const PROTOCOL_VERSION = 1;
-const ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]';
+// ChatGPT marks each assistant reply with a screen-reader heading followed by the reply body. The older
+// `data-message-author-role` attribute survives only on an empty placeholder, so it is the fallback.
+const ASSISTANT_SELECTORS = ['h4[data-conversation-role="assistant"] + *', '[data-message-author-role="assistant"]'] as const;
+// Present only while ChatGPT is still streaming text or rendering an image. After the first prompt, ChatGPT keeps
+// the hidden home composer in the DOM with a stale Stop button, so only the thread composer counts once it exists.
+const STOP_BUTTON = ':is(button[data-testid="stop-button"], button[aria-label*="Stop" i])';
+const BUSY_SELECTOR = `form[data-composer-placement="thread"] ${STOP_BUTTON}, body:not(:has(form[data-composer-placement="thread"])) ${STOP_BUTTON}`;
+const CHATGPT_ORIGIN = "https://chatgpt.com";
+const DOWNLOAD_DIRECTORY = process.env.AGENTTAB_DOWNLOAD_DIR ?? join(homedir(), "Downloads");
+const DOWNLOAD_TIMEOUT_MS = 60_000;
 const FILE_INPUT_SELECTOR = 'input[type="file"]';
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_HOSTS = ["oaiusercontent.com", "files.openai.com"] as const;
+const BLOB_IMAGE_PATTERN = /^blob:https:\/\/chatgpt\.com\/[0-9a-f-]{36}$/i;
 
 interface DriverRequest {
   version: number;
@@ -176,14 +186,14 @@ async function completeAction(
   tabId: number,
   pageRevision: number,
   actions: BrowserAction[],
-): Promise<void> {
+): Promise<unknown> {
   const response = await client.request("browser_act", {
     tab_id: tabId,
     expected_page_revision: pageRevision,
     actions,
   });
   if (!response.ok) throw new AgentTabError(response);
-  if (response.outcome === "completed") return;
+  if (response.outcome === "completed") return response.result;
   if (response.outcome !== "commit_required") {
     throw new Error(`AgentTab browser_act returned unexpected outcome ${response.outcome}`);
   }
@@ -193,7 +203,7 @@ async function completeAction(
   while (Date.now() < deadline) {
     const committed = await client.request("browser_commit", { staged_token: stagedToken });
     if (!committed.ok) throw new AgentTabError(committed);
-    if (committed.outcome === "completed") return;
+    if (committed.outcome === "completed") return committed.result;
     if (committed.outcome !== "commit_required") {
       throw new Error(`AgentTab browser_commit returned unexpected outcome ${committed.outcome}`);
     }
@@ -328,7 +338,20 @@ async function submitPrompt(session: DriverSession, prompt: string): Promise<voi
   }
 }
 
+function isPageBoundImageUrl(raw: string): boolean {
+  if (BLOB_IMAGE_PATTERN.test(raw)) return true;
+  try {
+    const url = new URL(raw);
+    return url.origin === CHATGPT_ORIGIN && !url.username && !url.password
+      && url.pathname === "/backend-api/estuary/content" && Boolean(url.searchParams.get("id"));
+  } catch {
+    return false;
+  }
+}
+
 function approvedImageUrl(raw: string): string | undefined {
+  // Blob and authenticated same-origin image URLs must be downloaded through the owned page.
+  if (isPageBoundImageUrl(raw)) return raw;
   let url: URL;
   try {
     url = new URL(raw);
@@ -350,7 +373,9 @@ export function extractAssistantTurn(html: string): { text: string; imageUrls: s
     seen.add(approved);
     images.push(approved);
   }
+  // Image turns have no `.markdown` body; their buttons ("Edit", share) are controls, not model output.
   const content = root.querySelector(".markdown") ?? root;
+  if (content === root) for (const control of root.querySelectorAll("button")) control.remove();
   const text = content.structuredText
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -370,27 +395,47 @@ export function nextAssistantProgress(
   };
 }
 
+/**
+ * Returns the outerHTML of the first or last match, or undefined when nothing matches. Depending on the
+ * extension build a miss is either a `Selector did not match` error or empty content; a real element's
+ * outerHTML is never empty, so both mean the same thing.
+ */
+async function matchedHtml(
+  client: AgentTabClient,
+  tabId: number,
+  selector: string,
+  match: "first" | "last",
+  maxBytes: number,
+): Promise<string | undefined> {
+  try {
+    const snapshot = await client.call<"browser_snapshot", HtmlSnapshot>("browser_snapshot", {
+      tab_id: tabId,
+      mode: "html",
+      selector,
+      match,
+      max_bytes: maxBytes,
+    });
+    return snapshot.content || undefined;
+  } catch (error) {
+    if (error instanceof AgentTabError && error.code === "snapshot_failed" && /Selector did not match/.test(error.message)) return undefined;
+    throw error;
+  }
+}
+
 async function readAssistant(session: DriverSession): Promise<{ count: number; text: string; imageUrls: string[] }> {
   const client = await connectSession(session.sessionId);
   try {
-    let snapshot: HtmlSnapshot;
-    try {
-      snapshot = await client.call<"browser_snapshot", HtmlSnapshot>("browser_snapshot", {
-        tab_id: session.pageId,
-        mode: "html",
-        selector: ASSISTANT_SELECTOR,
-        match: "last",
-        max_bytes: 1_000_000,
-      });
-    } catch (error) {
-      if (error instanceof AgentTabError && error.code === "snapshot_failed" && /Selector did not match/.test(error.message)) {
-        const metadata = await readMetadata(session.sessionId);
-        return { count: metadata.assistantCount, text: "", imageUrls: [] };
-      }
-      throw error;
-    }
-    const turn = extractAssistantTurn(snapshot.content);
     const metadata = await readMetadata(session.sessionId);
+    const unchanged = { count: metadata.assistantCount, text: "", imageUrls: [] };
+    // A turn that is still streaming, or an image still rendering progressive previews, is not a reply yet.
+    if (await matchedHtml(client, session.pageId, BUSY_SELECTOR, "first", 256)) return unchanged;
+    let html: string | undefined;
+    for (const selector of ASSISTANT_SELECTORS) {
+      html = await matchedHtml(client, session.pageId, selector, "last", 1_000_000);
+      if (html) break;
+    }
+    if (!html) return unchanged;
+    const turn = extractAssistantTurn(html);
     const progress = nextAssistantProgress(metadata, turn.fingerprint);
     if (progress) await writeMetadata({ ...metadata, ...progress });
     return {
@@ -398,6 +443,146 @@ async function readAssistant(session: DriverSession): Promise<{ count: number; t
       text: turn.text,
       imageUrls: turn.imageUrls,
     };
+  } finally {
+    client.close();
+  }
+}
+
+export async function findDownloadedImage(directory: string, before: ReadonlySet<string>, since: number, expectedName: string): Promise<string> {
+  if (!expectedName || /[/\\]/.test(expectedName) || !/\.png$/i.test(expectedName)) {
+    throw new Error("The browser did not report a safe PNG download filename");
+  }
+  const stem = expectedName.slice(0, -4);
+  const candidates: string[] = [];
+  for (const name of await readdir(directory)) {
+    const matches = name === expectedName || (name.startsWith(stem) && /^ \([1-9]\d*\)\.png$/i.test(name.slice(stem.length)));
+    if (before.has(name) || !matches) continue;
+    const path = join(directory, name);
+    const info = await lstat(path).catch(() => undefined);
+    if (info?.isFile() && info.birthtimeMs >= since && info.size > 0) candidates.push(path);
+  }
+  if (candidates.length !== 1) {
+    throw new Error(`Expected exactly one new PNG matching the owned download filename, found ${candidates.length}; check AGENTTAB_DOWNLOAD_DIR and avoid concurrent downloads with the same name.`);
+  }
+  return candidates[0];
+}
+
+
+async function buttonNodes(client: AgentTabClient, tabId: number, name: RegExp): Promise<{ revision: number; buttons: AccessibilityNode[] }> {
+  const snapshot = await client.call<"browser_snapshot", AccessibilitySnapshot>("browser_snapshot", {
+    tab_id: tabId,
+    mode: "accessibility",
+    max_depth: 80,
+    max_nodes: 5_000,
+  });
+  const buttons = snapshot.nodes.filter((node) => node.role === "button" && typeof node.ref === "string" && name.test(node.name ?? ""));
+  return { revision: snapshot.page_revision, buttons };
+}
+
+const GALLERY_SELECTOR = '[data-testid="generated-image-gallery"]';
+const SHARE_DIALOG_SELECTOR = '[role="dialog"][aria-modal="true"][data-state="open"]';
+const MAX_SELECTOR_LENGTH = 2048;
+
+function cssString(value: string): string {
+  return `"${value.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\a ")}"`;
+}
+
+/**
+ * Returns the label of the Share button that belongs to `url` in one generated-image gallery. Galleries list
+ * their page-bound images and Share buttons in the same order; labels may sit on the image or its button.
+ */
+export function shareLabelFor(galleryHtml: string, url: string): string {
+  const root = parse(galleryHtml);
+  const images = [...new Set(root.querySelectorAll("img").map((image) => image.getAttribute("src") ?? "").filter(isPageBoundImageUrl))];
+  const labels = root.querySelectorAll('button[aria-label^="Share generated image"]').map((button) => button.getAttribute("aria-label") ?? "");
+  const index = images.indexOf(url);
+  if (index < 0) throw new Error("Generated image is no longer in the ChatGPT thread");
+  if (labels.length !== images.length) {
+    throw new Error(`Found ${labels.length} image share buttons for ${images.length} generated images`);
+  }
+  return labels[index];
+}
+
+function gallerySelector(url: string): string {
+  return `${GALLERY_SELECTOR}:has(img[src=${cssString(url)}])`;
+}
+
+/** Opens the image's share dialog in the owned tab, downloads it, and returns the browser's local file. */
+async function downloadGeneratedImage(client: AgentTabClient, tabId: number, url: string): Promise<string> {
+  const existingDialog = await matchedHtml(client, tabId, SHARE_DIALOG_SELECTOR, "last", 1_000_000);
+  if (existingDialog) {
+    if (!parse(existingDialog).querySelectorAll("img").some((image) => image.getAttribute("src") === url)) {
+      throw new Error("An unrelated dialog is open; close it before saving the generated image");
+    }
+  } else {
+    // Snapshot only the gallery holding this image, so thread length never truncates the lookup.
+    const gallery = gallerySelector(url);
+    const galleryHtml = await matchedHtml(client, tabId, gallery, "last", 1_000_000);
+    if (!galleryHtml) throw new Error("Generated image is no longer in the ChatGPT thread");
+    const share = `${gallery} button[aria-label=${cssString(shareLabelFor(galleryHtml, url))}]`;
+    if (share.length > MAX_SELECTOR_LENGTH) throw new Error("Generated image URL is too long to target its Share button");
+    await completeAction(client, tabId, await tabRevision(client, tabId), [{ kind: "click", selector: share }]);
+  }
+  await client.call("browser_wait", {
+    tab_id: tabId,
+    condition: { kind: "selector", value: `${SHARE_DIALOG_SELECTOR} button[aria-label="Download"]` },
+    timeout_ms: 10_000,
+  }, { timeoutMs: 20_000 });
+  const download = await buttonNodes(client, tabId, /^Download$/);
+  const button = download.buttons.at(-1);
+  if (!button?.ref) throw new Error("ChatGPT share dialog has no Download button");
+  const before = new Set(await readdir(DOWNLOAD_DIRECTORY));
+  const since = Date.now();
+  const action = { kind: "click" as const, ref: button.ref, expect_download: true };
+  const clicked = record(await completeAction(client, tabId, download.revision, [action]), "download action");
+  if (!Array.isArray(clicked.actions)) throw new Error("Download action omitted its results");
+  const cursor = stringField(record(clicked.actions.at(-1), "download result"), "download_cursor");
+  const condition = { kind: "download" as const, after: cursor };
+  const completed = await client.call<"browser_wait", Record<string, unknown>>("browser_wait", {
+    tab_id: tabId,
+    condition,
+    timeout_ms: DOWNLOAD_TIMEOUT_MS,
+  }, { timeoutMs: DOWNLOAD_TIMEOUT_MS + 10_000 });
+  const expectedName = stringField(record(completed.download, "completed download"), "suggested_filename");
+  const downloaded = await findDownloadedImage(DOWNLOAD_DIRECTORY, before, since, expectedName);
+  if (await matchedHtml(client, tabId, SHARE_DIALOG_SELECTOR, "last", 256)) {
+    const close = await buttonNodes(client, tabId, /^Close/);
+    const closeButton = close.buttons.at(-1);
+    if (closeButton?.ref) await completeAction(client, tabId, close.revision, [{ kind: "click", ref: closeButton.ref }]);
+  }
+  return downloaded;
+}
+
+/**
+ * Saves a generated image at full resolution. Page-bound URLs require the signed-in page, so the image is
+ * downloaded through ChatGPT's own share dialog and copied from Chrome's download directory to `outputPath`.
+ */
+async function saveImage(session: DriverSession, url: string, outputPath: string): Promise<string> {
+  if (!isAbsolute(outputPath)) throw new Error("Image output path must be absolute");
+  if (!isPageBoundImageUrl(url)) throw new Error("save_image accepts only ChatGPT page-bound image URLs");
+  const client = await connectSession(session.sessionId);
+  try {
+    let downloaded: string;
+    try {
+      downloaded = await downloadGeneratedImage(client, session.pageId, url);
+    } catch (error) {
+      if (!(error instanceof AgentTabError && error.code === "multiple_download_throttle")) throw error;
+      // Chrome allows one automatic download per page load. Authenticated image URLs survive a reload of the
+      // owned tab; blob URLs do not, and then fail as no longer present.
+      await completeAction(client, session.pageId, await tabRevision(client, session.pageId), [{ kind: "reload" }]);
+      await waitForComposer(client, session.pageId, 30_000);
+      await client.call("browser_wait", {
+        tab_id: session.pageId,
+        condition: { kind: "selector", value: gallerySelector(url) },
+        timeout_ms: 15_000,
+      }, { timeoutMs: 25_000 }).catch(() => undefined);
+      downloaded = await downloadGeneratedImage(client, session.pageId, url);
+    }
+    await mkdir(dirname(outputPath), { recursive: true });
+    // Keep the browser's download intact; never move a possibly concurrent user download.
+    await copyFile(downloaded, outputPath);
+    await chmod(outputPath, 0o600);
+    return outputPath;
   } finally {
     client.close();
   }
@@ -427,6 +612,8 @@ async function captureScreenshot(session: DriverSession, outputPath: string): Pr
       tab_id: session.pageId,
       mode: "screenshot",
       format: "png",
+      max_width: 1024,
+      max_height: 768,
       max_bytes: 750_000,
     });
     await mkdir(dirname(outputPath), { recursive: true });
@@ -485,6 +672,8 @@ async function dispatch(request: DriverRequest): Promise<unknown> {
       return null;
     case "screenshot":
       return captureScreenshot(sessionField(params), stringField(params, "outputPath"));
+    case "save_image":
+      return saveImage(sessionField(params), stringField(params, "url"), stringField(params, "outputPath"));
     default:
       throw new Error(`Unsupported GPT-Control browser driver action: ${request.action}`);
   }
