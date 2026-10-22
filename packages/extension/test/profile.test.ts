@@ -75,6 +75,7 @@ let nativePort: MockNativePort | null = null;
 // Listener registries outlive per-test data resets: the background entrypoint registers once.
 const listeners = new Map<string, Listener[]>();
 const alarmClears: string[] = [];
+const alarmClearWaiters = new Map<string, () => void>();
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -232,13 +233,29 @@ function resetFakeData(): void {
 
 class MockNativePort {
   readonly posted: Array<Record<string, unknown>> = [];
+  private readonly postWaiters: Array<{ matches: (message: Record<string, unknown>) => boolean; resolve: (message: Record<string, unknown>) => void }> = [];
   private readonly messageListeners: Listener[] = [];
   private readonly disconnectListeners: Listener[] = [];
   readonly onMessage = { addListener: (listener: Listener) => void this.messageListeners.push(listener) };
   readonly onDisconnect = { addListener: (listener: Listener) => void this.disconnectListeners.push(listener) };
 
   postMessage(message: unknown): void {
-    if (isRecord(message)) this.posted.push(clone(message));
+    if (!isRecord(message)) return;
+    const posted = clone(message);
+    this.posted.push(posted);
+    for (const waiter of this.postWaiters.filter((candidate) => candidate.matches(posted))) {
+      this.postWaiters.splice(this.postWaiters.indexOf(waiter), 1);
+      waiter.resolve(posted);
+    }
+  }
+
+  /** Resolves with the first posted message that matches, including one already posted. */
+  nextPosted(matches: (message: Record<string, unknown>) => boolean): Promise<Record<string, unknown>> {
+    const existing = this.posted.find(matches);
+    if (existing) return Promise.resolve(existing);
+    const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+    this.postWaiters.push({ matches, resolve });
+    return promise;
   }
 
   disconnect(): void {
@@ -470,6 +487,7 @@ function installChrome(): void {
         create() {},
         async clear(name: string) {
           alarmClears.push(name);
+          alarmClearWaiters.get(name)?.();
           return true;
         },
         onAlarm: chromeEvent("alarms.onAlarm"),
@@ -1113,34 +1131,16 @@ describe("browser_profile through the extension entrypoint", () => {
   // Each command needs a distinct request id; the counter fills the UUID's last group.
   let requestCounter = 0;
 
-  async function waitFor(predicate: () => boolean): Promise<void> {
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      if (predicate()) return;
-      // The background settles through storage promise chains and microtask-dispatched tab events;
-      // a zero-delay macrotask yield lets them run without guessing a duration.
-      await Bun.sleep(0);
-    }
-    throw new Error("condition did not settle within the bounded wait");
-  }
-
-  async function send(method: string, params: Record<string, unknown>, taskId = TASK_A): Promise<Record<string, unknown>> {
+  async function deliver(message: Record<string, unknown>): Promise<Record<string, unknown>> {
     requestCounter += 1;
     const requestId = `018f47b8-2f80-7c20-9c77-${(0x700000000000 + requestCounter).toString(16)}`;
-    port.receive({
-      protocol: NATIVE_PROTOCOL,
-      version: PROTOCOL_VERSION,
-      kind: "command",
-      request_id: requestId,
-      task_id: taskId,
-      connection_id: CONNECTION_ID,
-      method,
-      params,
-    });
-    const isResponse = (message: Record<string, unknown>) => message.kind === "response" && message.request_id === requestId;
-    await waitFor(() => port.posted.some(isResponse));
-    const response = port.posted.find(isResponse);
-    if (!response) throw new Error("no response");
+    const response = port.nextPosted((posted) => posted.kind === "response" && posted.request_id === requestId);
+    port.receive({ protocol: NATIVE_PROTOCOL, version: PROTOCOL_VERSION, request_id: requestId, ...message });
     return response;
+  }
+
+  function send(method: string, params: Record<string, unknown>, taskId = TASK_A): Promise<Record<string, unknown>> {
+    return deliver({ kind: "command", task_id: taskId, connection_id: CONNECTION_ID, method, params });
   }
 
   async function popup(message: Record<string, unknown>): Promise<unknown> {
@@ -1168,9 +1168,12 @@ describe("browser_profile through the extension entrypoint", () => {
     // this file's Chrome fake, separate from any instance another test file already loaded.
     const backgroundModule = "../src/background.ts?profile-test";
     await import(backgroundModule);
-    await waitFor(() => port.posted.some((message) => message.kind === "hello"));
+    await port.nextPosted((message) => message.kind === "hello");
+    const reconnectCleared = alarmClears.includes(RECONNECT_ALARM)
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => alarmClearWaiters.set(RECONNECT_ALARM, resolve));
     port.receive({ protocol: NATIVE_PROTOCOL, version: PROTOCOL_VERSION, kind: "ready", host_version: "0.2.0", state: "ready" });
-    await waitFor(() => alarmClears.includes(RECONNECT_ALARM));
+    await reconnectCleared;
   });
 
   test("bookmarks_remove returns commit_required with skip-review on, and browser_commit removes it", async () => {
@@ -1282,6 +1285,51 @@ describe("browser_profile through the extension entrypoint", () => {
       outcome: "completed",
       result: { paused: false },
     });
+  });
+
+  test("finish defers and close clears a profile stage owned by a task that never opened a tab", async () => {
+    expect((await readState()).tasks[TASK_B]).toBeUndefined();
+    const token = stagedToken(await send("browser_profile", { operation: "bookmarks_remove", id: "22" }, TASK_B));
+    expect((await readState()).tasks[TASK_B]).toBeUndefined();
+
+    const finished = await deliver({ kind: "finish_task", task_id: TASK_B, disposition: "auto", keep_tab_ids: [] });
+    expect(finished).toMatchObject({
+      outcome: "completed",
+      result: { task_id: TASK_B, finished: false, deferred: "commit_review_active", retained_tab_ids: [] },
+    });
+    expect((await readState()).stagedCommits[token]).toBeDefined();
+
+    const closed = await deliver({ kind: "close_task", task_id: TASK_B });
+    expect(closed).toMatchObject({ outcome: "completed", result: { task_id: TASK_B, closed_tab_ids: [] } });
+    expect((await readState()).stagedCommits[token]).toBeUndefined();
+    expect(bookmarks.has("22")).toBe(true);
+
+    const finishedAfterClose = await deliver({ kind: "finish_task", task_id: TASK_B, disposition: "auto", keep_tab_ids: [] });
+    expect(finishedAfterClose).toMatchObject({ outcome: "completed", result: { finished: true } });
+  });
+
+  test("a download control whose entry vanishes after the Chrome call reports an unknown outcome", async () => {
+    expect(await send("browser_profile", { operation: "downloads_cancel", id: 404 })).toMatchObject({
+      outcome: "not_started",
+      error: { code: "download_not_found" },
+    });
+    const downloadsApi = chrome.downloads as unknown as { cancel: (id: number) => Promise<void> };
+    const cancel = downloadsApi.cancel;
+    // The human clears the entry from the downloads list between the cancel and the re-read.
+    downloadsApi.cancel = async (id) => {
+      await cancel(id);
+      downloadItems.delete(id);
+    };
+    try {
+      calls = [];
+      expect(await send("browser_profile", { operation: "downloads_cancel", id: 8 })).toMatchObject({
+        outcome: "unknown",
+        error: { code: "download_not_found" },
+      });
+      expect(callsTo("downloads.cancel")).toEqual([{ api: "downloads.cancel", args: [8] }]);
+    } finally {
+      downloadsApi.cancel = cancel;
+    }
   });
 
   test("no private profile data reached the console or a non-read response", async () => {

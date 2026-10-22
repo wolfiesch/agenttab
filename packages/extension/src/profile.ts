@@ -491,7 +491,14 @@ export class ProfileRuntime {
     } else {
       await chromeCall(() => chrome.downloads.resume(id), "resume the download");
     }
-    const after = await this.download(id);
+    // The Chrome call already ran, so a failed re-lookup (for example, an entry erased in
+    // between) cannot prove the control had no effect.
+    let after: chrome.downloads.DownloadItem;
+    try {
+      after = await this.download(id);
+    } catch (error) {
+      throw Object.assign(error instanceof Error ? error : new Error(String(error)), { outcome: "unknown" });
+    }
     return { id, state: after.state, paused: after.paused };
   }
 }

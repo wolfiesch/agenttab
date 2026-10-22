@@ -620,7 +620,10 @@ impl Runtime {
                 .lookup_mutation(task_id, key, request.method, &input_hash)
             {
                 Ok(Some(decision)) => {
-                    if request.method == RpcMethod::BrowserAct {
+                    if matches!(
+                        request.method,
+                        RpcMethod::BrowserAct | RpcMethod::BrowserProfile
+                    ) {
                         if let BeginDecision::Cached(cached) = &decision {
                             if let Some(staged_token) = staged_token_from_cached_response(cached) {
                                 let terminal_response =
@@ -4108,6 +4111,105 @@ mod tests {
         assert_eq!(native.removed.load(Ordering::Relaxed), 1);
         // Profile-scoped commits carry no tab origin policy.
         assert_eq!(native.origin_policies.lock().last(), Some(&None));
+    }
+
+    #[test]
+    fn committed_profile_remove_replay_never_replays_a_dead_review_token() {
+        let native = Arc::new(ProfileNative::default());
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let task_id = start_task(&runtime, &connection);
+        let remove_key = Uuid::now_v7();
+        let remove = |request_id: &str| {
+            runtime.handle(
+                &connection,
+                profile_request(
+                    request_id,
+                    Some(remove_key),
+                    json!({"operation": "bookmarks_remove", "id": "12"}),
+                ),
+            )
+        };
+        let stage = remove("remove-committed");
+        assert_eq!(stage["outcome"], "commit_required", "{stage}");
+        let staged_token = stage["result"]["staged_token"].as_str().unwrap().to_owned();
+        let review_handle = native.review_handles.lock().last().cloned().unwrap();
+        let event = NativePopupCommitEvent {
+            review_handle,
+            task_id,
+            tab_id: 0,
+        };
+        let approved = runtime.commit_popup_review(&event, &Uuid::now_v7().to_string());
+        assert_eq!(approved.outcome, Outcome::Completed, "{:?}", approved.error);
+        let committed = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "commit-profile-remove",
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_commit",
+                "params": {"staged_token": staged_token}
+            }),
+        );
+        assert_eq!(committed["outcome"], "completed", "{committed}");
+        let dispatches_before_replay = native.methods.lock().len();
+
+        let replayed = remove("remove-committed-recovery");
+        assert_eq!(replayed["outcome"], "not_started", "{replayed}");
+        assert_eq!(replayed["error"]["code"], "staged_token_invalid");
+        assert!(replayed["result"]["staged_token"].is_null());
+        let replayed_again = remove("remove-committed-recovery-again");
+        assert_eq!(replayed_again["error"], replayed["error"]);
+        assert_eq!(native.methods.lock().len(), dispatches_before_replay);
+        assert_eq!(native.removed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn expired_profile_remove_replay_replaces_the_cached_review_without_redispatch() {
+        let native = Arc::new(ProfileNative::default());
+        let (temp, runtime, connection) = connected_runtime(native.clone());
+        let task_id = start_task(&runtime, &connection);
+        let remove_key = Uuid::now_v7();
+        let remove_params = json!({"operation": "bookmarks_remove", "id": "12"});
+        let remove = |request_id: &str| {
+            runtime.handle(
+                &connection,
+                profile_request(request_id, Some(remove_key), remove_params.clone()),
+            )
+        };
+        let stage = remove("remove-expired");
+        assert_eq!(stage["outcome"], "commit_required", "{stage}");
+        rusqlite::Connection::open(temp.path().join("agenttab/state.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE staged_commits SET expires_at_ms = ?1 WHERE native_token = ?2",
+                rusqlite::params![current_time_ms() - 1, "profile-native-token"],
+            )
+            .unwrap();
+        let dispatches_before_replay = native.methods.lock().len();
+
+        let expired = remove("remove-expired-recovery");
+        assert_eq!(expired["outcome"], "not_started", "{expired}");
+        assert_eq!(expired["error"]["code"], "staged_token_invalid");
+        let replayed = remove("remove-expired-recovery-again");
+        assert_eq!(replayed["outcome"], expired["outcome"]);
+        assert_eq!(replayed["error"], expired["error"]);
+        assert_eq!(native.methods.lock().len(), dispatches_before_replay);
+        let BeginDecision::Cached(cached) = runtime
+            .journal
+            .lookup_mutation(
+                task_id,
+                remove_key,
+                RpcMethod::BrowserProfile,
+                &request_hash(RpcMethod::BrowserProfile, &remove_params),
+            )
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expired staged removal must retain a terminal cached response");
+        };
+        assert_eq!(cached["outcome"], "not_started");
+        assert_eq!(cached["error"]["code"], "staged_token_invalid");
     }
 
     #[test]
