@@ -35,6 +35,19 @@ MUTATIONS = {
     "browser_developer",
 }
 
+# browser_profile is not a method-level mutation: only these operations change the profile and
+# carry an idempotency key. Its read operations must be sent without one.
+PROFILE_WRITE_OPERATIONS = frozenset({
+    "bookmarks_update",
+    "bookmarks_create",
+    "bookmarks_move",
+    "bookmarks_remove",
+    "sessions_restore",
+    "downloads_cancel",
+    "downloads_pause",
+    "downloads_resume",
+})
+
 JsonObject = dict[str, Any]
 
 BrowserPressKey = Literal[
@@ -196,6 +209,13 @@ class ChallengeBearingResult(TypedDict, total=False):
 
     challenge: ChallengeEvent
     status: str
+
+
+def requires_idempotency_key(method: str, params: Mapping[str, Any]) -> bool:
+    """True for method-level mutations and for browser_profile write operations."""
+    if method in MUTATIONS:
+        return True
+    return method == "browser_profile" and params.get("operation") in PROFILE_WRITE_OPERATIONS
 
 
 def resolve_transport_timeout(
@@ -1078,7 +1098,7 @@ class AgentTabClient:
                 "Persist pending_resume_capability durably, then call confirm_resume_capability before RPC"
             )
         mutation_idempotency_key: str | None = None
-        if method in MUTATIONS:
+        if requires_idempotency_key(method, params):
             mutation_idempotency_key = (
                 idempotency_key if idempotency_key is not None else str(uuid7())
             )

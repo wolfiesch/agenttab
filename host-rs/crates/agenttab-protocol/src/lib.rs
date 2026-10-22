@@ -84,6 +84,10 @@ pub const RPC_SCHEMA_ASSETS: &[(&str, &str)] = &[
         include_str!("../../../../schemas/rpc/v1/browser-commit.schema.json"),
     ),
     (
+        "browser_profile",
+        include_str!("../../../../schemas/rpc/v1/browser-profile.schema.json"),
+    ),
+    (
         "browser_developer",
         include_str!("../../../../schemas/rpc/v1/browser-developer.schema.json"),
     ),
@@ -184,6 +188,7 @@ pub enum RpcMethod {
     BrowserHandoff,
     BrowserCommit,
     BrowserCredentials,
+    BrowserProfile,
     #[serde(rename = "agenttab.status")]
     AgenttabStatus,
     #[serde(rename = "agenttab.finish")]
@@ -252,7 +257,7 @@ impl RpcRequest {
         if request.request_id.is_empty() || request.request_id.chars().count() > 128 {
             return Err(ProtocolError::InvalidRequestId);
         }
-        if request.method.is_mutation() {
+        if request.method.is_mutation() || params_require_idempotency(request.method, &request.params) {
             let key = request
                 .idempotency_key
                 .ok_or(ProtocolError::MissingIdempotencyKey(request.method))?;
@@ -261,9 +266,38 @@ impl RpcRequest {
             }
         }
         let params = MethodParams::parse(request.method, request.params.clone())?;
+        if request.method == RpcMethod::BrowserProfile
+            && !params.requires_idempotency()
+            && request.idempotency_key.is_some()
+        {
+            return Err(ProtocolError::InvalidParamConstraint {
+                method: request.method,
+                message: "idempotency_key is accepted only for mutating operations".into(),
+            });
+        }
         Ok((request, params))
     }
 }
+
+fn params_require_idempotency(method: RpcMethod, params: &Value) -> bool {
+    method == RpcMethod::BrowserProfile
+        && params
+            .get("operation")
+            .and_then(Value::as_str)
+            .is_some_and(|operation| PROFILE_WRITE_OPERATIONS.contains(&operation))
+}
+
+/// `browser_profile` operations that change profile state and therefore require an idempotency key.
+pub const PROFILE_WRITE_OPERATIONS: &[&str] = &[
+    "bookmarks_update",
+    "bookmarks_create",
+    "bookmarks_move",
+    "bookmarks_remove",
+    "sessions_restore",
+    "downloads_cancel",
+    "downloads_pause",
+    "downloads_resume",
+];
 
 fn validate_serialized_request_limit(value: &Value) -> Result<(), ProtocolError> {
     let encoded = serde_json::to_vec(value)?;
@@ -298,6 +332,7 @@ pub enum MethodParams {
     Tabs(BrowserTabsParams),
     Handoff(BrowserHandoffParams),
     Credentials(BrowserCredentialsParams),
+    Profile(BrowserProfileParams),
     Commit(BrowserCommitParams),
     Status(BrowserTabsParams),
     Finish(AgenttabFinishParams),
@@ -315,6 +350,7 @@ impl MethodParams {
             RpcMethod::BrowserTabs => Self::Tabs(decode_params(method, value)?),
             RpcMethod::BrowserHandoff => Self::Handoff(decode_params(method, value)?),
             RpcMethod::BrowserCredentials => Self::Credentials(decode_params(method, value)?),
+            RpcMethod::BrowserProfile => Self::Profile(decode_params(method, value)?),
             RpcMethod::BrowserCommit => Self::Commit(decode_params(method, value)?),
             RpcMethod::AgenttabStatus => Self::Status(decode_params(method, value)?),
             RpcMethod::AgenttabFinish => Self::Finish(decode_params(method, value)?),
@@ -334,6 +370,7 @@ impl MethodParams {
             Self::Tabs(value) => serde_json::to_value(value),
             Self::Handoff(value) => serde_json::to_value(value),
             Self::Credentials(value) => serde_json::to_value(value),
+            Self::Profile(value) => serde_json::to_value(value),
             Self::Commit(value) => serde_json::to_value(value),
             Self::Status(value) => serde_json::to_value(value),
             Self::Finish(value) => serde_json::to_value(value),
@@ -341,6 +378,12 @@ impl MethodParams {
             Self::Developer(value) => serde_json::to_value(value),
         }
         .expect("typed protocol parameters serialize")
+    }
+
+    /// True when the parsed parameters describe a state-changing operation of a
+    /// method that is not a mutation as a whole.
+    pub fn requires_idempotency(&self) -> bool {
+        matches!(self, Self::Profile(params) if params.is_write())
     }
 }
 
@@ -792,6 +835,264 @@ pub struct BrowserDeveloperParams {
     pub action: String,
     pub params: Map<String, Value>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadStateFilter {
+    InProgress,
+    Interrupted,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BrowserProfileParams {
+    BookmarksSearch {
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    BookmarksTree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<u32>,
+    },
+    BookmarksUpdate {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    BookmarksCreate {
+        parent_id: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+    },
+    BookmarksMove {
+        id: String,
+        parent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+    },
+    BookmarksRemove {
+        id: String,
+    },
+    HistorySearch {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_time: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_time: Option<f64>,
+        limit: u32,
+    },
+    SessionsRecent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    SessionsDevices {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    SessionsRestore {
+        session_id: String,
+    },
+    DownloadsSearch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<DownloadStateFilter>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    DownloadsCancel {
+        id: u64,
+    },
+    DownloadsPause {
+        id: u64,
+    },
+    DownloadsResume {
+        id: u64,
+    },
+}
+
+impl BrowserProfileParams {
+    pub fn operation(&self) -> &'static str {
+        match self {
+            Self::BookmarksSearch { .. } => "bookmarks_search",
+            Self::BookmarksTree { .. } => "bookmarks_tree",
+            Self::BookmarksUpdate { .. } => "bookmarks_update",
+            Self::BookmarksCreate { .. } => "bookmarks_create",
+            Self::BookmarksMove { .. } => "bookmarks_move",
+            Self::BookmarksRemove { .. } => "bookmarks_remove",
+            Self::HistorySearch { .. } => "history_search",
+            Self::SessionsRecent { .. } => "sessions_recent",
+            Self::SessionsDevices { .. } => "sessions_devices",
+            Self::SessionsRestore { .. } => "sessions_restore",
+            Self::DownloadsSearch { .. } => "downloads_search",
+            Self::DownloadsCancel { .. } => "downloads_cancel",
+            Self::DownloadsPause { .. } => "downloads_pause",
+            Self::DownloadsResume { .. } => "downloads_resume",
+        }
+    }
+
+    pub fn is_write(&self) -> bool {
+        PROFILE_WRITE_OPERATIONS.contains(&self.operation())
+    }
+
+    fn validate(&self, method: RpcMethod) -> Result<(), ProtocolError> {
+        match self {
+            Self::BookmarksSearch { query, limit } => {
+                require_len(method, query, 1, MAX_PROFILE_QUERY_CHARS, "query")?;
+                validate_optional_limit(method, *limit, MAX_PROFILE_RESULTS)
+            }
+            Self::BookmarksTree { folder_id, depth } => {
+                if let Some(folder_id) = folder_id {
+                    require_bookmark_id(method, folder_id, "folder_id")?;
+                }
+                require(
+                    method,
+                    depth.is_none_or(|depth| (1..=MAX_BOOKMARK_TREE_DEPTH).contains(&depth)),
+                    format!("depth must be between 1 and {MAX_BOOKMARK_TREE_DEPTH}"),
+                )
+            }
+            Self::BookmarksUpdate { id, title, url } => {
+                require_bookmark_id(method, id, "id")?;
+                require(
+                    method,
+                    title.is_some() || url.is_some(),
+                    "bookmarks_update requires title or url",
+                )?;
+                if let Some(title) = title {
+                    require_len(method, title, 0, MAX_BOOKMARK_TITLE_CHARS, "title")?;
+                }
+                if let Some(url) = url {
+                    require_bookmark_url(method, url)?;
+                }
+                Ok(())
+            }
+            Self::BookmarksCreate {
+                parent_id,
+                title,
+                url,
+                index,
+            } => {
+                require_bookmark_id(method, parent_id, "parent_id")?;
+                require_len(method, title, 0, MAX_BOOKMARK_TITLE_CHARS, "title")?;
+                if let Some(url) = url {
+                    require_bookmark_url(method, url)?;
+                }
+                validate_bookmark_index(method, *index)
+            }
+            Self::BookmarksMove {
+                id,
+                parent_id,
+                index,
+            } => {
+                require_bookmark_id(method, id, "id")?;
+                require_bookmark_id(method, parent_id, "parent_id")?;
+                validate_bookmark_index(method, *index)
+            }
+            Self::BookmarksRemove { id } => require_bookmark_id(method, id, "id"),
+            Self::HistorySearch {
+                text,
+                start_time,
+                end_time,
+                limit,
+            } => {
+                require_len(method, text, 0, MAX_PROFILE_QUERY_CHARS, "text")?;
+                for (name, value) in [("start_time", start_time), ("end_time", end_time)] {
+                    require(
+                        method,
+                        value.is_none_or(|value| value.is_finite() && value >= 0.0),
+                        format!("{name} must be a non-negative epoch millisecond value"),
+                    )?;
+                }
+                if let (Some(start), Some(end)) = (start_time, end_time) {
+                    require(method, start <= end, "start_time must not be after end_time")?;
+                }
+                validate_optional_limit(method, Some(*limit), MAX_PROFILE_RESULTS)
+            }
+            Self::SessionsRecent { limit } | Self::SessionsDevices { limit } => {
+                validate_optional_limit(method, *limit, MAX_SESSION_RESULTS)
+            }
+            Self::SessionsRestore { session_id } => {
+                require_len(method, session_id, 1, MAX_REF_CHARS, "session_id")?;
+                require(
+                    method,
+                    !session_id.chars().any(char::is_whitespace),
+                    "session_id must not contain whitespace",
+                )
+            }
+            Self::DownloadsSearch { query, limit, .. } => {
+                if let Some(query) = query {
+                    require_len(method, query, 1, MAX_PROFILE_QUERY_CHARS, "query")?;
+                }
+                validate_optional_limit(method, *limit, MAX_PROFILE_RESULTS)
+            }
+            Self::DownloadsCancel { .. }
+            | Self::DownloadsPause { .. }
+            | Self::DownloadsResume { .. } => Ok(()),
+        }
+    }
+}
+
+const MAX_PROFILE_QUERY_CHARS: usize = 256;
+const MAX_PROFILE_RESULTS: u32 = 100;
+const MAX_SESSION_RESULTS: u32 = 25;
+const MAX_BOOKMARK_TREE_DEPTH: u32 = 5;
+const MAX_BOOKMARK_TITLE_CHARS: usize = 1_024;
+const MAX_BOOKMARK_INDEX: u32 = 100_000;
+
+fn validate_optional_limit(
+    method: RpcMethod,
+    limit: Option<u32>,
+    maximum: u32,
+) -> Result<(), ProtocolError> {
+    require(
+        method,
+        limit.is_none_or(|limit| (1..=maximum).contains(&limit)),
+        format!("limit must be between 1 and {maximum}"),
+    )
+}
+
+fn validate_bookmark_index(method: RpcMethod, index: Option<u32>) -> Result<(), ProtocolError> {
+    require(
+        method,
+        index.is_none_or(|index| index <= MAX_BOOKMARK_INDEX),
+        format!("index must be at most {MAX_BOOKMARK_INDEX}"),
+    )
+}
+
+fn require_bookmark_id(method: RpcMethod, value: &str, name: &str) -> Result<(), ProtocolError> {
+    require(
+        method,
+        (1..=20).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit()),
+        format!("{name} must be a numeric bookmark id"),
+    )
+}
+
+/// Bookmark URLs accept the schemes Chrome stores for bookmarks, never script URLs.
+fn require_bookmark_url(method: RpcMethod, value: &str) -> Result<(), ProtocolError> {
+    require_len(method, value, 1, MAX_URL_CHARS, "url")?;
+    require(
+        method,
+        !value.chars().any(char::is_whitespace)
+            && ["http://", "https://", "file://", "chrome://"]
+                .iter()
+                .any(|prefix| {
+                    value
+                        .get(..prefix.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                        && value.len() > prefix.len()
+                }),
+        "url must be an http, https, file, or chrome URL",
+    )
+}
 impl MethodParams {
     fn validate(&self, method: RpcMethod) -> Result<(), ProtocolError> {
         match self {
@@ -1017,6 +1318,7 @@ impl MethodParams {
                     }
                 }
             }
+            Self::Profile(params) => params.validate(method)?,
             Self::Commit(params) => require_len(
                 method,
                 &params.staged_token,
@@ -1907,10 +2209,20 @@ pub struct NativeStagedCommit {
     pub fingerprint: String,
     pub expires_at_ms: i64,
 }
+
+/// Effect of the only profile-scoped staged operation. It names no bookmark
+/// title or URL because the host journals the effect text.
+pub const PROFILE_BOOKMARK_REMOVE_EFFECT: &str = "Remove a bookmark";
+
 impl NativeStagedCommit {
+    /// Profile-scoped stages are bound to the task rather than to a tab.
+    pub fn is_profile_scoped(&self) -> bool {
+        self.tab_id == 0 && self.page_revision == 0 && self.effect == PROFILE_BOOKMARK_REMOVE_EFFECT
+    }
+
     fn validate(&self) -> Result<(), ProtocolError> {
         if !(16..=256).contains(&self.native_token.chars().count())
-            || self.tab_id == 0
+            || (self.tab_id == 0 && !self.is_profile_scoped())
             || self.effect.is_empty()
             || self.effect.chars().count() > 512
             || !(32..=256).contains(&self.fingerprint.chars().count())
@@ -2047,7 +2359,6 @@ impl NativeEvent {
             NativeEventPayload::PopupCommitApproved(popup)
             | NativeEventPayload::PopupCommitAbandoned(popup)
                 if !(16..=256).contains(&popup.review_handle.chars().count())
-                    || popup.tab_id == 0
                     || event
                         .event_id
                         .as_deref()
@@ -2056,7 +2367,7 @@ impl NativeEvent {
                         .is_none() =>
             {
                 return Err(ProtocolError::InvalidNativeMessage(
-                    "popup commit event must bind a review handle, task tab, and UUIDv7 event_id"
+                    "popup commit event must bind a review handle, task, and UUIDv7 event_id"
                         .into(),
                 ));
             }
@@ -2242,6 +2553,7 @@ mod tests {
             "browser_tabs",
             "browser_handoff",
             "browser_commit",
+            "browser_profile",
             "browser_developer",
         ] {
             assert!(names.contains(&required));
@@ -2272,6 +2584,114 @@ mod tests {
             RpcRequest::parse(wrong_key),
             Err(ProtocolError::InvalidIdempotencyKey)
         ));
+    }
+
+    #[test]
+    fn profile_writes_require_keys_and_reads_reject_them() {
+        for params in [
+            json!({"operation": "bookmarks_update", "id": "12", "url": "https://example.com/"}),
+            json!({"operation": "bookmarks_create", "parent_id": "1", "title": "Docs"}),
+            json!({"operation": "bookmarks_move", "id": "12", "parent_id": "2", "index": 0}),
+            json!({"operation": "bookmarks_remove", "id": "12"}),
+            json!({"operation": "sessions_restore", "session_id": "41"}),
+            json!({"operation": "downloads_cancel", "id": 3}),
+            json!({"operation": "downloads_pause", "id": 3}),
+            json!({"operation": "downloads_resume", "id": 3}),
+        ] {
+            assert!(matches!(
+                RpcRequest::parse(request("browser_profile", params.clone(), false)),
+                Err(ProtocolError::MissingIdempotencyKey(RpcMethod::BrowserProfile))
+            ));
+            let (_, parsed) = RpcRequest::parse(request("browser_profile", params, true)).unwrap();
+            assert!(parsed.requires_idempotency());
+        }
+        for params in [
+            json!({"operation": "bookmarks_search", "query": "Northstar"}),
+            json!({"operation": "bookmarks_tree"}),
+            json!({"operation": "history_search", "text": "", "limit": 10}),
+            json!({"operation": "sessions_recent"}),
+            json!({"operation": "sessions_devices", "limit": 3}),
+            json!({"operation": "downloads_search", "state": "complete"}),
+        ] {
+            let (_, parsed) =
+                RpcRequest::parse(request("browser_profile", params.clone(), false)).unwrap();
+            assert!(!parsed.requires_idempotency());
+            assert!(RpcRequest::parse(request("browser_profile", params, true)).is_err());
+        }
+    }
+
+    #[test]
+    fn profile_parameters_validate_ids_urls_and_bounds() {
+        let invalid = [
+            json!({"operation": "bookmarks_update", "id": "12"}),
+            json!({"operation": "bookmarks_update", "id": "abc", "title": "x"}),
+            json!({"operation": "bookmarks_update", "id": "12", "url": "javascript:alert(1)"}),
+            json!({"operation": "bookmarks_update", "id": "12", "url": "JavaScript://x"}),
+            json!({"operation": "bookmarks_update", "id": "12", "url": "data:text/html,x"}),
+            json!({"operation": "bookmarks_update", "id": "12", "url": "https://a b"}),
+            json!({"operation": "bookmarks_create", "parent_id": "1", "title": "x", "url": "about:blank"}),
+            json!({"operation": "bookmarks_move", "id": "12", "parent_id": "2", "index": 100_001}),
+            json!({"operation": "bookmarks_search", "query": ""}),
+            json!({"operation": "bookmarks_search", "query": "x", "limit": 0}),
+            json!({"operation": "bookmarks_tree", "depth": 6}),
+            json!({"operation": "history_search", "text": "x"}),
+            json!({"operation": "history_search", "text": "x", "limit": 101}),
+            json!({"operation": "history_search", "text": "x", "limit": 5, "start_time": 10, "end_time": 5}),
+            json!({"operation": "sessions_recent", "limit": 26}),
+            json!({"operation": "sessions_restore", "session_id": "a b"}),
+            json!({"operation": "downloads_search", "state": "paused"}),
+            json!({"operation": "downloads_show", "id": 1}),
+            json!({"operation": "downloads_erase", "id": 1}),
+            json!({"operation": "history_delete", "url": "https://example.com/"}),
+            json!({"operation": "bookmarks_search", "query": "x", "extra": true}),
+        ];
+        for params in invalid {
+            let mutation = params_require_idempotency(RpcMethod::BrowserProfile, &params);
+            assert!(
+                RpcRequest::parse(request("browser_profile", params.clone(), mutation)).is_err(),
+                "{params} must be rejected"
+            );
+        }
+        for url in [
+            "https://example.com/a?b=c",
+            "http://localhost:8080/",
+            "file:///tmp/notes.txt",
+            "chrome://settings/",
+        ] {
+            RpcRequest::parse(request(
+                "browser_profile",
+                json!({"operation": "bookmarks_update", "id": "12", "url": url}),
+                true,
+            ))
+            .unwrap_or_else(|error| panic!("{url} must be accepted: {error}"));
+        }
+    }
+
+    #[test]
+    fn profile_stages_bind_to_the_task_only_with_the_fixed_effect() {
+        let profile = NativeStagedCommit {
+            native_token: "n".repeat(16),
+            task_id: Uuid::now_v7(),
+            tab_id: 0,
+            page_revision: 0,
+            effect: PROFILE_BOOKMARK_REMOVE_EFFECT.into(),
+            fingerprint: "f".repeat(64),
+            expires_at_ms: 1,
+        };
+        assert!(profile.validate().is_ok());
+        assert!(profile.is_profile_scoped());
+        for invalid in [
+            NativeStagedCommit {
+                effect: "submit order".into(),
+                ..profile.clone()
+            },
+            NativeStagedCommit {
+                page_revision: 3,
+                ..profile.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]

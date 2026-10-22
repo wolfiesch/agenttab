@@ -15,11 +15,14 @@ The Rust host writes a local `audit.jsonl` by default under the AgentTab state d
 - structural argument and result summaries;
 - a SHA-256 digest of canonical request parameters;
 - error code and recovery text when present;
-- a `challenge` summary when a result, or an error's details, carries a bot-challenge event.
+- a `challenge` summary when a result, or an error's details, carries a bot-challenge event;
+- the `operation` name for `browser_profile` requests.
 
 The `challenge` summary is a fixed set of fields: `challenge_id`, `vendor`, `product`, `kind`, `interaction`, `state`, `confidence`, `page_origin`, `elapsed_ms`, and, only once the episode has ended, `resolved_by`. Each value is a bundled catalog identifier, an enum, an integer, or an origin without path or query. `resolved_by` is `wait` (a `challenge_cleared` wait), `handoff` (a notice `resolve`), `navigation` (the tab left the challenge), or `observed` (cleared and seen by any other operation). The summary contains no page text, URL path, or response token, and no other event field is recorded. A malformed or partial event is omitted from the audit entry. Like every other audit field, it stays in the local file and is not transmitted anywhere.
 
 It intentionally does not write raw request values or raw result values. Structural metadata can still be sensitive: origins, object keys, string lengths, error text, and parameter digests can reveal useful context. A digest is not a promise that low-entropy data cannot be guessed. Keep the state directory private and do not upload an audit log as support evidence without review.
+
+For `browser_profile`, every string argument other than `operation` is replaced by a length-only redaction marker before the target origins, argument summary, and digest are computed. Bookmark titles, URLs, folder names, and search text therefore never reach the audit file, and the digest is computed without them. The result summary stays structural, as for every method.
 
 The local policy can disable audit writing. Disabling it changes local accountability, not product telemetry, and does not cause data to be sent elsewhere.
 

@@ -54,6 +54,16 @@ impl AuditLog {
             return Ok(());
         };
         let completed_at_ms = now_ms();
+        // Profile data (bookmark, history, session, and download titles and URLs)
+        // belongs to the caller only: audit keeps the operation name and shapes.
+        let profile = entry.method == RpcMethod::BrowserProfile;
+        let redacted_params;
+        let params = if profile {
+            redacted_params = redact_profile_strings(entry.params);
+            &redacted_params
+        } else {
+            entry.params
+        };
         let mut record = json!({
             "schema_version": 1,
             "started_at_ms": entry.started_at_ms,
@@ -65,13 +75,18 @@ impl AuditLog {
             "outcome": entry.outcome,
             "duration_ms": entry.duration_ms,
             "replayed": entry.replayed,
-            "target_origins": target_origins(entry.params),
-            "argument_summary": summarize(entry.params),
-            "argument_digest": digest(entry.params),
+            "target_origins": target_origins(params),
+            "argument_summary": summarize(params),
+            "argument_digest": digest(params),
             "result_summary": entry.result.map(summarize),
             "error_code": entry.error.map(|error| error.code.as_str()),
             "recovery": entry.error.and_then(|error| error.recovery.as_deref()),
         });
+        if profile {
+            if let Some(operation) = entry.params.get("operation").and_then(Value::as_str) {
+                record["operation"] = Value::String(operation.to_string());
+            }
+        }
         if let Some(challenge) = challenge_summary(&entry) {
             record["challenge"] = challenge;
         }
@@ -99,6 +114,31 @@ fn summarize(value: &Value) -> Value {
             "type": "object",
             "keys": object.keys().collect::<Vec<_>>(),
         }),
+    }
+}
+
+/// Replaces every string except the operation discriminator so neither URLs,
+/// titles, nor query text reach the audit digest or origin list.
+fn redact_profile_strings(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        Value::String(_) if key == "operation" => value.clone(),
+                        Value::String(text) => {
+                            Value::String(format!("[redacted:{}]", text.chars().count()))
+                        }
+                        other => redact_profile_strings(other),
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_profile_strings).collect()),
+        Value::String(text) => Value::String(format!("[redacted:{}]", text.chars().count())),
+        _ => value.clone(),
     }
 }
 

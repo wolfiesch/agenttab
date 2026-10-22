@@ -7,6 +7,7 @@ import {
   CHALLENGE_GUIDANCE,
   createUuidV7,
   createResumeCapabilityStore,
+  requiresIdempotencyKey,
   type AgenttabFinishParams,
   type MethodParams,
   type MutationMethod,
@@ -19,6 +20,7 @@ import waitSchema from "../../../schemas/rpc/v1/browser-wait.schema.json" with {
 import tabsSchema from "../../../schemas/rpc/v1/browser-tabs.schema.json" with { type: "json" };
 import handoffSchema from "../../../schemas/rpc/v1/browser-handoff.schema.json" with { type: "json" };
 import credentialsSchema from "../../../schemas/rpc/v1/browser-credentials.schema.json" with { type: "json" };
+import profileSchema from "../../../schemas/rpc/v1/browser-profile.schema.json" with { type: "json" };
 import commitSchema from "../../../schemas/rpc/v1/browser-commit.schema.json" with { type: "json" };
 import finishSchema from "../../../schemas/rpc/v1/agenttab-finish.schema.json" with { type: "json" };
 import developerSchema from "../../../schemas/rpc/v1/browser-developer.schema.json" with { type: "json" };
@@ -188,6 +190,11 @@ export const STANDARD_TOOLS: readonly Tool[] = [
     name: "browser_credentials",
     description: "Prefer this before human handoff: use an origin-matching 1Password Login without exposing values; more than three matches require the user.",
     inputSchema: schema(credentialsSchema),
+  },
+  {
+    name: "browser_profile",
+    description: "Search and edit Chrome bookmarks, search history, list recent or synced sessions, and inspect downloads for this Chrome profile. Not tab-scoped. Reads need no key; writes are idempotent; bookmarks_remove stages a Commit review. Never focuses Chrome.",
+    inputSchema: schema(profileSchema),
   },
   {
     name: "browser_commit",
@@ -429,7 +436,8 @@ export class McpServer {
       const response = await client.request(
         method,
         argumentsValue as MethodParams[RpcMethod],
-        isMutation(method)
+        // browser_profile keys only its write operations; reads must reach Core without a key.
+        (method === "browser_profile" ? requiresIdempotencyKey(method, argumentsValue) : isMutation(method))
           ? { idempotencyKey: this.#invocationKeys.for(invocationId, method, argumentsValue) }
           : {},
       );

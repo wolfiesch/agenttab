@@ -101,7 +101,11 @@
       "properties": {
         "review_handle": { "type": "string", "minLength": 16, "maxLength": 256 },
         "task_id": { "type": "string", "format": "uuid" },
-        "tab_id": { "type": "integer", "minimum": 1 }
+        "tab_id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Owned tab of the staged action; 0 for profile-scoped stages that have no tab."
+        }
       },
       "additionalProperties": false
     },

@@ -12,7 +12,9 @@ import {
   DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
   FrameDecoder,
   LONG_OPERATION_TRANSPORT_GRACE_MS,
+  PROFILE_WRITE_OPERATIONS,
   createUuidV7,
+  requiresIdempotencyKey,
   createResumeCapabilityStore,
   encodeFrame,
   resolveTransportTimeoutMs,
@@ -233,6 +235,75 @@ test("routes concurrent out-of-order responses by request id", async () => {
   await expect(tabs).resolves.toEqual({ method: "browser_tabs" });
   expect(requests[0].idempotency_key).toMatch(/-7[0-9a-f]{3}-/);
   expect(requests[1]).not.toHaveProperty("idempotency_key");
+  client.close();
+});
+
+test("requiresIdempotencyKey covers method mutations and browser_profile writes only", () => {
+  expect(requiresIdempotencyKey("browser_act", {})).toBe(true);
+  expect(requiresIdempotencyKey("browser_tabs", {})).toBe(false);
+  for (const operation of PROFILE_WRITE_OPERATIONS) {
+    expect(requiresIdempotencyKey("browser_profile", { operation })).toBe(true);
+  }
+  for (const operation of [
+    "bookmarks_search",
+    "bookmarks_tree",
+    "history_search",
+    "sessions_recent",
+    "sessions_devices",
+    "downloads_search",
+  ]) {
+    expect(PROFILE_WRITE_OPERATIONS.has(operation)).toBe(false);
+    expect(requiresIdempotencyKey("browser_profile", { operation })).toBe(false);
+  }
+  expect(requiresIdempotencyKey("browser_profile", {})).toBe(false);
+  expect(requiresIdempotencyKey("browser_profile", null)).toBe(false);
+});
+
+test("browser_profile sends an idempotency key for writes and never for reads", async () => {
+  const requests: Array<Record<string, unknown>> = [];
+  const endpoint = await listen((socket) => {
+    const decoder = new FrameDecoder(64 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da42",
+            resumed: false,
+            state: "ready",
+          }, 1024 * 1024));
+          continue;
+        }
+        requests.push(value);
+        socket.write(encodeFrame({
+          protocol: "agenttab.rpc",
+          version: 1,
+          request_id: value.request_id,
+          ok: true,
+          outcome: "completed",
+          result: { method: value.method },
+        }, 1024 * 1024));
+      }
+    });
+  });
+
+  const suppliedKey = "019a0000-0000-7000-8000-000000000042";
+  const client = await AgentTabClient.connect({ endpoint });
+  await client.call("browser_profile", { operation: "bookmarks_search", query: "docs" });
+  await client.call("browser_profile", { operation: "history_search", text: "", limit: 5 }, {
+    idempotencyKey: suppliedKey,
+  });
+  await client.call("browser_profile", { operation: "bookmarks_remove", id: "42" });
+  await client.call("browser_profile", { operation: "downloads_pause", id: 7 }, {
+    idempotencyKey: suppliedKey,
+  });
+  expect(requests).toHaveLength(4);
+  expect(requests[0]).not.toHaveProperty("idempotency_key");
+  expect(requests[1]).not.toHaveProperty("idempotency_key");
+  expect(requests[2].idempotency_key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  expect(requests[3].idempotency_key).toBe(suppliedKey);
   client.close();
 });
 

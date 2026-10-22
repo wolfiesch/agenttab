@@ -43,4 +43,26 @@ describe("AgentTab native (Tern) tool views", () => {
     const expanded = describeResultView("browser_tabs", result, { expanded: true }, {});
     expect(expanded.body?.find((node) => node.key === "details")?.p?.collapsed).toBe(false);
   });
+
+  test("profile results keep titles and URLs out of folded views until expanded", () => {
+    const args = { operation: "history_search", text: "private-query", limit: 5 };
+    const result = {
+      details: {
+        operation: "history_search",
+        items: [{ id: "1", url: "https://private.example/page", title: "Private Page", visit_count: 2, typed_count: 0 }],
+        count: 1,
+        _agenttab: { outcome: "completed" },
+      },
+    };
+    const call = JSON.stringify(describeCallView("browser_profile", args));
+    const collapsed = describeResultView("browser_profile", result, {}, args);
+    for (const view of [call, JSON.stringify(collapsed)]) {
+      expect(view).not.toContain("private-query");
+      expect(view).not.toContain("private.example");
+      expect(view).not.toContain("Private Page");
+    }
+    expect(collapsed.body?.some((node) => node.key === "details") ?? false).toBe(false);
+    const expanded = describeResultView("browser_profile", result, { expanded: true }, args);
+    expect(expanded.body?.find((node) => node.key === "details")?.p?.collapsed).toBe(false);
+  });
 });

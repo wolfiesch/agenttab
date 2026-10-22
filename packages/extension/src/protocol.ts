@@ -15,6 +15,7 @@ export type NativeMethod =
   | "browser_tabs"
   | "browser_handoff"
   | "browser_commit"
+  | "browser_profile"
   | "browser_developer"
   | "agenttab.close"
   | "browser_credentials_fill"
@@ -29,6 +30,7 @@ const CORE_METHODS: Record<NativeMethod, true> = {
   browser_tabs: true,
   browser_handoff: true,
   browser_commit: true,
+  browser_profile: true,
   browser_developer: true,
   "agenttab.close": true,
   browser_credentials_fill: true,
@@ -155,6 +157,20 @@ export interface StagedCommit {
 }
 
 export type PublicStagedCommit = Omit<StagedCommit, "action" | "preview" | "dialog">;
+
+/** Tab id of profile-scoped stages, which bind to the task rather than an owned tab. */
+export const PROFILE_STAGE_TAB_ID = 0;
+/**
+ * Effect of the only profile-scoped staged operation. It names no bookmark because the
+ * host journals effect text; the popup reads bookmark detail from the local preview.
+ */
+export const PROFILE_BOOKMARK_REMOVE_EFFECT = "Remove a bookmark";
+
+export function isProfileStage(staged: Pick<StagedCommit, "tab_id" | "page_revision" | "effect">): boolean {
+  return staged.tab_id === PROFILE_STAGE_TAB_ID &&
+    staged.page_revision === 0 &&
+    staged.effect === PROFILE_BOOKMARK_REMOVE_EFFECT;
+}
 
 export interface NativeResponse {
   protocol: typeof NATIVE_PROTOCOL;
@@ -583,6 +599,118 @@ function assertCredentialFillParams(value: unknown): Record<string, unknown> {
   return params;
 }
 
+const BOOKMARK_ID_PATTERN = /^[0-9]{1,20}$/;
+const BOOKMARK_URL_PATTERN = /^(?:https?|file|chrome):\/\/\S+$/i;
+
+function assertBookmarkId(value: unknown, field: string): string {
+  if (typeof value !== "string" || !BOOKMARK_ID_PATTERN.test(value)) commandError(`${field} must be a numeric bookmark id`);
+  return value;
+}
+
+function assertBookmarkUrl(value: unknown): string {
+  const url = assertBoundedString(value, "url", 1, 2_048);
+  if (!BOOKMARK_URL_PATTERN.test(url)) commandError("url must be an http, https, file, or chrome URL");
+  return url;
+}
+
+function assertOptionalLimit(value: unknown, maximum: number, field = "limit"): void {
+  if (value !== undefined && !isIntegerInRange(value, 1, maximum)) commandError(`${field} must be between 1 and ${maximum}`);
+}
+
+function assertTimeMs(value: unknown, field: string): void {
+  if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) {
+    commandError(`${field} must be a non-negative epoch millisecond value`);
+  }
+}
+
+/** Mirrors schemas/rpc/v1/browser-profile.schema.json. */
+function assertProfileParams(value: unknown): Record<string, unknown> {
+  if (!isRecord(value) || typeof value.operation !== "string") commandError("browser_profile requires an operation");
+  const label = `browser_profile ${value.operation} parameters`;
+  switch (value.operation) {
+    case "bookmarks_search": {
+      const params = assertExactObject(value, ["operation", "query"], ["limit"], label);
+      assertBoundedString(params.query, "query", 1, 256);
+      assertOptionalLimit(params.limit, 100);
+      return params;
+    }
+    case "bookmarks_tree": {
+      const params = assertExactObject(value, ["operation"], ["folder_id", "depth"], label);
+      if (params.folder_id !== undefined) assertBookmarkId(params.folder_id, "folder_id");
+      assertOptionalLimit(params.depth, 5, "depth");
+      return params;
+    }
+    case "bookmarks_update": {
+      const params = assertExactObject(value, ["operation", "id"], ["title", "url"], label);
+      assertBookmarkId(params.id, "id");
+      if (params.title === undefined && params.url === undefined) commandError("bookmarks_update requires title or url");
+      if (params.title !== undefined) assertBoundedString(params.title, "title", 0, 1_024);
+      if (params.url !== undefined) assertBookmarkUrl(params.url);
+      return params;
+    }
+    case "bookmarks_create": {
+      const params = assertExactObject(value, ["operation", "parent_id", "title"], ["url", "index"], label);
+      assertBookmarkId(params.parent_id, "parent_id");
+      assertBoundedString(params.title, "title", 0, 1_024);
+      if (params.url !== undefined) assertBookmarkUrl(params.url);
+      if (params.index !== undefined && !isIntegerInRange(params.index, 0, 100_000)) commandError("index must be between 0 and 100000");
+      return params;
+    }
+    case "bookmarks_move": {
+      const params = assertExactObject(value, ["operation", "id", "parent_id"], ["index"], label);
+      assertBookmarkId(params.id, "id");
+      assertBookmarkId(params.parent_id, "parent_id");
+      if (params.index !== undefined && !isIntegerInRange(params.index, 0, 100_000)) commandError("index must be between 0 and 100000");
+      return params;
+    }
+    case "bookmarks_remove": {
+      const params = assertExactObject(value, ["operation", "id"], [], label);
+      assertBookmarkId(params.id, "id");
+      return params;
+    }
+    case "history_search": {
+      const params = assertExactObject(value, ["operation", "text", "limit"], ["start_time", "end_time"], label);
+      assertBoundedString(params.text, "text", 0, 256);
+      assertOptionalLimit(params.limit, 100);
+      assertTimeMs(params.start_time, "start_time");
+      assertTimeMs(params.end_time, "end_time");
+      if (typeof params.start_time === "number" && typeof params.end_time === "number" && params.start_time > params.end_time) {
+        commandError("start_time must not be after end_time");
+      }
+      return params;
+    }
+    case "sessions_recent":
+    case "sessions_devices": {
+      const params = assertExactObject(value, ["operation"], ["limit"], label);
+      assertOptionalLimit(params.limit, 25);
+      return params;
+    }
+    case "sessions_restore": {
+      const params = assertExactObject(value, ["operation", "session_id"], [], label);
+      const sessionId = assertBoundedString(params.session_id, "session_id", 1, 256);
+      if (/\s/.test(sessionId)) commandError("session_id must not contain whitespace");
+      return params;
+    }
+    case "downloads_search": {
+      const params = assertExactObject(value, ["operation"], ["query", "state", "limit"], label);
+      if (params.query !== undefined) assertBoundedString(params.query, "query", 1, 256);
+      if (params.state !== undefined && !["in_progress", "interrupted", "complete"].includes(String(params.state))) {
+        commandError("state must be in_progress, interrupted, or complete");
+      }
+      assertOptionalLimit(params.limit, 100);
+      return params;
+    }
+    case "downloads_cancel":
+    case "downloads_pause":
+    case "downloads_resume": {
+      const params = assertExactObject(value, ["operation", "id"], [], label);
+      if (!isIntegerInRange(params.id, 0)) commandError("id must be a non-negative integer");
+      return params;
+    }
+  }
+  commandError(`Unsupported browser_profile operation: ${value.operation}`);
+}
+
 function validateParams(method: NativeMethod, value: unknown): Record<string, unknown> {
   switch (method) {
     case "browser_open": {
@@ -628,6 +756,8 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
       assertBoundedString(params.native_token, "native_token", 16, 256);
       return params;
     }
+    case "browser_profile":
+      return assertProfileParams(value);
     case "agenttab.close":
       return assertExactObject(value, [], [], "agenttab.close parameters");
     case "browser_developer":

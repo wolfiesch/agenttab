@@ -27,8 +27,10 @@ from agenttab import (
     ChallengeEvent,
     ChallengeSurface,
     LONG_OPERATION_TRANSPORT_GRACE,
+    PROFILE_WRITE_OPERATIONS,
     encode_frame,
     read_frame,
+    requires_idempotency_key,
     resolve_transport_timeout,
     uuid7,
 )
@@ -320,6 +322,70 @@ class ClientTests(unittest.TestCase):
             worker.join(timeout=2)
             server.close()
             self.assertRegex(str(captured[0]["idempotency_key"]), r"-7[0-9a-f]{3}-")
+
+    def test_requires_idempotency_key_covers_mutations_and_profile_writes(self) -> None:
+        self.assertTrue(requires_idempotency_key("browser_act", {}))
+        self.assertFalse(requires_idempotency_key("browser_tabs", {}))
+        for operation in PROFILE_WRITE_OPERATIONS:
+            self.assertTrue(requires_idempotency_key("browser_profile", {"operation": operation}))
+        for operation in (
+            "bookmarks_search",
+            "bookmarks_tree",
+            "history_search",
+            "sessions_recent",
+            "sessions_devices",
+            "downloads_search",
+        ):
+            self.assertNotIn(operation, PROFILE_WRITE_OPERATIONS)
+            self.assertFalse(requires_idempotency_key("browser_profile", {"operation": operation}))
+        self.assertFalse(requires_idempotency_key("browser_profile", {}))
+
+    def test_browser_profile_keys_writes_and_never_reads(self) -> None:
+        stream, peer = socket.socketpair()
+        captured: list[dict[str, object]] = []
+
+        def serve() -> None:
+            for _ in range(4):
+                request = read_frame(peer)
+                captured.append(request)
+                peer.sendall(encode_frame({
+                    "protocol": "agenttab.rpc",
+                    "version": 1,
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "outcome": "completed",
+                    "result": {},
+                }, 1024 * 1024))
+
+        worker = threading.Thread(target=serve)
+        worker.start()
+        supplied_key = "019a0000-0000-7000-8000-000000000042"
+        client = AgentTabClient(stream, {})
+        try:
+            client.call("browser_profile", {"operation": "bookmarks_search", "query": "docs"})
+            client.call(
+                "browser_profile",
+                {"operation": "history_search", "text": "", "limit": 5},
+                idempotency_key=supplied_key,
+            )
+            client.call("browser_profile", {"operation": "bookmarks_remove", "id": "42"})
+            client.call(
+                "browser_profile",
+                {"operation": "downloads_pause", "id": 7},
+                idempotency_key=supplied_key,
+            )
+        finally:
+            worker.join(timeout=2)
+            client.close()
+            peer.close()
+        self.assertEqual(len(captured), 4)
+        self.assertNotIn("idempotency_key", captured[0])
+        self.assertNotIn("idempotency_key", captured[1])
+        self.assertRegex(
+            str(captured[2]["idempotency_key"]),
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        )
+        self.assertEqual(captured[3]["idempotency_key"], supplied_key)
 
     def test_file_transport_enforces_request_deadline(self) -> None:
         class BlockingStream(io.RawIOBase):

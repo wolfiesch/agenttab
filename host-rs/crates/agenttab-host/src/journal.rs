@@ -94,6 +94,15 @@ pub struct StagedRecord {
     pub upload_paths: Vec<PathBuf>,
 }
 
+impl StagedRecord {
+    /// Profile-scoped stages bind to the task rather than to an owned tab.
+    pub fn is_profile_scoped(&self) -> bool {
+        self.tab_id == 0
+            && self.page_revision == 0
+            && self.effect == agenttab_protocol::PROFILE_BOOKMARK_REMOVE_EFFECT
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StagedCommitHandles {
     pub staged_token: String,
@@ -672,16 +681,8 @@ impl Journal {
         let upload_paths_json = serde_json::to_string(upload_paths)?;
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_revision: Option<i64> = transaction
-            .query_row(
-                "SELECT task_tabs.page_revision
-                 FROM task_tabs JOIN tasks USING(task_id)
-                 WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
-                   AND tasks.state = 'active'",
-                params![staged.task_id.to_string(), tab_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let current_revision =
+            staged_binding_revision(&transaction, &staged.task_id.to_string(), tab_id)?;
         if current_revision != Some(page_revision) {
             return Err(JournalError::InvalidStagedBinding);
         }
@@ -804,16 +805,8 @@ impl Journal {
             transaction.rollback()?;
             return Ok(StagedCommitConsumption::ApprovalRequired);
         }
-        let current_revision: Option<i64> = transaction
-            .query_row(
-                "SELECT task_tabs.page_revision
-                 FROM task_tabs JOIN tasks USING(task_id)
-                 WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
-                   AND tasks.state = 'active'",
-                params![task_id.to_string(), tab_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let current_revision =
+            staged_binding_revision(&transaction, &task_id.to_string(), tab_id)?;
         if current_revision != Some(page_revision) {
             transaction.rollback()?;
             return Err(JournalError::StaleStagedCommit);
@@ -899,16 +892,8 @@ impl Journal {
                 &upload_paths_json,
             )?));
         }
-        let current_revision: Option<i64> = transaction
-            .query_row(
-                "SELECT task_tabs.page_revision
-                 FROM task_tabs JOIN tasks USING(task_id)
-                 WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
-                   AND tasks.state = 'active'",
-                params![task_id.to_string(), stored_tab_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let current_revision =
+            staged_binding_revision(&transaction, &task_id.to_string(), stored_tab_id)?;
         if current_revision != Some(page_revision) {
             transaction.rollback()?;
             return Err(JournalError::StaleStagedCommit);
@@ -1298,6 +1283,35 @@ fn generate_capability() -> String {
 
 fn capability_hash(capability: &str) -> [u8; 32] {
     Sha256::digest(capability.as_bytes()).into()
+}
+
+/// Current page revision a staged commit is bound to. Tab 0 marks a
+/// profile-scoped stage: it binds only to the active task at revision 0.
+fn staged_binding_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: &str,
+    tab_id: i64,
+) -> Result<Option<i64>, JournalError> {
+    if tab_id == 0 {
+        let active = transaction
+            .query_row(
+                "SELECT 1 FROM tasks WHERE task_id = ?1 AND state = 'active'",
+                params![task_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        return Ok(active.map(|()| 0));
+    }
+    Ok(transaction
+        .query_row(
+            "SELECT task_tabs.page_revision
+             FROM task_tabs JOIN tasks USING(task_id)
+             WHERE task_tabs.task_id = ?1 AND task_tabs.tab_id = ?2
+               AND tasks.state = 'active'",
+            params![task_id, tab_id],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 fn sqlite_u64(value: u64) -> Result<i64, JournalError> {

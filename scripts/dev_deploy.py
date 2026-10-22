@@ -42,11 +42,17 @@ REQUIRED_EXTENSION_FILES: tuple[str, ...] = (
 
 REQUIRED_PERMISSIONS: tuple[str, ...] = (
     "alarms",
+    "bookmarks",
     "debugger",
+    "downloads",
+    "history",
+    "idle",
     "nativeMessaging",
+    "sessions",
     "storage",
     "tabGroups",
     "tabs",
+    "webNavigation",
 )
 
 OPTIONAL_PERMISSIONS: tuple[str, ...] = ("scripting",)

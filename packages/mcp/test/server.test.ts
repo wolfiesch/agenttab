@@ -19,7 +19,7 @@ import {
 } from "../src/server";
 
 describe("AgentTab MCP surface", () => {
-  test("Standard mode exposes exactly nine Core RPC tools", () => {
+  test("Standard mode exposes exactly ten Core RPC tools", () => {
     expect(STANDARD_TOOLS.map((tool) => tool.name)).toEqual([
       "browser_open",
       "browser_snapshot",
@@ -28,10 +28,11 @@ describe("AgentTab MCP surface", () => {
       "browser_tabs",
       "browser_handoff",
       "browser_credentials",
+      "browser_profile",
       "browser_commit",
       "browser_finish",
     ]);
-    expect(listedTools(false)).toHaveLength(9);
+    expect(listedTools(false)).toHaveLength(10);
     expect(listedTools(false).some((tool) => tool.name === DEVELOPER_TOOL.name)).toBe(false);
   });
 
@@ -72,6 +73,21 @@ describe("AgentTab MCP surface", () => {
   test("browser_credentials fills only and cannot bypass Browser Act submission review", () => {
     const credentialTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_credentials")!;
     expect(JSON.stringify(credentialTool.inputSchema)).not.toContain("submit_ref");
+  });
+
+  test("browser_profile advertises the profile params schema with its definitions", async () => {
+    const profileTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_profile")!;
+    expect(profileTool.inputSchema.$schema).toBeUndefined();
+    expect(Array.isArray(profileTool.inputSchema.oneOf)).toBe(true);
+    const schema = JSON.stringify(profileTool.inputSchema);
+    for (const ref of schema.match(/"\$ref":"#\/\$defs\/[a-z_]+"/g) ?? []) {
+      const name = ref.slice(ref.lastIndexOf("/") + 1, -1);
+      expect((profileTool.inputSchema.$defs as Record<string, unknown>)[name]).toBeDefined();
+    }
+    const server = new McpServer({ clientFactory: async () => { throw new Error("unused"); } });
+    const listed = await server.handle({ jsonrpc: "2.0", id: 1, method: "tools/list" }) as { tools: Array<{ name: string }> };
+    expect(listed.tools.map((tool) => tool.name)).toContain("browser_profile");
+    server.close();
   });
 
 
@@ -551,6 +567,42 @@ describe("AgentTab MCP surface", () => {
     expect(keys[1]).toBe(keys[0]);
     expect(keys[2]).not.toBe(keys[0]);
     expect(keys[3]).not.toBe(keys[0]);
+    server.close();
+  });
+
+  test("browser_profile carries an idempotency key for write operations only", async () => {
+    const requests: Array<{ method: string; params: unknown; key: unknown }> = [];
+    const client = {
+      connection: { task_id: "task-profile" },
+      get closed() {
+        return false;
+      },
+      request: async (method: string, params: unknown, options: { idempotencyKey?: string }) => {
+        requests.push({ method, params, key: options.idempotencyKey });
+        return { ok: true, outcome: "completed", request_id: "request-profile", result: {} };
+      },
+      close: () => undefined,
+    } as unknown as AgentTabClient;
+    const server = new McpServer({ clientFactory: async () => client });
+    const call = (id: number, args: Record<string, unknown>) => server.handle({
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: "browser_profile", arguments: args },
+    });
+    await call(21, { operation: "bookmarks_search", query: "docs" });
+    await call(22, { operation: "history_search", text: "", limit: 5 });
+    await call(23, { operation: "bookmarks_remove", id: "42" });
+    await call(23, { operation: "bookmarks_remove", id: "42" });
+    await call(24, { operation: "downloads_pause", id: 7 });
+    expect(requests.map((request) => request.method)).toEqual(Array(5).fill("browser_profile"));
+    expect(requests[0].key).toBeUndefined();
+    expect(requests[1].key).toBeUndefined();
+    expect(requests[2].key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(requests[3].key).toBe(requests[2].key);
+    expect(requests[4].key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(requests[4].key).not.toBe(requests[2].key);
+    expect(requests[0].params).toEqual({ operation: "bookmarks_search", query: "docs" });
     server.close();
   });
 

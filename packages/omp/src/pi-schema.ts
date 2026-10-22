@@ -16,6 +16,12 @@ const object = (properties: Record<string, unknown>) => {
 };
 const ref = () => Type.String({ minLength: 1, maxLength: 256 });
 const selector = () => Type.String({ minLength: 1, maxLength: 2048 });
+const bookmarkId = () => Type.String({ pattern: "^[0-9]{1,20}$" });
+const bookmarkUrl = () => Type.String({ minLength: 1, maxLength: 2048, pattern: "^(https?://|file://|chrome://)[^\\s]+$" });
+const bookmarkTitle = () => Type.String({ maxLength: 1024 });
+const bookmarkIndex = () => Type.Integer({ minimum: 0, maximum: 100_000 });
+const resultLimit = (options: { default?: number } = {}) => Type.Integer({ minimum: 1, maximum: 100, ...options });
+const timeMs = () => Type.Number({ minimum: 0 });
 
 const schemas: Record<ToolMethod, unknown> = {
   browser_open: Type.Union([
@@ -116,6 +122,69 @@ const schemas: Record<ToolMethod, unknown> = {
       username_ref: Type.Optional(ref()),
       password_ref: Type.Optional(ref()),
       otp_ref: Type.Optional(ref()),
+    }),
+  ]),
+  browser_profile: Type.Union([
+    object({
+      operation: Type.Literal("bookmarks_search"),
+      query: Type.String({ minLength: 1, maxLength: 256 }),
+      limit: Type.Optional(resultLimit({ default: 25 })),
+    }),
+    object({
+      operation: Type.Literal("bookmarks_tree"),
+      folder_id: Type.Optional(bookmarkId()),
+      depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 5, default: 1 })),
+    }),
+    object({
+      operation: Type.Literal("bookmarks_update"),
+      id: bookmarkId(),
+      title: bookmarkTitle(),
+      url: Type.Optional(bookmarkUrl()),
+    }),
+    object({
+      operation: Type.Literal("bookmarks_update"),
+      id: bookmarkId(),
+      title: Type.Optional(bookmarkTitle()),
+      url: bookmarkUrl(),
+    }),
+    object({
+      operation: Type.Literal("bookmarks_create"),
+      parent_id: bookmarkId(),
+      title: bookmarkTitle(),
+      url: Type.Optional(bookmarkUrl()),
+      index: Type.Optional(bookmarkIndex()),
+    }),
+    object({
+      operation: Type.Literal("bookmarks_move"),
+      id: bookmarkId(),
+      parent_id: bookmarkId(),
+      index: Type.Optional(bookmarkIndex()),
+    }),
+    object({ operation: Type.Literal("bookmarks_remove"), id: bookmarkId() }),
+    object({
+      operation: Type.Literal("history_search"),
+      text: Type.String({ maxLength: 256 }),
+      start_time: Type.Optional(timeMs()),
+      end_time: Type.Optional(timeMs()),
+      limit: resultLimit(),
+    }),
+    object({
+      operation: stringEnum(["sessions_recent", "sessions_devices"]),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 25, default: 10 })),
+    }),
+    object({
+      operation: Type.Literal("sessions_restore"),
+      session_id: Type.String({ minLength: 1, maxLength: 256, pattern: "^[^\\s]+$" }),
+    }),
+    object({
+      operation: Type.Literal("downloads_search"),
+      query: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+      state: Type.Optional(stringEnum(["in_progress", "interrupted", "complete"])),
+      limit: Type.Optional(resultLimit({ default: 25 })),
+    }),
+    object({
+      operation: stringEnum(["downloads_cancel", "downloads_pause", "downloads_resume"]),
+      id: Type.Integer({ minimum: 0 }),
     }),
   ]),
   browser_commit: object({ staged_token: Type.String({ minLength: 32, maxLength: 256 }) }),

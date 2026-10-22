@@ -54,14 +54,18 @@ REQUIRED_PERMISSIONS = (
     "tabGroups",
     "storage",
     "alarms",
+    "bookmarks",
+    "history",
+    "sessions",
+    "downloads",
+    "webNavigation",
+    "idle",
 )
 OPTIONAL_PERMISSIONS = ("scripting",)
 REMOVED_PERMISSIONS = (
     "activeTab",
-    "bookmarks",
     "contentSettings",
     "cookies",
-    "history",
 )
 HOST_PERMISSIONS = ("<all_urls>",)
 CORE_PROTOCOL = "agenttab.rpc"

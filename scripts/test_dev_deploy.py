@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.dev_deploy import (
+    REQUIRED_PERMISSIONS,
     DeployError,
     check_platform_reload_support,
     clean_version,
@@ -58,14 +59,7 @@ def create_mock_extension_bundle(
         "version": version,
         "version_name": version_name,
         "key": key,
-        "permissions": permissions if permissions is not None else [
-            "alarms",
-            "debugger",
-            "nativeMessaging",
-            "storage",
-            "tabGroups",
-            "tabs",
-        ],
+        "permissions": permissions if permissions is not None else list(REQUIRED_PERMISSIONS),
         "optional_permissions": optional_permissions if optional_permissions is not None else ["scripting"],
         "host_permissions": host_permissions if host_permissions is not None else ["<all_urls>"],
     }
@@ -222,7 +216,7 @@ class DevDeployTests(unittest.TestCase):
             # 5. Extra permissions rejected
             create_mock_extension_bundle(
                 bundle_dir,
-                permissions=["alarms", "debugger", "nativeMessaging", "storage", "tabGroups", "tabs", "unapprovedExtra"],
+                permissions=[*REQUIRED_PERMISSIONS, "unapprovedExtra"],
             )
             with self.assertRaises(DeployError) as ctx:
                 verify_bundle(bundle_dir, exp_key, exp_manifest_ver, exp_ver)

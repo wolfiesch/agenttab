@@ -189,6 +189,8 @@ function evidenceNode(evidence: readonly string[]): NativeNode {
 /** The redacted structured result, folded unless the transcript is expanded. */
 function detailsNode(card: OperationCard, expanded: boolean): NativeNode | undefined {
   if (card.details === undefined) return undefined;
+  // Profile results carry bookmark, history, and download titles and URLs; keep them out of folded views.
+  if (card.method === "browser_profile" && !expanded) return undefined;
   const { _agenttab: _presentation, ...rest } = toRecord(card.details);
   const payload = Object.keys(rest).length === 0 ? undefined : rest;
   if (payload === undefined) return undefined;

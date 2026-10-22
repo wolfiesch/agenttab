@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   createCallCard,
   createCallComponent,
+  createResultCard,
   createResultComponent,
   MAX_SELECTOR_LENGTH,
   selectorMeta,
@@ -511,5 +512,78 @@ describe("AgentTab challenge rendering", () => {
     expect(widget).toContain("token_present");
     expect(widget).not.toContain("[redacted]");
     expect(widget).not.toContain("Sensitive fields redacted");
+  });
+});
+
+describe("AgentTab profile rendering", () => {
+  const searchArgs = { operation: "bookmarks_search", query: "private-query", limit: 10 };
+  const searchResult = {
+    details: {
+      operation: "bookmarks_search",
+      bookmarks: [
+        { id: "11", title: "Private Bookmark Title", url: "https://private.example/secret", kind: "bookmark" },
+        { id: "12", title: "Another Private Title", url: "https://private.example/other", kind: "bookmark" },
+        { id: "13", title: "Folder Title", kind: "folder" },
+      ],
+      count: 3,
+      truncated: false,
+      _agenttab: { outcome: "completed", task_id: "task-profile-123456" },
+    },
+  };
+
+  test("search results render an observed card with counts and keep titles and URLs out of the collapsed view", () => {
+    const card = createResultCard("browser_profile", searchResult, {}, searchArgs);
+    expect(card.method).toBe("browser_profile");
+    expect(card.status).toBe("observed");
+    expect(card.title).toContain("3");
+    expect(card.context.tabId).toBeUndefined();
+    expect(card.context.pageRevision).toBeUndefined();
+    const call = createCallComponent("browser_profile", searchArgs, theme).render(160).join("\n");
+    const collapsed = createResultComponent("browser_profile", searchResult, {}, theme, searchArgs)
+      .render(160)
+      .join("\n");
+    for (const view of [call, collapsed]) {
+      expect(view).not.toContain("private-query");
+      expect(view).not.toContain("Private Bookmark Title");
+      expect(view).not.toContain("private.example");
+    }
+    expect(createCallCard("browser_profile", searchArgs).title).not.toBe(
+      createCallCard("browser_profile", { operation: "history_search", text: "", limit: 5 }).title,
+    );
+  });
+
+  test("a commit_required bookmarks_remove renders as a staged approval without tab context", () => {
+    const staged = {
+      details: {
+        staged_token: "never-display-this-token",
+        tab_id: 0,
+        page_revision: 0,
+        effect: "Remove a bookmark",
+        fingerprint: "fp-1",
+        expires_at_ms: 1_000,
+        _agenttab: { outcome: "commit_required", task_id: "task-profile-123456" },
+      },
+    };
+    const args = { operation: "bookmarks_remove", id: "42" };
+    const card = createResultCard("browser_profile", staged, {}, args);
+    expect(card.status).toBe("awaiting_approval");
+    expect(card.steps.find((step) => step.state === "active")?.label).toBe(
+      createResultCard("browser_act", staged, {}, { tab_id: 1, actions: [] }).steps.find((step) => step.state === "active")?.label,
+    );
+    expect(card.context.tabId).toBeUndefined();
+    expect(createCallCard("browser_profile", args).meta.join(" ")).toContain("42");
+    const expanded = createResultComponent("browser_profile", staged, { expanded: true }, theme, args).render(160).join("\n");
+    expect(expanded).not.toContain("never-display");
+  });
+
+  test("an approved bookmark removal commit reports the removed id", () => {
+    const card = createResultCard(
+      "browser_commit",
+      { details: { operation: "bookmarks_remove", id: "42", removed: true, _agenttab: { outcome: "completed" } } },
+      {},
+      { staged_token: "x".repeat(32) },
+    );
+    expect(card.status).toBe("executed");
+    expect(card.title).toContain("42");
   });
 });

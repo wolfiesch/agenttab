@@ -1,5 +1,6 @@
 use agenttab_protocol::{
-    BrowserAction, BrowserOpenParams, MethodParams, NativeOriginPolicy, RpcError, RpcMethod,
+    BrowserAction, BrowserOpenParams, BrowserProfileParams, MethodParams, NativeOriginPolicy,
+    RpcError, RpcMethod,
 };
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
@@ -202,6 +203,17 @@ impl Guardrails {
                 return Err(RpcError::new(
                     "adopt_origin_unverified",
                     "AgentTab cannot adopt an active tab while origin policy is restricted",
+                )
+                .with_recovery(
+                    "Open the URL through browser_open create, or remove the managed origin restriction.",
+                ));
+            }
+            MethodParams::Profile(BrowserProfileParams::SessionsRestore { .. })
+                if self.has_origin_constraints() =>
+            {
+                return Err(RpcError::new(
+                    "origin_policy_unverifiable",
+                    "AgentTab cannot verify restored session origins while origin policy is restricted",
                 )
                 .with_recovery(
                     "Open the URL through browser_open create, or remove the managed origin restriction.",
