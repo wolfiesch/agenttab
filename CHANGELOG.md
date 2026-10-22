@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- Recognize image-only ChatGPT turns, including authenticated generated-image URLs and images outside the empty assistant text body. Ignore progressive previews until rendering completes.
+- Recognize image-only ChatGPT turns, including authenticated generated-image URLs and images outside the empty assistant text body. Ignore progressive previews until rendering completes, and ignore the stale Stop button ChatGPT leaves in its hidden home composer after the first prompt.
 - Save generated images through the owned tab's Download control, using its attributed download cursor and filename. Distinguish modal dialogs from the conversation container, preserve browser downloads, and reject ambiguous local file matches.
 - Bound GPT-Control diagnostic PNG captures to a 1024 by 768 CSS-pixel viewport while retaining the 750 KB payload limit, avoiding oversized full-resolution captures on large displays.
 - Tightened three `browser_profile` edge cases. Finishing a task whose only profile work is a staged `bookmarks_remove` now defers with `deferred: "commit_review_active"` while the review is pending, as it does for a task that owns tabs, and closing that task clears the stage, so the popup no longer shows a review the host can no longer commit. Retrying `bookmarks_remove` with the same idempotency key after its stage was committed, abandoned, or expired now fails with `staged_token_invalid`, as `browser_act` replays already did, instead of returning the cached review with a dead token. A download cancel, pause, or resume whose entry disappears after the Chrome call now reports `outcome: "unknown"` instead of `not_started`.

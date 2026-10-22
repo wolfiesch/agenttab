@@ -18,8 +18,10 @@ const PROTOCOL_VERSION = 1;
 // ChatGPT marks each assistant reply with a screen-reader heading followed by the reply body. The older
 // `data-message-author-role` attribute survives only on an empty placeholder, so it is the fallback.
 const ASSISTANT_SELECTORS = ['h4[data-conversation-role="assistant"] + *', '[data-message-author-role="assistant"]'] as const;
-// Present only while ChatGPT is still streaming text or rendering an image.
-const BUSY_SELECTOR = 'button[data-testid="stop-button"], button[aria-label*="Stop" i]';
+// Present only while ChatGPT is still streaming text or rendering an image. After the first prompt, ChatGPT keeps
+// the hidden home composer in the DOM with a stale Stop button, so only the thread composer counts once it exists.
+const STOP_BUTTON = ':is(button[data-testid="stop-button"], button[aria-label*="Stop" i])';
+const BUSY_SELECTOR = `form[data-composer-placement="thread"] ${STOP_BUTTON}, body:not(:has(form[data-composer-placement="thread"])) ${STOP_BUTTON}`;
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 const DOWNLOAD_DIRECTORY = process.env.AGENTTAB_DOWNLOAD_DIR ?? join(homedir(), "Downloads");
 const DOWNLOAD_TIMEOUT_MS = 60_000;
