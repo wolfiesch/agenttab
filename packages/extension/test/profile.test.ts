@@ -1123,24 +1123,19 @@ describe("browser_profile through the extension entrypoint", () => {
     throw new Error("condition did not settle within the bounded wait");
   }
 
-  async function send(method: string, params: Record<string, unknown>, taskId = TASK_A): Promise<Record<string, unknown>> {
+  async function deliver(message: Record<string, unknown>): Promise<Record<string, unknown>> {
     requestCounter += 1;
     const requestId = `018f47b8-2f80-7c20-9c77-${(0x700000000000 + requestCounter).toString(16)}`;
-    port.receive({
-      protocol: NATIVE_PROTOCOL,
-      version: PROTOCOL_VERSION,
-      kind: "command",
-      request_id: requestId,
-      task_id: taskId,
-      connection_id: CONNECTION_ID,
-      method,
-      params,
-    });
-    const isResponse = (message: Record<string, unknown>) => message.kind === "response" && message.request_id === requestId;
+    port.receive({ protocol: NATIVE_PROTOCOL, version: PROTOCOL_VERSION, request_id: requestId, ...message });
+    const isResponse = (posted: Record<string, unknown>) => posted.kind === "response" && posted.request_id === requestId;
     await waitFor(() => port.posted.some(isResponse));
     const response = port.posted.find(isResponse);
     if (!response) throw new Error("no response");
     return response;
+  }
+
+  function send(method: string, params: Record<string, unknown>, taskId = TASK_A): Promise<Record<string, unknown>> {
+    return deliver({ kind: "command", task_id: taskId, connection_id: CONNECTION_ID, method, params });
   }
 
   async function popup(message: Record<string, unknown>): Promise<unknown> {
@@ -1282,6 +1277,51 @@ describe("browser_profile through the extension entrypoint", () => {
       outcome: "completed",
       result: { paused: false },
     });
+  });
+
+  test("finish defers and close clears a profile stage owned by a task that never opened a tab", async () => {
+    expect((await readState()).tasks[TASK_B]).toBeUndefined();
+    const token = stagedToken(await send("browser_profile", { operation: "bookmarks_remove", id: "22" }, TASK_B));
+    expect((await readState()).tasks[TASK_B]).toBeUndefined();
+
+    const finished = await deliver({ kind: "finish_task", task_id: TASK_B, disposition: "auto", keep_tab_ids: [] });
+    expect(finished).toMatchObject({
+      outcome: "completed",
+      result: { task_id: TASK_B, finished: false, deferred: "commit_review_active", retained_tab_ids: [] },
+    });
+    expect((await readState()).stagedCommits[token]).toBeDefined();
+
+    const closed = await deliver({ kind: "close_task", task_id: TASK_B });
+    expect(closed).toMatchObject({ outcome: "completed", result: { task_id: TASK_B, closed_tab_ids: [] } });
+    expect((await readState()).stagedCommits[token]).toBeUndefined();
+    expect(bookmarks.has("22")).toBe(true);
+
+    const finishedAfterClose = await deliver({ kind: "finish_task", task_id: TASK_B, disposition: "auto", keep_tab_ids: [] });
+    expect(finishedAfterClose).toMatchObject({ outcome: "completed", result: { finished: true } });
+  });
+
+  test("a download control whose entry vanishes after the Chrome call reports an unknown outcome", async () => {
+    expect(await send("browser_profile", { operation: "downloads_cancel", id: 404 })).toMatchObject({
+      outcome: "not_started",
+      error: { code: "download_not_found" },
+    });
+    const downloadsApi = chrome.downloads as unknown as { cancel: (id: number) => Promise<void> };
+    const cancel = downloadsApi.cancel;
+    // The human clears the entry from the downloads list between the cancel and the re-read.
+    downloadsApi.cancel = async (id) => {
+      await cancel(id);
+      downloadItems.delete(id);
+    };
+    try {
+      calls = [];
+      expect(await send("browser_profile", { operation: "downloads_cancel", id: 8 })).toMatchObject({
+        outcome: "unknown",
+        error: { code: "download_not_found" },
+      });
+      expect(callsTo("downloads.cancel")).toEqual([{ api: "downloads.cancel", args: [8] }]);
+    } finally {
+      downloadsApi.cancel = cancel;
+    }
   });
 
   test("no private profile data reached the console or a non-read response", async () => {

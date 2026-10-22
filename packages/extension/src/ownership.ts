@@ -456,17 +456,20 @@ export class OwnershipLedger {
   ): Promise<Record<string, unknown>> {
     const state = await readState();
     const task = state.tasks[taskId];
-    if (!task) {
-      return { task_id: taskId, finished: true, closed_tab_ids: [], retained_tab_ids: [] };
-    }
-    if (Object.values(state.stagedCommits).some((staged) => staged.task_id === taskId)) {
+    const reviewActive = Object.values(state.stagedCommits).some((staged) => staged.task_id === taskId);
+    if (reviewActive) {
+      // A task that only staged a profile change owns no tabs yet; it still defers like
+      // a tab task so the host keeps the task open for the pending review.
       return {
         task_id: taskId,
         finished: false,
         closed_tab_ids: [],
-        retained_tab_ids: [...task.tabIds],
+        retained_tab_ids: task ? [...task.tabIds] : [],
         deferred: "commit_review_active",
       };
+    }
+    if (!task) {
+      return { task_id: taskId, finished: true, closed_tab_ids: [], retained_tab_ids: [] };
     }
     if (disposition === "auto" && state.cleanupPolicy === "ask") {
       await this.setTaskState(taskId, "completed");
@@ -557,7 +560,15 @@ export class OwnershipLedger {
 
   private async closeTaskNow(taskId: string): Promise<number[]> {
     const existing = (await readState()).tasks[taskId];
-    if (!existing) return [];
+    if (!existing) {
+      // Profile stages bind to the task, not a tab, so a task without tabs can still own one.
+      await mutateState((state) => {
+        for (const [token, staged] of Object.entries(state.stagedCommits)) {
+          if (staged.task_id === taskId) delete state.stagedCommits[token];
+        }
+      });
+      return [];
+    }
     for (const tabId of existing.tabIds) this.scheduler.revokeTab(tabId);
     const tabIds = await mutateState((state) => {
       const task = state.tasks[taskId];
