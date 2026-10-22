@@ -237,18 +237,13 @@ h3 {
 }
 
 .brand-mark {
-  position: relative;
-  display: inline-grid;
+  display: block;
   width: 1.7rem;
   height: 1.7rem;
-  place-items: center;
-  color: #fff;
-  background: linear-gradient(135deg, #7249e8, #0d978d);
-  border-radius: 0.55rem;
+  border-radius: 22%;
   box-shadow: 0 4px 14px color-mix(in srgb, #7249e8 38%, transparent);
 }
 
-.brand-mark::before,
 .task-spark::before {
   width: 0.8rem;
   aspect-ratio: 1;
