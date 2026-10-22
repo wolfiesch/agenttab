@@ -298,12 +298,23 @@ function recursivelySortObjectKeys(value: unknown): unknown {
   );
 }
 
+// Bumped before every test so a wait abandoned by a timed-out test stops yielding instead of
+// spinning into the next test. The stale wait is parked rather than rejected, so nothing from the
+// failed test settles or reports while the next test runs.
+let conditionWaitEpoch = 0;
+beforeEach(() => {
+  conditionWaitEpoch += 1;
+});
+
+// Yields macrotasks until the predicate holds. The background settles through storage chains,
+// tab events, and off-thread work such as `crypto.subtle`, so no fixed number of yields is enough
+// on a loaded runner; the test's own timeout bounds a condition that never holds.
 async function waitForCondition(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (predicate()) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const epoch = conditionWaitEpoch;
+  while (!predicate()) {
+    if (epoch !== conditionWaitEpoch) return new Promise<void>(() => {});
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
-  throw new Error("condition did not settle within the bounded wait");
 }
 
 async function flushPromiseQueue(): Promise<void> {
@@ -2172,9 +2183,12 @@ describe("page revision monotonicity", () => {
       async () => undefined,
     );
 
+    // The wait resolves as soon as the retried probe matches (about 100 ms unloaded). The deadline
+    // only bounds a regression, so it is generous enough that a loaded runner's slower polling
+    // cannot expire it before the retries this test proves.
     const result = await runtime.wait(61, {
       condition: { kind: "selector", value: "#ready" },
-      timeout_ms: 500,
+      timeout_ms: 4_000,
     });
 
     expect(documentReads).toBeGreaterThanOrEqual(7);
