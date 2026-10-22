@@ -9,7 +9,7 @@ The adapter is stdio only. Standard mode uses local AgentTab IPC behind the adap
 Before starting the adapter, an approved local installation must have:
 
 1. An enabled AgentTab extension in Chrome 127 or later.
-2. Chrome's required `debugger` permission present from installation and the optional `scripting` permission granted from the AgentTab popup. `browser_profile` never reads or acts on page content and works without `scripting`.
+2. Chrome's required `debugger` permission present from installation and the optional `scripting` permission granted from the AgentTab popup. `browser_profile` never reads or acts on page content and works without `scripting`, except `sessions_restore`, which opens tabs and so needs the same automation permissions as `browser_open`.
 3. A running `dev.agenttab.host` connected to the extension through Native Messaging.
 4. Local IPC readiness. Check it with `agenttab doctor --layer ipc` after the command is available.
 

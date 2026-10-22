@@ -449,7 +449,8 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       );
     }
     // Profile operations need no site access, so they bypass the automation gate and revoked
-    // automation permissions; pause and disconnect still refuse them.
+    // automation permissions; pause and disconnect still refuse them. sessions_restore opens
+    // tabs, so it keeps the same permission admission as browser_open.
     if (command.method === "browser_profile") {
       if ((await readState()).paused) throw new NotStartedError("paused", "AgentTab is paused");
       if (
@@ -461,7 +462,9 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
           code: "origin_policy_unverifiable",
         });
       }
-      const execution = await scheduler.enqueueProfile(mutating, () => profile.run(command.task_id, params));
+      const execution = params.operation === "sessions_restore"
+        ? await scheduler.enqueueGlobal(() => profile.run(command.task_id, params))
+        : await scheduler.enqueueProfile(mutating, () => profile.run(command.task_id, params));
       return execution.staged
         ? commitRequired(command.request_id, execution.result, execution.staged)
         : completed(command.request_id, execution.result);

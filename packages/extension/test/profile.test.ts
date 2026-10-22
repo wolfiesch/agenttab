@@ -1262,6 +1262,11 @@ describe("browser_profile through the extension entrypoint", () => {
     });
     expect(callsTo("debugger.attach")).toEqual([]);
     expect(callsTo("scripting.executeScript")).toEqual([]);
+    // Restoring opens tabs, so it keeps browser_open's permission admission.
+    expect(await send("browser_profile", { operation: "sessions_restore", session_id: "win-1" })).toMatchObject({
+      outcome: "not_started",
+    });
+    expect(callsTo("tabs.create")).toEqual([]);
 
     expect(await popup({ kind: "pause" })).toEqual({ paused: true });
     calls = [];
