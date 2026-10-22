@@ -299,7 +299,8 @@ function recursivelySortObjectKeys(value: unknown): unknown {
 }
 
 // Bumped before every test so a wait abandoned by a timed-out test stops yielding instead of
-// spinning into the next test.
+// spinning into the next test. The stale wait is parked rather than rejected, so nothing from the
+// failed test settles or reports while the next test runs.
 let conditionWaitEpoch = 0;
 beforeEach(() => {
   conditionWaitEpoch += 1;
@@ -311,7 +312,7 @@ beforeEach(() => {
 async function waitForCondition(predicate: () => boolean): Promise<void> {
   const epoch = conditionWaitEpoch;
   while (!predicate()) {
-    if (epoch !== conditionWaitEpoch) throw new Error("condition wait outlived its test");
+    if (epoch !== conditionWaitEpoch) return new Promise<void>(() => {});
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
 }
