@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Replaced the extension icon with two facing tab grids, violet on the left and teal on the right, in place of the bracket-and-spark mark.
 - Fixed multi-event gestures reporting `outcome: "not_started"` after the page had already received input. `drag`, `double_click`, and `context_click` send several mouse events, and task authorization is rechecked before each one. If ownership was revoked or permissions were withdrawn after the first event, a single-action batch reported the action as not started. Any failure after a gesture's first input event now reports `outcome: "unknown"` and keeps its original error code.
 - Fixed the GPT-Control driver missing a reply when it polled before the new answer appeared. A poll that still saw the previous answer cleared the driver's awaiting-reply state, so the reply that followed was not counted as new.
 - Fixed the Python SDK failing to import on Python 3.10, the oldest version its package metadata accepts. The SDK imported `typing.NotRequired`, which Python added in 3.11. Optional keys now live in `total=False` TypedDict bases, so at runtime each type's `__required_keys__` and `__optional_keys__` match the protocol on every supported version. Before, every key reported as required, even on Python 3.11 and later.
