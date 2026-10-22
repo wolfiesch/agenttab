@@ -479,67 +479,109 @@ async function buttonNodes(client: AgentTabClient, tabId: number, name: RegExp):
   return { revision: snapshot.page_revision, buttons };
 }
 
+const GALLERY_SELECTOR = '[data-testid="generated-image-gallery"]';
+const SHARE_DIALOG_SELECTOR = '[role="dialog"][aria-modal="true"][data-state="open"]';
+const MAX_SELECTOR_LENGTH = 2048;
+
+function cssString(value: string): string {
+  return `"${value.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\a ")}"`;
+}
+
+/**
+ * Returns the label of the Share button that belongs to `url` in one generated-image gallery. Galleries list
+ * their page-bound images and Share buttons in the same order; labels may sit on the image or its button.
+ */
+export function shareLabelFor(galleryHtml: string, url: string): string {
+  const root = parse(galleryHtml);
+  const images = [...new Set(root.querySelectorAll("img").map((image) => image.getAttribute("src") ?? "").filter(isPageBoundImageUrl))];
+  const labels = root.querySelectorAll('button[aria-label^="Share generated image"]').map((button) => button.getAttribute("aria-label") ?? "");
+  const index = images.indexOf(url);
+  if (index < 0) throw new Error("Generated image is no longer in the ChatGPT thread");
+  if (labels.length !== images.length) {
+    throw new Error(`Found ${labels.length} image share buttons for ${images.length} generated images`);
+  }
+  return labels[index];
+}
+
+function gallerySelector(url: string): string {
+  return `${GALLERY_SELECTOR}:has(img[src=${cssString(url)}])`;
+}
+
+/** Opens the image's share dialog in the owned tab, downloads it, and returns the browser's local file. */
+async function downloadGeneratedImage(client: AgentTabClient, tabId: number, url: string): Promise<string> {
+  const existingDialog = await matchedHtml(client, tabId, SHARE_DIALOG_SELECTOR, "last", 1_000_000);
+  if (existingDialog) {
+    if (!parse(existingDialog).querySelectorAll("img").some((image) => image.getAttribute("src") === url)) {
+      throw new Error("An unrelated dialog is open; close it before saving the generated image");
+    }
+  } else {
+    // Snapshot only the gallery holding this image, so thread length never truncates the lookup.
+    const gallery = gallerySelector(url);
+    const galleryHtml = await matchedHtml(client, tabId, gallery, "last", 1_000_000);
+    if (!galleryHtml) throw new Error("Generated image is no longer in the ChatGPT thread");
+    const share = `${gallery} button[aria-label=${cssString(shareLabelFor(galleryHtml, url))}]`;
+    if (share.length > MAX_SELECTOR_LENGTH) throw new Error("Generated image URL is too long to target its Share button");
+    await completeAction(client, tabId, await tabRevision(client, tabId), [{ kind: "click", selector: share }]);
+  }
+  await client.call("browser_wait", {
+    tab_id: tabId,
+    condition: { kind: "selector", value: `${SHARE_DIALOG_SELECTOR} button[aria-label="Download"]` },
+    timeout_ms: 10_000,
+  }, { timeoutMs: 20_000 });
+  const download = await buttonNodes(client, tabId, /^Download$/);
+  const button = download.buttons.at(-1);
+  if (!button?.ref) throw new Error("ChatGPT share dialog has no Download button");
+  const before = new Set(await readdir(DOWNLOAD_DIRECTORY));
+  const since = Date.now();
+  const action = { kind: "click" as const, ref: button.ref, expect_download: true };
+  const clicked = record(await completeAction(client, tabId, download.revision, [action]), "download action");
+  if (!Array.isArray(clicked.actions)) throw new Error("Download action omitted its results");
+  const cursor = stringField(record(clicked.actions.at(-1), "download result"), "download_cursor");
+  const condition = { kind: "download" as const, after: cursor };
+  const completed = await client.call<"browser_wait", Record<string, unknown>>("browser_wait", {
+    tab_id: tabId,
+    condition,
+    timeout_ms: DOWNLOAD_TIMEOUT_MS,
+  }, { timeoutMs: DOWNLOAD_TIMEOUT_MS + 10_000 });
+  const expectedName = stringField(record(completed.download, "completed download"), "suggested_filename");
+  const downloaded = await findDownloadedImage(DOWNLOAD_DIRECTORY, before, since, expectedName);
+  if (await matchedHtml(client, tabId, SHARE_DIALOG_SELECTOR, "last", 256)) {
+    const close = await buttonNodes(client, tabId, /^Close/);
+    const closeButton = close.buttons.at(-1);
+    if (closeButton?.ref) await completeAction(client, tabId, close.revision, [{ kind: "click", ref: closeButton.ref }]);
+  }
+  return downloaded;
+}
+
 /**
  * Saves a generated image at full resolution. Page-bound URLs require the signed-in page, so the image is
- * downloaded through ChatGPT's own share dialog and moved from Chrome's download directory to `outputPath`.
+ * downloaded through ChatGPT's own share dialog and copied from Chrome's download directory to `outputPath`.
  */
 async function saveImage(session: DriverSession, url: string, outputPath: string): Promise<string> {
   if (!isAbsolute(outputPath)) throw new Error("Image output path must be absolute");
   if (!isPageBoundImageUrl(url)) throw new Error("save_image accepts only ChatGPT page-bound image URLs");
   const client = await connectSession(session.sessionId);
   try {
-    // Standard actions target accessibility refs, so the image's share button is found by document position:
-    // the Nth generated image in the thread owns the Nth "Share generated image" button.
-    const thread = await matchedHtml(client, session.pageId, "main", "last", 1_000_000);
-    if (!thread) throw new Error("ChatGPT thread is not rendered");
-    const sources = parse(thread)
-      .querySelectorAll('[data-testid="generated-image-gallery"] img[alt^="Generated image"]')
-      .map((image) => image.getAttribute("src"));
-    const index = sources.lastIndexOf(url);
-    if (index < 0) throw new Error("Generated image is no longer in the ChatGPT thread");
-    const existingDialog = await matchedHtml(client, session.pageId, '[role="dialog"][aria-modal="true"][data-state="open"]', "last", 1_000_000);
-    if (existingDialog) {
-      if (!parse(existingDialog).querySelectorAll("img").some((image) => image.getAttribute("src") === url)) {
-        throw new Error("An unrelated dialog is open; close it before saving the generated image");
-      }
-    } else {
-      const share = await buttonNodes(client, session.pageId, /^Share generated image \d+$/);
-      if (share.buttons.length !== sources.length) {
-        throw new Error(`Found ${share.buttons.length} image share buttons for ${sources.length} generated images`);
-      }
-      await completeAction(client, session.pageId, share.revision, [{ kind: "click", ref: share.buttons[index].ref! }]);
+    let downloaded: string;
+    try {
+      downloaded = await downloadGeneratedImage(client, session.pageId, url);
+    } catch (error) {
+      if (!(error instanceof AgentTabError && error.code === "multiple_download_throttle")) throw error;
+      // Chrome allows one automatic download per page load. Authenticated image URLs survive a reload of the
+      // owned tab; blob URLs do not, and then fail as no longer present.
+      await completeAction(client, session.pageId, await tabRevision(client, session.pageId), [{ kind: "reload" }]);
+      await waitForComposer(client, session.pageId, 30_000);
+      await client.call("browser_wait", {
+        tab_id: session.pageId,
+        condition: { kind: "selector", value: gallerySelector(url) },
+        timeout_ms: 15_000,
+      }, { timeoutMs: 25_000 }).catch(() => undefined);
+      downloaded = await downloadGeneratedImage(client, session.pageId, url);
     }
-    await client.call("browser_wait", {
-      tab_id: session.pageId,
-      condition: { kind: "selector", value: '[role="dialog"][aria-modal="true"][data-state="open"] button[aria-label="Download"]' },
-      timeout_ms: 10_000,
-    }, { timeoutMs: 20_000 });
-    const download = await buttonNodes(client, session.pageId, /^Download$/);
-    const button = download.buttons.at(-1);
-    if (!button?.ref) throw new Error("ChatGPT share dialog has no Download button");
-    const before = new Set(await readdir(DOWNLOAD_DIRECTORY));
-    const since = Date.now();
-    const action = { kind: "click" as const, ref: button.ref, expect_download: true };
-    const clicked = record(await completeAction(client, session.pageId, download.revision, [action]), "download action");
-    if (!Array.isArray(clicked.actions)) throw new Error("Download action omitted its results");
-    const cursor = stringField(record(clicked.actions.at(-1), "download result"), "download_cursor");
-    const condition = { kind: "download" as const, after: cursor };
-    const completed = await client.call<"browser_wait", Record<string, unknown>>("browser_wait", {
-      tab_id: session.pageId,
-      condition,
-      timeout_ms: DOWNLOAD_TIMEOUT_MS,
-    }, { timeoutMs: DOWNLOAD_TIMEOUT_MS + 10_000 });
-    const expectedName = stringField(record(completed.download, "completed download"), "suggested_filename");
-    const downloaded = await findDownloadedImage(DOWNLOAD_DIRECTORY, before, since, expectedName);
     await mkdir(dirname(outputPath), { recursive: true });
     // Keep the browser's download intact; never move a possibly concurrent user download.
     await copyFile(downloaded, outputPath);
     await chmod(outputPath, 0o600);
-    if (await matchedHtml(client, session.pageId, '[role="dialog"][aria-modal="true"][data-state="open"]', "last", 256)) {
-      const close = await buttonNodes(client, session.pageId, /^Close/);
-      const closeButton = close.buttons.at(-1);
-      if (closeButton?.ref) await completeAction(client, session.pageId, close.revision, [{ kind: "click", ref: closeButton.ref }]);
-    }
     return outputPath;
   } finally {
     client.close();

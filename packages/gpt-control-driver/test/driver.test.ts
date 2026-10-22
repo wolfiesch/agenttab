@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { extractAssistantTurn, findDownloadedImage, nextAssistantProgress } from "../src/driver.js";
+import { extractAssistantTurn, findDownloadedImage, nextAssistantProgress, shareLabelFor } from "../src/driver.js";
 
 describe("extractAssistantTurn", () => {
   test("returns only assistant prose and approved generated images", () => {
@@ -80,6 +80,30 @@ test("selects newly named images while excluding old, partial, and symlink files
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+describe("shareLabelFor", () => {
+  const first = "blob:https://chatgpt.com/6a8feb64-4550-4148-ab34-4a3101d26886";
+  const second = "https://chatgpt.com/backend-api/estuary/content?id=file_2";
+  const gallery = `
+    <div data-testid="generated-image-gallery">
+      <button aria-label="Generated image 1"><img src="${first}"></button>
+      <button aria-label="Edit generated image 1"></button>
+      <button aria-label="Share generated image 1"></button>
+      <button aria-label="Generated image 2"><img alt="Generated image 2" src="${second}"></button>
+      <button aria-label="Share generated image 2"></button>
+    </div>`;
+
+  test("maps each image, including one labeled only on its button, to its own Share button", () => {
+    expect(shareLabelFor(gallery, first)).toBe("Share generated image 1");
+    expect(shareLabelFor(gallery, second)).toBe("Share generated image 2");
+  });
+
+  test("rejects images that are absent or whose Share buttons do not line up", () => {
+    expect(() => shareLabelFor(gallery, "blob:https://chatgpt.com/00000000-0000-4000-8000-000000000000")).toThrow("no longer");
+    expect(() => shareLabelFor(gallery.replace('<button aria-label="Share generated image 2"></button>', ""), second))
+      .toThrow("Found 1 image share buttons for 2 generated images");
+  });
 });
 
 describe("nextAssistantProgress", () => {
