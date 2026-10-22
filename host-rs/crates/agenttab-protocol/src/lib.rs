@@ -257,7 +257,9 @@ impl RpcRequest {
         if request.request_id.is_empty() || request.request_id.chars().count() > 128 {
             return Err(ProtocolError::InvalidRequestId);
         }
-        if request.method.is_mutation() || params_require_idempotency(request.method, &request.params) {
+        if request.method.is_mutation()
+            || params_require_idempotency(request.method, &request.params)
+        {
             let key = request
                 .idempotency_key
                 .ok_or(ProtocolError::MissingIdempotencyKey(request.method))?;
@@ -1013,7 +1015,11 @@ impl BrowserProfileParams {
                     )?;
                 }
                 if let (Some(start), Some(end)) = (start_time, end_time) {
-                    require(method, start <= end, "start_time must not be after end_time")?;
+                    require(
+                        method,
+                        start <= end,
+                        "start_time must not be after end_time",
+                    )?;
                 }
                 validate_optional_limit(method, Some(*limit), MAX_PROFILE_RESULTS)
             }
@@ -2600,7 +2606,9 @@ mod tests {
         ] {
             assert!(matches!(
                 RpcRequest::parse(request("browser_profile", params.clone(), false)),
-                Err(ProtocolError::MissingIdempotencyKey(RpcMethod::BrowserProfile))
+                Err(ProtocolError::MissingIdempotencyKey(
+                    RpcMethod::BrowserProfile
+                ))
             ));
             let (_, parsed) = RpcRequest::parse(request("browser_profile", params, true)).unwrap();
             assert!(parsed.requires_idempotency());

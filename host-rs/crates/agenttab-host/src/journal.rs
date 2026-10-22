@@ -805,8 +805,7 @@ impl Journal {
             transaction.rollback()?;
             return Ok(StagedCommitConsumption::ApprovalRequired);
         }
-        let current_revision =
-            staged_binding_revision(&transaction, &task_id.to_string(), tab_id)?;
+        let current_revision = staged_binding_revision(&transaction, &task_id.to_string(), tab_id)?;
         if current_revision != Some(page_revision) {
             transaction.rollback()?;
             return Err(JournalError::StaleStagedCommit);

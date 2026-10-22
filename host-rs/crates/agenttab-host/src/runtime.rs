@@ -14,11 +14,10 @@ use crate::task::ConnectionContext;
 use agenttab_protocol::{
     AgenttabFinishParams, BrowserAction, BrowserCommitParams, BrowserCredentialsParams,
     BrowserHandoffParams, BrowserProfileParams, BrowserSnapshotParams, BrowserWaitParams,
-    ConnectionAck, ConnectionInit,
-    MethodParams, NativeEventPayload, NativePopupCommitEvent, NativeResponse, NativeStagedCommit,
-    NativeTab, Outcome, ResumeCapabilityConfirm, ResumeCapabilityConfirmed, RpcError, RpcMethod,
-    RpcRequest, RpcResponse, TaskBinding, WaitCondition, HOST_TO_CLIENT_MAX_BYTES,
-    PROTOCOL_VERSION,
+    ConnectionAck, ConnectionInit, MethodParams, NativeEventPayload, NativePopupCommitEvent,
+    NativeResponse, NativeStagedCommit, NativeTab, Outcome, ResumeCapabilityConfirm,
+    ResumeCapabilityConfirmed, RpcError, RpcMethod, RpcRequest, RpcResponse, TaskBinding,
+    WaitCondition, HOST_TO_CLIENT_MAX_BYTES, PROTOCOL_VERSION,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
@@ -4183,7 +4182,12 @@ mod tests {
         let audit = std::fs::read_to_string(temp.path().join("agenttab/audit.jsonl")).unwrap();
         assert!(audit.contains("\"operation\":\"bookmarks_search\""));
         assert!(audit.contains("\"operation\":\"bookmarks_update\""));
-        for private in [PRIVATE_TITLE, PRIVATE_URL, "private-ledger.example.net", "Northwind"] {
+        for private in [
+            PRIVATE_TITLE,
+            PRIVATE_URL,
+            "private-ledger.example.net",
+            "Northwind",
+        ] {
             assert!(!audit.contains(private), "audit leaked {private}");
         }
         let mut stored = Vec::new();
