@@ -85,7 +85,9 @@ AgentTab operates locally on the user's computer. It does not collect, sell, sha
 
 The extension and local host process browser information only to perform the user's requested task workflow. That information may include the content and state of task-owned tabs, accessibility snapshots, screenshots, action targets, download events, and handoff or Commit state. When the user's agent requests it, it may also include the profile's bookmarks, browsing history, recently closed and synced tabs, and download list, including saved file locations. That profile data is returned only to the requesting local agent and is not written to AgentTab logs or audit records. Standard mode does not return raw cookies, browser storage, passwords, arbitrary scripts, raw CDP, or raw network data to agents.
 
-The local host and extension communicate through Chrome Native Messaging and per-user operating-system-native IPC. Local task and recovery state remains on the user's computer. The `<all_urls>` host permission is limited to the defined `chrome.scripting` text, HTML, selector, wait, and scroll paths on task-owned tabs, not a Standard raw browser-data interface. The final public privacy policy, support destination, and site destination remain unverified placeholders until controlled hosting exists. They must not be invented or entered into a store listing from this draft.
+The local host and extension communicate through Chrome Native Messaging and per-user operating-system-native IPC. Local task and recovery state remains on the user's computer. The `<all_urls>` host permission is limited to the defined `chrome.scripting` text, HTML, selector, wait, and scroll paths on task-owned tabs, not a Standard raw browser-data interface.
+
+The public privacy policy is published at `https://agenttab.wolfie.gg/privacy/` and the support destination at `https://agenttab.wolfie.gg/support/`. The first store submission was rejected on September 4, 2026 under User Data Privacy ("Privacy policy link is broken or unavailable") because no privacy policy was publicly hosted at the time. Enter only these verified URLs in the listing.
 
 ## Asset and submission checklist
 
@@ -96,8 +98,8 @@ None of these items is represented as complete by this draft. Verify each item a
 - [ ] Store promotional image in the required current dimensions.
 - [ ] Screenshots that show a task workspace, an attention notice, Commit staged but not approved, and the local-only status without exposing identity, URLs, secrets, or local paths.
 - [ ] Scrubbed reviewer demonstration using a dedicated test profile and accounts.
-- [ ] Public privacy-policy destination verified under controlled hosting.
-- [ ] Public support destination verified under controlled hosting.
+- [x] Public privacy-policy destination verified under controlled hosting.
+- [x] Public support destination verified under controlled hosting.
 - [ ] Store title, short description, category, permission rationale, and reviewer instructions reconciled with the exact final package.
 - [ ] Chrome Web Store item identity checked against `config/identity.json` without adding an unverified public URL to launch copy.
 - [ ] Explicit authorization received for any upload, submission, review request, or publication.
