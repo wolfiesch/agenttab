@@ -1009,6 +1009,21 @@ nav a[aria-current="page"],
   margin-bottom: 1rem;
 }
 
+.privacy-page section > ul {
+  margin: 0 0 1rem;
+  padding-left: 1.25rem;
+  color: var(--ink-muted);
+}
+
+.privacy-page section li {
+  margin-bottom: 0.5rem;
+}
+
+.privacy-effective {
+  margin: 1rem 0 0;
+  font-size: 0.94rem;
+}
+
 .policy-highlight {
   padding: clamp(1.25rem, 4vw, 2rem);
   border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
