@@ -68,6 +68,8 @@ export function withoutPointerHost(html: string): string {
 export class AgentPointer {
   private readonly lastPoint = new Map<number, Point>();
   private readonly liveUntil = new Map<number, number>();
+  /** Scene injections still running per tab, including ones `scene` stopped waiting for. */
+  private readonly pending = new Map<number, number>();
 
   constructor(private readonly send: CdpSend) {}
 
@@ -128,7 +130,7 @@ export class AgentPointer {
 
   /** Runs a capture with the pointer hidden so screenshots show only the page. */
   async whileConcealed<T>(tabId: number, capture: () => Promise<T>): Promise<T> {
-    if ((this.liveUntil.get(tabId) ?? 0) < Date.now()) return capture();
+    if ((this.liveUntil.get(tabId) ?? 0) < Date.now() && !this.pending.has(tabId)) return capture();
     await this.scene(tabId, { op: "conceal" }).catch(() => undefined);
     try {
       return await capture();
@@ -142,25 +144,43 @@ export class AgentPointer {
   }
 
   private async play(tabId: number, command: SceneCommand): Promise<void> {
-    const result = await this.scene(tabId, command);
-    if (!result?.shown) return;
+    // A busy page can run the injection after `scene` gives up waiting for it.
+    // Count it as pending until it settles and record a late arrival, so a
+    // screenshot taken meanwhile still conceals the pointer.
+    this.pending.set(tabId, (this.pending.get(tabId) ?? 0) + 1);
+    await this.scene(tabId, command, (result) => {
+      const remaining = (this.pending.get(tabId) ?? 1) - 1;
+      if (remaining > 0) this.pending.set(tabId, remaining);
+      else this.pending.delete(tabId);
+      if (!result?.shown) return;
+      if (result.at) this.lastPoint.set(tabId, result.at);
+      this.markLive(tabId, Date.now() + POINTER_IDLE_MS + 1_000);
+    });
+  }
+
+  private markLive(tabId: number, until: number): void {
     const now = Date.now();
     // Forget faded pointers, so closed tabs never accumulate.
-    for (const [staleTabId, until] of this.liveUntil) {
-      if (until >= now) continue;
+    for (const [staleTabId, staleUntil] of this.liveUntil) {
+      if (staleUntil >= now) continue;
       this.liveUntil.delete(staleTabId);
       this.lastPoint.delete(staleTabId);
     }
-    if (result.at) this.lastPoint.set(tabId, result.at);
-    this.liveUntil.set(tabId, now + POINTER_IDLE_MS + 1_000);
+    this.liveUntil.set(tabId, until);
   }
 
-  private async scene(tabId: number, command: SceneCommand): Promise<SceneResult | null> {
+  private async scene(
+    tabId: number,
+    command: SceneCommand,
+    settled?: (result: SceneResult | null) => void,
+  ): Promise<SceneResult | null> {
     const { promise: timeout, resolve: expire } = Promise.withResolvers<null>();
     const timer = setTimeout(() => expire(null), POINTER_SCENE_TIMEOUT_MS);
     const injected = chrome.scripting
       .executeScript({ target: { tabId }, func: runPointerScene, args: [command] })
       .then(([frame]) => (isSceneResult(frame?.result) ? frame.result : null));
+    // Runs on late completion too; the race only bounds how long the action waits.
+    if (settled) void injected.then(settled, () => settled(null));
     try {
       return await Promise.race([injected, timeout]);
     } finally {
