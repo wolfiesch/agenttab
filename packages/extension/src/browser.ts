@@ -104,6 +104,12 @@ const TAB_ONLY_ACTIONS: Readonly<Record<string, true>> = {
 };
 /** Single-target actions dispatched as mouse input at the target's on-screen point. */
 const POINTER_GESTURE_KINDS: ReadonlySet<string> = new Set(["hover", "double_click", "context_click"]);
+/**
+ * Called on the target element; returns a function that removes the listener it adds.
+ * The listener runs in the capture phase so page handlers cannot stop it, fires
+ * once, and removes itself after five seconds without depending on the extension.
+ */
+const SUPPRESS_NATIVE_CONTEXT_MENU = "function(){const view=this.ownerDocument&&this.ownerDocument.defaultView;if(!view)return undefined;const suppress=(event)=>event.preventDefault();const remove=()=>{view.removeEventListener('contextmenu',suppress,true);view.clearTimeout(timer)};const timer=view.setTimeout(remove,5000);view.addEventListener('contextmenu',suppress,{capture:true,once:true});return remove}";
 const TAB_ONLY_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   load: true,
   url: true,
@@ -2835,7 +2841,7 @@ export class StandardBrowserRuntime {
       const point = await this.pointerTargetPoint(tabId, target);
       await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "none", buttons: 0 }, false, target.sessionId);
       if (kind !== "hover") {
-        await this.afterInputDispatched(async () => {
+        const click = () => this.afterInputDispatched(async () => {
           const button = kind === "context_click" ? "right" : "left";
           const buttons = kind === "context_click" ? 2 : 1;
           for (let clickCount = 1; clickCount <= (kind === "double_click" ? 2 : 1); clickCount += 1) {
@@ -2844,6 +2850,7 @@ export class StandardBrowserRuntime {
             await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button, buttons: 0, clickCount }, false, target.sessionId);
           }
         });
+        await (kind === "context_click" ? this.withoutNativeContextMenu(tabId, target, click) : click());
       }
     } else if (kind === "upload_file") {
       if (!Array.isArray(action.files) || !action.files.every((file) => typeof file === "string")) {
@@ -3188,7 +3195,7 @@ export class StandardBrowserRuntime {
     }
     const binding = parseTargetRef(request.ref);
     if (binding === null) {
-      throw Object.assign(new Error("Snapshot ref is not task-bound"), { code: "stale_ref" });
+      throw Object.assign(new Error("Snapshot ref is unknown or expired; take a new snapshot"), { code: "stale_ref" });
     }
     if (
       binding.tabId !== tabId ||
@@ -3414,6 +3421,39 @@ export class StandardBrowserRuntime {
   /** Scrolls a target into the viewport only when it lies outside it, as a person would before pointing. */
   private async revealTarget(tabId: number, target: ResolvedTarget): Promise<void> {
     await this.send(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId: target.backendNodeId }, false, target.sessionId);
+  }
+
+  /**
+   * Runs a right click without Chrome's native context menu. On macOS that menu
+   * runs a nested event loop that stalls every extension request until someone
+   * dismisses it, and an agent cannot reach it anyway. Page handlers still run,
+   * though they see the event as already handled, so a page's own menu still opens.
+   */
+  private async withoutNativeContextMenu(tabId: number, target: ResolvedTarget, run: () => Promise<void>): Promise<void> {
+    const owner = await this.send(tabId, "DOM.resolveNode", {
+      backendNodeId: target.backendNodeId,
+      ...(target.contextId !== undefined ? { executionContextId: target.contextId } : {}),
+    }, false, target.sessionId);
+    if (!isRecord(owner.object) || typeof owner.object.objectId !== "string") {
+      throw Object.assign(new Error("Pointer target no longer resolves"), { code: "stale_ref" });
+    }
+    const installed = await this.send(tabId, "Runtime.callFunctionOn", {
+      objectId: owner.object.objectId,
+      functionDeclaration: SUPPRESS_NATIVE_CONTEXT_MENU,
+    }, false, target.sessionId);
+    const restore = isRecord(installed.result) && typeof installed.result.objectId === "string" ? installed.result.objectId : undefined;
+    try {
+      await run();
+    } finally {
+      // Remove the listener early when the gesture did not consume it. If this
+      // fails (navigation, revoked access), the listener's own timer removes it.
+      if (restore !== undefined) {
+        await this.send(tabId, "Runtime.callFunctionOn", {
+          objectId: restore,
+          functionDeclaration: "function(){this()}",
+        }, false, target.sessionId).catch(() => undefined);
+      }
+    }
   }
 
   private async pointerTargetPoint(
