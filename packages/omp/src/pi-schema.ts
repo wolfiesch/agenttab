@@ -1,5 +1,6 @@
 import { Type } from "typebox";
 import {
+  ACT_INTENT_MAX_CHARS,
   SCREENSHOT_MAX_BYTES,
   SCREENSHOT_MAX_DIMENSION,
   SNAPSHOT_TEXT_MAX_BYTES,
@@ -71,6 +72,8 @@ const schemas: Record<ToolMethod, unknown> = {
       object({ kind: Type.Literal("upload_file"), ref: ref(), frame_id: Type.Optional(ref()), files: Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { minItems: 1, maxItems: 4 }) }),
       object({ kind: Type.Literal("upload_file"), selector: selector(), frame_id: Type.Optional(ref()), files: Type.Array(Type.String({ minLength: 1, maxLength: 512 }), { minItems: 1, maxItems: 4 }) }),
     ]), { minItems: 1, maxItems: 64 }),
+    // maxLength counts UTF-16 units here; the Zod schema and host enforce the scalar-value bound.
+    intent: Type.Optional(Type.String({ minLength: 1, maxLength: ACT_INTENT_MAX_CHARS * 2, pattern: "^[^\\u0000-\\u001f\\u007f-\\u009f]+$" })),
   }),
   browser_wait: object({
     tab_id: Type.Integer({ minimum: 0 }),

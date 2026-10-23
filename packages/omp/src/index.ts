@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
+  ACT_INTENT_GUIDANCE,
+  ACT_INTENT_MAX_CHARS,
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
@@ -181,7 +183,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_act",
       label: "Browser Act",
-      description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${CHALLENGE_GUIDANCE.summary}`,
+      description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${ACT_INTENT_GUIDANCE} ${CHALLENGE_GUIDANCE.summary}`,
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);
@@ -243,6 +245,8 @@ const DEFINITIONS: ReadonlyArray<{
           tab_id: z.number().int().min(0),
           expected_page_revision: z.number().int().min(0),
           actions: z.array(action).min(1).max(64),
+          // With the `u` flag the quantifier counts Unicode scalar values, matching the host.
+          intent: z.string().regex(new RegExp(`^\\P{Cc}{1,${ACT_INTENT_MAX_CHARS}}$`, "u")).optional(),
         }).strict();
       },
     },

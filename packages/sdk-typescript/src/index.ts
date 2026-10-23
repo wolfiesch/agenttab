@@ -12,6 +12,10 @@ export const CLIENT_TO_HOST_MAX_BYTES = 1024 * 1024;
 export const HOST_TO_CLIENT_MAX_BYTES = 1024 * 1024;
 
 export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
+/** Unicode scalar values allowed in a `browser_act` intent caption. */
+export const ACT_INTENT_MAX_CHARS = 120;
+/** Tool-description sentence that teaches agents the `browser_act` intent contract. */
+export const ACT_INTENT_GUIDANCE = `Optional \`intent\` (one line, up to ${ACT_INTENT_MAX_CHARS} characters) states the batch's purpose and becomes the on-screen pointer caption, for example "Open the bookmarks folder"; never put secrets or field values in it.`;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_WAIT_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;
@@ -160,6 +164,8 @@ export interface BrowserActParams {
   tab_id: number;
   expected_page_revision: number;
   actions: BrowserAction[];
+  /** One-line purpose shown as the pointer caption, replacing the generated action label. */
+  intent?: string;
 }
 
 export type BrowserWaitCondition =

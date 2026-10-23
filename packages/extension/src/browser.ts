@@ -1515,6 +1515,7 @@ export class StandardBrowserRuntime {
     tabId: number,
     expectedRevision: unknown,
     actions: unknown,
+    intent?: string,
   ): Promise<ActionExecution> {
     await this.authorizeDebuggerUse(tabId);
     const pageRevision = await this.revisions.assertExpected(tabId, expectedRevision);
@@ -1662,7 +1663,7 @@ export class StandardBrowserRuntime {
             },
           };
         }
-        completedActions.push(await this.performAction(taskId, tabId, pageRevision, action, resolvedTarget));
+        completedActions.push(await this.performAction(taskId, tabId, pageRevision, action, resolvedTarget, intent));
       }
     } catch (error) {
       throw batchStepFailure(error, stepIndex, validated, completedActions);
@@ -2613,6 +2614,8 @@ export class StandardBrowserRuntime {
     pageRevision: number,
     action: Record<string, unknown>,
     resolvedTarget?: ResolvedTarget,
+    /** Agent-authored batch purpose; replaces the pointer's generated caption. */
+    intent?: string,
   ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const kind = action.kind;
@@ -2658,7 +2661,7 @@ export class StandardBrowserRuntime {
       return { kind, completed: true };
     }
     if (kind === "scroll" && action.ref === undefined && action.frame_id === undefined) {
-      await this.pointer.announce(tabId, "Scroll page");
+      await this.pointer.announce(tabId, intent ?? "Scroll page");
       await chrome.scripting.executeScript({
         target: { tabId },
         func: (deltaX: number, deltaY: number) => window.scrollBy(deltaX, deltaY),
@@ -2696,7 +2699,7 @@ export class StandardBrowserRuntime {
     });
     const backendNodeId = target.backendNodeId;
     const pointerCue = ACTION_POINTER_CUES[String(kind)];
-    if (pointerCue && target.route !== "scripting") await this.pointer.point(tabId, target, pointerCue);
+    if (pointerCue && target.route !== "scripting") await this.pointer.point(tabId, target, pointerCue, intent);
     let windowRequests: Array<Record<string, unknown>> = [];
     if (kind === "click" || kind === "press") {
       const [activeTab, existingTabs] = await Promise.all([
@@ -2803,7 +2806,7 @@ export class StandardBrowserRuntime {
       if (target.sessionId !== dropTarget.sessionId || target.frameId !== dropTarget.frameId) {
         throw Object.assign(new Error("Drag endpoints must belong to the same frame"), { code: "invalid_request" });
       }
-      await this.pointer.drag(tabId, target, dropTarget);
+      await this.pointer.drag(tabId, target, dropTarget, intent);
       const [sourcePoint, dropPoint] = await Promise.all([
         this.pointerTargetPoint(tabId, target),
         this.pointerTargetPoint(tabId, dropTarget),

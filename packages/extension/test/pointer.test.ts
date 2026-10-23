@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import { AgentPointer } from "../src/pointer";
+import { ACTION_POINTER_CUES, AgentPointer, type PointerTarget } from "../src/pointer";
 import { resetStateForTest } from "../src/storage";
 
 const TAB = 7;
 
 interface Injection {
   op: string;
+  command: Record<string, unknown>;
   finish: (result: unknown) => void;
 }
 
@@ -31,9 +32,10 @@ function installChromeMock(): void {
     chrome: {
       storage: { local: storageArea, session: storageArea, onChanged: { addListener() {} } },
       scripting: {
-        executeScript(details: { args: [{ op: string }] }) {
+        executeScript(details: { args: [Record<string, unknown> & { op: string }] }) {
           const { promise, resolve } = Promise.withResolvers<unknown>();
-          injections.push({ op: details.args[0].op, finish: (result) => resolve([{ result }]) });
+          const command = details.args[0];
+          injections.push({ op: command.op, command, finish: (result) => resolve([{ result }]) });
           return promise;
         },
       },
@@ -86,6 +88,25 @@ describe("agent pointer", () => {
     await flush();
     injections.at(-1)?.finish({ shown: false });
     expect(await afterArrival).toBe("late capture");
+  });
+
+  test("an agent intent replaces the generated caption", async () => {
+    const send = async (_tabId: number, method: string) =>
+      method === "DOM.resolveNode"
+        ? { object: { objectId: "node-1" } }
+        : { result: { value: { x: 40, y: 60, label: "Bookmarks" } } };
+    const pointer = new AgentPointer(send);
+    const node: PointerTarget = { backendNodeId: 22 };
+    const captions: unknown[] = [];
+    for (const intent of [undefined, "Open the bookmarks folder"]) {
+      const pointed = pointer.point(TAB, node, ACTION_POINTER_CUES.click, intent);
+      while (injections.length === captions.length) await flush();
+      const injection = injections[captions.length];
+      captions.push(injection.command.caption);
+      injection.finish({ shown: true, at: { x: 40, y: 60 } });
+      await pointed;
+    }
+    expect(captions).toEqual(["Click “Bookmarks”", "Open the bookmarks folder"]);
   });
 
   test("skips concealment once no pointer is shown or pending", async () => {

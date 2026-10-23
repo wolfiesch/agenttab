@@ -120,6 +120,16 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
             {
                 "tab_id": 1,
                 "expected_page_revision": 2,
+                "actions": [{"kind": "click", "ref": "e7"}],
+                "intent": "Open the bookmarks folder",
+            },
+            mutation=True,
+        ),
+        core_request(
+            "browser_act",
+            {
+                "tab_id": 1,
+                "expected_page_revision": 2,
                 "actions": [
                     {"kind": "click", "selector": "button.submit"},
                     {"kind": "type", "selector": "input.search", "text": "agenttab"},
@@ -312,6 +322,20 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
             mutation=True,
         )
         expect_invalid(request_validator, invalid_req, label)
+    for invalid_intent, label in [
+        ("", "empty act intent"),
+        ("x" * 121, "oversized act intent"),
+        ("Open the\nbookmarks", "multi-line act intent"),
+    ]:
+        expect_invalid(
+            request_validator,
+            core_request(
+                "browser_act",
+                {"tab_id": 1, "expected_page_revision": 2, "actions": [{"kind": "go_back"}], "intent": invalid_intent},
+                mutation=True,
+            ),
+            label,
+        )
     for invalid_action, label in [
         ({"kind": "dialog", "decision": "dismiss", "prompt_text": "forbidden"}, "dialog prompt dismiss"),
         ({"kind": "dialog", "decision": "accept", "prompt_text": "x" * 4097}, "oversized dialog prompt"),

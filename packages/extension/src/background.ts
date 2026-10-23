@@ -613,7 +613,13 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
           await assertCurrentOrigin(targetTabId, command.origin_policy);
           // Registered before the action runs, so a fast load cannot finish unobserved.
           if (endsInNavigation) watch = watchNavigation(targetTabId);
-          const execution = await browser.act(command.task_id, targetTabId, params.expected_page_revision, params.actions);
+          const execution = await browser.act(
+            command.task_id,
+            targetTabId,
+            params.expected_page_revision,
+            params.actions,
+            typeof params.intent === "string" ? params.intent : undefined,
+          );
           // The navigated page is scanned once its load settles, outside this tab slot.
           if (watch !== undefined && navigationStarted(execution.result)) return execution;
           return {
