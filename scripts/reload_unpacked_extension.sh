@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CHROME_APP="${AGENTTAB_CHROME_APP:-Google Chrome}"
+CHROME_USER_DATA_DIR="${AGENTTAB_CHROME_USER_DATA_DIR:-}"
+CHROME_PROFILE_DIRECTORY="${AGENTTAB_CHROME_PROFILE_DIRECTORY:-}"
 EXTENSION_ID=""
 LIVE_LIFECYCLE=0
 SOCKET_PATH=""
@@ -16,6 +18,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   scripts/reload_unpacked_extension.sh [--extension-id ID] [--chrome-app APP] \
+    [--user-data-dir DIR] [--profile-directory NAME] \
     [--debugging-url http://127.0.0.1:PORT]
   scripts/reload_unpacked_extension.sh --live-lifecycle --extension-id ID \
     --socket PATH --debugging-url http://127.0.0.1:PORT --download-dir PATH \
@@ -25,7 +28,11 @@ Usage:
 
 The default form reloads through a supplied loopback DevTools service-worker
 target without changing the active tab, or falls back to opening the AgentTab
-wake page in the background with reload=1.
+wake page in the background with reload=1. The wake page is handed to the
+Chrome instance that owns the user data directory (the application's default
+unless --user-data-dir is given) and opened in every profile there that has
+the extension installed, so an unrelated Chrome instance or the last-focused
+profile cannot receive it. Use --profile-directory to pick one profile.
 The live form runs the explicit, interactive PR3 lifecycle probe only after the
 candidate is already loaded into a disposable trusted macOS Chrome profile.
 It does not request or remove Chrome permissions; each permission, pause,
@@ -53,6 +60,16 @@ while (($#)); do
     --chrome-app)
       require_value "$1" "${2:-}"
       CHROME_APP="$2"
+      shift 2
+      ;;
+    --user-data-dir)
+      require_value "$1" "${2:-}"
+      CHROME_USER_DATA_DIR="$2"
+      shift 2
+      ;;
+    --profile-directory)
+      require_value "$1" "${2:-}"
+      CHROME_PROFILE_DIRECTORY="$2"
       shift 2
       ;;
     --live-lifecycle)
@@ -125,10 +142,76 @@ if ((LIVE_LIFECYCLE == 0)) && [[ -n "$DEBUGGING_URL" ]]; then
     --debugging-url "$DEBUGGING_URL"
 fi
 
-open -g -a "$CHROME_APP" "chrome-extension://$EXTENSION_ID/wake.html?reload=1"
+if ((LIVE_LIFECYCLE != 0)); then
+  open -g -a "$CHROME_APP" "chrome-extension://$EXTENSION_ID/wake.html?reload=1"
+else
+  default_user_data_dir() {
+    case "$1" in
+      "Google Chrome") printf '%s\n' "$HOME/Library/Application Support/Google/Chrome" ;;
+      "Google Chrome Beta") printf '%s\n' "$HOME/Library/Application Support/Google/Chrome Beta" ;;
+      "Google Chrome Dev") printf '%s\n' "$HOME/Library/Application Support/Google/Chrome Dev" ;;
+      "Google Chrome Canary") printf '%s\n' "$HOME/Library/Application Support/Google/Chrome Canary" ;;
+      "Google Chrome for Testing") printf '%s\n' "$HOME/Library/Application Support/Google/Chrome for Testing" ;;
+      "Chromium") printf '%s\n' "$HOME/Library/Application Support/Chromium" ;;
+      *) return 1 ;;
+    esac
+  }
 
-if ((LIVE_LIFECYCLE == 0)); then
-  printf '%s\n' 'AgentTab reload requested in the selected Chrome application'
+  user_data_dir="$CHROME_USER_DATA_DIR"
+  if [[ -z "$user_data_dir" ]] && ! user_data_dir="$(default_user_data_dir "$CHROME_APP")"; then
+    printf 'No default user data directory is known for %s; pass --user-data-dir\n' "$CHROME_APP" >&2
+    exit 64
+  fi
+
+  profiles=()
+  if [[ -n "$CHROME_PROFILE_DIRECTORY" ]]; then
+    profiles=("$CHROME_PROFILE_DIRECTORY")
+  else
+    # Every profile listed in Local State whose preferences record the extension.
+    while IFS= read -r profile; do
+      profiles+=("$profile")
+    done < <(
+      python3 - "$user_data_dir" "$EXTENSION_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+extension_id = sys.argv[2]
+try:
+    profiles = json.loads((root / "Local State").read_text())["profile"]["info_cache"]
+except (OSError, ValueError, KeyError, TypeError):
+    profiles = {}
+for profile in sorted(profiles):
+    for name in ("Secure Preferences", "Preferences"):
+        try:
+            settings = json.loads((root / profile / name).read_text())["extensions"]["settings"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if isinstance(settings, dict) and extension_id in settings:
+            print(profile)
+            break
+PY
+    )
+  fi
+  if ((${#profiles[@]} == 0)); then
+    printf 'Extension %s is not installed in any Chrome profile under %s; pass --user-data-dir or --profile-directory\n' \
+      "$EXTENSION_ID" "$user_data_dir" >&2
+    exit 69
+  fi
+
+  # `open -n` starts a short-lived Chrome process that forwards the URL to the
+  # instance owning the user data directory through Chrome's process singleton.
+  # Plain `open -a` sends it to whichever same-named instance macOS picks first,
+  # which can be a headless or test Chrome without the extension.
+  for profile in "${profiles[@]}"; do
+    launch_args=(--profile-directory="$profile")
+    if [[ -n "$CHROME_USER_DATA_DIR" ]]; then
+      launch_args=(--user-data-dir="$CHROME_USER_DATA_DIR" "${launch_args[@]}")
+    fi
+    open -g -n -a "$CHROME_APP" --args "${launch_args[@]}" "chrome-extension://$EXTENSION_ID/wake.html?reload=1"
+    printf 'AgentTab reload requested in %s profile %s\n' "$CHROME_APP" "$profile"
+  done
   exit 0
 fi
 
