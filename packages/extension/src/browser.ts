@@ -104,8 +104,12 @@ const TAB_ONLY_ACTIONS: Readonly<Record<string, true>> = {
 };
 /** Single-target actions dispatched as mouse input at the target's on-screen point. */
 const POINTER_GESTURE_KINDS: ReadonlySet<string> = new Set(["hover", "double_click", "context_click"]);
-/** Called on the target element; returns a function that removes the listener it adds. */
-const SUPPRESS_NATIVE_CONTEXT_MENU = "function(){const view=this.ownerDocument&&this.ownerDocument.defaultView;if(!view)return undefined;const suppress=(event)=>event.preventDefault();view.addEventListener('contextmenu',suppress);return function(){view.removeEventListener('contextmenu',suppress)}}";
+/**
+ * Called on the target element; returns a function that removes the listener it adds.
+ * The listener runs in the capture phase so page handlers cannot stop it, fires
+ * once, and removes itself after five seconds without depending on the extension.
+ */
+const SUPPRESS_NATIVE_CONTEXT_MENU = "function(){const view=this.ownerDocument&&this.ownerDocument.defaultView;if(!view)return undefined;const suppress=(event)=>event.preventDefault();const remove=()=>{view.removeEventListener('contextmenu',suppress,true);view.clearTimeout(timer)};const timer=view.setTimeout(remove,5000);view.addEventListener('contextmenu',suppress,{capture:true,once:true});return remove}";
 const TAB_ONLY_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   load: true,
   url: true,
@@ -3422,9 +3426,8 @@ export class StandardBrowserRuntime {
   /**
    * Runs a right click without Chrome's native context menu. On macOS that menu
    * runs a nested event loop that stalls every extension request until someone
-   * dismisses it, and an agent cannot reach it anyway. The listener is added to
-   * the target's window last, so page handlers run first and see the event as
-   * usual; only a menu the page left to the browser is suppressed.
+   * dismisses it, and an agent cannot reach it anyway. Page handlers still run,
+   * though they see the event as already handled, so a page's own menu still opens.
    */
   private async withoutNativeContextMenu(tabId: number, target: ResolvedTarget, run: () => Promise<void>): Promise<void> {
     const owner = await this.send(tabId, "DOM.resolveNode", {
@@ -3442,7 +3445,8 @@ export class StandardBrowserRuntime {
     try {
       await run();
     } finally {
-      // A navigation from the click discards the listener with its document.
+      // Remove the listener early when the gesture did not consume it. If this
+      // fails (navigation, revoked access), the listener's own timer removes it.
       if (restore !== undefined) {
         await this.send(tabId, "Runtime.callFunctionOn", {
           objectId: restore,

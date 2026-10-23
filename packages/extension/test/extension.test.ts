@@ -6379,7 +6379,7 @@ describe("mouse gestures on targets outside the viewport", () => {
 });
 
 describe("context clicks", () => {
-  test("suppress only the browser's native menu, after page handlers run", async () => {
+  test("suppress the browser's native menu once, without relying on the extension to clean up", async () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const calls: string[] = [];
@@ -6408,18 +6408,37 @@ describe("context clicks", () => {
     await runtime.act(TASK_A, 7, revision, [{ kind: "context_click", ref: mintedRef(TASK_A, 7, revision) }]);
     expect(calls).toEqual(["mouseMoved", "suppress", "mousePressed", "mouseReleased", "restore"]);
 
-    // Run the installed listener against a stand-in window.
-    const view = new EventTarget();
-    let pageSawPrevented: boolean | undefined;
-    view.addEventListener("contextmenu", (event) => { pageSawPrevented = event.defaultPrevented; });
-    const restore = new Function(`return (${suppress})`)().call({ ownerDocument: { defaultView: view } }) as () => void;
-    const suppressed = new Event("contextmenu", { cancelable: true });
-    view.dispatchEvent(suppressed);
-    expect(pageSawPrevented).toBe(false);
-    expect(suppressed.defaultPrevented).toBe(true);
-    restore();
-    const restored = new Event("contextmenu", { cancelable: true });
-    view.dispatchEvent(restored);
-    expect(restored.defaultPrevented).toBe(false);
+    // Run the installed listener against a stand-in window whose timer is driven by hand.
+    const install = () => {
+      const view = Object.assign(new EventTarget(), {
+        expire: () => undefined as void,
+        setTimeout(callback: () => void) { view.expire = callback; return 1; },
+        clearTimeout() {},
+      });
+      const restore = new Function(`return (${suppress})`)().call({ ownerDocument: { defaultView: view } }) as () => void;
+      const rightClick = () => {
+        const event = new Event("contextmenu", { cancelable: true });
+        view.dispatchEvent(event);
+        return event.defaultPrevented;
+      };
+      return { view, restore, rightClick };
+    };
+
+    // A page handler that stops propagation cannot keep the native menu open, and the
+    // listener fires only for the gesture's own right click.
+    const stopping = install();
+    let pageHandlerRan = false;
+    stopping.view.addEventListener("contextmenu", (event) => { pageHandlerRan = true; event.stopImmediatePropagation(); });
+    expect(stopping.rightClick()).toBe(true);
+    expect(pageHandlerRan).toBe(true);
+    expect(stopping.rightClick()).toBe(false);
+
+    // Unconsumed listeners go away through the extension's cleanup or, failing that, their own timer.
+    const restored = install();
+    restored.restore();
+    expect(restored.rightClick()).toBe(false);
+    const expired = install();
+    expired.view.expire();
+    expect(expired.rightClick()).toBe(false);
   });
 });
