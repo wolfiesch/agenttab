@@ -53,8 +53,11 @@ failure, the command restores the prior bundle and development receipt and attem
 to reload the restored bundle. Inspect the reported runtime status before treating
 recovery as complete.
 
-Default extension reload uses `scripts/reload_unpacked_extension.sh` (via macOS
-`open -g -a "$CHROME_APP"`), which is supported by default only on macOS. On Linux
+Default extension reload uses `scripts/reload_unpacked_extension.sh`, which opens
+the extension's wake page with macOS `open` in every Chrome profile that has the
+extension installed. Pass `--user-data-dir` or `--profile-directory` to the script
+(or set `AGENTTAB_CHROME_USER_DATA_DIR` or `AGENTTAB_CHROME_PROFILE_DIRECTORY`) when
+Chrome runs with a non-default user data directory. This reload is supported by default only on macOS. On Linux
 and other non-macOS platforms, the default reload mechanism is unsupported and the
 deployment fails pre-mutation before building, creating backups, or swapping files.
 To iterate on Linux or other platforms, provide an explicit reload override:
