@@ -6321,6 +6321,10 @@ describe("mouse gestures on targets outside the viewport", () => {
       if (method === "Page.getLayoutMetrics") {
         return { cssLayoutViewport: revealed ? SCROLL : { pageX: 0, pageY: 0 } };
       }
+      if (method === "DOM.getBoxModel" && params.backendNodeId === 23) {
+        // A drop target 900px below the source, beyond any one viewport.
+        return { model: { content: [10, 890, 30, 890, 30, 910, 10, 910] } };
+      }
       if (method === "Input.dispatchMouseEvent") {
         calls.push(`${method}:${String(params.type)}`);
         mousePoints.push([params.x, params.y]);
@@ -6358,5 +6362,18 @@ describe("mouse gestures on targets outside the viewport", () => {
       runtime.act(TASK_A, 7, revision, [{ kind: "hover", ref: mintedRef(TASK_A, 7, revision) }]),
     ).rejects.toMatchObject({ code: "action_failed", message: expect.stringContaining("outside the visible viewport") });
     expect(calls).toEqual(["DOM.scrollIntoViewIfNeeded"]);
+  });
+
+  test("refuses a drag whose drop target cannot share the viewport with its source", async () => {
+    const { runtime, revisions, calls } = offscreenRuntime(true);
+    const revision = await revisions.ensure(7);
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{
+        kind: "drag",
+        ref: mintedRef(TASK_A, 7, revision),
+        target_ref: mintedRef(TASK_A, 7, revision, 23),
+      }]),
+    ).rejects.toMatchObject({ code: "action_failed", message: expect.stringContaining("do not fit in the viewport together") });
+    expect(calls.some((call) => call.startsWith("Input.dispatchMouseEvent"))).toBe(false);
   });
 });

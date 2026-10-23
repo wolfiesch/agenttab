@@ -2813,11 +2813,16 @@ export class StandardBrowserRuntime {
       // Reveal the drop target, then the source, so the press lands on a visible source.
       await this.revealTarget(tabId, dropTarget);
       await this.revealTarget(tabId, target);
+      const sourcePoint = await this.pointerTargetPoint(tabId, target);
+      // Revealing the source scrolls a distant drop target back out of view; refuse
+      // before pressing rather than release the drag at an offscreen point.
+      const dropPoint = await this.pointerTargetPoint(tabId, dropTarget).catch((error: unknown) => {
+        if (String(error).includes("outside the visible viewport")) {
+          throw Object.assign(new Error("Drag source and drop target do not fit in the viewport together"), { code: "action_failed" });
+        }
+        throw error;
+      });
       await this.pointer.drag(tabId, target, dropTarget, intent);
-      const [sourcePoint, dropPoint] = await Promise.all([
-        this.pointerTargetPoint(tabId, target),
-        this.pointerTargetPoint(tabId, dropTarget),
-      ]);
       await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...sourcePoint, button: "left", buttons: 1, clickCount: 1 }, false, target.sessionId);
       await this.afterInputDispatched(async () => {
         try {
