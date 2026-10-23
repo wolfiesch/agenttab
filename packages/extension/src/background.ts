@@ -26,6 +26,7 @@ import {
 import { MutationScheduler, NotStartedError } from "./scheduler";
 import { IdempotentStartup, StartupOperationQueue } from "./startup";
 import { mutateState, readState } from "./storage";
+import { targetRefs } from "./target-resolution";
 import { isRecord } from "./type-guards";
 
 const RUNTIME_INSTANCE_ID = crypto.randomUUID();
@@ -883,6 +884,9 @@ chrome.tabs.onCreated.addListener((tab: { id?: number; openerTabId?: number }) =
   runAfterStart(() => ownership.adoptOwnedChild(tab));
 });
 chrome.tabs.onRemoved.addListener((removedTabId: number) => {
+  void targetRefs.forgetTab(removedTabId).catch((error) => {
+    console.warn("AgentTab could not drop a closed tab's snapshot refs", error);
+  });
   for (const releaseWaiter of tabLoadWaiters.get(removedTabId) ?? []) releaseWaiter();
   for (const watch of navigationWatches.get(removedTabId) ?? []) watch.markLoaded();
   runAfterStart(async () => {
@@ -949,7 +953,13 @@ chrome.tabGroups.onRemoved.addListener((group: { id?: number }) => {
     await reconcileOwnership();
   });
 });
-chrome.runtime.onStartup.addListener(() => runAfterStart());
+chrome.runtime.onStartup.addListener(() => {
+  // Tab ids restart with the browser, so stored refs from the last session name other tabs.
+  void targetRefs.clear().catch((error) => {
+    console.warn("AgentTab could not clear the last session's snapshot refs", error);
+  });
+  runAfterStart();
+});
 chrome.runtime.onInstalled.addListener(() => runAfterStart());
 chrome.permissions.onRemoved.addListener((permissions) => {
   if (!permissions.permissions?.includes("scripting")) return;

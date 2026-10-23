@@ -11,11 +11,7 @@ import {
 } from "./input-actions";
 import { automationRoute, debuggerUnavailableError, restrictedOriginError } from "./routes";
 import { isRecord } from "./type-guards";
-import {
-  mintTargetRef,
-  parseTargetRef,
-  type ResolvedTarget,
-} from "./target-resolution";
+import { targetRefs, type ResolvedTarget } from "./target-resolution";
 import {
   SCREENSHOT_MAX_BYTES,
   SNAPSHOT_TEXT_MAX_BYTES,
@@ -1083,7 +1079,7 @@ export class StandardBrowserRuntime {
     const nodes = (Array.isArray(outline.nodes) ? outline.nodes.filter(isRecord) : []).map(({ id, ...node }) => ({
       ...(typeof id === "number"
         ? {
-          ref: mintTargetRef({
+          ref: targetRefs.mint({
             tabId,
             backendNodeId: id,
             documentId,
@@ -1344,6 +1340,19 @@ export class StandardBrowserRuntime {
     tabId: number,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    const snapshot = await this.captureSnapshot(taskId, tabId, params);
+    // Store the refs before handing them out, so they outlive this service worker.
+    await targetRefs.persist().catch((error: unknown) => {
+      console.warn("AgentTab could not store snapshot refs; they last until the extension restarts", error);
+    });
+    return snapshot;
+  }
+
+  private async captureSnapshot(
+    taskId: string,
+    tabId: number,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
     const mode = params.mode;
     if (mode !== "text" && mode !== "html" && mode !== "screenshot" && mode !== "accessibility") {
@@ -1363,7 +1372,7 @@ export class StandardBrowserRuntime {
         reason === undefined ? await this.screenshot(tabId, params) : await this.scriptingScreenshot(tabId, params, reason),
       );
     }
-    const rootBinding = parseTargetRef(params.root_ref);
+    const rootBinding = await targetRefs.lookup(params.root_ref);
     if (frameId === undefined && (rootBinding === null || rootBinding.route === "scripting")) {
       const reason = await this.scriptingRouteReason(tabId);
       if (reason !== undefined || rootBinding?.route === "scripting") {
@@ -1416,7 +1425,7 @@ export class StandardBrowserRuntime {
         currentPageRevision,
       });
     }
-    const mintRef = (backendNodeId: number): string => mintTargetRef({
+    const mintRef = (backendNodeId: number): string => targetRefs.mint({
         tabId,
         backendNodeId,
         documentId: frameDocument.documentId,
@@ -1499,7 +1508,7 @@ export class StandardBrowserRuntime {
         if (encoded) {
           fallback.push({
             ...encoded,
-            ref: mintTargetRef({
+            ref: targetRefs.mint({
                 tabId,
                 backendNodeId: node.backendNodeId,
                 documentId: document.documentId,
@@ -3193,7 +3202,7 @@ export class StandardBrowserRuntime {
         ...(document.contextId !== undefined ? { contextId: document.contextId } : {}),
       };
     }
-    const binding = parseTargetRef(request.ref);
+    const binding = await targetRefs.lookup(request.ref);
     if (binding === null) {
       throw Object.assign(new Error("Snapshot ref is unknown or expired; take a new snapshot"), { code: "stale_ref" });
     }

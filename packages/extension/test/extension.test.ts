@@ -10,7 +10,7 @@ import { MutationScheduler } from "../src/scheduler";
 import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
-import { mintTargetRef } from "../src/target-resolution";
+import { targetRefs } from "../src/target-resolution";
 import {
   PAGE_AGENT_GLOBAL,
   PAGE_AGENT_VERSION,
@@ -24,7 +24,7 @@ const TASK_A = "018f47b8-2f80-7c20-9c77-f8a38c9e621e";
 const TASK_B = "018f47b8-2f80-7c20-9c77-f8a38c9e621f";
 const TASK_C = "018f47b8-2f80-7c20-9c77-f8a38c9e6220";
 function mintedRef(taskId: string, tabId: number, pageRevision = 1, backendNodeId = 22): string {
-  return mintTargetRef({
+  return targetRefs.mint({
     backendNodeId,
     documentId: "top:loader-default:1",
     frameId: "top",
