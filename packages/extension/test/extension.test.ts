@@ -6301,3 +6301,62 @@ describe("gestures interrupted after the first input event", () => {
     },
   );
 });
+
+describe("mouse gestures on targets outside the viewport", () => {
+  // The default box model centers the target at viewport (20, 30).
+  const SCROLL = { pageX: 5, pageY: 400 };
+
+  function offscreenRuntime(scrolls: boolean) {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const calls: string[] = [];
+    const mousePoints: Array<[unknown, unknown]> = [];
+    let revealed = false;
+    debuggerCommandOverride = (method, params) => {
+      if (method === "DOM.scrollIntoViewIfNeeded") {
+        calls.push(method);
+        revealed = scrolls;
+        return {};
+      }
+      if (method === "Page.getLayoutMetrics") {
+        return { cssLayoutViewport: revealed ? SCROLL : { pageX: 0, pageY: 0 } };
+      }
+      if (method === "Input.dispatchMouseEvent") {
+        calls.push(`${method}:${String(params.type)}`);
+        mousePoints.push([params.x, params.y]);
+        return {};
+      }
+      if (method === "DOM.getNodeForLocation") {
+        // Chrome hit-tests in document coordinates: viewport point plus scroll.
+        if (revealed && params.x === 20 + SCROLL.pageX && params.y === 30 + SCROLL.pageY) return { backendNodeId: 22 };
+        throw new Error(JSON.stringify({ code: -32000, message: "No node found at given location" }));
+      }
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("isConnected")) {
+        return { result: { value: true } };
+      }
+      return undefined;
+    };
+    return { runtime, revisions, calls, mousePoints };
+  }
+
+  test.each(["hover", "double_click", "context_click", "drag"])("scrolls the %s target into view first", async (kind) => {
+    const { runtime, revisions, calls, mousePoints } = offscreenRuntime(true);
+    const revision = await revisions.ensure(7);
+    const ref = mintedRef(TASK_A, 7, revision);
+    const acted = await runtime.act(TASK_A, 7, revision, [{ kind, ref, ...(kind === "drag" ? { target_ref: ref } : {}) }]);
+    expect(acted.result?.actions).toEqual([expect.objectContaining({ kind, completed: true })]);
+    expect(calls[0]).toBe("DOM.scrollIntoViewIfNeeded");
+    expect(mousePoints.length).toBeGreaterThan(0);
+    // Mouse input stays in viewport coordinates.
+    expect(mousePoints.every(([x, y]) => x === 20 && y === 30)).toBe(true);
+  });
+
+  test("reports a target that stays outside the viewport without dispatching input", async () => {
+    const { runtime, revisions, calls } = offscreenRuntime(false);
+    const revision = await revisions.ensure(7);
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{ kind: "hover", ref: mintedRef(TASK_A, 7, revision) }]),
+    ).rejects.toMatchObject({ code: "action_failed", message: expect.stringContaining("outside the visible viewport") });
+    expect(calls).toEqual(["DOM.scrollIntoViewIfNeeded"]);
+  });
+});

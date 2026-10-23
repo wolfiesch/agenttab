@@ -102,6 +102,8 @@ const TAB_ONLY_ACTIONS: Readonly<Record<string, true>> = {
   reload: true,
   close: true,
 };
+/** Single-target actions dispatched as mouse input at the target's on-screen point. */
+const POINTER_GESTURE_KINDS: ReadonlySet<string> = new Set(["hover", "double_click", "context_click"]);
 const TAB_ONLY_WAIT_CONDITIONS: Readonly<Record<string, true>> = {
   load: true,
   url: true,
@@ -2698,6 +2700,8 @@ export class StandardBrowserRuntime {
       actionKind: String(kind),
     });
     const backendNodeId = target.backendNodeId;
+    // Mouse gestures land at the target's on-screen point, so bring it into view first.
+    if (POINTER_GESTURE_KINDS.has(String(kind)) && target.route !== "scripting") await this.revealTarget(tabId, target);
     const pointerCue = ACTION_POINTER_CUES[String(kind)];
     if (pointerCue && target.route !== "scripting") await this.pointer.point(tabId, target, pointerCue, intent);
     let windowRequests: Array<Record<string, unknown>> = [];
@@ -2806,6 +2810,9 @@ export class StandardBrowserRuntime {
       if (target.sessionId !== dropTarget.sessionId || target.frameId !== dropTarget.frameId) {
         throw Object.assign(new Error("Drag endpoints must belong to the same frame"), { code: "invalid_request" });
       }
+      // Reveal the drop target, then the source, so the press lands on a visible source.
+      await this.revealTarget(tabId, dropTarget);
+      await this.revealTarget(tabId, target);
       await this.pointer.drag(tabId, target, dropTarget, intent);
       const [sourcePoint, dropPoint] = await Promise.all([
         this.pointerTargetPoint(tabId, target),
@@ -3399,6 +3406,11 @@ export class StandardBrowserRuntime {
     }
   }
 
+  /** Scrolls a target into the viewport only when it lies outside it, as a person would before pointing. */
+  private async revealTarget(tabId: number, target: ResolvedTarget): Promise<void> {
+    await this.send(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId: target.backendNodeId }, false, target.sessionId);
+  }
+
   private async pointerTargetPoint(
     tabId: number,
     target: ResolvedTarget,
@@ -3413,11 +3425,23 @@ export class StandardBrowserRuntime {
         expectedPoint && (point.x !== expectedPoint.x || point.y !== expectedPoint.y)) {
       throw Object.assign(new Error("Pointer target moved before the gesture completed"), { code: "action_failed" });
     }
-    const hit = await this.send(tabId, "DOM.getNodeForLocation", {
-      x: Math.round(point.x),
-      y: Math.round(point.y),
+    // DOM.getNodeForLocation takes document coordinates, while box-model quads
+    // and mouse input use the viewport, so add the layout viewport's scroll.
+    const metrics = await this.send(tabId, "Page.getLayoutMetrics", {}, false, target.sessionId);
+    const scroll = isRecord(metrics.cssLayoutViewport) ? metrics.cssLayoutViewport : {};
+    const scrollX = typeof scroll.pageX === "number" ? scroll.pageX : 0;
+    const scrollY = typeof scroll.pageY === "number" ? scroll.pageY : 0;
+    // The agent pointer sits on top of the target it glided to; hide it so the
+    // hit test sees the page, as mouse input does.
+    const hit = await this.pointer.whileConcealed(tabId, () => this.send(tabId, "DOM.getNodeForLocation", {
+      x: Math.round(point.x + scrollX),
+      y: Math.round(point.y + scrollY),
       includeUserAgentShadowDOM: true,
-    }, false, target.sessionId);
+    }, false, target.sessionId)).catch((error: unknown): Record<string, unknown> => {
+      // Chrome reports a point outside the viewport as an error rather than an empty hit.
+      if (String(error).includes("No node found at given location")) return {};
+      throw error;
+    });
     if (typeof hit.backendNodeId !== "number") {
       throw Object.assign(new Error("Pointer target is outside the visible viewport"), { code: "action_failed" });
     }
