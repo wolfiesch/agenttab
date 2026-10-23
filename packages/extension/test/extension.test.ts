@@ -6377,3 +6377,49 @@ describe("mouse gestures on targets outside the viewport", () => {
     expect(calls.some((call) => call.startsWith("Input.dispatchMouseEvent"))).toBe(false);
   });
 });
+
+describe("context clicks", () => {
+  test("suppress only the browser's native menu, after page handlers run", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const calls: string[] = [];
+    let suppress = "";
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("contextmenu")) {
+        calls.push("suppress");
+        suppress = String(params.functionDeclaration);
+        return { result: { type: "function", objectId: "restore-1" } };
+      }
+      if (method === "Runtime.callFunctionOn" && params.objectId === "restore-1") {
+        calls.push("restore");
+        return { result: { type: "undefined" } };
+      }
+      if (method === "Input.dispatchMouseEvent") {
+        calls.push(String(params.type));
+        return {};
+      }
+      if (method === "DOM.getNodeForLocation") return { backendNodeId: 22 };
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("isConnected")) {
+        return { result: { value: true } };
+      }
+      return undefined;
+    };
+    const revision = await revisions.ensure(7);
+    await runtime.act(TASK_A, 7, revision, [{ kind: "context_click", ref: mintedRef(TASK_A, 7, revision) }]);
+    expect(calls).toEqual(["mouseMoved", "suppress", "mousePressed", "mouseReleased", "restore"]);
+
+    // Run the installed listener against a stand-in window.
+    const view = new EventTarget();
+    let pageSawPrevented: boolean | undefined;
+    view.addEventListener("contextmenu", (event) => { pageSawPrevented = event.defaultPrevented; });
+    const restore = new Function(`return (${suppress})`)().call({ ownerDocument: { defaultView: view } }) as () => void;
+    const suppressed = new Event("contextmenu", { cancelable: true });
+    view.dispatchEvent(suppressed);
+    expect(pageSawPrevented).toBe(false);
+    expect(suppressed.defaultPrevented).toBe(true);
+    restore();
+    const restored = new Event("contextmenu", { cancelable: true });
+    view.dispatchEvent(restored);
+    expect(restored.defaultPrevented).toBe(false);
+  });
+});
