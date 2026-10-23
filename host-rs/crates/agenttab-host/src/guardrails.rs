@@ -716,6 +716,7 @@ mod tests {
                 frame_id: None,
                 files: vec![std::env::current_exe().unwrap().display().to_string()],
             }],
+            intent: None,
         });
         assert_eq!(
             guardrails
@@ -786,6 +787,7 @@ mod tests {
             actions: vec![BrowserAction::GoBack {
                 expect_download: false,
             }],
+            intent: None,
         });
         assert_eq!(
             guardrails
@@ -850,6 +852,7 @@ mod tests {
                 frame_id: None,
                 files: vec![link.display().to_string()],
             }],
+            intent: None,
         });
         let mut serialized = params.value();
         let staged = guardrails
@@ -878,6 +881,7 @@ mod tests {
                 frame_id: None,
                 files: vec![hardlink.display().to_string()],
             }],
+            intent: None,
         });
         let mut serialized = hardlinked.value();
         let error = guardrails
@@ -913,6 +917,7 @@ mod tests {
                     frame_id: None,
                     files: vec![file.display().to_string()],
                 }],
+                intent: None,
             })
         };
 

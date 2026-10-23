@@ -259,6 +259,19 @@ function assertBoundedString(value: unknown, field: string, minimum: number, max
   return value;
 }
 
+const ACT_INTENT_MAX_CHARS = 120;
+
+/** Mirrors the host: 1 to 120 Unicode scalar values on one line, no control characters. */
+function assertActIntent(value: unknown): string {
+  if (typeof value !== "string") commandError("intent must be a string");
+  const length = [...value].length;
+  if (length === 0 || length > ACT_INTENT_MAX_CHARS) {
+    commandError(`intent must be between 1 and ${ACT_INTENT_MAX_CHARS} characters`);
+  }
+  if (/\p{Cc}/u.test(value)) commandError("intent must be a single line without control characters");
+  return value;
+}
+
 function assertUrl(value: unknown, field = "url"): string {
   const url = assertBoundedString(value, field, 1, 2_048);
   if (!URL_PATTERN.test(url)) commandError(`${field} must be an http(s) or about URL without whitespace`);
@@ -736,13 +749,14 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
     case "browser_snapshot":
       return assertSnapshotParams(value);
     case "browser_act": {
-      const params = assertExactObject(value, ["tab_id", "expected_page_revision", "actions"], [], "browser_act parameters");
+      const params = assertExactObject(value, ["tab_id", "expected_page_revision", "actions"], ["intent"], "browser_act parameters");
       assertTabId(params.tab_id);
       assertRevision(params.expected_page_revision);
       if (!Array.isArray(params.actions) || params.actions.length === 0 || params.actions.length > 64) {
         commandError("actions must contain between 1 and 64 operations");
       }
       for (const action of params.actions) assertAction(action);
+      if (params.intent !== undefined) assertActIntent(params.intent);
       return params;
     }
     case "browser_wait":

@@ -27,6 +27,7 @@ const MAX_DOWNLOAD_CURSOR_CHARS: usize = 256;
 const MAX_DIALOG_PROMPT_CHARS: usize = 4_096;
 const MAX_HANDOFF_PROMPT_CHARS: usize = 2_000;
 const MAX_HANDOFF_COMPLETION_CHARS: usize = 2_048;
+const MAX_ACT_INTENT_CHARS: usize = 120;
 const MAX_STAGED_TOKEN_CHARS: usize = 256;
 const MAX_RESUME_CAPABILITY_CHARS: usize = 64;
 const MAX_DEVELOPER_PARAMS: usize = 16;
@@ -499,6 +500,9 @@ pub struct BrowserActParams {
     pub tab_id: u64,
     pub expected_page_revision: u64,
     pub actions: Vec<BrowserAction>,
+    /// Short agent-authored purpose shown as the agent pointer's caption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1236,6 +1240,14 @@ impl MethodParams {
                 )?;
                 for action in &params.actions {
                     validate_action(method, action)?;
+                }
+                if let Some(intent) = &params.intent {
+                    require_len(method, intent, 1, MAX_ACT_INTENT_CHARS, "intent")?;
+                    require(
+                        method,
+                        !intent.chars().any(char::is_control),
+                        "intent must be a single line without control characters",
+                    )?;
                 }
             }
             Self::Wait(params) => {
@@ -2909,7 +2921,8 @@ mod tests {
                     {"kind": "go_back"},
                     {"kind": "select", "ref": "e1", "value": ""},
                     {"kind": "scroll", "delta_x": 100000, "delta_y": -100000}
-                ]
+                ],
+                "intent": "é".repeat(MAX_ACT_INTENT_CHARS)
             }),
             true,
         );
@@ -2926,6 +2939,24 @@ mod tests {
                 "tab_id": 7,
                 "expected_page_revision": 11,
                 "actions": [{"kind": "click", "ref": ""}]
+            }),
+            json!({
+                "tab_id": 7,
+                "expected_page_revision": 11,
+                "actions": [{"kind": "go_back"}],
+                "intent": ""
+            }),
+            json!({
+                "tab_id": 7,
+                "expected_page_revision": 11,
+                "actions": [{"kind": "go_back"}],
+                "intent": "x".repeat(MAX_ACT_INTENT_CHARS + 1)
+            }),
+            json!({
+                "tab_id": 7,
+                "expected_page_revision": 11,
+                "actions": [{"kind": "go_back"}],
+                "intent": "Open the\nbookmarks"
             }),
         ] {
             assert!(matches!(

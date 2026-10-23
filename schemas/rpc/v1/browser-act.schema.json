@@ -267,6 +267,13 @@
       "minItems": 1,
       "maxItems": 64,
       "items": { "$ref": "#/$defs/action" }
+    },
+    "intent": {
+      "description": "Short single-line purpose shown as the agent pointer's caption in the tab, for example \"Open the bookmarks folder\". Visible on screen; never include secrets or field values.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
     }
   },
   "additionalProperties": false

@@ -73,8 +73,11 @@ export class AgentPointer {
 
   constructor(private readonly send: CdpSend) {}
 
-  /** Glides to a node, plays its effect, and resolves once the cursor has arrived. */
-  async point(tabId: number, node: PointerTarget, cue: ActionPointerCue): Promise<void> {
+  /**
+   * Glides to a node, plays its effect, and resolves once the cursor has arrived.
+   * An agent-supplied `intent` replaces the generated caption.
+   */
+  async point(tabId: number, node: PointerTarget, cue: ActionPointerCue, intent?: string): Promise<void> {
     try {
       if (!(await this.enabled())) return;
       const target = await this.nodeCue(tabId, node);
@@ -82,7 +85,7 @@ export class AgentPointer {
       await this.play(tabId, {
         op: "move",
         to: { x: target.x, y: target.y },
-        caption: quoted(cue.verb, target.label),
+        caption: intent ?? quoted(cue.verb, target.label),
         effect: cue.effect,
         origin: this.lastPoint.get(tabId) ?? null,
         idleMs: POINTER_IDLE_MS,
@@ -92,7 +95,7 @@ export class AgentPointer {
     }
   }
 
-  async drag(tabId: number, sourceNode: PointerTarget, targetNode: PointerTarget): Promise<void> {
+  async drag(tabId: number, sourceNode: PointerTarget, targetNode: PointerTarget, intent?: string): Promise<void> {
     try {
       if (!(await this.enabled())) return;
       const [source, target] = await Promise.all([
@@ -104,7 +107,7 @@ export class AgentPointer {
         op: "drag",
         from: { x: source.x, y: source.y },
         to: { x: target.x, y: target.y },
-        caption: quoted("Drag", source.label) + (target.label ? ` to “${target.label}”` : ""),
+        caption: intent ?? quoted("Drag", source.label) + (target.label ? ` to “${target.label}”` : ""),
         origin: this.lastPoint.get(tabId) ?? null,
         idleMs: POINTER_IDLE_MS,
       });
@@ -331,8 +334,8 @@ export function runPointerScene(command: SceneCommand): SceneResult | Promise<Sc
       .cursor { position: absolute; left: 0; top: 0; will-change: transform; }
       .arrow { position: absolute; left: -3px; top: -2px; width: 22px; height: 24px; overflow: visible;
         transform-origin: 3px 2px; filter: drop-shadow(0 1px 1.5px rgba(0,0,0,.55)) drop-shadow(0 0 7px var(--halo)); }
-      .caption { position: absolute; left: 17px; top: 19px; max-width: 280px; padding: 5px 9px; border-radius: 7px;
-        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      .caption { position: absolute; left: 17px; top: 19px; width: max-content; max-width: 320px; padding: 5px 9px; border-radius: 7px;
+        overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere;
         font: 500 12px/1.25 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; letter-spacing: .01em;
         color: #f4f4f6; background: rgba(18,18,24,.84); border: 1px solid rgba(255,255,255,.14);
         box-shadow: 0 4px 16px rgba(0,0,0,.28); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
