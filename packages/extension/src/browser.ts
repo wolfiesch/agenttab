@@ -55,6 +55,7 @@ import {
   type SurfaceMatchers,
 } from "./challenge-guard";
 import { challengeStoreAvailable, readTaskEpisodes, updateTaskEpisodes } from "./challenge-store";
+import { ACTION_POINTER_CUES, AgentPointer, withoutPointerHost } from "./pointer";
 import { mutateState, readState } from "./storage";
 import { sensitiveFieldState } from "./sensitive-field";
 import {
@@ -579,6 +580,9 @@ export class StandardBrowserRuntime {
   private readonly downloadCursors = new Map<string, DownloadCursor>();
   private readonly expectedDetaches = new Map<number, number>();
   private readonly debuggerCandidates = new Set<number>();
+  private readonly pointer = new AgentPointer(
+    (tabId, method, params, sessionId) => this.send(tabId, method, params, false, sessionId),
+  );
   private readonly debuggerRefusals = new Map<number, { reason: string; until: number }>();
   /** Page revision of the last completed challenge scan, per tab. */
   private readonly challengeScanRevisions = new Map<number, number>();
@@ -2239,7 +2243,8 @@ export class StandardBrowserRuntime {
         });
       }
     }
-    const bytes = utf8Encoder.encode(String(result ?? ""));
+    const content = mode === "html" ? withoutPointerHost(String(result ?? "")) : String(result ?? "");
+    const bytes = utf8Encoder.encode(content);
     const requestedBytes = Math.min(bytes.length, requestedMaxBytes);
     const buildResult = (byteLimit: number): Record<string, unknown> => {
       const content = utf8Prefix(bytes, byteLimit);
@@ -2343,7 +2348,7 @@ export class StandardBrowserRuntime {
     } else if (typeof params.max_width === "number" || typeof params.max_height === "number") {
       throw Object.assign(new Error("Could not inspect the screenshot viewport"), { code: "snapshot_failed" });
     }
-    const result = await this.send(tabId, "Page.captureScreenshot", capture);
+    const result = await this.pointer.whileConcealed(tabId, () => this.send(tabId, "Page.captureScreenshot", capture));
     const after = await this.pageIdentity(tabId);
     const currentPageRevision = await this.revisions.observeDocument(tabId, after.documentId, after.loaderId);
     if (
@@ -2653,6 +2658,7 @@ export class StandardBrowserRuntime {
       return { kind, completed: true };
     }
     if (kind === "scroll" && action.ref === undefined && action.frame_id === undefined) {
+      await this.pointer.announce(tabId, "Scroll page");
       await chrome.scripting.executeScript({
         target: { tabId },
         func: (deltaX: number, deltaY: number) => window.scrollBy(deltaX, deltaY),
@@ -2689,6 +2695,8 @@ export class StandardBrowserRuntime {
       actionKind: String(kind),
     });
     const backendNodeId = target.backendNodeId;
+    const pointerCue = ACTION_POINTER_CUES[String(kind)];
+    if (pointerCue && target.route !== "scripting") await this.pointer.point(tabId, target, pointerCue);
     let windowRequests: Array<Record<string, unknown>> = [];
     if (kind === "click" || kind === "press") {
       const [activeTab, existingTabs] = await Promise.all([
@@ -2795,6 +2803,7 @@ export class StandardBrowserRuntime {
       if (target.sessionId !== dropTarget.sessionId || target.frameId !== dropTarget.frameId) {
         throw Object.assign(new Error("Drag endpoints must belong to the same frame"), { code: "invalid_request" });
       }
+      await this.pointer.drag(tabId, target, dropTarget);
       const [sourcePoint, dropPoint] = await Promise.all([
         this.pointerTargetPoint(tabId, target),
         this.pointerTargetPoint(tabId, dropTarget),

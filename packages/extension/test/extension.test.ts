@@ -1878,7 +1878,9 @@ describe("page revision monotonicity", () => {
       selector: "button.submit",
     }]);
     expect(queryCount).toBe(1);
-    expect(executedObjectIds).toEqual(["obj-500", "obj-500"]);
+    // Classification, the agent pointer cue, and execution all bind the pinned node.
+    expect(executedObjectIds).toContain("obj-500");
+    expect(new Set(executedObjectIds)).toEqual(new Set(["obj-500"]));
 
     // 2. If node is removed between describe and execution, DOM.resolveNode fails with stale_ref
     let describedOnce = false;
@@ -2594,6 +2596,21 @@ describe("page revision monotonicity", () => {
 
     expect(result.truncated).toBe(true);
     expect(new TextEncoder().encode(JSON.stringify(result)).length).toBeLessThanOrEqual(1_032_000);
+  });
+
+  test("excludes the agent pointer overlay from HTML snapshots", async () => {
+    scriptResult = "<html><head></head><body><main>page</main></body><agenttab-pointer></agenttab-pointer></html>";
+    const runtime = new StandardBrowserRuntime(
+      new RevisionTracker(),
+      async () => undefined,
+      () => undefined,
+      async () => undefined,
+    );
+
+    const result = await runtime.snapshot(TASK_A, 65, { mode: "html" });
+
+    expect(result.content).toBe("<html><head></head><body><main>page</main></body></html>");
+    expect(result.truncated).toBe(false);
   });
 
   test("rejects text and HTML snapshots when the document changes during capture", async () => {

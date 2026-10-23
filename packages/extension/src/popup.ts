@@ -458,7 +458,7 @@ function render(state: UiState): void {
   pointerToggle.checked = state.pointer === true;
   pointerDetail.textContent = state.pointer === null
     ? "Unavailable: the runtime did not report a pointer preference."
-    : "Show where an agent clicks in a visible tab.";
+    : "Show the agent's cursor, clicks, and typing in a visible tab.";
   cleanupPolicy.value = state.cleanupPolicy;
 
   taskCount.textContent = String(state.tasks.length);
