@@ -490,9 +490,10 @@ impl NativeTransport for StdioNative {
 /// Keeps the extension's own error for a failed lifecycle command, so the caller sees why the
 /// extension refused, and reports a protocol error only when the failure carries none.
 fn lifecycle_failure(response: NativeResponse, unconfirmed: &str) -> NativeError {
-    response
-        .error
-        .map_or_else(|| NativeError::Protocol(unconfirmed.into()), NativeError::Extension)
+    response.error.map_or_else(
+        || NativeError::Protocol(unconfirmed.into()),
+        NativeError::Extension,
+    )
 }
 
 #[cfg(test)]
@@ -654,7 +655,12 @@ mod tests {
         let finishing = {
             let native = native.clone();
             std::thread::spawn(move || {
-                native.finish_task(task_id, FinishDisposition::Auto, &[99], Duration::from_secs(5))
+                native.finish_task(
+                    task_id,
+                    FinishDisposition::Auto,
+                    &[99],
+                    Duration::from_secs(5),
+                )
             })
         };
 
