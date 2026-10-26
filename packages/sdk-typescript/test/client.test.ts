@@ -554,6 +554,50 @@ test("starts a fresh task when the host reports the stored capability's task clo
   client.close();
 });
 
+test("starts a fresh task when the pending capability's task closed after an interrupted rotation", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "agenttab-sdk-state-"));
+  roots.push(stateDir);
+  const store = createResumeCapabilityStore("mcp", { scope: "closed-pending", stateDir });
+  const rotatedAway = "a".repeat(32);
+  const confirmedPending = "c".repeat(32);
+  await store.save(rotatedAway);
+  await store.prepareReplacement(rotatedAway, confirmedPending);
+  const connects: Array<Record<string, unknown>> = [];
+
+  const endpoint = await listen((socket) => {
+    socket.on("error", () => {});
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind !== "connect") continue;
+        connects.push(value);
+        const ack = {
+          protocol: "agenttab.rpc",
+          version: 1,
+          kind: "connected",
+          connection_id: `018f22b2-4126-7c1a-8c31-3f45a783da6${connects.length}`,
+          resumed: false,
+          state: "ready",
+        };
+        if (value.resume_capability === confirmedPending) {
+          socket.end(encodeFrame({ ...ack, resume_rejection: "task_closed" }, 1024 * 1024));
+        } else if (value.resume_capability !== undefined) {
+          socket.end(encodeFrame({ ...ack, resume_rejection: "unknown_capability" }, 1024 * 1024));
+        } else {
+          socket.write(encodeFrame(ack, 1024 * 1024));
+        }
+      }
+    });
+  });
+
+  const client = await AgentTabClient.connect({ endpoint, capabilityStore: store });
+  expect(client.connection.resumed).toBe(false);
+  expect(connects.map((connect) => connect.resume_capability)).toEqual([confirmedPending, undefined]);
+  expect(await store.load()).toBeUndefined();
+  expect(await store.loadPending()).toBeUndefined();
+  client.close();
+});
+
 for (const [label, rejection] of [
   ["unknown_capability", { resume_rejection: "unknown_capability" }],
   ["an absent rejection from an older host", {}],

@@ -1019,15 +1019,17 @@ export class AgentTabClient {
       const attempt = await negotiateConnection(endpoint, timeoutMs, options.conversationId, capability);
       if (capability && !attempt.connected.resumed) {
         attempt.socket.destroy();
-        if (capability !== activeCapability) continue;
-        if (attempt.connected.resume_rejection !== "task_closed") {
-          throw new Error(
-            "AgentTab rejected the stored resume capability; remove that client state only when starting a new task is intended",
-          );
+        // A pending candidate is a rotation of the active capability's task, so either one
+        // reporting the task closed means nothing remains to resume.
+        if (attempt.connected.resume_rejection === "task_closed") {
+          await store?.clear();
+          negotiated = await negotiateConnection(endpoint, timeoutMs, options.conversationId, undefined);
+          break;
         }
-        await store?.clear();
-        negotiated = await negotiateConnection(endpoint, timeoutMs, options.conversationId, undefined);
-        break;
+        if (capability !== activeCapability) continue;
+        throw new Error(
+          "AgentTab rejected the stored resume capability; remove that client state only when starting a new task is intended",
+        );
       }
       attemptedCapability = capability;
       negotiated = attempt;

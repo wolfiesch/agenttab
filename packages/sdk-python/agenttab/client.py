@@ -820,26 +820,28 @@ class AgentTabClient:
             )
             if capability is not None and connection.get("resumed") is not True:
                 stream.close()
+                # A pending candidate is a rotation of the active capability's task, so
+                # either one reporting the task closed means nothing remains to resume.
+                if (
+                    capability_store is not None
+                    and connection.get("resume_rejection") == "task_closed"
+                ):
+                    capability_store.clear()
+                    negotiated = cls._negotiate_connection(
+                        address,
+                        conversation_id=conversation_id,
+                        resume_capability=None,
+                        connect_timeout=connect_timeout,
+                        request_timeout=request_timeout,
+                    )
+                    break
                 if capability_store is not None and capability != active_capability:
                     continue
-                if (
-                    capability_store is None
-                    or connection.get("resume_rejection") != "task_closed"
-                ):
-                    source = "stored" if capability_store is not None else "supplied"
-                    raise RuntimeError(
-                        f"AgentTab rejected the {source} resume capability; "
-                        "start without it only when creating a new task is intended"
-                    )
-                capability_store.clear()
-                negotiated = cls._negotiate_connection(
-                    address,
-                    conversation_id=conversation_id,
-                    resume_capability=None,
-                    connect_timeout=connect_timeout,
-                    request_timeout=request_timeout,
+                source = "stored" if capability_store is not None else "supplied"
+                raise RuntimeError(
+                    f"AgentTab rejected the {source} resume capability; "
+                    "start without it only when creating a new task is intended"
                 )
-                break
             negotiated = (stream, connection)
             attempted_capability = capability
             break
