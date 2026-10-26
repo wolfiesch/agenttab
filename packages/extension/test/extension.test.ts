@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test, vi } from "bun:test";
 import { removeTabIfPresent, StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
+import { BoundedChain } from "../src/bounded";
 import { OWNERSHIP_OPERATION_HOLD_MS, OwnershipLedger } from "../src/ownership";
 import { TAB_REMOVAL_WAIT_MS } from "../src/tab-removal";
 import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from "../src/protocol";
@@ -3807,6 +3808,37 @@ describe("ownership and task isolation", () => {
       }));
     } finally {
       warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  test("starts operations queued behind a stuck one one at a time", async () => {
+    vi.useFakeTimers();
+    try {
+      const overruns: Error[] = [];
+      const chain = new BoundedChain("test", 1_000, (error) => overruns.push(error));
+      const started: string[] = [];
+      const { promise: secondHeld, resolve: releaseSecond } = Promise.withResolvers<void>();
+      void chain.run(() => new Promise<void>(() => undefined));
+      void chain.run(async () => {
+        started.push("second");
+        await secondHeld;
+      });
+      void chain.run(() => {
+        started.push("third");
+      });
+
+      await advanceTimers(0);
+      await advanceTimers(1_000);
+      expect(started).toEqual(["second"]);
+      await advanceTimers(900);
+      expect(started).toEqual(["second"]);
+
+      releaseSecond();
+      await advanceTimers(0);
+      expect(started).toEqual(["second", "third"]);
+      expect(overruns).toHaveLength(1);
+    } finally {
       vi.useRealTimers();
     }
   });

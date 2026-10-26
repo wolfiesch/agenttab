@@ -29,13 +29,18 @@ export class BoundedChain {
   ) { }
 
   run<T>(operation: () => T | Promise<T>): Promise<T> {
-    const running = this.tail.then(operation);
-    this.tail = settledWithin(running, this.holdMs).then(
-      (settled) => {
-        if (!settled) this.onOverrun(this.overrun());
-      },
-      () => undefined,
-    );
+    const previous = this.tail;
+    const running = previous.then(operation);
+    // Time the hold from when the operation starts, not when it is queued, so operations that
+    // waited behind a stuck one still run one at a time.
+    this.tail = previous
+      .then(() => settledWithin(running, this.holdMs))
+      .then(
+        (settled) => {
+          if (!settled) this.onOverrun(this.overrun());
+        },
+        () => undefined,
+      );
     return running;
   }
 
