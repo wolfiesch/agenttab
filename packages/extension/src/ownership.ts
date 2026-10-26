@@ -5,6 +5,31 @@ import { RevisionTracker } from "./revisions";
 
 const GROUP_COLORS: readonly TaskColor[] = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
 const NO_GROUP = -1;
+/**
+ * How long task cleanup waits for Chrome to close its tabs. `chrome.tabs.remove` settles only
+ * once Chrome destroys the tab, and a page's beforeunload "Leave site?" prompt postpones that
+ * until someone answers it; a background tab shows the prompt only when it is activated.
+ * Cleanup runs inside the ownership chain, so an unbounded wait there stalls every later
+ * ownership transition. Removal stays requested after the wait: the tab still closes if the
+ * user confirms leaving.
+ */
+export const TASK_TAB_REMOVAL_WAIT_MS = 2_000;
+
+/** Request every removal at once and return the tabs Chrome closed within the shared wait. */
+async function removeTaskTabs(tabIds: readonly number[]): Promise<number[]> {
+  if (tabIds.length === 0) return [];
+  const { promise: waitExpired, resolve: expire } = Promise.withResolvers<"pending">();
+  const timer = setTimeout(() => expire("pending"), TASK_TAB_REMOVAL_WAIT_MS);
+  try {
+    const outcomes = await Promise.all(tabIds.map((tabId) => Promise.race([
+      chrome.tabs.remove(tabId).then(() => "closed" as const, () => "failed" as const),
+      waitExpired,
+    ])));
+    return tabIds.filter((_, index) => outcomes[index] === "closed");
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 
@@ -530,7 +555,7 @@ export class OwnershipLedger {
         await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined);
       }
     }
-    const closedTabIds: number[] = [];
+    const removableTabIds: number[] = [];
     for (const tabId of closedCandidates) {
       const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
       if (!tab) continue;
@@ -541,13 +566,11 @@ export class OwnershipLedger {
         }
         continue;
       }
-      try {
-        await chrome.tabs.remove(tabId);
-        closedTabIds.push(tabId);
-      } catch {
-        // Ownership is already durably removed; a missing/closed tab is safe.
-      }
+      removableTabIds.push(tabId);
     }
+    // Ownership is already durably removed. A tab that failed to close or is still waiting on a
+    // leave-page prompt is reported as neither closed nor retained.
+    const closedTabIds = await removeTaskTabs(removableTabIds);
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
     return {
@@ -581,17 +604,15 @@ export class OwnershipLedger {
       return ownedTabIds;
     });
     for (const tabId of tabIds) await this.revisions.remove(tabId);
-    const closedTabIds: number[] = [];
+    const removableTabIds: number[] = [];
     for (const tabId of tabIds) {
       const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
       if (!tab || existing.groupId === null || tab.groupId !== existing.groupId) continue;
-      try {
-        await chrome.tabs.remove(tabId);
-        closedTabIds.push(tabId);
-      } catch {
-        // Ownership is already durably removed; a missing/closed tab is safe.
-      }
+      removableTabIds.push(tabId);
     }
+    // Ownership is already durably removed, so a tab that failed to close or is still waiting on
+    // a leave-page prompt is simply not reported as closed.
+    const closedTabIds = await removeTaskTabs(removableTabIds);
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
     return closedTabIds;

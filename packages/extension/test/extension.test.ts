@@ -2,12 +2,12 @@ import { beforeEach, describe, expect, test, vi } from "bun:test";
 import { removeTabIfPresent, StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
-import { OwnershipLedger } from "../src/ownership";
+import { OwnershipLedger, TASK_TAB_REMOVAL_WAIT_MS } from "../src/ownership";
 import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from "../src/protocol";
 import { RevisionTracker } from "../src/revisions";
 import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
 import { MutationScheduler } from "../src/scheduler";
-import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
+import { IdempotentStartup, STARTUP_OPERATION_TIMEOUT_MS, StartupOperationQueue } from "../src/startup";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
 import { targetRefs } from "../src/target-resolution";
@@ -3727,6 +3727,54 @@ describe("ownership and task isolation", () => {
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
   });
 
+  test("finishes a task whose tab is held open by a leave-page prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      await seedTask(TASK_A, [21, 22]);
+      await seedTask(TASK_B, [23], 6);
+      await mutateState((state) => {
+        state.tasks[TASK_A].createdTabIds = [21, 22];
+        state.cleanupPolicy = "automatic";
+      });
+      const ownership = new OwnershipLedger(
+        new MutationScheduler(),
+        new RevisionTracker(),
+        () => undefined,
+      );
+      const removeTab = chrome.tabs.remove.bind(chrome.tabs);
+      chrome.tabs.remove = ((tabIds: number | number[]) => {
+        const tabId = Array.isArray(tabIds) ? tabIds[0] : tabIds;
+        // Chrome settles tabs.remove only once the tab is destroyed, which a beforeunload prompt defers.
+        if (tabId === 22) return new Promise<void>(() => undefined);
+        return removeTab(tabId);
+      }) as typeof chrome.tabs.remove;
+
+      let result: Record<string, unknown> | undefined;
+      void ownership.finishTask(TASK_A, "auto").then((finished) => {
+        result = finished;
+      });
+      for (let elapsed = 0; elapsed <= TASK_TAB_REMOVAL_WAIT_MS + 1_000 && !result; elapsed += 50) {
+        await advanceTimers(50);
+      }
+
+      expect(result).toEqual({
+        task_id: TASK_A,
+        finished: true,
+        closed_tab_ids: [21],
+        retained_tab_ids: [],
+      });
+      expect((await readState()).tasks[TASK_A]).toBeUndefined();
+      let closedOtherTask: number[] | undefined;
+      void ownership.closeTask(TASK_B).then((closed) => {
+        closedOtherTask = closed;
+      });
+      for (let turn = 0; turn < 20 && !closedOtherTask; turn += 1) await advanceTimers(0);
+      expect(closedOtherTask).toEqual([23]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("explicit close preserves a tab that left its task group", async () => {
     await seedTask(TASK_A, [21, 22]);
     tabStore.get(22)!.groupId = -1;
@@ -4743,6 +4791,33 @@ describe("startup lifecycle", () => {
     await operationCompleted.promise;
 
     expect(attempts).toBe(2);
+  });
+
+  test("moves past a queued operation that never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const operationErrors: unknown[] = [];
+      const queue = new StartupOperationQueue(
+        new IdempotentStartup(async () => undefined),
+        () => undefined,
+        (error) => operationErrors.push(error),
+      );
+      let ranNext = false;
+
+      queue.enqueue(() => new Promise<void>(() => undefined));
+      queue.enqueue(() => {
+        ranNext = true;
+      });
+      await advanceTimers(STARTUP_OPERATION_TIMEOUT_MS - 50);
+      expect(ranNext).toBe(false);
+      await advanceTimers(100);
+
+      expect(ranNext).toBe(true);
+      expect(operationErrors).toHaveLength(1);
+      expect(String(operationErrors[0])).toContain(`did not settle within ${STARTUP_OPERATION_TIMEOUT_MS} ms`);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

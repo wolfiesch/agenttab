@@ -52,6 +52,14 @@ export class IdempotentStartup {
 
 type StartupOperation = () => void | Promise<void>;
 
+/**
+ * Longest one queued operation may hold the queue. Tab events, alarms (including native
+ * reconnect), and `browser_open` load barriers all drain through this one queue, so an
+ * operation awaiting something that never settles would otherwise stall every later one.
+ * Every bounded wait an operation legitimately makes is far shorter.
+ */
+export const STARTUP_OPERATION_TIMEOUT_MS = 30_000;
+
 export class StartupOperationQueue {
   private readonly pending: StartupOperation[] = [];
   private draining: Promise<void> | null = null;
@@ -105,10 +113,23 @@ export class StartupOperationQueue {
       const operation = this.pending.shift();
       if (!operation) continue;
       try {
-        await operation();
+        await this.runBounded(operation);
       } catch (error) {
         this.report(this.onOperationError, error);
       }
+    }
+  }
+
+  /** An operation still running at its deadline keeps running, but no longer holds the queue. */
+  private async runBounded(operation: StartupOperation): Promise<void> {
+    const { promise: overrun, reject } = Promise.withResolvers<never>();
+    const timer = setTimeout(() => {
+      reject(new Error(`AgentTab background operation did not settle within ${STARTUP_OPERATION_TIMEOUT_MS} ms`));
+    }, STARTUP_OPERATION_TIMEOUT_MS);
+    try {
+      await Promise.race([operation(), overrun]);
+    } finally {
+      clearTimeout(timer);
     }
   }
 
