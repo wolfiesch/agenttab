@@ -160,7 +160,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_snapshot",
       label: "Browser Snapshot",
-      description: `Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab. ${CHALLENGE_GUIDANCE.summary}`,
+      description: `Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab. Accessibility mode accepts query.role (exact, case-insensitive) and query.name (case-insensitive accessible-name substring, not description or value); combine them with root_ref/frame_id and max_nodes to return matching actionable refs. ${CHALLENGE_GUIDANCE.summary}`,
       approval: "read",
       schema: (z) => z.object({
         tab_id: z.number().int().min(0),
@@ -169,6 +169,10 @@ const DEFINITIONS: ReadonlyArray<{
         root_ref: z.string().min(1).optional(),
         max_depth: z.number().int().min(1).max(200).optional(),
         max_nodes: z.number().int().min(1).max(5000).optional(),
+        query: z.object({
+          role: z.string().min(1).max(256).optional(),
+          name: z.string().min(1).max(2048).optional(),
+        }).strict().optional(),
         selector: z.string().min(1).optional(),
         match: z.enum(["first", "last"]).optional(),
         full_page: z.boolean().optional(),

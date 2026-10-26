@@ -41,7 +41,7 @@ const schemas: Record<ToolMethod, unknown> = {
     object({ mode: Type.Literal("adopt_active") }),
   ]),
   browser_snapshot: Type.Union([
-    object({ tab_id: Type.Integer({ minimum: 0 }), mode: Type.Literal("accessibility"), frame_id: Type.Optional(ref()), root_ref: Type.Optional(ref()), max_depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })), max_nodes: Type.Optional(Type.Integer({ minimum: 1, maximum: 5000 })) }),
+    object({ tab_id: Type.Integer({ minimum: 0 }), mode: Type.Literal("accessibility"), frame_id: Type.Optional(ref()), root_ref: Type.Optional(ref()), max_depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })), max_nodes: Type.Optional(Type.Integer({ minimum: 1, maximum: 5000 })), query: Type.Optional(object({ role: Type.Optional(ref()), name: Type.Optional(selector()) })) }),
     object({ tab_id: Type.Integer({ minimum: 0 }), mode: stringEnum(["text", "html"]), frame_id: Type.Optional(ref()), selector: Type.Optional(selector()), match: Type.Optional(stringEnum(["first", "last"])), max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: SNAPSHOT_TEXT_MAX_BYTES })) }),
     object({ tab_id: Type.Integer({ minimum: 0 }), mode: Type.Literal("screenshot"), frame_id: Type.Optional(ref()), selector: Type.Optional(selector()), full_page: Type.Optional(Type.Boolean()), format: Type.Optional(stringEnum(["png", "jpeg", "webp"])), quality: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })), max_width: Type.Optional(Type.Integer({ minimum: 1, maximum: SCREENSHOT_MAX_DIMENSION })), max_height: Type.Optional(Type.Integer({ minimum: 1, maximum: SCREENSHOT_MAX_DIMENSION })), max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: SCREENSHOT_MAX_BYTES })) }),
   ]),

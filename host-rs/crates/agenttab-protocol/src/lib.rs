@@ -423,6 +423,38 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessibilityQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+// Serde's derived struct visitor also accepts sequences; the wire query must be an object.
+fn deserialize_accessibility_query<'de, D>(deserializer: D) -> Result<Option<AccessibilityQuery>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct QueryObject;
+    impl<'de> serde::de::Visitor<'de> for QueryObject {
+        type Value = AccessibilityQuery;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an accessibility query object")
+        }
+
+        fn visit_map<M>(self, map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            AccessibilityQuery::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+    deserializer.deserialize_map(QueryObject).map(Some)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserSnapshotParams {
     Accessibility {
@@ -435,6 +467,8 @@ pub enum BrowserSnapshotParams {
         max_depth: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_nodes: Option<u32>,
+        #[serde(default, deserialize_with = "deserialize_accessibility_query", skip_serializing_if = "Option::is_none")]
+        query: Option<AccessibilityQuery>,
     },
     Text {
         tab_id: u64,
@@ -1132,6 +1166,7 @@ impl MethodParams {
                 root_ref,
                 max_depth,
                 max_nodes,
+                query,
                 ..
             }) => {
                 validate_optional_frame_id(method, frame_id)?;
@@ -1151,6 +1186,14 @@ impl MethodParams {
                         (1..=5_000).contains(value),
                         "max_nodes must be between 1 and 5000",
                     )?;
+                }
+                if let Some(query) = query {
+                    if let Some(role) = &query.role {
+                        require_len(method, role, 1, 256, "query.role")?;
+                    }
+                    if let Some(name) = &query.name {
+                        require_len(method, name, 1, 2_048, "query.name")?;
+                    }
                 }
             }
             Self::Snapshot(BrowserSnapshotParams::Text {
@@ -2963,6 +3006,59 @@ mod tests {
                 RpcRequest::parse(request("browser_act", params, true)),
                 Err(ProtocolError::InvalidParamConstraint { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn snapshot_accessibility_queries_are_bounded_and_mode_specific() {
+        for query in [
+            json!({}),
+            json!({"role": "BUTTON"}),
+            json!({"name": "message"}),
+            json!({"role": "button", "name": "More message options"}),
+        ] {
+            let params = json!({
+                "tab_id": 1, "mode": "accessibility", "frame_id": "frame-1",
+                "root_ref": "rt1.root", "max_nodes": 1, "query": query,
+            });
+            let (_, parsed) = RpcRequest::parse(request("browser_snapshot", params.clone(), false)).unwrap();
+            assert_eq!(parsed.value(), params);
+        }
+        for query in [
+            json!(null),
+            json!([]),
+            json!(["button", "options"]),
+            json!("button"),
+            json!(1),
+            json!({"role": null}),
+            json!({"name": null}),
+            json!({"role": 1}),
+            json!({"name": true}),
+            json!({"role": ""}),
+            json!({"name": ""}),
+            json!({"role": "x".repeat(257)}),
+            json!({"name": "x".repeat(2049)}),
+            json!({"description": "message"}),
+            json!({"role": "button", "extra": true}),
+        ] {
+            assert!(
+                RpcRequest::parse(request(
+                    "browser_snapshot",
+                    json!({"tab_id": 1, "mode": "accessibility", "query": query}),
+                    false,
+                ))
+                .is_err()
+            );
+        }
+        for mode in ["text", "html", "screenshot"] {
+            assert!(
+                RpcRequest::parse(request(
+                    "browser_snapshot",
+                    json!({"tab_id": 1, "mode": mode, "query": {"role": "button"}}),
+                    false,
+                ))
+                .is_err()
+            );
         }
     }
 

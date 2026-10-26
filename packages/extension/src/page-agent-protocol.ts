@@ -1,3 +1,5 @@
+import type { AccessibilityQuery } from "./accessibility-query";
+
 /**
  * Contract between the extension worker and the scripting page agent, the
  * route AgentTab uses when Chrome refuses its debugger for a tab. The agent
@@ -6,7 +8,7 @@
  */
 
 /** Bump whenever a request or response shape changes, so a stale agent reinstalls. */
-export const PAGE_AGENT_VERSION = 2;
+export const PAGE_AGENT_VERSION = 3;
 /** Bundled agent script, injected with `chrome.scripting.executeScript({ files })`. */
 export const PAGE_AGENT_FILE = "page-agent.js";
 
@@ -14,7 +16,7 @@ export type PageAgentActionKind = "click" | "type" | "fill" | "select" | "press"
 export type PageAgentPointerKind = "hover" | "double_click" | "context_click";
 
 export type PageAgentRequest =
-  | { op: "snapshot"; max_nodes: number; max_depth: number; root_id?: number }
+  | { op: "snapshot"; max_nodes: number; max_depth: number; root_id?: number; query?: AccessibilityQuery }
   | { op: "select"; selector: string }
   | { op: "probe"; id: number }
   | { op: "describe"; id: number; requested_value: string | null }

@@ -1111,6 +1111,21 @@ test("OMP tools expose compact and expanded custom renderers", () => {
   }
 });
 
+test("Pi accessibility queries validate predicates only in accessibility mode", () => {
+  const schema = piSchema("browser_snapshot") as Parameters<typeof Value.Check>[0];
+  for (const query of [{}, { role: "button" }, { name: "options" }, { role: "BUTTON", name: "message" }]) {
+    expect(Value.Check(schema, {
+      tab_id: 1, mode: "accessibility", query, root_ref: "rt1.root", frame_id: "child", max_nodes: 1,
+    })).toBe(true);
+  }
+  for (const query of [null, [], "button", { role: 1 }, { name: "" }, { role: "x".repeat(257) }, { name: "x".repeat(2049) }, { description: "message" }]) {
+    expect(Value.Check(schema, { tab_id: 1, mode: "accessibility", query })).toBe(false);
+  }
+  for (const mode of ["text", "html", "screenshot"]) {
+    expect(Value.Check(schema, { tab_id: 1, mode, query: { role: "button" } })).toBe(false);
+  }
+});
+
 test("Pi mode registers the same tools with TypeBox schemas and Pi metadata", () => {
   const tools = register(false, "pi").tools;
   expect(tools.map((tool) => tool.name)).toEqual([

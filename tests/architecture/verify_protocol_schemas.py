@@ -80,7 +80,7 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         core_request("browser_open", {"mode": "create", "background": True}, mutation=True),
         core_request(
             "browser_snapshot",
-            {"tab_id": 1, "mode": "accessibility", "max_nodes": 100},
+            {"tab_id": 1, "mode": "accessibility", "max_nodes": 100, "query": {"role": "button", "name": "options"}},
             mutation=False,
         ),
         core_request(
@@ -283,6 +283,22 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         mutation=False,
     )
     expect_invalid(request_validator, invalid_snapshot_match, "snapshot match without selector")
+    for query in [
+        None, [], "button", {"role": None}, {"name": True}, {"role": ""},
+        {"name": ""}, {"role": "x" * 257}, {"name": "x" * 2049},
+        {"description": "message"},
+    ]:
+        expect_invalid(
+            request_validator,
+            core_request("browser_snapshot", {"tab_id": 1, "mode": "accessibility", "query": query}, mutation=False),
+            "invalid accessibility query",
+        )
+    for mode in ["text", "html", "screenshot"]:
+        expect_invalid(
+            request_validator,
+            core_request("browser_snapshot", {"tab_id": 1, "mode": mode, "query": {"role": "button"}}, mutation=False),
+            "accessibility query in another mode",
+        )
     ambiguous_upload_target = core_request(
         "browser_act",
         {

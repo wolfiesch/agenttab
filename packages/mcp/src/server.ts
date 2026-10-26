@@ -164,7 +164,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_snapshot",
-    description: `Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab. ${CHALLENGE_GUIDANCE.summary}`,
+    description: `Read an accessibility snapshot, bounded text or HTML, or a screenshot from a task-owned tab. Accessibility mode accepts query.role (exact, case-insensitive) and query.name (case-insensitive accessible-name substring, not description or value); combine them with root_ref/frame_id and max_nodes to return matching actionable refs. ${CHALLENGE_GUIDANCE.summary}`,
     inputSchema: schema(snapshotSchema),
   },
   {

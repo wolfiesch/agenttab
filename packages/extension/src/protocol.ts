@@ -406,6 +406,7 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
       "root_ref",
       "max_depth",
       "max_nodes",
+      "query",
       "selector",
       "max_bytes",
       "match",
@@ -419,11 +420,16 @@ function assertSnapshotParams(value: unknown): Record<string, unknown> {
   );
   assertTabId(params.tab_id);
   if (params.mode === "accessibility") {
-    assertExactObject(params, ["tab_id", "mode"], ["frame_id", "root_ref", "max_depth", "max_nodes"], "accessibility snapshot parameters");
+    assertExactObject(params, ["tab_id", "mode"], ["frame_id", "root_ref", "max_depth", "max_nodes", "query"], "accessibility snapshot parameters");
     assertFrameId(params.frame_id);
     if (params.root_ref !== undefined) assertBoundedString(params.root_ref, "root_ref", 1, 256);
     if (params.max_depth !== undefined && !isIntegerInRange(params.max_depth, 1, 200)) commandError("max_depth must be between 1 and 200");
     if (params.max_nodes !== undefined && !isIntegerInRange(params.max_nodes, 1, 5_000)) commandError("max_nodes must be between 1 and 5000");
+    if (params.query !== undefined) {
+      const query = assertExactObject(params.query, [], ["role", "name"], "accessibility query");
+      if (query.role !== undefined) assertBoundedString(query.role, "query.role", 1, 256);
+      if (query.name !== undefined) assertBoundedString(query.name, "query.name", 1, 2_048);
+    }
     return params;
   }
   if (params.mode === "text" || params.mode === "html") {
