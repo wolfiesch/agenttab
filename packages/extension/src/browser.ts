@@ -1093,7 +1093,6 @@ export class StandardBrowserRuntime {
             taskId,
             route: "scripting",
           }),
-          frame_id: SCRIPTING_FRAME_ID,
         }
         : {}),
       ...node,

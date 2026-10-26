@@ -6566,10 +6566,11 @@ describe("scripting route when Chrome refuses the debugger", () => {
       page_revision: revision,
       page_route: "scripting",
       debugger_unavailable_reason: REFUSAL,
-      nodes: [{ role: "button", name: "Next", frame_id: "scripting:top" }],
+      nodes: [{ role: "button", name: "Next" }],
     });
     const nodes = snapshot.nodes as Array<Record<string, unknown>>;
     const ref = String(nodes[0]?.ref);
+    expect(nodes[0]).not.toHaveProperty("frame_id");
     const acted = await runtime.act(TASK_A, 7, revision, [{ kind: "click", ref }]);
     expect(acted.result?.actions).toEqual([{ kind: "click", completed: true, page_route: "scripting" }]);
     expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([{ op: "act", id: 3, kind: "click" }]);
