@@ -1,0 +1,6 @@
+# The MSVC linker stamps the link time into every PE header, so two release
+# builds of the same source differ and the release workflow's determinism check
+# fails. /Brepro replaces the timestamp and debug-directory GUID with values
+# derived from the binary's contents.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/Brepro"]
