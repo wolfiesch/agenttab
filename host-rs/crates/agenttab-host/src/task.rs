@@ -32,9 +32,12 @@ impl ConnectionContext {
         journal: &Arc<Journal>,
         runtime_state: RuntimeState,
     ) -> Result<(Arc<Self>, ConnectionAck), JournalError> {
-        let resumed_lease = match init.resume_capability.as_deref() {
-            Some(capability) => journal.resume_task(capability)?,
-            None => None,
+        let (resumed_lease, resume_rejection) = match init.resume_capability.as_deref() {
+            Some(capability) => match journal.resume_task(capability)? {
+                Some(lease) => (Some(lease), None),
+                None => (None, Some(journal.resume_rejection(capability)?)),
+            },
+            None => (None, None),
         };
         let resumed = resumed_lease.is_some();
         let ack = ConnectionAck {
@@ -47,6 +50,7 @@ impl ConnectionContext {
             resume_capability: resumed_lease
                 .as_ref()
                 .map(|lease| lease.resume_capability.clone()),
+            resume_rejection,
             state: runtime_state,
         };
         let context = Arc::new(Self {
@@ -175,7 +179,9 @@ impl ConnectionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agenttab_protocol::{ConnectKind, ConnectionInit, ResumeCapabilityConfirmKind};
+    use agenttab_protocol::{
+        ConnectKind, ConnectionInit, ResumeCapabilityConfirmKind, ResumeRejection,
+    };
 
     fn init(capability: Option<String>) -> ConnectionInit {
         ConnectionInit {
@@ -303,5 +309,32 @@ mod tests {
             .resume_task(&created.resume_capability)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn rejected_resume_reports_whether_the_task_was_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::open(&temp.path().join("state.sqlite3")).unwrap());
+        let closed = journal.create_task(None).unwrap();
+        journal.close_task(closed.task_id).unwrap();
+        let live = journal.create_task(None).unwrap();
+        let negotiate = |capability: Option<String>| {
+            ConnectionContext::negotiate(init(capability), &journal, RuntimeState::Ready)
+                .unwrap()
+                .1
+        };
+
+        let ack = negotiate(Some(closed.resume_capability));
+        assert!(!ack.resumed);
+        assert_eq!(ack.resume_rejection, Some(ResumeRejection::TaskClosed));
+        let ack = negotiate(Some("x".repeat(43)));
+        assert_eq!(
+            ack.resume_rejection,
+            Some(ResumeRejection::UnknownCapability)
+        );
+        assert_eq!(negotiate(None).resume_rejection, None);
+        let ack = negotiate(Some(live.resume_capability));
+        assert!(ack.resumed);
+        assert_eq!(ack.resume_rejection, None);
     }
 }

@@ -395,6 +395,7 @@ export interface ConnectionAck {
   task_id?: string;
   resume_capability?: string;
   state?: "starting" | "reconciling" | "ready" | "paused" | "terminal";
+  resume_rejection?: "task_closed" | "unknown_capability";
 }
 
 export type Outcome = "completed" | "not_started" | "unknown" | "needs_user" | "commit_required";
@@ -1018,6 +1019,13 @@ export class AgentTabClient {
       const attempt = await negotiateConnection(endpoint, timeoutMs, options.conversationId, capability);
       if (capability && !attempt.connected.resumed) {
         attempt.socket.destroy();
+        // A pending candidate is a rotation of the active capability's task, so either one
+        // reporting the task closed means nothing remains to resume.
+        if (attempt.connected.resume_rejection === "task_closed") {
+          await store?.clear();
+          negotiated = await negotiateConnection(endpoint, timeoutMs, options.conversationId, undefined);
+          break;
+        }
         if (capability !== activeCapability) continue;
         throw new Error(
           "AgentTab rejected the stored resume capability; remove that client state only when starting a new task is intended",
@@ -1325,6 +1333,7 @@ function isConnectionAck(value: unknown): value is ConnectionAck {
     value.kind === "connected" &&
     typeof value.connection_id === "string" &&
     typeof value.resumed === "boolean" &&
+    (value.resume_rejection === undefined || typeof value.resume_rejection === "string") &&
     (!value.resumed ||
       (typeof value.task_id === "string" && typeof value.resume_capability === "string"))
   );

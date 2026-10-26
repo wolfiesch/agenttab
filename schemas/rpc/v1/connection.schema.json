@@ -26,6 +26,7 @@
         "resumed": { "type": "boolean" },
         "task_id": { "type": "string", "format": "uuid" },
         "resume_capability": { "type": "string", "minLength": 32, "maxLength": 64 },
+        "resume_rejection": { "enum": ["task_closed", "unknown_capability"] },
         "state": { "enum": ["starting", "reconciling", "ready", "paused", "terminal"] }
       },
       "allOf": [
@@ -36,6 +37,15 @@
           },
           "then": {
             "required": ["task_id", "resume_capability"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "resumed": { "const": true } },
+            "required": ["resumed"]
+          },
+          "then": {
+            "not": { "required": ["resume_rejection"] }
           }
         }
       ],

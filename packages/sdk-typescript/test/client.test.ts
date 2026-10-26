@@ -474,6 +474,204 @@ test("does not create a new task when a stored resume capability is rejected", a
   expect(connections).toBe(1);
 });
 
+test("starts a fresh task when the host reports the stored capability's task closed", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "agenttab-sdk-state-"));
+  roots.push(stateDir);
+  const store = createResumeCapabilityStore("mcp", { scope: "closed-task", stateDir });
+  const closedCapability = "a".repeat(32);
+  const freshCapability = "b".repeat(32);
+  await store.save(closedCapability);
+  const connects: Array<Record<string, unknown>> = [];
+  let clearedBeforeFreshConnect = false;
+  let confirmed = false;
+
+  const endpoint = await listen((socket) => {
+    socket.on("error", () => {});
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", async (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind === "connect") {
+          connects.push(value);
+          if (value.resume_capability !== undefined) {
+            socket.end(encodeFrame({
+              protocol: "agenttab.rpc",
+              version: 1,
+              kind: "connected",
+              connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da50",
+              resumed: false,
+              state: "ready",
+              resume_rejection: "task_closed",
+            }, 1024 * 1024));
+            continue;
+          }
+          clearedBeforeFreshConnect = await store.load() === undefined;
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da51",
+            resumed: false,
+            state: "ready",
+          }, 1024 * 1024));
+        } else if (value.kind === "resume_confirm") {
+          confirmed = value.resume_capability === freshCapability;
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "resume_confirmed",
+            connection_id: value.connection_id,
+          }, 1024 * 1024));
+        } else {
+          socket.write(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            request_id: value.request_id,
+            ok: true,
+            outcome: "completed",
+            result: { task: "created" },
+            task: {
+              task_id: "018f22b2-4126-7c1a-8c31-3f45a783da52",
+              resume_capability: freshCapability,
+            },
+          }, 1024 * 1024));
+        }
+      }
+    });
+  });
+
+  const client = await AgentTabClient.connect({ endpoint, capabilityStore: store });
+  expect(client.connection.resumed).toBe(false);
+  expect(client.connection.connection_id).toBe("018f22b2-4126-7c1a-8c31-3f45a783da51");
+  expect(connects).toHaveLength(2);
+  expect(connects[0].resume_capability).toBe(closedCapability);
+  expect("resume_capability" in connects[1]).toBe(false);
+  expect(clearedBeforeFreshConnect).toBe(true);
+
+  await expect(client.call("browser_open", { mode: "create" })).resolves.toEqual({ task: "created" });
+  expect(confirmed).toBe(true);
+  expect(client.resumeCapability).toBe(freshCapability);
+  expect(await store.load()).toBe(freshCapability);
+  client.close();
+});
+
+test("starts a fresh task when the pending capability's task closed after an interrupted rotation", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "agenttab-sdk-state-"));
+  roots.push(stateDir);
+  const store = createResumeCapabilityStore("mcp", { scope: "closed-pending", stateDir });
+  const rotatedAway = "a".repeat(32);
+  const confirmedPending = "c".repeat(32);
+  await store.save(rotatedAway);
+  await store.prepareReplacement(rotatedAway, confirmedPending);
+  const connects: Array<Record<string, unknown>> = [];
+
+  const endpoint = await listen((socket) => {
+    socket.on("error", () => {});
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind !== "connect") continue;
+        connects.push(value);
+        const ack = {
+          protocol: "agenttab.rpc",
+          version: 1,
+          kind: "connected",
+          connection_id: `018f22b2-4126-7c1a-8c31-3f45a783da6${connects.length}`,
+          resumed: false,
+          state: "ready",
+        };
+        if (value.resume_capability === confirmedPending) {
+          socket.end(encodeFrame({ ...ack, resume_rejection: "task_closed" }, 1024 * 1024));
+        } else if (value.resume_capability !== undefined) {
+          socket.end(encodeFrame({ ...ack, resume_rejection: "unknown_capability" }, 1024 * 1024));
+        } else {
+          socket.write(encodeFrame(ack, 1024 * 1024));
+        }
+      }
+    });
+  });
+
+  const client = await AgentTabClient.connect({ endpoint, capabilityStore: store });
+  expect(client.connection.resumed).toBe(false);
+  expect(connects.map((connect) => connect.resume_capability)).toEqual([confirmedPending, undefined]);
+  expect(await store.load()).toBeUndefined();
+  expect(await store.loadPending()).toBeUndefined();
+  client.close();
+});
+
+for (const [label, rejection] of [
+  ["unknown_capability", { resume_rejection: "unknown_capability" }],
+  ["an absent rejection from an older host", {}],
+  ["an unrecognized rejection value", { resume_rejection: "future_reason" }],
+] as const) {
+  test(`refuses a fresh task and keeps the stored capability for ${label}`, async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "agenttab-sdk-state-"));
+    roots.push(stateDir);
+    const store = createResumeCapabilityStore("mcp", { scope: "rejected-capability", stateDir });
+    const capability = "a".repeat(32);
+    await store.save(capability);
+    let connections = 0;
+    const endpoint = await listen((socket) => {
+      connections += 1;
+      socket.on("error", () => {});
+      const decoder = new FrameDecoder(1024 * 1024);
+      socket.on("data", (chunk) => {
+        for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+          if (value.kind !== "connect") continue;
+          socket.end(encodeFrame({
+            protocol: "agenttab.rpc",
+            version: 1,
+            kind: "connected",
+            connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da53",
+            resumed: false,
+            state: "ready",
+            ...rejection,
+          }, 1024 * 1024));
+        }
+      });
+    });
+
+    await expect(AgentTabClient.connect({ endpoint, capabilityStore: store })).rejects.toThrow(
+      "AgentTab rejected the stored resume capability; remove that client state only when starting a new task is intended",
+    );
+    expect(connections).toBe(1);
+    expect(await store.load()).toBe(capability);
+  });
+}
+
+test("treats a non-string resume_rejection as an invalid connection acknowledgement", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "agenttab-sdk-state-"));
+  roots.push(stateDir);
+  const store = createResumeCapabilityStore("mcp", { scope: "invalid-rejection", stateDir });
+  const capability = "a".repeat(32);
+  await store.save(capability);
+  let connections = 0;
+  const endpoint = await listen((socket) => {
+    connections += 1;
+    socket.on("error", () => {});
+    const decoder = new FrameDecoder(1024 * 1024);
+    socket.on("data", (chunk) => {
+      for (const value of decoder.push(chunk) as Array<Record<string, unknown>>) {
+        if (value.kind !== "connect") continue;
+        socket.end(encodeFrame({
+          protocol: "agenttab.rpc",
+          version: 1,
+          kind: "connected",
+          connection_id: "018f22b2-4126-7c1a-8c31-3f45a783da54",
+          resumed: false,
+          state: "ready",
+          resume_rejection: 1,
+        }, 1024 * 1024));
+      }
+    });
+  });
+
+  await expect(AgentTabClient.connect({ endpoint, capabilityStore: store })).rejects.toThrow(
+    "AgentTab sent a response before connection negotiation completed",
+  );
+  expect(connections).toBe(1);
+  expect(await store.load()).toBe(capability);
+});
+
 test("retries the active capability after a pending replacement is rejected", async () => {
   const activeCapability = "a".repeat(32);
   const pendingCapability = "b".repeat(32);

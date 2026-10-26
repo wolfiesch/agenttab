@@ -762,6 +762,9 @@ class ClientTests(unittest.TestCase):
             def activate_replacement(self, _replacement: str) -> None:
                 return None
 
+            def clear(self) -> None:
+                self.capability = None
+
         with tempfile.TemporaryDirectory() as root:
             endpoint = str(Path(root) / "agenttab.sock")
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -946,6 +949,244 @@ class ClientTests(unittest.TestCase):
             client.close()
             worker.join(timeout=2)
             server.close()
+
+    def test_closed_task_capability_is_cleared_and_connect_starts_a_new_task(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            store = create_resume_capability_store(
+                "python-sdk",
+                scope="closed-task",
+                state_dir=root,
+            )
+            active = "a" * 32
+            issued = "c" * 32
+            store.save(active)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(endpoint)
+            server.listen(2)
+            attempted: list[object] = []
+            stored_at_renegotiation: list[str | None] = []
+
+            def serve() -> None:
+                rejected, _ = server.accept()
+                try:
+                    hello = read_frame(rejected)
+                    attempted.append(hello.get("resume_capability"))
+                    rejected.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "kind": "connected",
+                        "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da41",
+                        "resumed": False,
+                        "resume_rejection": "task_closed",
+                        "state": "ready",
+                    }, 1024 * 1024))
+                finally:
+                    rejected.close()
+
+                fresh, _ = server.accept()
+                try:
+                    hello = read_frame(fresh)
+                    attempted.append(hello.get("resume_capability"))
+                    stored_at_renegotiation.append(store.load())
+                    fresh.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "kind": "connected",
+                        "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                        "resumed": False,
+                        "state": "ready",
+                    }, 1024 * 1024))
+                    request = read_frame(fresh)
+                    fresh.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "request_id": request["request_id"],
+                        "ok": True,
+                        "outcome": "completed",
+                        "result": {"created": True},
+                        "task": {
+                            "task_id": "018f22b2-4126-7c1a-8c31-3f45a783da44",
+                            "resume_capability": issued,
+                        },
+                    }, 1024 * 1024))
+                    confirmation = read_frame(fresh)
+                    self.assertEqual(confirmation["kind"], "resume_confirm")
+                    self.assertEqual(confirmation["resume_capability"], issued)
+                    fresh.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "kind": "resume_confirmed",
+                        "connection_id": confirmation["connection_id"],
+                    }, 1024 * 1024))
+                finally:
+                    fresh.close()
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            client = AgentTabClient.connect(endpoint=endpoint, capability_store=store)
+            self.assertFalse(client.connection["resumed"])
+            self.assertIsNone(client.resume_capability)
+            self.assertIsNone(client.pending_resume_capability)
+            self.assertEqual(attempted, [active, None])
+            self.assertEqual(stored_at_renegotiation, [None])
+            self.assertFalse(store.path.exists())
+
+            self.assertEqual(
+                client.call("browser_open", {"mode": "create"}),
+                {"created": True},
+            )
+            self.assertEqual(client.resume_capability, issued)
+            self.assertEqual(store.load(), issued)
+            self.assertIsNone(store.load_pending())
+            client.close()
+            worker.join(timeout=2)
+            server.close()
+
+    def test_pending_capability_task_closed_starts_a_new_task(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            store = create_resume_capability_store(
+                "python-sdk",
+                scope="closed-pending",
+                state_dir=root,
+            )
+            rotated_away = "a" * 32
+            confirmed_pending = "c" * 32
+            store.save(rotated_away)
+            store.prepare_replacement(rotated_away, confirmed_pending)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(endpoint)
+            server.listen(2)
+            attempted: list[object] = []
+            ack = {
+                "protocol": "agenttab.rpc",
+                "version": 1,
+                "kind": "connected",
+                "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da51",
+                "resumed": False,
+                "state": "ready",
+            }
+            accepted: list[socket.socket] = []
+
+            def serve() -> None:
+                rejected, _ = server.accept()
+                try:
+                    attempted.append(read_frame(rejected).get("resume_capability"))
+                    rejected.sendall(
+                        encode_frame(dict(ack, resume_rejection="task_closed"), 1024 * 1024)
+                    )
+                finally:
+                    rejected.close()
+                fresh, _ = server.accept()
+                accepted.append(fresh)
+                attempted.append(read_frame(fresh).get("resume_capability"))
+                fresh.sendall(encode_frame(ack, 1024 * 1024))
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            client = AgentTabClient.connect(endpoint=endpoint, capability_store=store)
+            worker.join(timeout=2)
+            self.assertFalse(client.connection["resumed"])
+            self.assertEqual(attempted, [confirmed_pending, None])
+            self.assertIsNone(store.load())
+            self.assertIsNone(store.load_pending())
+            client.close()
+            for connection in accepted:
+                connection.close()
+            server.close()
+
+    def test_stored_capability_rejection_other_than_task_closed_keeps_the_store(
+        self,
+    ) -> None:
+        for rejection in ("unknown_capability", None, "future_reason"):
+            with self.subTest(resume_rejection=rejection), tempfile.TemporaryDirectory() as root:
+                endpoint = str(Path(root) / "agenttab.sock")
+                store = create_resume_capability_store(
+                    "python-sdk",
+                    scope="rejected-capability",
+                    state_dir=root,
+                )
+                active = "a" * 32
+                store.save(active)
+                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                server.bind(endpoint)
+                server.listen(1)
+                acknowledgement: dict[str, object] = {
+                    "protocol": "agenttab.rpc",
+                    "version": 1,
+                    "kind": "connected",
+                    "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                    "resumed": False,
+                    "state": "ready",
+                }
+                if rejection is not None:
+                    acknowledgement["resume_rejection"] = rejection
+
+                def serve() -> None:
+                    connection, _ = server.accept()
+                    try:
+                        hello = read_frame(connection)
+                        self.assertEqual(hello["resume_capability"], active)
+                        connection.sendall(encode_frame(acknowledgement, 1024 * 1024))
+                    finally:
+                        connection.close()
+
+                worker = threading.Thread(target=serve)
+                worker.start()
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "rejected the stored resume capability",
+                ):
+                    AgentTabClient.connect(
+                        endpoint=endpoint,
+                        capability_store=store,
+                        connect_timeout=1,
+                    )
+                worker.join(timeout=2)
+                server.close()
+                self.assertEqual(store.load(), active)
+                self.assertIsNone(store.load_pending())
+
+    def test_non_string_resume_rejection_invalidates_the_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            endpoint = str(Path(root) / "agenttab.sock")
+            store = create_resume_capability_store(
+                "python-sdk",
+                scope="invalid-rejection",
+                state_dir=root,
+            )
+            active = "a" * 32
+            store.save(active)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(endpoint)
+            server.listen(1)
+
+            def serve() -> None:
+                connection, _ = server.accept()
+                try:
+                    read_frame(connection)
+                    connection.sendall(encode_frame({
+                        "protocol": "agenttab.rpc",
+                        "version": 1,
+                        "kind": "connected",
+                        "connection_id": "018f22b2-4126-7c1a-8c31-3f45a783da42",
+                        "resumed": False,
+                        "resume_rejection": 1,
+                        "state": "ready",
+                    }, 1024 * 1024))
+                finally:
+                    connection.close()
+
+            worker = threading.Thread(target=serve)
+            worker.start()
+            with self.assertRaisesRegex(RuntimeError, "invalid connection acknowledgement"):
+                AgentTabClient.connect(endpoint=endpoint, capability_store=store)
+            worker.join(timeout=2)
+            server.close()
+            self.assertEqual(store.load(), active)
 
 
     def test_explicit_memory_only_resume_is_rejected_when_a_store_is_configured(
