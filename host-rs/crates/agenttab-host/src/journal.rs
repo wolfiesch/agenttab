@@ -348,6 +348,8 @@ impl Journal {
         let next_hash = capability_hash(&next_capability);
         let now = now_ms();
         let mut connection = self.connection.lock();
+        // Expire first so an idle task cannot resume merely because no mutation ran lately.
+        cleanup_expired_tasks(&connection, now)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task_id: Option<String> = transaction
             .query_row(
@@ -1517,6 +1519,31 @@ mod tests {
             .resume_task(&created.resume_capability)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn idle_task_expires_on_resume_without_an_intervening_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let task = journal.create_task(None).unwrap();
+        journal.detach_connection(task.task_id).unwrap();
+        journal
+            .connection
+            .lock()
+            .execute(
+                "UPDATE tasks SET updated_at_ms = ?1",
+                params![now_ms() - IDLE_TASK_RETENTION_MS - 1],
+            )
+            .unwrap();
+
+        assert!(journal
+            .resume_task(&task.resume_capability)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            journal.resume_rejection(&task.resume_capability).unwrap(),
+            ResumeRejection::TaskClosed
+        );
     }
 
     #[test]
