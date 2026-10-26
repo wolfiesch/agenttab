@@ -561,6 +561,9 @@ class ResumeCapabilityStore(Protocol):
     def activate_replacement(self, replacement_capability: str) -> None:
         ...
 
+    def clear(self) -> None:
+        ...
+
 
 def _validate_resume_capability(capability: str) -> None:
     if not 32 <= len(capability) <= 64:
@@ -724,6 +727,18 @@ class _FileResumeCapabilityStore:
             {"schemaVersion": 1, "resumeCapability": replacement_capability}
         )
 
+    def clear(self) -> None:
+        directory = self.path.parent
+        if not _prepare_capability_directory(directory, create=False):
+            return
+        self.path.unlink(missing_ok=True)
+        if os.name != "nt":
+            descriptor = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
 
 def create_resume_capability_store(
     namespace: str,
@@ -807,11 +822,24 @@ class AgentTabClient:
                 stream.close()
                 if capability_store is not None and capability != active_capability:
                     continue
-                source = "stored" if capability_store is not None else "supplied"
-                raise RuntimeError(
-                    f"AgentTab rejected the {source} resume capability; "
-                    "start without it only when creating a new task is intended"
+                if (
+                    capability_store is None
+                    or connection.get("resume_rejection") != "task_closed"
+                ):
+                    source = "stored" if capability_store is not None else "supplied"
+                    raise RuntimeError(
+                        f"AgentTab rejected the {source} resume capability; "
+                        "start without it only when creating a new task is intended"
+                    )
+                capability_store.clear()
+                negotiated = cls._negotiate_connection(
+                    address,
+                    conversation_id=conversation_id,
+                    resume_capability=None,
+                    connect_timeout=connect_timeout,
+                    request_timeout=request_timeout,
                 )
+                break
             negotiated = (stream, connection)
             attempted_capability = capability
             break
@@ -917,6 +945,10 @@ class AgentTabClient:
                 connection.get("protocol") != RPC_PROTOCOL
                 or connection.get("version") != RPC_VERSION
                 or connection.get("kind") != "connected"
+            ):
+                raise RuntimeError("AgentTab returned an invalid connection acknowledgement")
+            if "resume_rejection" in connection and not isinstance(
+                connection["resume_rejection"], str
             ):
                 raise RuntimeError("AgentTab returned an invalid connection acknowledgement")
             if connection.get("resumed") and (

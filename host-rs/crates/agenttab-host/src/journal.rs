@@ -1,4 +1,6 @@
-use agenttab_protocol::{NativeStagedCommit, NativeTab, Outcome, RpcError, RpcMethod, RpcResponse};
+use agenttab_protocol::{
+    NativeStagedCommit, NativeTab, Outcome, ResumeRejection, RpcError, RpcMethod, RpcResponse,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use parking_lot::Mutex;
@@ -18,9 +20,12 @@ const IDEMPOTENCY_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 const MAX_RECORDS_PER_TASK: i64 = 10_000;
 const CLOSED_TASK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 /// A task with no connection, tabs, or staged Commit that has been untouched this long
-/// is closed: resuming it could only recover an empty task, and a missing or closed
-/// capability already yields a fresh one.
+/// is closed: resuming it could only recover an empty task, and its capability then
+/// reports `task_closed` so the client starts a new task.
 const IDLE_TASK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+/// How long a deleted closed task's capability hashes still report `task_closed` on resume,
+/// letting a client that returns late start a new task instead of failing.
+const CLOSED_CAPABILITY_RETENTION_MS: i64 = 365 * 24 * 60 * 60 * 1000;
 const MAX_STAGE_LIFETIME_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Error)]
@@ -241,7 +246,11 @@ impl Journal {
                  FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
              );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_staged_commits_native_token
-                 ON staged_commits(native_token);",
+                 ON staged_commits(native_token);
+             CREATE TABLE IF NOT EXISTS closed_task_capabilities (
+                 capability_hash BLOB PRIMARY KEY,
+                 closed_at_ms INTEGER NOT NULL
+             );",
         )?;
         ensure_column(
             &connection,
@@ -285,11 +294,20 @@ impl Journal {
              ON staged_commits(review_handle_hash)",
             [],
         )?;
+        let now = now_ms();
+        // Connections held when the host stopped never detached; count their idle time
+        // from this restart, the latest moment they are known to have been connected.
         connection.execute(
-            "UPDATE tasks SET active_connections = 0, pending_resume_hash = NULL",
-            [],
+            "UPDATE tasks
+             SET updated_at_ms = CASE
+                     WHEN active_connections > 0 OR pending_resume_hash IS NOT NULL THEN ?1
+                     ELSE updated_at_ms
+                 END,
+                 active_connections = 0,
+                 pending_resume_hash = NULL",
+            params![now],
         )?;
-        cleanup_expired_tasks(&connection, now_ms())?;
+        cleanup_expired_tasks(&connection, now)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -363,6 +381,28 @@ impl Journal {
             task_id: Uuid::parse_str(&task_id)?,
             resume_capability: next_capability,
         }))
+    }
+
+    /// Classifies a capability that `resume_task` did not resume.
+    pub fn resume_rejection(&self, capability: &str) -> Result<ResumeRejection, JournalError> {
+        let hash = capability_hash(capability);
+        let connection = self.connection.lock();
+        let closed: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM tasks
+                 WHERE state = 'closed' AND (resume_hash = ?1 OR pending_resume_hash = ?1)
+                 UNION ALL
+                 SELECT 1 FROM closed_task_capabilities WHERE capability_hash = ?1
+                 LIMIT 1",
+                params![hash.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(if closed.is_some() {
+            ResumeRejection::TaskClosed
+        } else {
+            ResumeRejection::UnknownCapability
+        })
     }
 
     pub fn acknowledge_resume_capability(
@@ -1284,10 +1324,27 @@ fn cleanup_expired_tasks(connection: &Connection, now: i64) -> Result<(), Journa
            )",
         params![now, now - IDLE_TASK_RETENTION_MS],
     )?;
+    let expired_before = now - CLOSED_TASK_RETENTION_MS;
+    // Insert the tombstones before deleting the rows so a crash between the two statements
+    // never loses the closed status of a capability.
+    connection.execute(
+        "INSERT OR IGNORE INTO closed_task_capabilities(capability_hash, closed_at_ms)
+         SELECT resume_hash, closed_at_ms FROM tasks
+         WHERE state = 'closed' AND closed_at_ms IS NOT NULL AND closed_at_ms < ?1
+         UNION ALL
+         SELECT pending_resume_hash, closed_at_ms FROM tasks
+         WHERE state = 'closed' AND closed_at_ms IS NOT NULL AND closed_at_ms < ?1
+           AND pending_resume_hash IS NOT NULL",
+        params![expired_before],
+    )?;
     connection.execute(
         "DELETE FROM tasks
          WHERE state = 'closed' AND closed_at_ms IS NOT NULL AND closed_at_ms < ?1",
-        params![now - CLOSED_TASK_RETENTION_MS],
+        params![expired_before],
+    )?;
+    connection.execute(
+        "DELETE FROM closed_task_capabilities WHERE closed_at_ms < ?1",
+        params![now - CLOSED_CAPABILITY_RETENTION_MS],
     )?;
     Ok(())
 }
@@ -1539,6 +1596,10 @@ mod tests {
             .resume_task(&idle.resume_capability)
             .unwrap()
             .is_none());
+        assert_eq!(
+            journal.resume_rejection(&idle.resume_capability).unwrap(),
+            ResumeRejection::TaskClosed
+        );
         for (task, label) in [
             (&recent, "recently detached"),
             (&connected, "connected"),
@@ -1553,6 +1614,85 @@ mod tests {
                 task.task_id
             );
         }
+    }
+
+    #[test]
+    fn host_restart_restarts_idle_clock_for_tasks_connected_at_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.sqlite3");
+        let stale = now_ms() - IDLE_TASK_RETENTION_MS - 1;
+        let (connected, detached) = {
+            let journal = Journal::open(&state_path).unwrap();
+            let connected = journal.create_task(None).unwrap();
+            let detached = journal.create_task(None).unwrap();
+            journal.detach_connection(detached.task_id).unwrap();
+            journal
+                .connection
+                .lock()
+                .execute("UPDATE tasks SET updated_at_ms = ?1", params![stale])
+                .unwrap();
+            (connected, detached)
+        };
+
+        let restarted = Journal::open(&state_path).unwrap();
+        assert!(restarted
+            .resume_task(&detached.resume_capability)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            restarted
+                .resume_task(&connected.resume_capability)
+                .unwrap()
+                .expect("a task connected at shutdown stays resumable")
+                .task_id,
+            connected.task_id
+        );
+    }
+
+    #[test]
+    fn deleted_closed_task_capability_reports_closed_until_tombstone_expires() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.sqlite3");
+        let (recent, ancient) = {
+            let journal = Journal::open(&state_path).unwrap();
+            let recent = journal.create_task(None).unwrap();
+            let ancient = journal.create_task(None).unwrap();
+            for (task, closed_at) in [
+                (&recent, now_ms() - CLOSED_TASK_RETENTION_MS - 1),
+                (&ancient, now_ms() - CLOSED_CAPABILITY_RETENTION_MS - 1),
+            ] {
+                journal.close_task(task.task_id).unwrap();
+                journal
+                    .connection
+                    .lock()
+                    .execute(
+                        "UPDATE tasks SET closed_at_ms = ?1 WHERE task_id = ?2",
+                        params![closed_at, task.task_id.to_string()],
+                    )
+                    .unwrap();
+            }
+            (recent, ancient)
+        };
+
+        let restarted = Journal::open(&state_path).unwrap();
+        let remaining: i64 = restarted
+            .connection
+            .lock()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "closed task rows are deleted after retention");
+        assert_eq!(
+            restarted
+                .resume_rejection(&recent.resume_capability)
+                .unwrap(),
+            ResumeRejection::TaskClosed
+        );
+        assert_eq!(
+            restarted
+                .resume_rejection(&ancient.resume_capability)
+                .unwrap(),
+            ResumeRejection::UnknownCapability
+        );
     }
 
     #[test]

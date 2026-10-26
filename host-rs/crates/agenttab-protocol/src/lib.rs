@@ -1988,6 +1988,10 @@ pub struct ConnectionAck {
     pub task_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_capability: Option<String>,
+    /// Why a supplied resume capability did not resume; absent when none was supplied
+    /// or the task resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_rejection: Option<ResumeRejection>,
     pub state: RuntimeState,
 }
 
@@ -1995,6 +1999,17 @@ impl ConnectionAck {
     pub fn value(&self) -> Value {
         serde_json::to_value(self).expect("connection acknowledgement serializes")
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeRejection {
+    /// The capability's task was finished, closed, or closed for inactivity; starting a new
+    /// task loses nothing.
+    TaskClosed,
+    /// The capability is not known to this host, such as a superseded capability or one
+    /// from a lost journal.
+    UnknownCapability,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

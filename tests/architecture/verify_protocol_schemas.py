@@ -461,14 +461,24 @@ def verify_core_messages(schemas: dict[Path, dict], registry: Registry) -> int:
         resumed_without_binding,
         "resumed connection task binding",
     )
-    connection_validator.validate(
-        dict(
-            resumed_without_binding,
-            task_id="018f47a0-7b10-7abc-8def-0123456789ac",
-            resume_capability="r" * 32,
-        )
+    resumed_connection = dict(
+        resumed_without_binding,
+        task_id="018f47a0-7b10-7abc-8def-0123456789ac",
+        resume_capability="r" * 32,
     )
-    return len(requests) + 10
+    connection_validator.validate(resumed_connection)
+    connection_validator.validate(dict(connected, resume_rejection="task_closed"))
+    expect_invalid(
+        connection_validator,
+        dict(connected, resume_rejection="expired"),
+        "unknown resume rejection",
+    )
+    expect_invalid(
+        connection_validator,
+        dict(resumed_connection, resume_rejection="task_closed"),
+        "resume rejection on a resumed connection",
+    )
+    return len(requests) + 13
 
 
 def verify_native_messages(schemas: dict[Path, dict], registry: Registry) -> int:

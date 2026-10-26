@@ -12,7 +12,9 @@ A fresh adapter connection therefore gets a distinct task. Adapters that need to
 
 A resume capability is a 256-bit random bearer secret. The host persists only its hash. A client must durably persist and confirm an initial capability before the host accepts another RPC. On successful resume the host returns a replacement capability under the same persist-then-confirm barrier; if delivery or confirmation fails, a durably retained capability remains recoverable. Once a replacement is confirmed, the old capability no longer resumes the task. A capability also stops resuming its task after the task is finished or closed, or after 24 hours with no connection, owned tab, or staged Commit.
 
-Store the capability only in adapter-owned private state. Never put it in prompts, page content, logs, task titles, or shared configuration. A missing or invalid capability creates a new task rather than recovering another agent's task.
+When a supplied capability does not resume, the host answers `resumed: false` with a `resume_rejection` reason and closes the connection. `task_closed` means the task was finished or closed, including for inactivity; the host remembers this for a year after the close. `unknown_capability` covers anything else, such as a superseded capability or one from a lost journal. The TypeScript and Python SDKs clear their stored capability and reconnect as a new task only for `task_closed`. For any other reason they refuse to connect and keep the stored capability, so a task is never abandoned silently.
+
+Store the capability only in adapter-owned private state. Never put it in prompts, page content, logs, task titles, or shared configuration. A connection without a capability gets a new task rather than recovering another agent's task.
 
 ## Task-owned tabs and visible groups
 
