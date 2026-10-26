@@ -1,4 +1,5 @@
 import { RevisionTracker } from "./revisions";
+import { accessibilityMatcher, type AccessibilityQuery } from "./accessibility-query";
 import {
   dispatchDomClick,
   dispatchDomFill,
@@ -1076,6 +1077,7 @@ export class StandardBrowserRuntime {
       max_nodes: maxNodes,
       max_depth: maxDepth,
       ...(root !== undefined ? { root_id: root.backendNodeId } : {}),
+      ...(params.query !== undefined ? { query: params.query as AccessibilityQuery } : {}),
     }, root?.documentId);
     await this.assertScriptingRevision(tabId, pageRevision, "Page changed while the accessibility outline was captured");
     const outline = isRecord(value) ? value : {};
@@ -1411,13 +1413,22 @@ export class StandardBrowserRuntime {
         ...(frameId !== undefined ? { frameId } : {}),
       }, false, frameDocument.sessionId);
     const nodes = (Array.isArray(result.nodes) ? result.nodes.filter(isRecord) : []) as AxNode[];
+    const matches = accessibilityMatcher(params.query as AccessibilityQuery | undefined);
+    const matchingNodes = params.query === undefined ? nodes : nodes.filter((node) => matches(
+      typeof node.role?.value === "string" ? node.role.value : "unknown",
+      typeof node.name?.value === "string" ? node.name.value : "",
+    ));
     const axBackendIds = new Set<number>();
     for (const node of nodes) {
       if (typeof node.backendDOMNodeId === "number") axBackendIds.add(node.backendDOMNodeId);
     }
-    const domFallbackNodes = rootTarget === undefined
+    const fallbackNodes = rootTarget === undefined
       ? await this.#domEditableFallbackNodes(tabId, pageRevision, axBackendIds, frameDocument, taskId)
       : [];
+    const domFallbackNodes = params.query === undefined ? fallbackNodes : fallbackNodes.filter((node) => matches(
+      typeof node.role === "string" ? node.role : "unknown",
+      typeof node.name === "string" ? node.name : "",
+    ));
     const after = await this.frameDocument(tabId, frameDocument.frameId);
     if (frameDocument.documentId !== after.documentId) {
       const currentPageRevision = isTopFrame
@@ -1436,7 +1447,7 @@ export class StandardBrowserRuntime {
         pageRevision,
         taskId,
       });
-    const encoded = nodes.slice(0, Math.max(0, maxNodes - domFallbackNodes.length)).map((node) => ({
+    const encoded = matchingNodes.slice(0, Math.max(0, maxNodes - domFallbackNodes.length)).map((node) => ({
       ...(typeof node.backendDOMNodeId === "number" ? { ref: mintRef(node.backendDOMNodeId) } : {}),
       ...(typeof node.backendDOMNodeId === "number" ? { frame_id: frameDocument.frameId } : {}),
       role: typeof node.role?.value === "string" ? node.role.value : "unknown",
@@ -1475,7 +1486,7 @@ export class StandardBrowserRuntime {
       ...(pendingFrames.length > 0 ? { frames_truncated: true, frames_limit: 256 } : {}),
       mode,
       nodes: combined.slice(0, maxNodes),
-      truncated: nodes.length + domFallbackNodes.length > maxNodes,
+      truncated: matchingNodes.length + domFallbackNodes.length > maxNodes,
       ...(domFallbackNodes.length > 0 ? { dom_fallback_nodes: domFallbackNodes.length } : {}),
     });
   }

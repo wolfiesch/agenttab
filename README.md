@@ -49,7 +49,7 @@ Standard mode exposes exactly ten tools:
 | Tool | Purpose |
 |---|---|
 | `browser_open` | Create a task tab, create an unfocused window for a new task, or explicitly adopt the active tab. Reports whether the resulting tab supports `full` or `tab_only` automation. |
-| `browser_snapshot` | Read an accessibility tree, bounded text or HTML, or a screenshot from a full-route task tab. |
+| `browser_snapshot` | Read an accessibility tree, bounded text or HTML, or a screenshot from a full-route task tab. Accessibility mode can filter actionable refs with `query: { role: "button", name: "More message options" }` (case-insensitive exact role and accessible-name substring). |
 | `browser_act` | Run typed actions against one task tab and expected page revision. Restricted-origin task tabs retain only navigation, history, reload, and close actions. |
 | `browser_wait` | Wait for load, URL, text, selector, network-idle, task-attributed download, or challenge-cleared conditions supported by the tab's route. |
 | `browser_tabs` | List only tabs owned by the current task, including each tab's automation route. |

@@ -19,6 +19,7 @@ import {
   runPageAgentRequest,
   type PageAgentRequest,
 } from "../src/page-agent-protocol";
+import { installPageAgent } from "../src/page-agent";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
@@ -1912,6 +1913,132 @@ describe("page revision monotonicity", () => {
     });
 
     await runtime.detach(72);
+  });
+
+  test("filters AX role and accessible name before the node budget and preserves actionable refs", async () => {
+    const axNode = (id: number, role: string, name: string, description?: string) => ({
+      nodeId: String(id),
+      backendDOMNodeId: id,
+      role: { value: role },
+      name: { value: name },
+      ...(description !== undefined ? { description: { value: description } } : {}),
+    });
+    const nodes = [
+      axNode(1, "RootWebArea", "Inbox"),
+      ...Array.from({ length: 80 }, (_, index) => axNode(index + 10, "generic", `Message ${index}`)),
+      axNode(201, "button", "More message options"),
+      axNode(202, "BUTTON", "More MESSAGE options for thread"),
+      axNode(203, "button", "Archive", "More message options"),
+      axNode(204, "link", "More message options"),
+      axNode(205, "menuitembutton", "More message options"),
+    ];
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getFullAXTree") return { nodes };
+      if (method === "DOM.querySelectorAll") return { nodeIds: [300] };
+      if (method === "DOM.describeNode" && params.nodeId === 300) {
+        return { node: { backendNodeId: 300, localName: "textarea", attributes: ["placeholder", "Message"] } };
+      }
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("const f=this.form")) {
+        return { result: { value: { tag: "BUTTON", text: "More message options" } } };
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(new RevisionTracker(), async () => undefined, () => undefined, async () => undefined);
+    const query = { role: "BuTtOn", name: "MESSAGE OPTIONS" };
+    const snapshot = await runtime.snapshot(TASK_A, 70, { mode: "accessibility", query, max_nodes: 2 });
+    const matches = snapshot.nodes as Array<Record<string, unknown>>;
+    expect(matches.map((node) => node.name)).toEqual(["More message options", "More MESSAGE options for thread"]);
+    expect(snapshot.truncated).toBe(false);
+    expect(snapshot.dom_fallback_nodes).toBeUndefined();
+    for (const [index, node] of matches.entries()) {
+      expect(node.frame_id).toBe("top");
+      expect(await targetRefs.lookup(node.ref)).toMatchObject({
+        backendNodeId: 201 + index, frameId: "top", tabId: 70, taskId: TASK_A,
+      });
+    }
+    const action = await runtime.act(TASK_A, 70, snapshot.page_revision, [{ kind: "click", ref: matches[0]!.ref }]);
+    expect(action.result?.actions).toEqual([{ kind: "click", completed: true }]);
+    expect(debuggerCommands.some(({ method, params }) => method === "DOM.resolveNode" && params.backendNodeId === 201)).toBe(true);
+
+    const limited = await runtime.snapshot(TASK_A, 70, { mode: "accessibility", query, max_nodes: 1 });
+    expect(limited.nodes).toEqual([expect.objectContaining({
+      role: "button", name: "More message options", ref: expect.any(String), frame_id: "top",
+    })]);
+    expect(limited.truncated).toBe(true);
+    const absent = await runtime.snapshot(TASK_A, 70, {
+      mode: "accessibility", query: { name: "not present" }, max_nodes: 1,
+    });
+    expect(absent.nodes).toEqual([]);
+    expect(absent.truncated).toBe(false);
+    const fallback = await runtime.snapshot(TASK_A, 70, {
+      mode: "accessibility", query: { role: "TEXTBOX", name: "message" }, max_nodes: 1,
+    });
+    expect(fallback.nodes).toEqual([expect.objectContaining({ role: "textbox", name: "Message", dom_fallback: true })]);
+    expect(fallback.truncated).toBe(false);
+    await runtime.detach(70);
+  });
+
+  test("combines an AX query with a frame-scoped root ref without widening the capture", async () => {
+    const rootRef = mintedRef(TASK_A, 71, 1, 90);
+    debuggerCommandOverride = (method, params) => {
+      if (method === "Accessibility.getPartialAXTree") {
+        expect(params).toEqual({ backendNodeId: 90, fetchRelatives: true });
+        return { nodes: [
+          { nodeId: "90", backendDOMNodeId: 90, role: { value: "group" }, name: { value: "Message" } },
+          { nodeId: "91", backendDOMNodeId: 91, role: { value: "button" }, name: { value: "More message options" } },
+        ] };
+      }
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(new RevisionTracker(), async () => undefined, () => undefined, async () => undefined);
+    const snapshot = await runtime.snapshot(TASK_A, 71, {
+      mode: "accessibility", root_ref: rootRef, frame_id: "top", query: { role: "button", name: "options" }, max_nodes: 1,
+    });
+    expect(snapshot.nodes).toEqual([expect.objectContaining({ role: "button", name: "More message options", frame_id: "top" })]);
+    expect(snapshot.truncated).toBe(false);
+    const [node] = snapshot.nodes as Array<Record<string, unknown>>;
+    expect(await targetRefs.lookup(node!.ref)).toMatchObject({ backendNodeId: 91, frameId: "top" });
+    expect(debuggerCalls).not.toContain("Accessibility.getFullAXTree");
+    expect(debuggerCalls).not.toContain("DOM.querySelectorAll");
+    await runtime.detach(71);
+  });
+
+  test("filters a child-frame AX snapshot and keeps refs bound to that frame", async () => {
+    debuggerCommandOverride = (method) => {
+      if (method === "Runtime.enable") {
+        emitDebuggerEvent(73, "Runtime.executionContextCreated", {
+          context: { id: 42, auxData: { frameId: "child" } },
+        });
+      }
+      if (method === "Page.getFrameTree") return { frameTree: {
+        frame: { id: "top", loaderId: "loader-default" },
+        childFrames: [{ frame: { id: "child", loaderId: "child-loader" } }],
+      } };
+      if (method === "Runtime.evaluate") return { result: { objectId: "child-document" } };
+      if (method === "DOM.requestNode") return { nodeId: 400 };
+      if (method === "DOM.describeNode") return { node: { backendNodeId: 400 } };
+      if (method === "Accessibility.getFullAXTree") return { nodes: [
+        { nodeId: "401", backendDOMNodeId: 401, role: { value: "StaticText" }, name: { value: "Message" } },
+        { nodeId: "402", backendDOMNodeId: 402, role: { value: "button" }, name: { value: "More message options" } },
+      ] };
+      return undefined;
+    };
+    const runtime = new StandardBrowserRuntime(new RevisionTracker(), async () => undefined, () => undefined, async () => undefined);
+    const result = await runtime.snapshot(TASK_A, 73, {
+      mode: "accessibility", frame_id: "child", query: { role: "button", name: "options" }, max_nodes: 1,
+    });
+    expect(result.nodes).toEqual([expect.objectContaining({
+      role: "button", name: "More message options", frame_id: "child", ref: expect.any(String),
+    })]);
+    const [node] = result.nodes as Array<Record<string, unknown>>;
+    expect(await targetRefs.lookup(node!.ref)).toMatchObject({
+      backendNodeId: 402, frameId: "child", documentId: "child:child-loader:400",
+    });
+    expect(result.truncated).toBe(false);
+    expect(debuggerCommands).toContainEqual({
+      method: "Accessibility.getFullAXTree", params: { depth: 50, frameId: "child" },
+    });
+    await runtime.detach(73);
   });
 
   test("appends DOM fallback refs for editables missing from the accessibility tree", async () => {
@@ -6374,6 +6501,53 @@ describe("scripting route when Chrome refuses the debugger", () => {
     return { runtime, revisions };
   }
 
+  test("the scripting outline filters before truncation and retains stable element ids under a root", async () => {
+    class OutlineElement {
+      readonly localName = "div";
+      readonly isConnected = true;
+      readonly shadowRoot = null;
+      constructor(readonly role: string, readonly name: string, readonly children: OutlineElement[] = []) {}
+      getAttribute(name: string): string | null {
+        return name === "role" ? this.role : name === "aria-label" ? this.name : null;
+      }
+      hasAttribute(): boolean { return false; }
+      checkVisibility(): boolean { return true; }
+      matches(): boolean { return false; }
+      getRootNode(): unknown { return Reflect.get(globalThis, "document"); }
+    }
+    const root = new OutlineElement("main", "Message", [
+      ...Array.from({ length: 80 }, () => new OutlineElement("button", "Archive")),
+      new OutlineElement("button", "More message options"),
+      new OutlineElement("button", "More MESSAGE options for thread"),
+      new OutlineElement("link", "More message options"),
+    ]);
+    const previousDocument = Reflect.get(globalThis, "document");
+    const previousAgent = Reflect.get(globalThis, PAGE_AGENT_GLOBAL);
+    Reflect.set(globalThis, "document", { documentElement: { children: [root] }, activeElement: null });
+    Reflect.deleteProperty(globalThis, PAGE_AGENT_GLOBAL);
+    try {
+      installPageAgent();
+      const capture = async (query: { role?: string; name?: string }, max_nodes: number, root_id?: number) =>
+        await runPageAgentRequest({ op: "snapshot", max_nodes, max_depth: 50, query, root_id }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL) as {
+          nodes: Array<{ id: number; role: string; name: string }>; truncated: boolean;
+        };
+      const query = { role: "BUTTON", name: "message OPTIONS" };
+      const full = await capture(query, 2);
+      expect(full).toMatchObject({ truncated: false, nodes: [
+        { id: 1, role: "button", name: "More message options" },
+        { id: 2, role: "button", name: "More MESSAGE options for thread" },
+      ] });
+      expect(await capture(query, 1)).toMatchObject({ nodes: [full.nodes[0]], truncated: true });
+      const scoped = await capture({ role: "main" }, 1);
+      expect(await capture(query, 2, scoped.nodes[0]!.id)).toEqual(full);
+    } finally {
+      if (previousDocument === undefined) Reflect.deleteProperty(globalThis, "document");
+      else Reflect.set(globalThis, "document", previousDocument);
+      if (previousAgent === undefined) Reflect.deleteProperty(globalThis, PAGE_AGENT_GLOBAL);
+      else Reflect.set(globalThis, PAGE_AGENT_GLOBAL, previousAgent);
+    }
+  });
+
   test("snapshots and acts through the page agent without re-attaching", async () => {
     const { runtime, revisions } = refusedRuntime();
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: true });
@@ -6384,7 +6558,10 @@ describe("scripting route when Chrome refuses the debugger", () => {
       return { id: 3 };
     };
     const revision = await revisions.ensure(7);
-    const snapshot = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    const snapshot = await runtime.snapshot(TASK_A, 7, { mode: "accessibility", query: { role: "BUTTON", name: "next" }, max_nodes: 1 });
+    expect(pageAgentRequests.filter((request) => request.op === "snapshot")).toEqual([{
+      op: "snapshot", max_nodes: 1, max_depth: 50, query: { role: "BUTTON", name: "next" },
+    }]);
     expect(snapshot).toMatchObject({
       page_revision: revision,
       page_route: "scripting",
@@ -6393,6 +6570,7 @@ describe("scripting route when Chrome refuses the debugger", () => {
     });
     const nodes = snapshot.nodes as Array<Record<string, unknown>>;
     const ref = String(nodes[0]?.ref);
+    expect(nodes[0]).not.toHaveProperty("frame_id");
     const acted = await runtime.act(TASK_A, 7, revision, [{ kind: "click", ref }]);
     expect(acted.result?.actions).toEqual([{ kind: "click", completed: true, page_route: "scripting" }]);
     expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([{ op: "act", id: 3, kind: "click" }]);

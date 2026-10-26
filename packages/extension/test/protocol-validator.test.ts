@@ -52,6 +52,29 @@ describe("native protocol reliability contracts", () => {
   });
 });
 
+describe("browser_snapshot accessibility query", () => {
+  test("accepts optional predicates with frame and root scoping", () => {
+    for (const query of [{}, { role: "BUTTON" }, { name: "message" }, { role: "button", name: "More message options" }]) {
+      expect(parseCommand(command("browser_snapshot", {
+        tab_id: 1, mode: "accessibility", frame_id: "frame-1", root_ref: "rt1.root", max_nodes: 1, query,
+      })).params.query).toEqual(query);
+    }
+  });
+
+  test("rejects invalid predicates and query in every other mode", () => {
+    for (const query of [
+      null, [], "button", 1, { role: null }, { name: null }, { role: 1 }, { name: true },
+      { role: "" }, { name: "" }, { role: "x".repeat(257) }, { name: "x".repeat(2049) },
+      { description: "message" }, { role: "button", extra: true },
+    ]) {
+      expect(() => parseCommand(command("browser_snapshot", { tab_id: 1, mode: "accessibility", query }))).toThrow();
+    }
+    for (const mode of ["text", "html", "screenshot"]) {
+      expect(() => parseCommand(command("browser_snapshot", { tab_id: 1, mode, query: { role: "button" } }))).toThrow();
+    }
+  });
+});
+
 describe("browser_handoff challenge_cleared completion", () => {
   const request = (completion: unknown) =>
     command("browser_handoff", {

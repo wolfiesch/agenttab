@@ -56,7 +56,7 @@ type Target = ({ ref: string; selector?: never } | { ref?: never; selector: stri
 type DownloadTarget = Target & { expect_download?: boolean };
 
 export type BrowserSnapshotParams =
-  | ({ tab_id: number; mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number } & FrameScoped)
+  | ({ tab_id: number; mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number; query?: { role?: string; name?: string } } & FrameScoped)
   | ({ tab_id: number; mode: "text" | "html"; selector?: string; match?: "first" | "last"; max_bytes?: number } & FrameScoped)
   | ({
     tab_id: number;

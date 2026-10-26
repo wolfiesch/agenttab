@@ -15,6 +15,7 @@ import {
   type PageAgentRequest,
 } from "./page-agent-protocol";
 import { sensitiveFieldState } from "./sensitive-field";
+import { accessibilityMatcher, type AccessibilityQuery } from "./accessibility-query";
 
 // Work bound so a snapshot of a pathological document stays responsive.
 const SNAPSHOT_INSPECT_LIMIT = 25_000;
@@ -232,7 +233,8 @@ function encodeNode(element: Element, role: string, name: string, id: number): R
  * and not hidden from assistive technology. It is an approximation of
  * Chrome's accessibility tree, which only the debugger can read.
  */
-function snapshot(registry: Registry, maxNodes: number, maxDepth: number, rootId?: number): unknown {
+function snapshot(registry: Registry, maxNodes: number, maxDepth: number, rootId?: number, query?: AccessibilityQuery): unknown {
+  const matches = accessibilityMatcher(query);
   let root: Element;
   if (rootId !== undefined) {
     const resolved = lookup(registry, rootId);
@@ -254,6 +256,7 @@ function snapshot(registry: Registry, maxNodes: number, maxDepth: number, rootId
     if (!isRendered(element)) return;
     const name = accessibleName(element, role);
     if (NAMED_ONLY_ROLES[role] === true && !name) return;
+    if (!matches(role, name)) return;
     nodes.push(encodeNode(element, role, name, register(registry, element)));
   };
   const walk = (parent: Element | ShadowRoot, depth: number): void => {
@@ -395,7 +398,7 @@ function fillCredential(element: Element, value: string, kind: string): unknown 
 async function run(registry: Registry, request: PageAgentRequest): Promise<unknown> {
   switch (request.op) {
     case "snapshot":
-      return snapshot(registry, request.max_nodes, request.max_depth, request.root_id);
+      return snapshot(registry, request.max_nodes, request.max_depth, request.root_id, request.query);
     case "select": {
       const element = selectUnique(request.selector);
       return isAgentError(element) ? element : { id: register(registry, element) };

@@ -12,7 +12,16 @@
         "frame_id": { "type": "string", "minLength": 1, "maxLength": 256 },
         "root_ref": { "type": "string", "minLength": 1, "maxLength": 256 },
         "max_depth": { "type": "integer", "minimum": 1, "maximum": 200 },
-        "max_nodes": { "type": "integer", "minimum": 1, "maximum": 5000 }
+        "max_nodes": { "type": "integer", "minimum": 1, "maximum": 5000 },
+        "query": {
+          "type": "object",
+          "description": "Accessibility only. Combine exact case-insensitive role and case-insensitive accessible-name substring filters; description and value are not searched. max_nodes limits matches.",
+          "properties": {
+            "role": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "name": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     },
