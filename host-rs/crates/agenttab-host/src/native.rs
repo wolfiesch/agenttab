@@ -30,6 +30,9 @@ pub enum NativeError {
     Protocol(String),
     #[error("native transport error: {0}")]
     Transport(String),
+    /// The extension answered a lifecycle command with its own failure, such as a refused finish.
+    #[error("extension error {}: {}", .0.code, .0.message)]
+    Extension(RpcError),
 }
 
 #[derive(Debug, Clone)]
@@ -382,20 +385,23 @@ impl NativeTransport for StdioNative {
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(NativeError::Disconnected),
         };
+        if response.outcome != Outcome::Completed {
+            return Err(lifecycle_failure(
+                response,
+                "native close_task cleanup was not confirmed by the extension",
+            ));
+        }
         let result = response.result.as_ref().and_then(Value::as_object);
         let expected_task_id = task_id.to_string();
         let closed_tab_ids_are_valid = result
             .and_then(|value| value.get("closed_tab_ids"))
             .and_then(Value::as_array)
             .is_some_and(|tab_ids| tab_ids.iter().all(Value::is_u64));
-        if response.outcome != Outcome::Completed
-            || result.is_none_or(|value| {
-                value.len() != 2
-                    || value.get("task_id").and_then(Value::as_str)
-                        != Some(expected_task_id.as_str())
-                    || !closed_tab_ids_are_valid
-            })
-        {
+        if result.is_none_or(|value| {
+            value.len() != 2
+                || value.get("task_id").and_then(Value::as_str) != Some(expected_task_id.as_str())
+                || !closed_tab_ids_are_valid
+        }) {
             return Err(NativeError::Protocol(
                 "native close_task cleanup was not confirmed by the extension".into(),
             ));
@@ -436,8 +442,9 @@ impl NativeTransport for StdioNative {
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(NativeError::Disconnected),
         };
         if response.outcome != Outcome::Completed {
-            return Err(NativeError::Protocol(
-                "native finish_task cleanup was not confirmed by the extension".into(),
+            return Err(lifecycle_failure(
+                response,
+                "native finish_task cleanup was not confirmed by the extension",
             ));
         }
         let result: NativeTaskFinish =
@@ -478,6 +485,15 @@ impl NativeTransport for StdioNative {
     fn set_event_sink(&self, sink: Arc<dyn NativeEventSink>) {
         *self.event_sink.write() = Some(sink);
     }
+}
+
+/// Keeps the extension's own error for a failed lifecycle command, so the caller sees why the
+/// extension refused, and reports a protocol error only when the failure carries none.
+fn lifecycle_failure(response: NativeResponse, unconfirmed: &str) -> NativeError {
+    response.error.map_or_else(
+        || NativeError::Protocol(unconfirmed.into()),
+        NativeError::Extension,
+    )
 }
 
 #[cfg(test)]
@@ -625,6 +641,68 @@ mod tests {
         assert_eq!(acknowledgement["event"], "popup_commit_approved");
         assert_eq!(acknowledgement["event_id"], event_id);
         assert_eq!(acknowledgement["outcome"], "completed");
+    }
+
+    #[test]
+    fn finish_refusal_keeps_the_extension_error() {
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+        let output = SharedWriter::default();
+        let native = StdioNative::new(output.clone(), lifecycle);
+        native.disconnected.store(false, Ordering::Release);
+        let task_id = Uuid::now_v7();
+        let finishing = {
+            let native = native.clone();
+            std::thread::spawn(move || {
+                native.finish_task(
+                    task_id,
+                    FinishDisposition::Auto,
+                    &[99],
+                    Duration::from_secs(5),
+                )
+            })
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let command = loop {
+            let bytes = output.bytes.lock().clone();
+            if let Ok(Some(command)) =
+                read_frame(&mut bytes.as_slice(), HOST_TO_EXTENSION_MAX_BYTES)
+            {
+                break command;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "finish_task was never sent to the extension"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(command["kind"], "finish_task");
+        native
+            .handle_inbound(json!({
+                "protocol": NATIVE_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "kind": "response",
+                "request_id": command["request_id"],
+                "outcome": "unknown",
+                "error": {
+                    "code": "ownership_denied",
+                    "message": format!("Tab 99 is not owned by task {task_id}"),
+                },
+            }))
+            .unwrap();
+
+        match finishing.join().unwrap() {
+            Err(NativeError::Extension(refusal)) => {
+                assert_eq!(refusal.code, "ownership_denied");
+                assert_eq!(
+                    refusal.message,
+                    format!("Tab 99 is not owned by task {task_id}")
+                );
+            }
+            other => panic!("expected the extension's refusal, got {other:?}"),
+        }
     }
 
     #[test]

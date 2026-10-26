@@ -1,10 +1,25 @@
+import { BoundedChain } from "./bounded";
 import { MutationScheduler } from "./scheduler";
 import { mutateState, readState, type TaskColor, type TaskRecord } from "./storage";
 import { automationRouteFields } from "./routes";
 import { RevisionTracker } from "./revisions";
+import { removeTabs } from "./tab-removal";
 
 const GROUP_COLORS: readonly TaskColor[] = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
 const NO_GROUP = -1;
+/**
+ * Longest one ownership transition holds the ownership chain. Transitions are a few Chrome tab
+ * and storage calls, plus at most `TAB_REMOVAL_WAIT_MS` when cleanup closes tabs. The cap stays
+ * well under the host's 30-second command deadline, so a command queued behind a stuck
+ * transition can still answer in time.
+ */
+export const OWNERSHIP_OPERATION_HOLD_MS = 10_000;
+
+/** Returns the tabs Chrome closed within the removal wait. */
+async function removeTaskTabs(tabIds: readonly number[]): Promise<number[]> {
+  const removals = await removeTabs(tabIds);
+  return removals.filter((removal) => removal.state === "closed").map((removal) => removal.tabId);
+}
 
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 
@@ -37,8 +52,13 @@ function groupTitle(task: TaskRecord, developerMode: boolean): string {
 }
 
 export class OwnershipLedger {
-  private transitionTail: Promise<unknown> = Promise.resolve();
+  private readonly transitions = new BoundedChain("ownership", OWNERSHIP_OPERATION_HOLD_MS);
   private inventoryTail: Promise<void> = Promise.resolve();
+  /**
+   * Tasks finished or closed in this service worker. An ownership operation that overran its
+   * hold can still resume after cleanup ran past it; it must not recreate the task's record.
+   */
+  private readonly endedTaskIds = new Set<string>();
 
   constructor(
     private readonly scheduler: MutationScheduler,
@@ -469,6 +489,7 @@ export class OwnershipLedger {
       };
     }
     if (!task) {
+      this.endedTaskIds.add(taskId);
       return { task_id: taskId, finished: true, closed_tab_ids: [], retained_tab_ids: [] };
     }
     if (disposition === "auto" && state.cleanupPolicy === "ask") {
@@ -516,6 +537,7 @@ export class OwnershipLedger {
     for (const tabId of task.tabIds) this.scheduler.revokeTab(tabId);
     await mutateState((next) => {
       delete next.tasks[taskId];
+      this.endedTaskIds.add(taskId);
       for (const [token, staged] of Object.entries(next.stagedCommits)) {
         if (staged.task_id === taskId) delete next.stagedCommits[token];
       }
@@ -530,7 +552,7 @@ export class OwnershipLedger {
         await chrome.action.setBadgeText({ tabId, text: "" }).catch(() => undefined);
       }
     }
-    const closedTabIds: number[] = [];
+    const removableTabIds: number[] = [];
     for (const tabId of closedCandidates) {
       const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
       if (!tab) continue;
@@ -541,13 +563,11 @@ export class OwnershipLedger {
         }
         continue;
       }
-      try {
-        await chrome.tabs.remove(tabId);
-        closedTabIds.push(tabId);
-      } catch {
-        // Ownership is already durably removed; a missing/closed tab is safe.
-      }
+      removableTabIds.push(tabId);
     }
+    // Ownership is already durably removed. A tab that failed to close or is still waiting on a
+    // leave-page prompt is reported as neither closed nor retained.
+    const closedTabIds = await removeTaskTabs(removableTabIds);
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
     return {
@@ -563,6 +583,7 @@ export class OwnershipLedger {
     if (!existing) {
       // Profile stages bind to the task, not a tab, so a task without tabs can still own one.
       await mutateState((state) => {
+        this.endedTaskIds.add(taskId);
         for (const [token, staged] of Object.entries(state.stagedCommits)) {
           if (staged.task_id === taskId) delete state.stagedCommits[token];
         }
@@ -571,6 +592,7 @@ export class OwnershipLedger {
     }
     for (const tabId of existing.tabIds) this.scheduler.revokeTab(tabId);
     const tabIds = await mutateState((state) => {
+      this.endedTaskIds.add(taskId);
       const task = state.tasks[taskId];
       if (!task) return [];
       const ownedTabIds = [...task.tabIds];
@@ -581,17 +603,15 @@ export class OwnershipLedger {
       return ownedTabIds;
     });
     for (const tabId of tabIds) await this.revisions.remove(tabId);
-    const closedTabIds: number[] = [];
+    const removableTabIds: number[] = [];
     for (const tabId of tabIds) {
       const tab = (await chrome.tabs.get(tabId).catch(() => null)) as TabLike | null;
       if (!tab || existing.groupId === null || tab.groupId !== existing.groupId) continue;
-      try {
-        await chrome.tabs.remove(tabId);
-        closedTabIds.push(tabId);
-      } catch {
-        // Ownership is already durably removed; a missing/closed tab is safe.
-      }
+      removableTabIds.push(tabId);
     }
+    // Ownership is already durably removed, so a tab that failed to close or is still waiting on
+    // a leave-page prompt is simply not reported as closed.
+    const closedTabIds = await removeTaskTabs(removableTabIds);
     this.emit("tab_removed", { task_id: taskId, tab_count: 0 });
     await this.emitInventory();
     return closedTabIds;
@@ -652,6 +672,11 @@ export class OwnershipLedger {
         );
         if (conflictingTask) {
           throw Object.assign(new Error("Tab ownership changed while grouping"), {
+            code: "ownership_denied",
+          });
+        }
+        if (!next.tasks[taskId] && this.endedTaskIds.has(taskId)) {
+          throw Object.assign(new Error("The AgentTab task already finished"), {
             code: "ownership_denied",
           });
         }
@@ -772,11 +797,6 @@ export class OwnershipLedger {
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.transitionTail.then(operation);
-    this.transitionTail = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+    return this.transitions.run(operation);
   }
 }

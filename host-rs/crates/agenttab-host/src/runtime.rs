@@ -502,37 +502,41 @@ impl Runtime {
                         disposition,
                         keep_tab_ids,
                     }),
-                ) => self
-                    .native
-                    .finish_task(task_id, disposition, &keep_tab_ids, CLOSE_TASK_TIMEOUT)
-                    .map_err(|error| JournalError::NativeTaskCleanup(error.to_string()))
-                    .and_then(|result| {
-                        if result.finished {
-                            self.journal.close_task(task_id)?;
-                            connection.cancel();
-                            self.native.cancel_connection(connection.connection_id);
+                ) => match self.native.finish_task(
+                    task_id,
+                    disposition,
+                    &keep_tab_ids,
+                    CLOSE_TASK_TIMEOUT,
+                ) {
+                    Err(error) => native_cleanup_failure(&request.request_id, error),
+                    Ok(result) => {
+                        let finalized = if result.finished {
+                            self.journal.close_task(task_id).map(|()| {
+                                connection.cancel();
+                                self.native.cancel_connection(connection.connection_id);
+                            })
+                        } else {
+                            Ok(())
+                        };
+                        match finalized {
+                            Ok(()) => RpcResponse::success(
+                                request.request_id.clone(),
+                                if result.finished {
+                                    Outcome::Completed
+                                } else {
+                                    Outcome::NeedsUser
+                                },
+                                serde_json::to_value(result)
+                                    .expect("native task finish result serializes"),
+                            ),
+                            Err(error) => RpcResponse::failure(
+                                request.request_id.clone(),
+                                Outcome::Unknown,
+                                journal_rpc_error(error),
+                            ),
                         }
-                        Ok(result)
-                    })
-                    .map(|result| {
-                        RpcResponse::success(
-                            request.request_id.clone(),
-                            if result.finished {
-                                Outcome::Completed
-                            } else {
-                                Outcome::NeedsUser
-                            },
-                            serde_json::to_value(result)
-                                .expect("native task finish result serializes"),
-                        )
-                    })
-                    .unwrap_or_else(|error| {
-                        RpcResponse::failure(
-                            request.request_id.clone(),
-                            Outcome::Unknown,
-                            journal_rpc_error(error),
-                        )
-                    }),
+                    }
+                },
                 (None, MethodParams::Finish(_)) => RpcResponse::success(
                     request.request_id.clone(),
                     Outcome::Completed,
@@ -559,27 +563,25 @@ impl Runtime {
         if request.method == RpcMethod::AgenttabClose {
             let task_id = connection.task_id().ok().flatten();
             let response = match task_id {
-                Some(task_id) => self
-                    .native
-                    .close_task(task_id, CLOSE_TASK_TIMEOUT)
-                    .map_err(|error| JournalError::NativeTaskCleanup(error.to_string()))
-                    .and_then(|()| self.journal.close_task(task_id))
-                    .map(|()| {
-                        connection.cancel();
-                        self.native.cancel_connection(connection.connection_id);
-                        RpcResponse::success(
-                            request.request_id.clone(),
-                            Outcome::Completed,
-                            json!({ "closed": true }),
-                        )
-                    })
-                    .unwrap_or_else(|error| {
-                        RpcResponse::failure(
+                Some(task_id) => match self.native.close_task(task_id, CLOSE_TASK_TIMEOUT) {
+                    Err(error) => native_cleanup_failure(&request.request_id, error),
+                    Ok(()) => match self.journal.close_task(task_id) {
+                        Ok(()) => {
+                            connection.cancel();
+                            self.native.cancel_connection(connection.connection_id);
+                            RpcResponse::success(
+                                request.request_id.clone(),
+                                Outcome::Completed,
+                                json!({ "closed": true }),
+                            )
+                        }
+                        Err(error) => RpcResponse::failure(
                             request.request_id.clone(),
                             Outcome::Unknown,
                             journal_rpc_error(error),
-                        )
-                    }),
+                        ),
+                    },
+                },
                 None => RpcResponse::success(
                     request.request_id.clone(),
                     Outcome::Completed,
@@ -1825,6 +1827,9 @@ fn native_event_result(response: RpcResponse) -> NativeEventResult {
 
 fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
     let (code, recovery) = match error {
+        NativeError::Extension(refusal) => {
+            return RpcResponse::failure(request_id, Outcome::Unknown, refusal);
+        }
         NativeError::Disconnected => (
             "extension_disconnected",
             "Wait for Chrome to reconnect AgentTab, inspect task state, then retry safely.",
@@ -1841,6 +1846,41 @@ fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
         NativeError::Transport(_) => (
             "native_transport_error",
             "Repair the AgentTab native host connection before retrying.",
+        ),
+    };
+    RpcResponse::failure(
+        request_id,
+        Outcome::Unknown,
+        RpcError::new(code, error.to_string()).with_recovery(recovery),
+    )
+}
+
+/// Maps a failed native `finish_task` or `close_task` command. The journal still lists the
+/// task as open, so the recovery is to finish or close it again once the extension answers.
+fn native_cleanup_failure(request_id: &str, error: NativeError) -> RpcResponse {
+    let (code, recovery) = match error {
+        // The extension refused the cleanup itself; its code says why, so keep it.
+        NativeError::Extension(mut refusal) => {
+            refusal.recovery.get_or_insert_with(|| {
+                "The task is still open. Resolve the extension's error, then finish or close the task again.".into()
+            });
+            return RpcResponse::failure(request_id, Outcome::Unknown, refusal);
+        }
+        NativeError::Disconnected => (
+            "extension_disconnected",
+            "The task is still open. Wait for Chrome to reconnect AgentTab, then finish or close the task again.",
+        ),
+        NativeError::Timeout => (
+            "extension_timeout",
+            "The task is still open. If the AgentTab extension stays unresponsive, reload it, then finish or close the task again.",
+        ),
+        NativeError::Protocol(_) => (
+            "native_protocol_error",
+            "The task is still open. Check the finish arguments, update AgentTab if the host and extension versions differ, then finish or close the task again.",
+        ),
+        NativeError::Transport(_) => (
+            "native_transport_error",
+            "The task is still open. Repair the AgentTab native host connection, then finish or close the task again.",
         ),
     };
     RpcResponse::failure(
@@ -1982,6 +2022,7 @@ mod tests {
         last_params: Mutex<Option<Value>>,
         last_act_params: Mutex<Option<Value>>,
         closed_tasks: Mutex<Vec<Uuid>>,
+        cleanup_timeouts: AtomicUsize,
     }
 
     impl FakeNative {
@@ -1998,6 +2039,7 @@ mod tests {
                 last_params: Mutex::new(None),
                 last_act_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
+                cleanup_timeouts: AtomicUsize::new(0),
             })
         }
 
@@ -2013,6 +2055,7 @@ mod tests {
                 origin_policies: Mutex::new(Vec::new()),
                 last_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
+                cleanup_timeouts: AtomicUsize::new(0),
                 last_act_params: Mutex::new(None),
             })
         }
@@ -2030,6 +2073,7 @@ mod tests {
                 last_params: Mutex::new(None),
                 last_act_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
+                cleanup_timeouts: AtomicUsize::new(0),
             })
         }
 
@@ -2046,7 +2090,17 @@ mod tests {
                 last_params: Mutex::new(None),
                 last_act_params: Mutex::new(None),
                 closed_tasks: Mutex::new(Vec::new()),
+                cleanup_timeouts: AtomicUsize::new(0),
             })
+        }
+
+        /// Consumes one queued cleanup timeout, standing in for an extension that never answers.
+        fn cleanup_times_out(&self) -> bool {
+            self.cleanup_timeouts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
         }
     }
     impl NativeTransport for FakeNative {
@@ -2143,6 +2197,9 @@ mod tests {
             })
         }
         fn close_task(&self, task_id: Uuid, _timeout: Duration) -> Result<(), NativeError> {
+            if self.cleanup_times_out() {
+                return Err(NativeError::Timeout);
+            }
             self.closed_tasks.lock().push(task_id);
             if self.close_task_error {
                 return Err(NativeError::Disconnected);
@@ -2156,6 +2213,9 @@ mod tests {
             keep_tab_ids: &[u64],
             _timeout: Duration,
         ) -> Result<NativeTaskFinish, NativeError> {
+            if self.cleanup_times_out() {
+                return Err(NativeError::Timeout);
+            }
             self.closed_tasks.lock().push(task_id);
             Ok(NativeTaskFinish {
                 task_id,
@@ -2505,6 +2565,122 @@ mod tests {
         assert_eq!(*native.closed_tasks.lock(), vec![task_id]);
         assert!(connection.is_cancelled());
         assert!(runtime.journal.resume_task(&capability).unwrap().is_none());
+    }
+
+    #[test]
+    fn task_cleanup_timeout_reports_the_extension_and_keeps_the_task_open() {
+        let native = FakeNative::normal();
+        let (_temp, runtime, connection) = connected_runtime(native.clone());
+        let opened = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "tabs",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+        let capability = opened["task"]["resume_capability"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let task_id = opened["task"]["task_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap();
+        confirm_new_capability(&runtime, &connection, capability.clone());
+        native.cleanup_timeouts.store(2, Ordering::SeqCst);
+
+        for (request_id, method, params) in [
+            ("close-timeout", "agenttab.close", json!({})),
+            (
+                "finish-timeout",
+                "agenttab.finish",
+                json!({ "disposition": "auto" }),
+            ),
+        ] {
+            let failed = runtime.handle(
+                &connection,
+                json!({
+                    "protocol": RPC_PROTOCOL,
+                    "version": PROTOCOL_VERSION,
+                    "request_id": request_id,
+                    "method": method,
+                    "params": params
+                }),
+            );
+
+            assert_eq!(failed["outcome"], "unknown", "{method}");
+            assert_eq!(failed["error"]["code"], "extension_timeout", "{method}");
+            let recovery = failed["error"]["recovery"].as_str().unwrap();
+            assert!(recovery.contains("reload it"), "{method}: {recovery}");
+            assert!(!recovery.contains("disk space"), "{method}: {recovery}");
+            assert!(!connection.is_cancelled(), "{method}");
+        }
+        let still_open = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "tabs-after-timeouts",
+                "method": "browser_tabs",
+                "params": {}
+            }),
+        );
+        assert_eq!(still_open["outcome"], "completed");
+        assert!(native.closed_tasks.lock().is_empty());
+
+        let finished = runtime.handle(
+            &connection,
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": "finish-retry",
+                "method": "agenttab.finish",
+                "params": { "disposition": "auto" }
+            }),
+        );
+
+        assert_eq!(finished["outcome"], "completed");
+        assert_eq!(finished["result"]["finished"], true);
+        assert_eq!(*native.closed_tasks.lock(), vec![task_id]);
+        assert!(connection.is_cancelled());
+        assert!(runtime.journal.resume_task(&capability).unwrap().is_none());
+    }
+
+    #[test]
+    fn task_cleanup_refusal_reports_the_extension_error() {
+        let refused = native_cleanup_failure(
+            "finish-refused",
+            NativeError::Extension(RpcError::new(
+                "ownership_denied",
+                "Tab 99 is not owned by task 018f47b8-2f80-7c20-9c77-f8a38c9e621e",
+            )),
+        );
+        let refused = serde_json::to_value(refused).unwrap();
+
+        assert_eq!(refused["outcome"], "unknown");
+        assert_eq!(refused["error"]["code"], "ownership_denied");
+        assert_eq!(
+            refused["error"]["message"],
+            "Tab 99 is not owned by task 018f47b8-2f80-7c20-9c77-f8a38c9e621e"
+        );
+        let recovery = refused["error"]["recovery"].as_str().unwrap();
+        assert!(recovery.contains("still open"), "{recovery}");
+
+        let own_recovery = native_cleanup_failure(
+            "finish-refused",
+            NativeError::Extension(
+                RpcError::new("task_window_conflict", "conflict")
+                    .with_recovery("Use placement task."),
+            ),
+        );
+        assert_eq!(
+            own_recovery.error.unwrap().recovery.as_deref(),
+            Some("Use placement task.")
+        );
     }
 
     fn confirm_new_capability(

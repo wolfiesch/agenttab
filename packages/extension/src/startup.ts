@@ -1,3 +1,5 @@
+import { settledWithin } from "./bounded";
+
 export type StartupPhase = "idle" | "starting" | "ready";
 
 export class IdempotentStartup {
@@ -52,6 +54,14 @@ export class IdempotentStartup {
 
 type StartupOperation = () => void | Promise<void>;
 
+/**
+ * Longest one queued operation may hold the queue. Tab events, alarms (including native
+ * reconnect), and `browser_open` load barriers all drain through this one queue, so an
+ * operation awaiting something that never settles would otherwise stall every later one.
+ * Every bounded wait an operation legitimately makes is far shorter.
+ */
+export const STARTUP_OPERATION_TIMEOUT_MS = 30_000;
+
 export class StartupOperationQueue {
   private readonly pending: StartupOperation[] = [];
   private draining: Promise<void> | null = null;
@@ -105,7 +115,12 @@ export class StartupOperationQueue {
       const operation = this.pending.shift();
       if (!operation) continue;
       try {
-        await operation();
+        // An operation still running at the cap keeps running but no longer holds the queue.
+        if (!(await settledWithin(operation(), STARTUP_OPERATION_TIMEOUT_MS))) {
+          throw new Error(
+            `AgentTab background operation still running after ${STARTUP_OPERATION_TIMEOUT_MS} ms; later operations no longer wait for it`,
+          );
+        }
       } catch (error) {
         this.report(this.onOperationError, error);
       }

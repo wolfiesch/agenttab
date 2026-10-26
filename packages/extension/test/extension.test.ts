@@ -2,12 +2,14 @@ import { beforeEach, describe, expect, test, vi } from "bun:test";
 import { removeTabIfPresent, StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
-import { OwnershipLedger } from "../src/ownership";
+import { BoundedChain } from "../src/bounded";
+import { OWNERSHIP_OPERATION_HOLD_MS, OwnershipLedger } from "../src/ownership";
+import { TAB_REMOVAL_WAIT_MS } from "../src/tab-removal";
 import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from "../src/protocol";
 import { RevisionTracker } from "../src/revisions";
 import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
 import { MutationScheduler } from "../src/scheduler";
-import { IdempotentStartup, StartupOperationQueue } from "../src/startup";
+import { IdempotentStartup, STARTUP_OPERATION_TIMEOUT_MS, StartupOperationQueue } from "../src/startup";
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
 import { targetRefs } from "../src/target-resolution";
@@ -3727,6 +3729,158 @@ describe("ownership and task isolation", () => {
     expect((await readState()).tasks[TASK_A]).toBeUndefined();
   });
 
+  test("finishes a task whose tab is held open by a leave-page prompt", async () => {
+    vi.useFakeTimers();
+    try {
+      await seedTask(TASK_A, [21, 22]);
+      await seedTask(TASK_B, [23], 6);
+      await mutateState((state) => {
+        state.tasks[TASK_A].createdTabIds = [21, 22];
+        state.cleanupPolicy = "automatic";
+      });
+      const ownership = new OwnershipLedger(
+        new MutationScheduler(),
+        new RevisionTracker(),
+        () => undefined,
+      );
+      const removeTab = chrome.tabs.remove.bind(chrome.tabs);
+      chrome.tabs.remove = ((tabIds: number | number[]) => {
+        const tabId = Array.isArray(tabIds) ? tabIds[0] : tabIds;
+        // Chrome settles tabs.remove only once the tab is destroyed, which a beforeunload prompt defers.
+        if (tabId === 22) return new Promise<void>(() => undefined);
+        return removeTab(tabId);
+      }) as typeof chrome.tabs.remove;
+
+      let result: Record<string, unknown> | undefined;
+      void ownership.finishTask(TASK_A, "auto").then((finished) => {
+        result = finished;
+      });
+      for (let elapsed = 0; elapsed <= TAB_REMOVAL_WAIT_MS + 1_000 && !result; elapsed += 50) {
+        await advanceTimers(50);
+      }
+
+      expect(result).toEqual({
+        task_id: TASK_A,
+        finished: true,
+        closed_tab_ids: [21],
+        retained_tab_ids: [],
+      });
+      expect((await readState()).tasks[TASK_A]).toBeUndefined();
+      let closedOtherTask: number[] | undefined;
+      void ownership.closeTask(TASK_B).then((closed) => {
+        closedOtherTask = closed;
+      });
+      for (let turn = 0; turn < 20 && !closedOtherTask; turn += 1) await advanceTimers(0);
+      expect(closedOtherTask).toEqual([23]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("moves the ownership chain past a transition that never settles", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await seedTask(TASK_A, [21]);
+      await seedTask(TASK_B, [23], 6);
+      const ownership = new OwnershipLedger(
+        new MutationScheduler(),
+        new RevisionTracker(),
+        () => undefined,
+      );
+      const getTab = chrome.tabs.get.bind(chrome.tabs);
+      chrome.tabs.get = ((tabId: number) => (
+        tabId === 21 ? new Promise(() => undefined) : getTab(tabId)
+      )) as typeof chrome.tabs.get;
+
+      void ownership.finishTask(TASK_A, "auto");
+      let closedOtherTask: number[] | undefined;
+      void ownership.closeTask(TASK_B).then((closed) => {
+        closedOtherTask = closed;
+      });
+      await advanceTimers(OWNERSHIP_OPERATION_HOLD_MS - 100);
+      expect(closedOtherTask).toBeUndefined();
+      for (let elapsed = 0; elapsed < 1_000 && !closedOtherTask; elapsed += 50) await advanceTimers(50);
+
+      expect(closedOtherTask).toEqual([23]);
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+        message: expect.stringContaining("ownership operation still running"),
+      }));
+    } finally {
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  test("starts operations queued behind a stuck one one at a time", async () => {
+    vi.useFakeTimers();
+    try {
+      const overruns: Error[] = [];
+      const chain = new BoundedChain("test", 1_000, (error) => overruns.push(error));
+      const started: string[] = [];
+      const { promise: secondHeld, resolve: releaseSecond } = Promise.withResolvers<void>();
+      void chain.run(() => new Promise<void>(() => undefined));
+      void chain.run(async () => {
+        started.push("second");
+        await secondHeld;
+      });
+      void chain.run(() => {
+        started.push("third");
+      });
+
+      await advanceTimers(0);
+      await advanceTimers(1_000);
+      expect(started).toEqual(["second"]);
+      await advanceTimers(900);
+      expect(started).toEqual(["second"]);
+
+      releaseSecond();
+      await advanceTimers(0);
+      expect(started).toEqual(["second", "third"]);
+      expect(overruns).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("an open that overran its hold cannot recreate a task that finished past it", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const create = chrome.tabs.create.bind(chrome.tabs);
+    try {
+      const ownership = new OwnershipLedger(
+        new MutationScheduler(),
+        new RevisionTracker(),
+        () => undefined,
+      );
+      const { promise: creationReleased, resolve: releaseCreation } = Promise.withResolvers<void>();
+      chrome.tabs.create = (async (options: Parameters<typeof chrome.tabs.create>[0]) => {
+        await creationReleased;
+        return create(options);
+      }) as typeof chrome.tabs.create;
+
+      const opening = ownership.open(TASK_B, { mode: "create", url: "https://example.test/late" });
+      opening.catch(() => undefined);
+      let finished: Record<string, unknown> | undefined;
+      void ownership.finishTask(TASK_B, "close").then((result) => {
+        finished = result;
+      });
+      await advanceTimers(0);
+      await advanceTimers(OWNERSHIP_OPERATION_HOLD_MS + 100);
+      expect(finished).toMatchObject({ task_id: TASK_B, finished: true });
+
+      releaseCreation();
+      await advanceTimers(0);
+      await expect(opening).rejects.toMatchObject({ code: "ownership_denied" });
+      expect((await readState()).tasks[TASK_B]).toBeUndefined();
+      expect(removedTabIds).toHaveLength(1);
+    } finally {
+      chrome.tabs.create = create as typeof chrome.tabs.create;
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   test("explicit close preserves a tab that left its task group", async () => {
     await seedTask(TASK_A, [21, 22]);
     tabStore.get(22)!.groupId = -1;
@@ -4182,7 +4336,7 @@ describe("tab removal", () => {
       },
     });
 
-    await expect(removeTabIfPresent(77)).resolves.toBeUndefined();
+    await expect(removeTabIfPresent(77)).resolves.toBe(true);
 
     tabStore.set(78, {
       id: 78,
@@ -4196,6 +4350,39 @@ describe("tab removal", () => {
       },
     });
     await expect(removeTabIfPresent(78)).rejects.toThrow("Tabs cannot be edited");
+  });
+
+  test("returns a close action while a leave-page prompt holds the tab open", async () => {
+    await mutateState((state) => {
+      state.skipCommitReview = true;
+    });
+    const revisions = new RevisionTracker();
+    const released: number[] = [];
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async (tabId) => {
+        released.push(tabId);
+      },
+      () => undefined,
+    );
+    const pageRevision = await revisions.ensure(7);
+    // Chrome settles tabs.remove only once the tab is destroyed, which a beforeunload prompt defers.
+    Object.assign(chrome.tabs, { remove: () => new Promise<void>(() => undefined) });
+    vi.useFakeTimers();
+    try {
+      let actions: unknown;
+      void runtime.act(TASK_A, 7, pageRevision, [{ kind: "close" }]).then((execution) => {
+        actions = execution.result?.actions;
+      });
+      for (let elapsed = 0; elapsed <= TAB_REMOVAL_WAIT_MS + 1_000 && actions === undefined; elapsed += 50) {
+        await advanceTimers(50);
+      }
+
+      expect(actions).toEqual([{ kind: "close", started: true, close_pending: true }]);
+      expect(released).toEqual([7]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -4743,6 +4930,33 @@ describe("startup lifecycle", () => {
     await operationCompleted.promise;
 
     expect(attempts).toBe(2);
+  });
+
+  test("moves past a queued operation that never settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const operationErrors: unknown[] = [];
+      const queue = new StartupOperationQueue(
+        new IdempotentStartup(async () => undefined),
+        () => undefined,
+        (error) => operationErrors.push(error),
+      );
+      let ranNext = false;
+
+      queue.enqueue(() => new Promise<void>(() => undefined));
+      queue.enqueue(() => {
+        ranNext = true;
+      });
+      await advanceTimers(STARTUP_OPERATION_TIMEOUT_MS - 50);
+      expect(ranNext).toBe(false);
+      await advanceTimers(100);
+
+      expect(ranNext).toBe(true);
+      expect(operationErrors).toHaveLength(1);
+      expect(String(operationErrors[0])).toContain(`still running after ${STARTUP_OPERATION_TIMEOUT_MS} ms`);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

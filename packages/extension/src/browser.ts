@@ -54,6 +54,7 @@ import { challengeStoreAvailable, readTaskEpisodes, updateTaskEpisodes } from ".
 import { ACTION_POINTER_CUES, AgentPointer, withoutPointerHost } from "./pointer";
 import { mutateState, readState } from "./storage";
 import { sensitiveFieldState } from "./sensitive-field";
+import { removeTabs } from "./tab-removal";
 import {
   PAGE_AGENT_FILE,
   PAGE_AGENT_GLOBAL,
@@ -62,13 +63,14 @@ import {
   type PageAgentRequest,
 } from "./page-agent-protocol";
 
-export async function removeTabIfPresent(tabId: number): Promise<void> {
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch (error) {
+/** Resolves `false` when the tab is still open after the removal wait, as with a leave-page prompt. */
+export async function removeTabIfPresent(tabId: number): Promise<boolean> {
+  const [removal] = await removeTabs([tabId]);
+  if (removal.state === "failed") {
     const tabStillExists = await chrome.tabs.get(tabId).then(() => true, () => false);
-    if (tabStillExists) throw error;
+    if (tabStillExists) throw removal.error;
   }
+  return removal.state !== "pending";
 }
 
 const DEBUGGER_VERSION = "1.3";
@@ -536,7 +538,8 @@ function releasePageWindowOpen(trapKey: string): unknown[] {
   return Array.isArray(requests) ? requests : [];
 }
 
-type CloseTab = (tabId: number) => Promise<void>;
+/** Releases a tab from its task, revoking ownership and detaching, before a close action removes it. */
+type ReleaseTab = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 type AuthorizeDebuggerUse = (tabId: number) => Promise<void>;
 type DebuggerLifecycle = (tabId: number) => Promise<void>;
@@ -595,7 +598,7 @@ export class StandardBrowserRuntime {
 
   constructor(
     private readonly revisions: RevisionTracker,
-    private readonly closeTab: CloseTab,
+    private readonly releaseTab: ReleaseTab,
     private readonly emit: EventSink,
     private readonly authorizeDebuggerUse: AuthorizeDebuggerUse = async () => undefined,
     private readonly recordDebuggerCandidate: DebuggerLifecycle = async () => undefined,
@@ -2660,8 +2663,9 @@ export class StandardBrowserRuntime {
       return { kind, started: true, ...downloadResult };
     }
     if (kind === "close") {
-      await this.closeTab(tabId);
-      return { kind, completed: true };
+      await this.releaseTab(tabId);
+      // A tab held open by a leave-page prompt still closes if the user confirms leaving.
+      return await removeTabIfPresent(tabId) ? { kind, completed: true } : { kind, started: true, close_pending: true };
     }
     if (kind === "set_viewport") {
       throw Object.assign(new Error("set_viewport is unavailable in Standard mode"), {
