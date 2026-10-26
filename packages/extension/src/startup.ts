@@ -1,3 +1,5 @@
+import { settledWithin } from "./bounded";
+
 export type StartupPhase = "idle" | "starting" | "ready";
 
 export class IdempotentStartup {
@@ -113,23 +115,15 @@ export class StartupOperationQueue {
       const operation = this.pending.shift();
       if (!operation) continue;
       try {
-        await this.runBounded(operation);
+        // An operation still running at the cap keeps running but no longer holds the queue.
+        if (!(await settledWithin(operation(), STARTUP_OPERATION_TIMEOUT_MS))) {
+          throw new Error(
+            `AgentTab background operation still running after ${STARTUP_OPERATION_TIMEOUT_MS} ms; later operations no longer wait for it`,
+          );
+        }
       } catch (error) {
         this.report(this.onOperationError, error);
       }
-    }
-  }
-
-  /** An operation still running at its deadline keeps running, but no longer holds the queue. */
-  private async runBounded(operation: StartupOperation): Promise<void> {
-    const { promise: overrun, reject } = Promise.withResolvers<never>();
-    const timer = setTimeout(() => {
-      reject(new Error(`AgentTab background operation did not settle within ${STARTUP_OPERATION_TIMEOUT_MS} ms`));
-    }, STARTUP_OPERATION_TIMEOUT_MS);
-    try {
-      await Promise.race([operation(), overrun]);
-    } finally {
-      clearTimeout(timer);
     }
   }
 

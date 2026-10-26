@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, test, vi } from "bun:test";
 import { removeTabIfPresent, StandardBrowserRuntime } from "../src/browser";
 import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
-import { OwnershipLedger, TASK_TAB_REMOVAL_WAIT_MS } from "../src/ownership";
+import { OWNERSHIP_OPERATION_HOLD_MS, OwnershipLedger } from "../src/ownership";
+import { TAB_REMOVAL_WAIT_MS } from "../src/tab-removal";
 import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from "../src/protocol";
 import { RevisionTracker } from "../src/revisions";
 import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
@@ -3753,7 +3754,7 @@ describe("ownership and task isolation", () => {
       void ownership.finishTask(TASK_A, "auto").then((finished) => {
         result = finished;
       });
-      for (let elapsed = 0; elapsed <= TASK_TAB_REMOVAL_WAIT_MS + 1_000 && !result; elapsed += 50) {
+      for (let elapsed = 0; elapsed <= TAB_REMOVAL_WAIT_MS + 1_000 && !result; elapsed += 50) {
         await advanceTimers(50);
       }
 
@@ -3771,6 +3772,41 @@ describe("ownership and task isolation", () => {
       for (let turn = 0; turn < 20 && !closedOtherTask; turn += 1) await advanceTimers(0);
       expect(closedOtherTask).toEqual([23]);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("moves the ownership chain past a transition that never settles", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await seedTask(TASK_A, [21]);
+      await seedTask(TASK_B, [23], 6);
+      const ownership = new OwnershipLedger(
+        new MutationScheduler(),
+        new RevisionTracker(),
+        () => undefined,
+      );
+      const getTab = chrome.tabs.get.bind(chrome.tabs);
+      chrome.tabs.get = ((tabId: number) => (
+        tabId === 21 ? new Promise(() => undefined) : getTab(tabId)
+      )) as typeof chrome.tabs.get;
+
+      void ownership.finishTask(TASK_A, "auto");
+      let closedOtherTask: number[] | undefined;
+      void ownership.closeTask(TASK_B).then((closed) => {
+        closedOtherTask = closed;
+      });
+      await advanceTimers(OWNERSHIP_OPERATION_HOLD_MS - 100);
+      expect(closedOtherTask).toBeUndefined();
+      for (let elapsed = 0; elapsed < 1_000 && !closedOtherTask; elapsed += 50) await advanceTimers(50);
+
+      expect(closedOtherTask).toEqual([23]);
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+        message: expect.stringContaining("ownership operation still running"),
+      }));
+    } finally {
+      warn.mockRestore();
       vi.useRealTimers();
     }
   });
@@ -4230,7 +4266,7 @@ describe("tab removal", () => {
       },
     });
 
-    await expect(removeTabIfPresent(77)).resolves.toBeUndefined();
+    await expect(removeTabIfPresent(77)).resolves.toBe(true);
 
     tabStore.set(78, {
       id: 78,
@@ -4244,6 +4280,39 @@ describe("tab removal", () => {
       },
     });
     await expect(removeTabIfPresent(78)).rejects.toThrow("Tabs cannot be edited");
+  });
+
+  test("returns a close action while a leave-page prompt holds the tab open", async () => {
+    await mutateState((state) => {
+      state.skipCommitReview = true;
+    });
+    const revisions = new RevisionTracker();
+    const released: number[] = [];
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async (tabId) => {
+        released.push(tabId);
+      },
+      () => undefined,
+    );
+    const pageRevision = await revisions.ensure(7);
+    // Chrome settles tabs.remove only once the tab is destroyed, which a beforeunload prompt defers.
+    Object.assign(chrome.tabs, { remove: () => new Promise<void>(() => undefined) });
+    vi.useFakeTimers();
+    try {
+      let actions: unknown;
+      void runtime.act(TASK_A, 7, pageRevision, [{ kind: "close" }]).then((execution) => {
+        actions = execution.result?.actions;
+      });
+      for (let elapsed = 0; elapsed <= TAB_REMOVAL_WAIT_MS + 1_000 && actions === undefined; elapsed += 50) {
+        await advanceTimers(50);
+      }
+
+      expect(actions).toEqual([{ kind: "close", started: true, close_pending: true }]);
+      expect(released).toEqual([7]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -4814,7 +4883,7 @@ describe("startup lifecycle", () => {
 
       expect(ranNext).toBe(true);
       expect(operationErrors).toHaveLength(1);
-      expect(String(operationErrors[0])).toContain(`did not settle within ${STARTUP_OPERATION_TIMEOUT_MS} ms`);
+      expect(String(operationErrors[0])).toContain(`still running after ${STARTUP_OPERATION_TIMEOUT_MS} ms`);
     } finally {
       vi.useRealTimers();
     }

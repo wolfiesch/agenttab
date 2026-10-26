@@ -1827,6 +1827,9 @@ fn native_event_result(response: RpcResponse) -> NativeEventResult {
 
 fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
     let (code, recovery) = match error {
+        NativeError::Extension(refusal) => {
+            return RpcResponse::failure(request_id, Outcome::Unknown, refusal);
+        }
         NativeError::Disconnected => (
             "extension_disconnected",
             "Wait for Chrome to reconnect AgentTab, inspect task state, then retry safely.",
@@ -1856,6 +1859,13 @@ fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
 /// task as open, so the recovery is to finish or close it again once the extension answers.
 fn native_cleanup_failure(request_id: &str, error: NativeError) -> RpcResponse {
     let (code, recovery) = match error {
+        // The extension refused the cleanup itself; its code says why, so keep it.
+        NativeError::Extension(mut refusal) => {
+            refusal.recovery.get_or_insert_with(|| {
+                "The task is still open. Resolve the extension's error, then finish or close the task again.".into()
+            });
+            return RpcResponse::failure(request_id, Outcome::Unknown, refusal);
+        }
         NativeError::Disconnected => (
             "extension_disconnected",
             "The task is still open. Wait for Chrome to reconnect AgentTab, then finish or close the task again.",
@@ -2638,6 +2648,39 @@ mod tests {
         assert_eq!(*native.closed_tasks.lock(), vec![task_id]);
         assert!(connection.is_cancelled());
         assert!(runtime.journal.resume_task(&capability).unwrap().is_none());
+    }
+
+    #[test]
+    fn task_cleanup_refusal_reports_the_extension_error() {
+        let refused = native_cleanup_failure(
+            "finish-refused",
+            NativeError::Extension(RpcError::new(
+                "ownership_denied",
+                "Tab 99 is not owned by task 018f47b8-2f80-7c20-9c77-f8a38c9e621e",
+            )),
+        );
+        let refused = serde_json::to_value(refused).unwrap();
+
+        assert_eq!(refused["outcome"], "unknown");
+        assert_eq!(refused["error"]["code"], "ownership_denied");
+        assert_eq!(
+            refused["error"]["message"],
+            "Tab 99 is not owned by task 018f47b8-2f80-7c20-9c77-f8a38c9e621e"
+        );
+        let recovery = refused["error"]["recovery"].as_str().unwrap();
+        assert!(recovery.contains("still open"), "{recovery}");
+
+        let own_recovery = native_cleanup_failure(
+            "finish-refused",
+            NativeError::Extension(
+                RpcError::new("task_window_conflict", "conflict")
+                    .with_recovery("Use placement task."),
+            ),
+        );
+        assert_eq!(
+            own_recovery.error.unwrap().recovery.as_deref(),
+            Some("Use placement task.")
+        );
     }
 
     fn confirm_new_capability(

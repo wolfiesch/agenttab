@@ -1,34 +1,24 @@
+import { BoundedChain } from "./bounded";
 import { MutationScheduler } from "./scheduler";
 import { mutateState, readState, type TaskColor, type TaskRecord } from "./storage";
 import { automationRouteFields } from "./routes";
 import { RevisionTracker } from "./revisions";
+import { removeTabs } from "./tab-removal";
 
 const GROUP_COLORS: readonly TaskColor[] = ["purple", "cyan", "green", "yellow", "orange", "red", "pink", "blue"];
 const NO_GROUP = -1;
 /**
- * How long task cleanup waits for Chrome to close its tabs. `chrome.tabs.remove` settles only
- * once Chrome destroys the tab, and a page's beforeunload "Leave site?" prompt postpones that
- * until someone answers it; a background tab shows the prompt only when it is activated.
- * Cleanup runs inside the ownership chain, so an unbounded wait there stalls every later
- * ownership transition. Removal stays requested after the wait: the tab still closes if the
- * user confirms leaving.
+ * Longest one ownership transition holds the ownership chain. Transitions are a few Chrome tab
+ * and storage calls, plus at most `TAB_REMOVAL_WAIT_MS` when cleanup closes tabs. The cap stays
+ * well under the host's 30-second command deadline, so a command queued behind a stuck
+ * transition can still answer in time.
  */
-export const TASK_TAB_REMOVAL_WAIT_MS = 2_000;
+export const OWNERSHIP_OPERATION_HOLD_MS = 10_000;
 
-/** Request every removal at once and return the tabs Chrome closed within the shared wait. */
+/** Returns the tabs Chrome closed within the removal wait. */
 async function removeTaskTabs(tabIds: readonly number[]): Promise<number[]> {
-  if (tabIds.length === 0) return [];
-  const { promise: waitExpired, resolve: expire } = Promise.withResolvers<"pending">();
-  const timer = setTimeout(() => expire("pending"), TASK_TAB_REMOVAL_WAIT_MS);
-  try {
-    const outcomes = await Promise.all(tabIds.map((tabId) => Promise.race([
-      chrome.tabs.remove(tabId).then(() => "closed" as const, () => "failed" as const),
-      waitExpired,
-    ])));
-    return tabIds.filter((_, index) => outcomes[index] === "closed");
-  } finally {
-    clearTimeout(timer);
-  }
+  const removals = await removeTabs(tabIds);
+  return removals.filter((removal) => removal.state === "closed").map((removal) => removal.tabId);
 }
 
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
@@ -62,7 +52,7 @@ function groupTitle(task: TaskRecord, developerMode: boolean): string {
 }
 
 export class OwnershipLedger {
-  private transitionTail: Promise<unknown> = Promise.resolve();
+  private readonly transitions = new BoundedChain("ownership", OWNERSHIP_OPERATION_HOLD_MS);
   private inventoryTail: Promise<void> = Promise.resolve();
 
   constructor(
@@ -793,11 +783,6 @@ export class OwnershipLedger {
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.transitionTail.then(operation);
-    this.transitionTail = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+    return this.transitions.run(operation);
   }
 }

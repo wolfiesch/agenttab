@@ -1,3 +1,4 @@
+import { BoundedChain } from "./bounded";
 import { MutationScheduler, NotStartedError } from "./scheduler";
 import { mutateState, readState, type HandoffNotice, type NoticeStatus } from "./storage";
 import { RevisionTracker } from "./revisions";
@@ -11,6 +12,14 @@ const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_NOTICES = 100;
 /** Seconds without input before Chrome reports the user as idle. */
 const IDLE_DETECTION_SECONDS = 60;
+/**
+ * Longest one notice transition holds the handoff chain. Transitions are storage and Chrome calls
+ * that finish well within this. A request for a tab, or a Pause, can wait longer for that tab's
+ * or every tab's in-flight mutation; it then keeps waiting outside the chain, so a stuck tab
+ * cannot stall notice status, dismissal, task cleanup, or alarms. The cap stays well under the
+ * host's 30-second command deadline.
+ */
+export const HANDOFF_OPERATION_HOLD_MS = 10_000;
 type PrivacyScrubber = (tabId: number) => Promise<void>;
 type EventSink = (event: string, payload: Record<string, unknown>) => void;
 
@@ -44,7 +53,7 @@ function terminal(status: NoticeStatus): boolean {
 }
 
 export class HandoffController {
-  private transitionTail: Promise<unknown> = Promise.resolve();
+  private readonly transitions = new BoundedChain("handoff", HANDOFF_OPERATION_HOLD_MS);
   private scrubber: PrivacyScrubber | null = null;
   private challengeScanner: ChallengeScanner | null = null;
 
@@ -146,7 +155,8 @@ export class HandoffController {
         state.paused = true;
       });
       await barrier;
-      this.emit("pause_changed", { paused: true });
+      // A Resume can run while this waits outside the chain; announce Pause only if it still holds.
+      if ((await readState()).paused) this.emit("pause_changed", { paused: true });
     });
   }
 
@@ -397,12 +407,7 @@ export class HandoffController {
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.transitionTail.then(operation);
-    this.transitionTail = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+    return this.transitions.run(operation);
   }
 }
 
