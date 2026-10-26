@@ -43,6 +43,8 @@ By default, Unix state lives under `$HOME/.agenttab`; Windows uses `%LOCALAPPDAT
 
 `state.sqlite3` uses WAL, full synchronous writes, foreign keys, and a busy timeout. It stores only hashes of resume capabilities and staged tokens. It also stores task ownership, monotonic page-revision floors, native-event receipts, staged Commit bindings, and idempotency entries.
 
+A task stays resumable after its last connection detaches. The host closes a task once it has had no connection, owned tab, or staged Commit for 24 hours, checking at startup and before each mutation, and deletes closed tasks 24 hours after they close. Resuming a closed task's capability starts a new task.
+
 Mutation idempotency is keyed by task and UUIDv7 key with a canonical method/parameter hash. The host records `started` before native dispatch and a terminal response after completion. A matching completed record replays the cached response. A durable started record after a crash returns `unknown` and is never re-executed. Terminal records are retained for seven days, with at most 10,000 records per task.
 
 `audit.jsonl` is a separate local audit record. It contains structural summaries and digests rather than raw request and result values. See [security.md](security.md) for the precise privacy implications.

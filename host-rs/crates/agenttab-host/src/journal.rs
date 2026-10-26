@@ -17,6 +17,10 @@ const IDEMPOTENCY_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const IDEMPOTENCY_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 const MAX_RECORDS_PER_TASK: i64 = 10_000;
 const CLOSED_TASK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+/// A task with no connection, tabs, or staged Commit that has been untouched this long
+/// is closed: resuming it could only recover an empty task, and a missing or closed
+/// capability already yields a fresh one.
+const IDLE_TASK_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_STAGE_LIFETIME_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Error)]
@@ -1267,6 +1271,20 @@ fn ensure_column(
 
 fn cleanup_expired_tasks(connection: &Connection, now: i64) -> Result<(), JournalError> {
     connection.execute(
+        "UPDATE tasks
+         SET state = 'closed', updated_at_ms = ?1, closed_at_ms = ?1
+         WHERE state = 'active'
+           AND active_connections = 0
+           AND pending_resume_hash IS NULL
+           AND tab_count = 0
+           AND updated_at_ms < ?2
+           AND NOT EXISTS (SELECT 1 FROM task_tabs WHERE task_tabs.task_id = tasks.task_id)
+           AND NOT EXISTS (
+               SELECT 1 FROM staged_commits WHERE staged_commits.task_id = tasks.task_id
+           )",
+        params![now, now - IDLE_TASK_RETENTION_MS],
+    )?;
+    connection.execute(
         "DELETE FROM tasks
          WHERE state = 'closed' AND closed_at_ms IS NOT NULL AND closed_at_ms < ?1",
         params![now - CLOSED_TASK_RETENTION_MS],
@@ -1475,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_task_remains_resumable_until_explicit_close() {
+    fn disconnected_task_remains_resumable_within_idle_retention() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_journal(&temp);
         let task = journal.create_task(None).unwrap();
@@ -1485,6 +1503,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed.task_id, task.task_id);
+    }
+
+    #[test]
+    fn idle_disconnected_task_without_tabs_closes_after_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = open_journal(&temp);
+        let idle = journal.create_task(None).unwrap();
+        journal.detach_connection(idle.task_id).unwrap();
+        let recent = journal.create_task(None).unwrap();
+        journal.detach_connection(recent.task_id).unwrap();
+        let connected = journal.create_task(None).unwrap();
+        let with_tab = journal.create_task(None).unwrap();
+        journal
+            .reconcile_inventory(&[owned_tab(with_tab.task_id, 1)])
+            .unwrap();
+        journal.detach_connection(with_tab.task_id).unwrap();
+        let stale = now_ms() - IDLE_TASK_RETENTION_MS - 1;
+        for task_id in [idle.task_id, connected.task_id, with_tab.task_id] {
+            journal
+                .connection
+                .lock()
+                .execute(
+                    "UPDATE tasks SET updated_at_ms = ?1 WHERE task_id = ?2",
+                    params![stale, task_id.to_string()],
+                )
+                .unwrap();
+        }
+
+        journal
+            .begin_mutation(recent.task_id, Uuid::now_v7(), RpcMethod::BrowserAct, "a")
+            .unwrap();
+
+        assert!(journal
+            .resume_task(&idle.resume_capability)
+            .unwrap()
+            .is_none());
+        for (task, label) in [
+            (&recent, "recently detached"),
+            (&connected, "connected"),
+            (&with_tab, "tab-owning"),
+        ] {
+            assert_eq!(
+                journal
+                    .resume_task(&task.resume_capability)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{label} task stays resumable"))
+                    .task_id,
+                task.task_id
+            );
+        }
     }
 
     #[test]
