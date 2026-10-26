@@ -3843,6 +3843,44 @@ describe("ownership and task isolation", () => {
     }
   });
 
+  test("an open that overran its hold cannot recreate a task that finished past it", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const create = chrome.tabs.create.bind(chrome.tabs);
+    try {
+      const ownership = new OwnershipLedger(
+        new MutationScheduler(),
+        new RevisionTracker(),
+        () => undefined,
+      );
+      const { promise: creationReleased, resolve: releaseCreation } = Promise.withResolvers<void>();
+      chrome.tabs.create = (async (options: Parameters<typeof chrome.tabs.create>[0]) => {
+        await creationReleased;
+        return create(options);
+      }) as typeof chrome.tabs.create;
+
+      const opening = ownership.open(TASK_B, { mode: "create", url: "https://example.test/late" });
+      opening.catch(() => undefined);
+      let finished: Record<string, unknown> | undefined;
+      void ownership.finishTask(TASK_B, "close").then((result) => {
+        finished = result;
+      });
+      await advanceTimers(0);
+      await advanceTimers(OWNERSHIP_OPERATION_HOLD_MS + 100);
+      expect(finished).toMatchObject({ task_id: TASK_B, finished: true });
+
+      releaseCreation();
+      await advanceTimers(0);
+      await expect(opening).rejects.toMatchObject({ code: "ownership_denied" });
+      expect((await readState()).tasks[TASK_B]).toBeUndefined();
+      expect(removedTabIds).toHaveLength(1);
+    } finally {
+      chrome.tabs.create = create as typeof chrome.tabs.create;
+      warn.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   test("explicit close preserves a tab that left its task group", async () => {
     await seedTask(TASK_A, [21, 22]);
     tabStore.get(22)!.groupId = -1;

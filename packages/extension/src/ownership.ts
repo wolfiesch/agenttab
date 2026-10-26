@@ -54,6 +54,11 @@ function groupTitle(task: TaskRecord, developerMode: boolean): string {
 export class OwnershipLedger {
   private readonly transitions = new BoundedChain("ownership", OWNERSHIP_OPERATION_HOLD_MS);
   private inventoryTail: Promise<void> = Promise.resolve();
+  /**
+   * Tasks finished or closed in this service worker. An ownership operation that overran its
+   * hold can still resume after cleanup ran past it; it must not recreate the task's record.
+   */
+  private readonly endedTaskIds = new Set<string>();
 
   constructor(
     private readonly scheduler: MutationScheduler,
@@ -484,6 +489,7 @@ export class OwnershipLedger {
       };
     }
     if (!task) {
+      this.endedTaskIds.add(taskId);
       return { task_id: taskId, finished: true, closed_tab_ids: [], retained_tab_ids: [] };
     }
     if (disposition === "auto" && state.cleanupPolicy === "ask") {
@@ -531,6 +537,7 @@ export class OwnershipLedger {
     for (const tabId of task.tabIds) this.scheduler.revokeTab(tabId);
     await mutateState((next) => {
       delete next.tasks[taskId];
+      this.endedTaskIds.add(taskId);
       for (const [token, staged] of Object.entries(next.stagedCommits)) {
         if (staged.task_id === taskId) delete next.stagedCommits[token];
       }
@@ -576,6 +583,7 @@ export class OwnershipLedger {
     if (!existing) {
       // Profile stages bind to the task, not a tab, so a task without tabs can still own one.
       await mutateState((state) => {
+        this.endedTaskIds.add(taskId);
         for (const [token, staged] of Object.entries(state.stagedCommits)) {
           if (staged.task_id === taskId) delete state.stagedCommits[token];
         }
@@ -584,6 +592,7 @@ export class OwnershipLedger {
     }
     for (const tabId of existing.tabIds) this.scheduler.revokeTab(tabId);
     const tabIds = await mutateState((state) => {
+      this.endedTaskIds.add(taskId);
       const task = state.tasks[taskId];
       if (!task) return [];
       const ownedTabIds = [...task.tabIds];
@@ -663,6 +672,11 @@ export class OwnershipLedger {
         );
         if (conflictingTask) {
           throw Object.assign(new Error("Tab ownership changed while grouping"), {
+            code: "ownership_denied",
+          });
+        }
+        if (!next.tasks[taskId] && this.endedTaskIds.has(taskId)) {
+          throw Object.assign(new Error("The AgentTab task already finished"), {
             code: "ownership_denied",
           });
         }
