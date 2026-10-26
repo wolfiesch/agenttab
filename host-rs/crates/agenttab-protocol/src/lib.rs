@@ -432,7 +432,9 @@ pub struct AccessibilityQuery {
 }
 
 // Serde's derived struct visitor also accepts sequences; the wire query must be an object.
-fn deserialize_accessibility_query<'de, D>(deserializer: D) -> Result<Option<AccessibilityQuery>, D::Error>
+fn deserialize_accessibility_query<'de, D>(
+    deserializer: D,
+) -> Result<Option<AccessibilityQuery>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -467,7 +469,11 @@ pub enum BrowserSnapshotParams {
         max_depth: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_nodes: Option<u32>,
-        #[serde(default, deserialize_with = "deserialize_accessibility_query", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_accessibility_query",
+            skip_serializing_if = "Option::is_none"
+        )]
         query: Option<AccessibilityQuery>,
     },
     Text {
@@ -3021,7 +3027,8 @@ mod tests {
                 "tab_id": 1, "mode": "accessibility", "frame_id": "frame-1",
                 "root_ref": "rt1.root", "max_nodes": 1, "query": query,
             });
-            let (_, parsed) = RpcRequest::parse(request("browser_snapshot", params.clone(), false)).unwrap();
+            let (_, parsed) =
+                RpcRequest::parse(request("browser_snapshot", params.clone(), false)).unwrap();
             assert_eq!(parsed.value(), params);
         }
         for query in [
@@ -3041,24 +3048,20 @@ mod tests {
             json!({"description": "message"}),
             json!({"role": "button", "extra": true}),
         ] {
-            assert!(
-                RpcRequest::parse(request(
-                    "browser_snapshot",
-                    json!({"tab_id": 1, "mode": "accessibility", "query": query}),
-                    false,
-                ))
-                .is_err()
-            );
+            assert!(RpcRequest::parse(request(
+                "browser_snapshot",
+                json!({"tab_id": 1, "mode": "accessibility", "query": query}),
+                false,
+            ))
+            .is_err());
         }
         for mode in ["text", "html", "screenshot"] {
-            assert!(
-                RpcRequest::parse(request(
-                    "browser_snapshot",
-                    json!({"tab_id": 1, "mode": mode, "query": {"role": "button"}}),
-                    false,
-                ))
-                .is_err()
-            );
+            assert!(RpcRequest::parse(request(
+                "browser_snapshot",
+                json!({"tab_id": 1, "mode": mode, "query": {"role": "button"}}),
+                false,
+            ))
+            .is_err());
         }
     }
 
