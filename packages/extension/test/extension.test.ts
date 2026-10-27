@@ -3496,12 +3496,18 @@ describe("page revision monotonicity", () => {
     expect(sensitive(field({ type: "text", name: "incidentId" }, "Incident"))).toBe(false);
     expect(sensitive(field({ type: "text", name: "shipping" }, "Shipping"))).toBe(false);
 
-    // Hard signals and whole-word names still require a handoff.
+    // Hard signals, secret names, and secret names joined to other words or digits still require a handoff.
     expect(sensitive(field({ type: "password", autocomplete: "new-password" }))).toBe(true);
     expect(sensitive(field({ type: "text", autocomplete: "current-password" }))).toBe(true);
     expect(sensitive(field({ type: "text", autocomplete: "new-password", name: "password" }))).toBe(true);
     expect(sensitive(field({ type: "text", name: "cardnumber" }))).toBe(true);
     expect(sensitive(field({ type: "text" }, "CID"))).toBe(true);
+    // A revealed password field: "show password" switches the type to text.
+    expect(sensitive(field({ type: "text", autocomplete: "new-password", name: "password2" }))).toBe(true);
+    expect(sensitive(field({ type: "text", id: "confirmpassword" }))).toBe(true);
+    expect(sensitive(field({ type: "text", name: "captchacode" }))).toBe(true);
+    expect(sensitive(field({ type: "text", name: "smsverificationcode" }))).toBe(true);
+    expect(sensitive(field({ type: "text", name: "cid2" }))).toBe(true);
   });
 
   test("rechecks inferred sensitivity immediately before mutation", async () => {

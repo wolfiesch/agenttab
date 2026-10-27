@@ -40,22 +40,26 @@ export function sensitiveFieldState(this: Element): SensitiveFieldState {
     ...accessible,
   ].filter(Boolean).join(" ");
   const descriptor = rawDescriptor.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const tokens = descriptor.split(" ");
+  const compactDescriptor = descriptor.replace(/\s+/g, "");
+  // Bare tokens without trailing digits, so "cid2" still reads as "cid".
+  const tokens = descriptor.split(" ").map((token) => token.replace(/\d+$/, ""));
   const tag = String(this.tagName || "").toUpperCase();
   const editable = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || control.isContentEditable === true ||
     role === "textbox" || role === "combobox" || role === "spinbutton";
-  // Whole words only: a substring match flags ordinary labels ("residual" contains "cid").
+  // Long terms are unambiguous, so they match inside joined names ("password2", "captchacode"). Short terms
+  // occur inside ordinary words ("residual" contains "cid"), so they must be a whole token.
   const namedSecret =
     /\b(password|otp|totp|mfa(?: code|token)?|2fa(?: code)?|(?:two|multi) factor (?:authentication )?(?:code|token)|one time (?:code|password)|verification code|authentication code|auth code|(?:re ?|h ?)?captcha|(?:cvv|cvc|cvn)\d*|cid|security code|card security code|card verification (?:value|code|number)|card number|credit card number|cc number|card (?:expiration|expiry) (?:date|month|year)|bank account number|routing number|iban)\b/
       .test(descriptor) ||
     [
-      "password", "onetimecode", "onetimepassword", "verificationcode", "authenticationcode", "authcode", "totp",
-      "2fa", "2facode", "twofactorcode", "twofactortoken", "twofactorauthenticationcode", "multifactorcode",
-      "multifactortoken", "multifactorauthenticationcode", "captcha", "cid", "securitycode",
+      "password", "onetimecode", "onetimepassword", "verificationcode", "authenticationcode", "authcode",
+      "2facode", "twofactorcode", "twofactortoken", "twofactorauthenticationcode", "multifactorcode",
+      "multifactortoken", "multifactorauthenticationcode", "captcha", "securitycode",
       "cardverificationvalue", "cardverificationcode", "cardverificationnumber", "cardnumber", "creditcardnumber",
       "ccnumber", "cardsecuritycode", "cardexpirationdate", "cardexpirationmonth", "cardexpirationyear",
       "cardexpirydate", "cardexpirymonth", "cardexpiryyear", "bankaccountnumber", "routingnumber",
-    ].some((term) => tokens.includes(term));
+    ].some((term) => compactDescriptor.includes(term)) ||
+    ["cid", "2fa", "totp"].some((term) => tokens.includes(term));
   const tokenSecret = /\b(pin|passcode)\b/.test(descriptor);
   // `autocomplete="new-password"` is not a signal on its own: sites put it on ordinary text inputs to stop
   // browser autofill. A real new-password field is still caught by `type="password"` or its name.
