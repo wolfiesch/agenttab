@@ -20,6 +20,7 @@ import {
   type PageAgentRequest,
 } from "../src/page-agent-protocol";
 import { installPageAgent } from "../src/page-agent";
+import { sensitiveFieldState } from "../src/sensitive-field";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
@@ -3476,6 +3477,31 @@ describe("page revision monotonicity", () => {
 
     expect(mutationCalls).toBe(0);
     expect((await readState()).stagedCommits).toEqual({});
+  });
+
+  test("does not treat autofill-suppressed or merely similar fields as sensitive", () => {
+    const field = (attributes: Record<string, string>, label = "") => ({
+      tagName: "INPUT",
+      id: attributes.id ?? "",
+      labels: label ? [{ innerText: label }] : [],
+      ownerDocument: { getElementById() { return null; } },
+      getAttribute(name: string) { return attributes[name] ?? null; },
+    }) as unknown as Element;
+    const sensitive = (element: Element) => sensitiveFieldState.call(element).sensitiveField;
+
+    // Portals put autocomplete="new-password" on plain text inputs to stop browser autofill.
+    expect(sensitive(field({ type: "text", autocomplete: "new-password", id: "field-r5__control" }, "City"))).toBe(false);
+    // Secret words embedded in ordinary words are not secrets.
+    expect(sensitive(field({ type: "text", name: "residualValue" }, "Residual value"))).toBe(false);
+    expect(sensitive(field({ type: "text", name: "incidentId" }, "Incident"))).toBe(false);
+    expect(sensitive(field({ type: "text", name: "shipping" }, "Shipping"))).toBe(false);
+
+    // Hard signals and whole-word names still require a handoff.
+    expect(sensitive(field({ type: "password", autocomplete: "new-password" }))).toBe(true);
+    expect(sensitive(field({ type: "text", autocomplete: "current-password" }))).toBe(true);
+    expect(sensitive(field({ type: "text", autocomplete: "new-password", name: "password" }))).toBe(true);
+    expect(sensitive(field({ type: "text", name: "cardnumber" }))).toBe(true);
+    expect(sensitive(field({ type: "text" }, "CID"))).toBe(true);
   });
 
   test("rechecks inferred sensitivity immediately before mutation", async () => {

@@ -40,10 +40,11 @@ export function sensitiveFieldState(this: Element): SensitiveFieldState {
     ...accessible,
   ].filter(Boolean).join(" ");
   const descriptor = rawDescriptor.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const compactDescriptor = descriptor.replace(/\s+/g, "");
+  const tokens = descriptor.split(" ");
   const tag = String(this.tagName || "").toUpperCase();
   const editable = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || control.isContentEditable === true ||
     role === "textbox" || role === "combobox" || role === "spinbutton";
+  // Whole words only: a substring match flags ordinary labels ("residual" contains "cid").
   const namedSecret =
     /\b(password|otp|totp|mfa(?: code|token)?|2fa(?: code)?|(?:two|multi) factor (?:authentication )?(?:code|token)|one time (?:code|password)|verification code|authentication code|auth code|(?:re ?|h ?)?captcha|(?:cvv|cvc|cvn)\d*|cid|security code|card security code|card verification (?:value|code|number)|card number|credit card number|cc number|card (?:expiration|expiry) (?:date|month|year)|bank account number|routing number|iban)\b/
       .test(descriptor) ||
@@ -54,11 +55,13 @@ export function sensitiveFieldState(this: Element): SensitiveFieldState {
       "cardverificationvalue", "cardverificationcode", "cardverificationnumber", "cardnumber", "creditcardnumber",
       "ccnumber", "cardsecuritycode", "cardexpirationdate", "cardexpirationmonth", "cardexpirationyear",
       "cardexpirydate", "cardexpirymonth", "cardexpiryyear", "bankaccountnumber", "routingnumber",
-    ].some((term) => compactDescriptor.includes(term));
+    ].some((term) => tokens.includes(term));
   const tokenSecret = /\b(pin|passcode)\b/.test(descriptor);
+  // `autocomplete="new-password"` is not a signal on its own: sites put it on ordinary text inputs to stop
+  // browser autofill. A real new-password field is still caught by `type="password"` or its name.
   const sensitiveField = type === "password" ||
     autocomplete.some((token) =>
-      token === "current-password" || token === "new-password" || token === "one-time-code" ||
+      token === "current-password" || token === "one-time-code" ||
       token === "webauthn" || token.startsWith("cc-")) ||
     (editable && (namedSecret || tokenSecret));
   return { sensitiveField, associated, accessible };
