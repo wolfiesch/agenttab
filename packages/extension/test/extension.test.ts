@@ -3508,6 +3508,8 @@ describe("page revision monotonicity", () => {
     expect(sensitive(field({ type: "text", name: "captchacode" }))).toBe(true);
     expect(sensitive(field({ type: "text", name: "smsverificationcode" }))).toBe(true);
     expect(sensitive(field({ type: "text", name: "cid2" }))).toBe(true);
+    expect(sensitive(field({ type: "text", name: "totpcode" }))).toBe(true);
+    expect(sensitive(field({ type: "text", name: "2fatoken" }))).toBe(true);
   });
 
   test("rechecks inferred sensitivity immediately before mutation", async () => {

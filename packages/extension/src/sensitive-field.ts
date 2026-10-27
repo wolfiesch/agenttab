@@ -53,7 +53,8 @@ export function sensitiveFieldState(this: Element): SensitiveFieldState {
       .test(descriptor) ||
     [
       "password", "onetimecode", "onetimepassword", "verificationcode", "authenticationcode", "authcode",
-      "2facode", "twofactorcode", "twofactortoken", "twofactorauthenticationcode", "multifactorcode",
+      "totpcode", "totptoken", "2facode", "2fatoken", "twofactorcode", "twofactortoken", "twofactorauthenticationcode",
+      "multifactorcode",
       "multifactortoken", "multifactorauthenticationcode", "captcha", "securitycode",
       "cardverificationvalue", "cardverificationcode", "cardverificationnumber", "cardnumber", "creditcardnumber",
       "ccnumber", "cardsecuritycode", "cardexpirationdate", "cardexpirationmonth", "cardexpirationyear",
