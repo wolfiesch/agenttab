@@ -62,7 +62,7 @@ export function debuggerUnavailableError(cause: unknown, operation?: string): Er
       outcome: "not_started",
       reason,
       cause,
-      recovery: "Snapshots, element actions, credential fills, and load, URL, text, selector, and value waits use AgentTab's scripting route on this tab. Frame-scoped control, drag, file upload, dialogs, downloads, network-idle waits, and full-page or background-tab screenshots need the debugger; they work again once the condition Chrome reports clears, such as another extension's frame on the page or open DevTools.",
+      recovery: "Snapshots, element actions, credential and email code fills, and load, URL, text, selector, and value waits use AgentTab's scripting route on this tab. Frame-scoped control, drag, file upload, dialogs, downloads, network-idle waits, and full-page or background-tab screenshots need the debugger; they work again once the condition Chrome reports clears, such as another extension's frame on the page or open DevTools.",
     },
   );
 }

@@ -17,6 +17,7 @@ import {
   SCREENSHOT_MAX_BYTES,
   SNAPSHOT_TEXT_MAX_BYTES,
   randomToken,
+  type EmailCodeFillRequest,
   sha256Hex,
   type StagedCommit,
   type StagedDialog,
@@ -57,6 +58,13 @@ import { mutateState, readState } from "./storage";
 import { sensitiveFieldState } from "./sensitive-field";
 import { removeTabs } from "./tab-removal";
 import {
+  assertEmailCodeFilled,
+  EMAIL_CODE_FILL_DECLARATION,
+  emailCodeError,
+  sanitizeEmailCodeFailure,
+} from "./email-code-fill";
+import type { EmailCodePageExpectation } from "./email-code-page";
+import {
   PAGE_AGENT_FILE,
   PAGE_AGENT_GLOBAL,
   PAGE_AGENT_VERSION,
@@ -80,6 +88,8 @@ const DEBUGGER_IDLE_MS = 30_000;
 const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
 // Scripting-route refs always name the tab's top document.
 const SCRIPTING_FRAME_ID = "scripting:top";
+/** CDP object group holding the email code targets for one fill; released after the page call. */
+const EMAIL_CODE_OBJECT_GROUP = "agenttab-email-code";
 /** Overall time a challenge scan may add to one result; an overrun omits `challenge`. */
 const CHALLENGE_SCAN_BUDGET_MS = 250;
 /** Minimum spacing between the starts of two scans inside a `challenge_cleared` wait. */
@@ -1800,6 +1810,135 @@ export class StandardBrowserRuntime {
       filled_fields: fields.length,
       ...(scripted ? { page_route: "scripting" } : {}),
     };
+  }
+
+  /**
+   * Fills a host-resolved email verification code into the approved page's code
+   * inputs without submitting. The tab, page revision, every ref, the target
+   * frame, and the page's verification context are checked before the first
+   * character; the page function then checks the exact origin, path, and every
+   * target again around each write and takes the code back if any check fails.
+   * Every failure carries fixed text only.
+   */
+  async fillEmailCode(
+    taskId: string,
+    tabId: number,
+    request: EmailCodeFillRequest,
+  ): Promise<Record<string, unknown>> {
+    let writeAttempted = false;
+    try {
+      await this.authorizeDebuggerUse(tabId);
+      const pageRevision = await this.revisions.assertExpected(tabId, request.expected_page_revision);
+      await this.requireFullAutomationRoute(tabId, "fill an email verification code");
+      const expectation: EmailCodePageExpectation = {
+        origin: request.expected_origin,
+        path: request.expected_path,
+        recipient: request.recipient,
+      };
+      await this.assertEmailCodePage(tabId, expectation);
+      if ((await this.guardEpisode(taskId, tabId, pageRevision, { first: true })) !== undefined) {
+        throw emailCodeError("challenge_active", "not_started");
+      }
+      const targets: ResolvedTarget[] = [];
+      for (const field of request.fields) {
+        await this.revisions.assertExpected(tabId, pageRevision);
+        targets.push(await this.resolveTarget(tabId, { taskId, pageRevision, ref: field.ref }));
+      }
+      const [first] = targets;
+      if (
+        targets.some((target) =>
+          target.route !== first.route || target.documentId !== first.documentId || target.frameId !== first.frameId) ||
+        new Set(targets.map((target) => target.backendNodeId)).size !== targets.length
+      ) {
+        throw emailCodeError("email_code_target_invalid", "not_started");
+      }
+      // Scripting refs always name the top document; debugger refs may name a child frame.
+      if (first.route !== "scripting") {
+        const topFrame = await this.frameIdentity(tabId);
+        if (first.frameId !== topFrame.frameId) {
+          const targetFrame = await this.frameIdentity(tabId, first.frameId);
+          let frameOrigin: string | undefined;
+          try {
+            frameOrigin = targetFrame.url === undefined ? undefined : new URL(targetFrame.url).origin;
+          } catch {
+            frameOrigin = undefined;
+          }
+          if (frameOrigin !== expectation.origin) {
+            throw emailCodeError("cross_origin_credentials_forbidden", "not_started");
+          }
+        }
+      }
+      const values = request.fields.map((field) => field.value);
+      await this.revisions.assertExpected(tabId, pageRevision);
+      await this.assertEmailCodePage(tabId, expectation);
+      if (first.route === "scripting") {
+        writeAttempted = true;
+        const { value } = await this.runPageAgent(tabId, {
+          op: "email_code_fill",
+          ids: targets.map((target) => target.backendNodeId),
+          values,
+          expectation,
+        }, first.documentId);
+        assertEmailCodeFilled(value, values.length);
+      } else {
+        try {
+          const objectIds: string[] = [];
+          for (const target of targets) {
+            let resolved: Record<string, unknown>;
+            try {
+              resolved = await this.send(tabId, "DOM.resolveNode", {
+                backendNodeId: target.backendNodeId,
+                objectGroup: EMAIL_CODE_OBJECT_GROUP,
+                ...(target.contextId !== undefined ? { executionContextId: target.contextId } : {}),
+              }, false, first.sessionId);
+            } catch {
+              throw emailCodeError("stale_ref", "not_started");
+            }
+            if (!isRecord(resolved.object) || typeof resolved.object.objectId !== "string") {
+              throw emailCodeError("stale_ref", "not_started");
+            }
+            objectIds.push(resolved.object.objectId);
+          }
+          writeAttempted = true;
+          const invoked = await this.send(tabId, "Runtime.callFunctionOn", {
+            objectId: objectIds[0],
+            functionDeclaration: EMAIL_CODE_FILL_DECLARATION,
+            arguments: [{ value: expectation }, { value: values }, ...objectIds.map((objectId) => ({ objectId }))],
+            awaitPromise: false,
+            returnByValue: true,
+            userGesture: false,
+          }, false, first.sessionId);
+          if (isRecord(invoked.exceptionDetails)) throw emailCodeError("email_code_fill_failed", "unknown");
+          assertEmailCodeFilled(isRecord(invoked.result) ? invoked.result.value : undefined, values.length);
+        } finally {
+          await this.send(tabId, "Runtime.releaseObjectGroup", { objectGroup: EMAIL_CODE_OBJECT_GROUP }, false, first.sessionId)
+            .catch(() => undefined);
+        }
+      }
+      return {
+        tab_id: tabId,
+        page_revision: await this.revisions.current(tabId),
+        filled_fields: values.length,
+      };
+    } catch (error) {
+      const staleBeforeWrite = isRecord(error) && error.code === "stale_ref";
+      throw sanitizeEmailCodeFailure(error, writeAttempted && !staleBeforeWrite ? "unknown" : "not_started");
+    }
+  }
+
+  /** The tab, including any navigation in flight, is on the exact approved origin and pathname. */
+  private async assertEmailCodePage(tabId: number, expectation: EmailCodePageExpectation): Promise<void> {
+    const tab = await chrome.tabs.get(tabId);
+    const rawUrl = tab.pendingUrl ?? tab.url;
+    let url: URL | null = null;
+    try {
+      url = typeof rawUrl === "string" ? new URL(rawUrl) : null;
+    } catch {
+      url = null;
+    }
+    if (url === null || url.origin !== expectation.origin || url.pathname !== expectation.path) {
+      throw emailCodeError("email_code_page_mismatch", "not_started");
+    }
   }
 
   async bindReview(taskId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {

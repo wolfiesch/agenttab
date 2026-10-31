@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod credentials;
+pub mod email_codes;
 pub mod guardrails;
 pub mod journal;
 pub mod lifecycle;

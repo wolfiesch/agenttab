@@ -506,6 +506,7 @@ function installChrome(): void {
       runtime: {
         id: EXTENSION_ID,
         getManifest() { return { version: "2.0.0" }; },
+        getURL(path: string) { return `chrome-extension://${EXTENSION_ID}/${path}`; },
         connectNative() {
           if (!nativePort) throw new Error("native host unavailable");
           return nativePort;
@@ -1147,7 +1148,8 @@ describe("browser_profile through the extension entrypoint", () => {
     const listener = listeners.get("runtime.onMessage")?.at(-1);
     if (!listener) throw new Error("popup listener is unavailable");
     const { promise, resolve } = Promise.withResolvers<unknown>();
-    listener(message, { id: EXTENSION_ID }, resolve);
+    // The popup page's sender: this extension, its popup URL, and no tab.
+    listener(message, { id: EXTENSION_ID, url: `chrome-extension://${EXTENSION_ID}/popup.html` }, resolve);
     return promise;
   }
 

@@ -172,6 +172,68 @@ number of origin-matching Login items, unavailable CLI state, or an unsupported
 verification step returns control to the user instead of trying additional
 credentials.
 
+## Email verification broker
+
+Email verification is opt-in and independent of 1Password. Use an already
+authenticated `gws` Gmail CLI; AgentTab does not install it, configure its
+authentication, or change the mailbox. Add `email_codes` to the existing
+owner-only policy, preserving any other settings:
+
+```json
+{
+  "email_codes": {
+    "enabled": true,
+    "executable": "/absolute/path/to/gws",
+    "mailbox": "owner@example.test",
+    "max_age_ms": 600000,
+    "timeout_ms": 30000,
+    "grants": [
+      {
+        "origin": "https://accounts.service.example",
+        "paths": ["/signup/verify-email"],
+        "recipient": "member@example.test",
+        "purposes": ["signup"],
+        "sender_domains": ["service.example"],
+        "relay_senders": [],
+        "code_pattern": "\\b([A-Z0-9]{6})\\b"
+      }
+    ]
+  }
+}
+```
+
+Replace the example executable and addresses with the approved local values.
+Origins and pathnames are exact, with no wildcards or prefixes. Use only
+`signup` or `email_sign_in`; MFA, authenticator, passkey, and recovery paths
+are not eligible. Each code pattern needs exactly one capture group yielding
+4 to 12 ASCII letters or digits. `max_age_ms` must be 30000 through 900000;
+`timeout_ms` must be 5000 through 120000. Reload the extension to restart
+the native host after a policy change.
+
+Select a message ID for the expected verification email, including Spam when
+appropriate. Call `browser_credentials` with `action: "fill_email"`, the owned
+`tab_id`, current `expected_page_revision`, `message_id`, exact `recipient`,
+`purpose`, and `otp_refs`. Provide one ref for a complete-code input or one
+ref per code character in document order. Never include the code, an origin,
+a credential token, or a Gmail query. The host verifies the mailbox, sender,
+recipient, freshness, and code before filling. The result contains only fill
+metadata. Use `browser_act` for explicit submission. Inspect the page
+before retrying an `unknown` result. On auto-submitting forms, you can
+complete verification as soon as the last character is entered.
+
+A compatible masked recipient is accepted automatically when it fits the exact
+granted recipient and no conflicting address is shown. Every ASCII `*` mask
+on the page must be the same bounded mask. `fill_email` enters the code
+directly, with no staged review, popup approval, or `browser_commit` step.
+An absent or incompatible recipient is refused before any write. Password,
+MFA, passkey, and human-challenge safeguards still apply.
+
+For forwarding, allow only an exact trusted relay address and review the
+[relay trust boundary](security.md#email-verification-broker). Unsupported or
+ambiguous messages fail closed. Existing password, MFA, and human-verification
+handoff requirements remain unchanged. Load matching host and extension
+builds and start a fresh adapter session when adding this action.
+
 ## Migration from Chrome Bridge v1.0.1
 
 AgentTab v2 is side-by-side and recoverable:

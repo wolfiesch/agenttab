@@ -1,6 +1,7 @@
+use crate::email_codes::EmailCodePolicy;
 use agenttab_protocol::{
-    BrowserAction, BrowserOpenParams, BrowserProfileParams, MethodParams, NativeOriginPolicy,
-    RpcError, RpcMethod,
+    BrowserAction, BrowserCredentialsParams, BrowserOpenParams, BrowserProfileParams, MethodParams,
+    NativeOriginPolicy, RpcError, RpcMethod,
 };
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
@@ -37,6 +38,8 @@ pub enum GuardrailLoadError {
     },
     #[error("invalid 1Password policy: {0}")]
     InvalidOnePasswordPolicy(String),
+    #[error("invalid email code policy: {0}")]
+    InvalidEmailCodePolicy(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,6 +76,7 @@ struct Policy {
     dlp_max_file_bytes: u64,
     redact_patterns: Vec<String>,
     one_password: OnePasswordPolicy,
+    email_codes: EmailCodePolicy,
 }
 
 impl Default for Policy {
@@ -85,6 +89,7 @@ impl Default for Policy {
             dlp_allowed_roots: Vec::new(),
             dlp_max_file_bytes: DEFAULT_DLP_MAX_FILE_BYTES,
             one_password: OnePasswordPolicy::default(),
+            email_codes: EmailCodePolicy::default(),
             redact_patterns: Vec::new(),
         }
     }
@@ -150,6 +155,10 @@ impl Guardrails {
                 "executable must be an absolute path".into(),
             ));
         }
+        policy
+            .email_codes
+            .validate()
+            .map_err(GuardrailLoadError::InvalidEmailCodePolicy)?;
         let mut patterns = vec![
             r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}\b".to_string(),
             r"\b\d{3}-\d{2}-\d{4}\b".to_string(),
@@ -179,6 +188,10 @@ impl Guardrails {
         &self.policy.one_password
     }
 
+    pub fn email_code_policy(&self) -> &EmailCodePolicy {
+        &self.policy.email_codes
+    }
+
     pub fn authorize(&self, method: RpcMethod, params: &MethodParams) -> Result<(), RpcError> {
         if method == RpcMethod::BrowserDeveloper && !self.policy.developer_enabled {
             return Err(RpcError::new(
@@ -187,12 +200,27 @@ impl Guardrails {
             )
             .with_recovery("Enable Developer mode in AgentTab's managed local policy."));
         }
-        if method == RpcMethod::BrowserCredentials && !self.policy.one_password.enabled {
-            return Err(RpcError::new(
-                "credential_provider_disabled",
-                "1Password credential filling is disabled by AgentTab policy",
-            )
-            .with_recovery("Enable one_password in AgentTab's managed local policy."));
+        if method == RpcMethod::BrowserCredentials {
+            if matches!(
+                params,
+                MethodParams::Credentials(BrowserCredentialsParams::FillEmail { .. })
+            ) {
+                if !self.policy.email_codes.enabled {
+                    return Err(RpcError::new(
+                        "email_code_provider_disabled",
+                        "Email verification code filling is disabled by AgentTab policy",
+                    )
+                    .with_recovery(
+                        "Enable email_codes with an exact grant in AgentTab's managed local policy.",
+                    ));
+                }
+            } else if !self.policy.one_password.enabled {
+                return Err(RpcError::new(
+                    "credential_provider_disabled",
+                    "1Password credential filling is disabled by AgentTab policy",
+                )
+                .with_recovery("Enable one_password in AgentTab's managed local policy."));
+            }
         }
 
         match params {
@@ -741,6 +769,116 @@ mod tests {
         })
         .unwrap();
         assert!(!disabled.one_password_policy().enabled);
+    }
+
+    fn email_code_policy_json(enabled: bool) -> Value {
+        json!({
+            "enabled": enabled,
+            "executable": "/opt/fixture/bin/gws",
+            "mailbox": "synthetic.owner@gmail.com",
+            "grants": [{
+                "origin": "https://id.service.example",
+                "paths": ["/signup/verify-email/otp"],
+                "recipient": "member-alias@relay.example",
+                "purposes": ["signup"],
+                "sender_domains": ["service.example"],
+                "relay_senders": ["forwarder@relay.example"],
+                "code_pattern": "code is ([A-Z0-9]{6})"
+            }]
+        })
+    }
+
+    fn credentials_requests() -> (MethodParams, MethodParams) {
+        let prepare = MethodParams::Credentials(BrowserCredentialsParams::Prepare {
+            tab_id: 4,
+            expected_page_revision: 9,
+        });
+        let fill_email = MethodParams::Credentials(BrowserCredentialsParams::FillEmail {
+            tab_id: 4,
+            expected_page_revision: 9,
+            message_id: "18c0ffee0000abcd".into(),
+            recipient: "member-alias@relay.example".into(),
+            purpose: "signup".into(),
+            otp_refs: vec!["e1".into()],
+        });
+        (prepare, fill_email)
+    }
+
+    #[test]
+    fn email_code_filling_is_gated_separately_from_one_password() {
+        let (prepare, fill_email) = credentials_requests();
+
+        let defaults = Guardrails::defaults();
+        assert!(!defaults.email_code_policy().enabled);
+        assert!(defaults
+            .authorize(RpcMethod::BrowserCredentials, &prepare)
+            .is_ok());
+        let refused = defaults
+            .authorize(RpcMethod::BrowserCredentials, &fill_email)
+            .unwrap_err();
+        assert_eq!(refused.code, "email_code_provider_disabled");
+
+        let email_only: Policy = serde_json::from_value(json!({
+            "one_password": { "enabled": false },
+            "email_codes": email_code_policy_json(true)
+        }))
+        .unwrap();
+        let email_only = Guardrails::from_policy(email_only).unwrap();
+        assert!(email_only.email_code_policy().enabled);
+        assert_eq!(email_only.email_code_policy().grants.len(), 1);
+        assert!(email_only
+            .authorize(RpcMethod::BrowserCredentials, &fill_email)
+            .is_ok());
+        assert_eq!(
+            email_only
+                .authorize(RpcMethod::BrowserCredentials, &prepare)
+                .unwrap_err()
+                .code,
+            "credential_provider_disabled"
+        );
+    }
+
+    #[test]
+    fn invalid_email_code_policy_fails_load_without_echoing_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy.json");
+        let mut email_codes = email_code_policy_json(true);
+        email_codes["grants"][0]["paths"] = json!(["/account/two-factor/verify"]);
+        fs::write(&path, json!({ "email_codes": email_codes }).to_string()).unwrap();
+        let error = Guardrails::load(&path).unwrap_err();
+        assert!(matches!(
+            error,
+            GuardrailLoadError::InvalidEmailCodePolicy(_)
+        ));
+        let rendered = error.to_string();
+        assert!(!rendered.contains("two-factor"));
+        assert!(!rendered.contains("member-alias"));
+
+        let mut email_codes = email_code_policy_json(false);
+        email_codes["grants"][0]["origin"] = json!("https://*.service.example");
+        fs::write(&path, json!({ "email_codes": email_codes }).to_string()).unwrap();
+        assert!(matches!(
+            Guardrails::load(&path).unwrap_err(),
+            GuardrailLoadError::InvalidEmailCodePolicy(_)
+        ));
+
+        fs::write(
+            &path,
+            json!({ "email_codes": { "enabled": false, "search_query": "in:anywhere" } })
+                .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Guardrails::load(&path).unwrap_err(),
+            GuardrailLoadError::InvalidPolicy(_)
+        ));
+
+        fs::write(
+            &path,
+            json!({ "email_codes": email_code_policy_json(true) }).to_string(),
+        )
+        .unwrap();
+        assert!(Guardrails::load(&path).unwrap().email_code_policy().enabled);
     }
 
     #[test]

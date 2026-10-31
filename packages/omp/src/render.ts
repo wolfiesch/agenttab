@@ -269,6 +269,9 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
     }
     case "browser_credentials": {
       const action = fieldString(args, "action") ?? "prepare";
+      if (action === "fill_email") {
+        return { title: "Fill email verification code", meta: "code stays hidden" };
+      }
       return {
         title: action === "prepare"
           ? "Prepare 1Password credentials"
@@ -519,7 +522,7 @@ function summarizeResult(
         const count = fieldNumber(result, "candidate_count") ?? 0;
         return `${count} matching login${count === 1 ? "" : "s"} ready`;
       }
-      if (credentialStatus === "filled") return "Credentials filled";
+      if (credentialStatus === "filled") return result.filled_email_code === true ? "Email code filled" : "Credentials filled";
       return credentialStatus ? humanize(credentialStatus) : "Credential action completed";
     }
     case "browser_commit":

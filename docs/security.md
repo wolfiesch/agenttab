@@ -27,7 +27,7 @@ Standard mode exposes exactly these ten MCP tools:
 
 Developer mode additionally exposes `browser_developer`. It is disabled by default in the host's local managed policy and is visibly marked on a task. Developer mode is intentionally a broader trust decision.
 
-Standard mode has no raw CDP method, arbitrary JavaScript API, raw cookie or storage API, coordinate action, generic browser-global mutation API, or credential-value API. The narrow exceptions are `browser_open` with `placement: "new_window"`, which creates one unfocused normal window for the first tab of an empty task; `browser_credentials`, which passes an origin-matched login field from 1Password directly to a selected field ref without returning the value; and `browser_profile`, which offers a fixed list of bookmark, history, session, and download operations described below. Internally, the extension uses Chrome debugging APIs for task-scoped accessibility snapshots and precise ref-based actions. Those implementation details are not a Standard-mode escape hatch.
+Standard mode has no raw CDP method, arbitrary JavaScript API, raw cookie or storage API, coordinate action, generic browser-global mutation API, or credential-value API. The narrow exceptions are `browser_open` with `placement: "new_window"`, which creates one unfocused normal window for the first tab of an empty task; `browser_credentials`, for private origin-matched 1Password fills or explicitly granted email-verification fills; and `browser_profile`, for the fixed bookmark, history, session, and download operations described below. Credential values are never returned. Internally, the extension uses Chrome debugging APIs for task-scoped accessibility snapshots and precise ref-based actions. Those implementation details are not a Standard-mode escape hatch.
 
 Passkeys, security keys, CAPTCHA, payment secrets, account recovery, and unsupported verification require `browser_handoff`. The human completes the step in Chrome; no secret is placed in an AgentTab request.
 
@@ -38,6 +38,26 @@ The broker is available unless `policy.json` sets `one_password.enabled` to `fal
 `one_password.max_candidates` and `one_password.max_attempts` are each restricted to `1..3`. More than the configured candidate limit returns `needs_user` without selecting or exposing an item. A prepared attempt receives a random, short-lived token bound to the task, tab, origin, candidate position, and attempt count. Tokens are one-use for fill or advance, expire after five minutes, and are invalidated by navigation.
 
 The host invokes the absolute `one_password.executable` when configured, or `op` from its process `PATH` otherwise. JSON output is captured in memory. The broker selects only username, password, and one-time-code fields, then sends them through the private host-to-extension credential method. Core RPC, MCP, OMP, Pi, and audit responses contain only candidate counts, booleans, attempt counters, and opaque tokens. Credential values are neither serialized into an adapter request nor written to audit output. A 1Password authentication timeout, no match, unsupported item, provider failure, exhausted attempts, or ambiguous candidate set returns `needs_user`.
+
+## Email verification broker
+
+Email verification is disabled by default and independent of the 1Password policy. Set an owner-managed `email_codes` grant for an exact origin, pathname, recipient, purpose, and sender domain before using `browser_credentials` with `action: "fill_email"`. Supported purposes are signup and email sign-in, not MFA, account recovery, or password entry.
+
+The host derives the origin and pathname from its verified task-tab inventory, checks the grant before reading mail, verifies the active Gmail mailbox, and reads exactly the supplied message ID through the configured absolute `gws` executable. No mailbox search, mutation, or authentication setup occurs. Require a fresh message, Gmail's topmost `Authentication-Results`, aligned passing DKIM and DMARC, an allowed sender, the exact recipient, and one unambiguous code. Messages in Spam retain these same checks; drafts, sent mail, and trash are ineligible.
+
+The code passes only over the private host-to-extension channel. Before writing, the extension checks task ownership, the current revision, exact origin and pathname, same-origin frames, every ref, and visible email-verification context for the intended recipient. Password, MFA, passkey, and human-challenge forms are refused. Recheck the origin, pathname, and target integrity around each write; stop and attempt to restore prior values if the page changes. A failure after input may have reached page listeners is `unknown`. On auto-submitting forms, you can complete verification during the final input event. Inspect the page before retrying an `unknown` result.
+
+The public request contains message metadata and ordered refs, never a code value or caller-supplied origin. Only sanitized outcomes and fill metadata are returned. Use `browser_act` for explicit submission, preserving normal Commit review. See [setup](setup.md#email-verification-broker) for the policy fields.
+
+A compatible ASCII `*` masked recipient is accepted automatically when it fits the exact granted recipient and no conflicting address is shown. Every ASCII `*` mask on the page must be the same bounded mask; the page must not display another full address that could match it. `fill_email` fills the code directly, without staging, popup approval, or `browser_commit`.[^email-mask]
+
+Failure responses retain only allowlisted reason codes with fixed host-generated messages and recovery text. `email_code_recipient_unverified` means the page lacks an exact full recipient or a compatible mask. An absent or incompatible recipient remains refused before any write. Refreshing refs does not resolve missing recipient proof. Native error messages and details never cross this boundary.
+
+Trusted forwarding requires an exact `relay_senders` address and an allowed original-sender domain in `Reply-To`, plus the intended recipient in the forwarded message.[^email-relay]
+
+[^email-relay]: Gmail authenticates the relay's From domain. A relay's claimed original sender is not a separate cryptographic authentication of that sender; configure a relay only when you trust its forwarding and recipient attribution.
+
+[^email-mask]: A compatible mask is not proof of an exact recipient on its own. Acceptance also requires the exact managed grant and a fresh authenticated message for that recipient; it does not override password, MFA, passkey, or human-challenge safeguards.
 
 ## Permissions
 
@@ -87,7 +107,7 @@ Before a Standard mutation, the extension prepares the target, classifies recogn
 
 Commit is an optional, best-effort semantic barrier, not proof that an action is harmless. In review mode it requires two distinct events: human approval in the popup and the agent's later Commit request. A page can hide an external effect behind an innocent label, alter meaning through script, or use an effect AgentTab does not recognize. Harmless-looking controls may execute without review. Batches are sequential and non-atomic: review mode stops before a staged action and never runs later actions implicitly.
 
-YOLO mode is enabled by default. It bypasses only Commit review. Task ownership, origin policy, expected revisions, restricted-origin routing, credential isolation, and action validation remain enforced. Turning YOLO mode on discards pending staged actions; turning it off restores the two-party Commit flow. YOLO mode never skips review for `browser_profile` bookmark removal.
+YOLO mode is enabled by default. It bypasses only optional Commit review. Task ownership, origin policy, expected revisions, restricted-origin routing, credential isolation, and action validation remain enforced. Turning YOLO mode on discards pending staged actions; turning it off restores the two-party Commit flow. Always obtain popup approval for `browser_profile` bookmark removal.
 
 ## Attention notices
 

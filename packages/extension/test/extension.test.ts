@@ -5,7 +5,12 @@ import { NativeBridge, RECONNECT_ALARM } from "../src/native";
 import { BoundedChain } from "../src/bounded";
 import { OWNERSHIP_OPERATION_HOLD_MS, OwnershipLedger } from "../src/ownership";
 import { TAB_REMOVAL_WAIT_MS } from "../src/tab-removal";
-import { parseCommand, parseInboundNativeMessage, type NativeOriginPolicy } from "../src/protocol";
+import {
+  parseCommand,
+  parseInboundNativeMessage,
+  type EmailCodeFillRequest,
+  type NativeOriginPolicy,
+} from "../src/protocol";
 import { RevisionTracker } from "../src/revisions";
 import { automationRoute, normalizeRestrictedOriginError } from "../src/routes";
 import { MutationScheduler } from "../src/scheduler";
@@ -13,6 +18,8 @@ import { IdempotentStartup, STARTUP_OPERATION_TIMEOUT_MS, StartupOperationQueue 
 import { mutateState, readState, resetStateForTest, STATE_KEY } from "../src/storage";
 import { isRecord } from "../src/type-guards";
 import { targetRefs } from "../src/target-resolution";
+import { fillEmailCodeInPage } from "../src/email-code-page";
+import { ATLASSIAN, atlassianSplitPage, type FakeDocument, type FakeInput } from "./email-code-dom";
 import {
   PAGE_AGENT_GLOBAL,
   PAGE_AGENT_VERSION,
@@ -124,9 +131,10 @@ interface DebuggerCommand {
   params: Record<string, unknown>;
 }
 
+type PopupMessageSender = { id?: string; url?: string; tab?: unknown };
 type PopupMessageListener = (
   message: unknown,
-  sender: { id?: string },
+  sender: PopupMessageSender,
   sendResponse: (response: Record<string, unknown>) => void,
 ) => boolean | undefined;
 type PermissionRemovedListener = (permissions: { permissions?: string[] }) => void;
@@ -143,6 +151,8 @@ type TabGroupRemovedListener = (group: { id?: number }) => void;
 type AlarmListener = (alarm: { name: string }) => void;
 
 const EXTENSION_ID = "agenttab-test-extension";
+/** The AgentTab popup page as Chrome reports it in `sender.url`. */
+const POPUP_SENDER: PopupMessageSender = { id: EXTENSION_ID, url: `chrome-extension://${EXTENSION_ID}/popup.html` };
 
 let debuggerCommands: DebuggerCommand[];
 let automationPermission: boolean;
@@ -733,6 +743,7 @@ function installChromeMock(): void {
       runtime: {
         id: EXTENSION_ID,
         getManifest() { return { version: "2.0.0" }; },
+        getURL(path: string) { return `chrome-extension://${EXTENSION_ID}/${path}`; },
         connectNative() {
           if (!nativePort) throw new Error("native host unavailable");
           return nativePort;
@@ -853,12 +864,12 @@ async function sendNativeCloseTask(
   return response as Record<string, unknown>;
 }
 
-async function sendPopupMessage(message: unknown): Promise<unknown> {
+async function sendPopupMessage(message: unknown, sender: PopupMessageSender = POPUP_SENDER): Promise<unknown> {
   const listener = popupMessageListeners.at(-1);
   if (!listener) throw new Error("popup message listener is unavailable");
   return new Promise((resolve) => {
     let settled = false;
-    const keepChannelOpen = listener(message, { id: EXTENSION_ID }, (response) => {
+    const keepChannelOpen = listener(message, sender, (response) => {
       settled = true;
       resolve(response);
     });
@@ -6057,6 +6068,32 @@ describe("extension entrypoint admission boundaries", () => {
         tab_id: 100,
       }],
     });
+    // Only the popup page itself decides a review: never a tab, another extension page, or another extension.
+    const eventsBeforeForgedDecisions = port.posted.length;
+    for (const sender of [
+      { id: EXTENSION_ID, url: POPUP_SENDER.url, tab: { id: 100 } },
+      { id: EXTENSION_ID, url: `chrome-extension://${EXTENSION_ID}/wake.html` },
+      { id: EXTENSION_ID, url: `chrome-extension://${EXTENSION_ID}/popup.html?forged=1` },
+      { id: EXTENSION_ID, url: "https://example.test/workspace", tab: { id: 100 } },
+      { id: EXTENSION_ID },
+    ]) {
+      for (const kind of ["approve_popup_commit", "abandon_popup_commit"]) {
+        expect(await sendPopupMessage({ kind, review_handle: reviewHandle }, sender)).toEqual({
+          error: "Commit reviews can only be decided in the AgentTab popup",
+        });
+      }
+    }
+    expect(
+      popupListener(
+        { kind: "approve_popup_commit", review_handle: reviewHandle },
+        { id: "other-extension", url: "chrome-extension://other-extension/popup.html" },
+        () => undefined,
+      ),
+    ).toBeUndefined();
+    await flushPromiseQueue();
+    expect(port.posted.slice(eventsBeforeForgedDecisions)).toEqual([]);
+    expect((await readState()).stagedCommits[stagedToken]).toMatchObject({ review_handle: reviewHandle });
+    expect((await readState()).stagedCommits[stagedToken]?.approved).not.toBe(true);
     const approval = sendPopupMessage({
       kind: "approve_popup_commit",
       review_handle: reviewHandle,
@@ -6867,4 +6904,259 @@ describe("context clicks", () => {
     expired.view.expire();
     expect(expired.rightClick()).toBe(false);
   });
+});
+
+describe("email code fill runtime", () => {
+  const CODE = "7K3Q9Z";
+  const ATLASSIAN_URL = `${ATLASSIAN.origin}${ATLASSIAN.path}`;
+
+  function request(tabId: number, pageRevision: number, refs: string[]): EmailCodeFillRequest {
+    return {
+      tab_id: tabId,
+      expected_page_revision: pageRevision,
+      expected_origin: ATLASSIAN.origin,
+      expected_path: ATLASSIAN.path,
+      recipient: ATLASSIAN.recipient,
+      purpose: "signup",
+      fields: refs.map((ref, index) => ({ kind: "otp", ref, value: CODE.charAt(index) })),
+    };
+  }
+
+  /** Runs the debugger declaration against the fake inputs the way Chrome would. */
+  function emulateDebuggerPage(inputs: FakeInput[], firstBackendNodeId: number): void {
+    debuggerCommandOverride = (method, params) => {
+      if (method !== "Runtime.callFunctionOn" || !String(params.functionDeclaration).includes("agenttab_email_code")) {
+        return undefined;
+      }
+      const elementFor = (objectId: unknown): FakeInput => {
+        const element = inputs[Number(String(objectId).replace("node-", "")) - firstBackendNodeId];
+        if (element === undefined) throw new Error("unknown remote object");
+        return element;
+      };
+      const declaration: unknown = Function(`return (${String(params.functionDeclaration)})`)();
+      if (typeof declaration !== "function") throw new Error("email code declaration is not a function");
+      const args = (Array.isArray(params.arguments) ? params.arguments : []).map((argument: unknown) => {
+        if (!isRecord(argument)) return undefined;
+        return "objectId" in argument ? elementFor(argument.objectId) : argument.value;
+      });
+      return { result: { value: Reflect.apply(declaration, elementFor(params.objectId), args) } };
+    };
+  }
+
+  test("fills Atlassian's split code boxes through the debugger without submitting", async () => {
+    tabStore.set(70, { id: 70, windowId: 1, groupId: -1, active: true, url: ATLASSIAN_URL });
+    const { inputs } = atlassianSplitPage();
+    emulateDebuggerPage(inputs, 31);
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const revision = await revisions.ensure(70);
+    const refs = inputs.map((_input, index) => mintedRef(TASK_A, 70, revision, 31 + index));
+
+    const result = await runtime.fillEmailCode(TASK_A, 70, request(70, revision, refs));
+
+    expect(result).toEqual({ tab_id: 70, page_revision: revision, filled_fields: 6 });
+    expect(inputs.map((input) => input.stored).join("")).toBe(CODE);
+    const calls = debuggerCommands.filter((command) =>
+      command.method === "Runtime.callFunctionOn" &&
+      String(command.params.functionDeclaration).includes("agenttab_email_code"));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.params).toMatchObject({ objectId: "node-31", returnByValue: true, userGesture: false });
+    expect(debuggerCommands.filter((command) => command.method === "DOM.resolveNode" &&
+      command.params.objectGroup === "agenttab-email-code")).toHaveLength(6);
+    expect(debuggerCommands).toContainEqual({
+      method: "Runtime.releaseObjectGroup",
+      params: { objectGroup: "agenttab-email-code" },
+    });
+  });
+
+  test("refuses a redirected tab and a stale ref before touching the page", async () => {
+    const { inputs } = atlassianSplitPage();
+    emulateDebuggerPage(inputs, 31);
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+
+    tabStore.set(71, { id: 71, windowId: 1, groupId: -1, active: true, url: `${ATLASSIAN.origin}/login` });
+    const redirectedRevision = await revisions.ensure(71);
+    const redirectedRefs = inputs.map((_input, index) => mintedRef(TASK_A, 71, redirectedRevision, 31 + index));
+    await expect(runtime.fillEmailCode(TASK_A, 71, request(71, redirectedRevision, redirectedRefs)))
+      .rejects.toMatchObject({ code: "email_code_page_mismatch", outcome: "not_started" });
+
+    tabStore.set(72, { id: 72, windowId: 1, groupId: -1, active: true, url: ATLASSIAN_URL });
+    const revision = await revisions.ensure(72);
+    const staleRefs = inputs.map((_input, index) => mintedRef(TASK_A, 72, revision + 1, 31 + index));
+    await expect(runtime.fillEmailCode(TASK_A, 72, request(72, revision, staleRefs)))
+      .rejects.toMatchObject({ code: "stale_ref", outcome: "not_started", message: "A code field ref no longer resolves" });
+
+    expect(debuggerCommands.some((command) =>
+      String(command.params.functionDeclaration ?? "").includes("agenttab_email_code"))).toBe(false);
+    untouchedInputs(inputs);
+  });
+
+  test("replaces a page exception that echoes the code with fixed text", async () => {
+    tabStore.set(73, { id: 73, windowId: 1, groupId: -1, active: true, url: ATLASSIAN_URL });
+    debuggerCommandOverride = (method, params) =>
+      method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("agenttab_email_code")
+        ? { exceptionDetails: { text: `Uncaught Error: rejected ${CODE}`, exception: { description: CODE } } }
+        : undefined;
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const revision = await revisions.ensure(73);
+    const refs = [...CODE].map((_character, index) => mintedRef(TASK_A, 73, revision, 31 + index));
+
+    const failure: unknown = await runtime.fillEmailCode(TASK_A, 73, request(73, revision, refs)).catch((error) => error);
+
+    expect(failure).toMatchObject({ code: "email_code_fill_failed", outcome: "unknown" });
+    expect(failure instanceof Error ? failure.message : "").not.toContain(CODE);
+    expect(JSON.stringify(failure)).not.toContain(CODE);
+  });
+
+  test("fills through the page agent when Chrome refuses the debugger", async () => {
+    debuggerAttachError = "Cannot access a chrome-extension:// URL of different extension";
+    tabStore.set(74, { id: 74, windowId: 1, groupId: -1, active: true, url: ATLASSIAN_URL });
+    const { inputs } = atlassianSplitPage();
+    pageAgentReply = (agentRequest) => {
+      if (agentRequest.op !== "email_code_fill") return {};
+      return fillEmailCodeInPage(
+        agentRequest.ids.map((id) => inputs[id - 1]),
+        agentRequest.values,
+        agentRequest.expectation,
+        sensitiveFieldState,
+      );
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const revision = await revisions.ensure(74);
+    const refs = inputs.map((_input, index) => targetRefs.mint({
+      backendNodeId: index + 1,
+      documentId: PAGE_AGENT_DOCUMENT,
+      frameId: "scripting:top",
+      pageRevision: revision,
+      taskId: TASK_A,
+      tabId: 74,
+      route: "scripting",
+    }));
+
+    const result = await runtime.fillEmailCode(TASK_A, 74, request(74, revision, refs));
+
+    expect(result).toEqual({ tab_id: 74, page_revision: revision, filled_fields: 6 });
+    expect(inputs.map((input) => input.stored).join("")).toBe(CODE);
+    expect(pageAgentRequests.filter((agentRequest) => agentRequest.op === "email_code_fill")).toEqual([{
+      op: "email_code_fill",
+      ids: [1, 2, 3, 4, 5, 6],
+      values: [...CODE],
+      expectation: { ...ATLASSIAN },
+    }]);
+    expect(debuggerCalls).not.toContain("Runtime.callFunctionOn");
+  });
+
+  /** A verification page that names its recipient only by a compatible mask. */
+  const MASKED_TEXT = "To complete your account setup, enter the code we've sent to: a***t@e***m";
+
+  test("fills a compatible masked recipient directly through the debugger", async () => {
+    tabStore.set(75, { id: 75, windowId: 1, groupId: -1, active: true, url: ATLASSIAN_URL });
+    const { inputs } = atlassianSplitPage({ title: "We've emailed you a code", text: MASKED_TEXT });
+    emulateDebuggerPage(inputs, 31);
+    const events: string[] = [];
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(
+      revisions,
+      async () => undefined,
+      (event: string) => {
+        events.push(event);
+      },
+      async () => undefined,
+    );
+    const revision = await revisions.ensure(75);
+    const refs = inputs.map((_input, index) => mintedRef(TASK_A, 75, revision, 31 + index));
+
+    const result = await runtime.fillEmailCode(TASK_A, 75, request(75, revision, refs));
+
+    expect(result).toEqual({ tab_id: 75, page_revision: revision, filled_fields: 6 });
+    expect(inputs.map((input) => input.stored).join("")).toBe(CODE);
+    const calls = debuggerCommands.filter((command) =>
+      command.method === "Runtime.callFunctionOn" &&
+      String(command.params.functionDeclaration).includes("agenttab_email_code"));
+    expect(calls).toHaveLength(1);
+    // The page receives only the exact scope: no approval, mask, or stage rides along.
+    expect(Array.isArray(calls[0]?.params.arguments) ? calls[0]?.params.arguments[0] : undefined)
+      .toEqual({ value: { ...ATLASSIAN } });
+    expect((await readState()).stagedCommits).toEqual({});
+    expect(JSON.stringify(await readState())).not.toContain(CODE);
+    expect(events).toEqual([]);
+  });
+
+  test("fills a compatible masked recipient directly through the page agent", async () => {
+    debuggerAttachError = "Cannot access a chrome-extension:// URL of different extension";
+    tabStore.set(76, { id: 76, windowId: 1, groupId: -1, active: true, url: ATLASSIAN_URL });
+    const { inputs } = atlassianSplitPage({ title: "We've emailed you a code", text: MASKED_TEXT });
+    pageAgentReply = (agentRequest) => {
+      if (agentRequest.op !== "email_code_fill") return {};
+      return fillEmailCodeInPage(
+        agentRequest.ids.map((id) => inputs[id - 1]),
+        agentRequest.values,
+        agentRequest.expectation,
+        sensitiveFieldState,
+      );
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const revision = await revisions.ensure(76);
+    const refs = inputs.map((_input, index) => targetRefs.mint({
+      backendNodeId: index + 1,
+      documentId: PAGE_AGENT_DOCUMENT,
+      frameId: "scripting:top",
+      pageRevision: revision,
+      taskId: TASK_A,
+      tabId: 76,
+      route: "scripting",
+    }));
+
+    const result = await runtime.fillEmailCode(TASK_A, 76, request(76, revision, refs));
+
+    expect(result).toEqual({ tab_id: 76, page_revision: revision, filled_fields: 6 });
+    expect(inputs.map((input) => input.stored).join("")).toBe(CODE);
+    expect(pageAgentRequests.filter((agentRequest) => agentRequest.op.startsWith("email_code"))).toEqual([{
+      op: "email_code_fill",
+      ids: [1, 2, 3, 4, 5, 6],
+      values: [...CODE],
+      expectation: { ...ATLASSIAN },
+    }]);
+    expect(debuggerCalls).not.toContain("Runtime.callFunctionOn");
+  });
+
+  test("refuses an incompatible or changed mask and keeps every page guard without writing", async () => {
+    const cases: Array<[string, (page: { doc: FakeDocument; inputs: FakeInput[] }) => void, string]> = [
+      ["incompatible", (page) => { page.doc.body.innerText = "We've emailed you a verification code to b***t@e***m"; }, "email_code_recipient_unverified"],
+      ["changed", (page) => { page.doc.body.innerText = "Enter the code we've emailed to: ag***@example.com or a***t@e***m"; }, "email_code_recipient_unverified"],
+      ["contradicted", (page) => { page.doc.body.innerText = `${MASKED_TEXT} (ant@exam.com)`; }, "email_code_recipient_unverified"],
+      ["absent", (page) => { page.doc.body.innerText = "Enter the verification code we emailed you."; }, "email_code_recipient_unverified"],
+      ["password", (page) => { page.doc.input({ type: "password", name: "password" }); }, "email_code_target_invalid"],
+      ["mfa", (page) => { page.doc.body.innerText = `${MASKED_TEXT}. Or use your authenticator app.`; }, "email_code_context_forbidden"],
+      ["human", (page) => { page.doc.body.innerText = `${MASKED_TEXT}. Please verify you are human.`; }, "email_code_context_forbidden"],
+    ];
+    let tabId = 80;
+    for (const [_label, mutate, code] of cases) {
+      tabId += 1;
+      tabStore.set(tabId, { id: tabId, windowId: 1, groupId: -1, active: true, url: ATLASSIAN_URL });
+      const page = atlassianSplitPage({ title: "Check your email", text: MASKED_TEXT });
+      mutate(page);
+      emulateDebuggerPage(page.inputs, 31);
+      const revisions = new RevisionTracker();
+      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+      const revision = await revisions.ensure(tabId);
+      const refs = page.inputs.map((_input, index) => mintedRef(TASK_A, tabId, revision, 31 + index));
+      const failure: unknown = await runtime.fillEmailCode(TASK_A, tabId, request(tabId, revision, refs))
+        .catch((error) => error);
+      expect(failure).toMatchObject({ code, outcome: "not_started" });
+      expect(JSON.stringify(failure)).not.toContain(CODE);
+      untouchedInputs(page.inputs);
+    }
+  });
+
+  function untouchedInputs(inputs: FakeInput[]): void {
+    for (const input of inputs) {
+      expect(input.stored).toBe("");
+      expect(input.events).toEqual([]);
+    }
+  }
 });

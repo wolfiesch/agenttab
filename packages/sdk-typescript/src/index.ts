@@ -20,6 +20,8 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_WAIT_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;
 export const DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS = 120_000;
+// Maximum email broker budget plus one native fill.
+const DEFAULT_BROWSER_EMAIL_CODE_TIMEOUT_MS = 120_000 + 30_000;
 // Core gives long-running extension operations five seconds to return after their
 // declared timeout. Keep a second, bounded five-second margin for the response to
 // cross the native and Core transports before the client classifies it as unknown.
@@ -27,6 +29,14 @@ export const LONG_OPERATION_TRANSPORT_GRACE_MS = 10_000;
 export const SNAPSHOT_TEXT_MAX_BYTES = 1_000_000;
 export const SCREENSHOT_MAX_BYTES = 750_000;
 export const SCREENSHOT_MAX_DIMENSION = 16_384;
+// browser_credentials fill_email bounds; mirror schemas/rpc/v1/browser-credentials.schema.json.
+export const EMAIL_CODE_PURPOSES = ["signup", "email_sign_in"] as const;
+export const EMAIL_CODE_MESSAGE_ID_PATTERN = "^[0-9A-Fa-f]{1,128}$";
+export const EMAIL_CODE_RECIPIENT_MIN_CHARS = 3;
+export const EMAIL_CODE_RECIPIENT_MAX_CHARS = 320;
+// One printable-ASCII addr-spec without whitespace, controls, or `@<>,;` inside either part.
+export const EMAIL_CODE_RECIPIENT_PATTERN = "^[!-+\\--:=?A-~]{1,64}@[!-+\\--:=?A-~]{1,255}$";
+export const EMAIL_CODE_MAX_REFS = 12;
 
 export const STANDARD_PRESS_KEYS = [
   "ArrowUp",
@@ -211,7 +221,18 @@ export type BrowserCredentialsParams =
     username_ref?: string;
     password_ref?: string;
     otp_ref?: string;
+  }
+  | {
+    action: "fill_email";
+    tab_id: number;
+    expected_page_revision: number;
+    message_id: string;
+    recipient: string;
+    purpose: BrowserEmailCodePurpose;
+    otp_refs: string[];
   };
+
+export type BrowserEmailCodePurpose = (typeof EMAIL_CODE_PURPOSES)[number];
 
 export interface BrowserCommitParams {
   staged_token: string;
@@ -718,6 +739,10 @@ function longOperationTimeoutMs(
     && params.operation === "request"
   ) {
     defaultTimeoutMs = DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS;
+  } else if (
+    method === "browser_credentials" && "action" in params && params.action === "fill_email"
+  ) {
+    defaultTimeoutMs = DEFAULT_BROWSER_EMAIL_CODE_TIMEOUT_MS;
   } else if (method === "browser_credentials") {
     defaultTimeoutMs = DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS;
   } else {

@@ -134,7 +134,7 @@ trait CredentialProvider: Send + Sync {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ProviderError {
+pub(crate) enum ProviderError {
     Timeout,
     Unavailable,
 }
@@ -501,9 +501,27 @@ fn run_op(
     arguments: &[String],
     timeout: Duration,
 ) -> Result<Vec<u8>, ProviderError> {
+    run_provider_process(
+        executable,
+        arguments,
+        &[("OP_BIOMETRIC_UNLOCK_ENABLED", "true")],
+        timeout,
+    )
+}
+
+/// Runs a configured credential provider CLI from an argument vector (never a
+/// shell), with stdin closed, stdout bounded and captured, stderr bounded and
+/// discarded, and a hard deadline. Provider output never reaches callers on
+/// failure.
+pub(crate) fn run_provider_process(
+    executable: &Path,
+    arguments: &[String],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<Vec<u8>, ProviderError> {
     let mut child = Command::new(executable)
         .args(arguments)
-        .env("OP_BIOMETRIC_UNLOCK_ENABLED", "true")
+        .envs(environment.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
