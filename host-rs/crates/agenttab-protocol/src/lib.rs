@@ -34,6 +34,13 @@ const MAX_DEVELOPER_PARAMS: usize = 16;
 const MAX_DEVELOPER_PARAM_KEY_CHARS: usize = 64;
 const MAX_DEVELOPER_VALUE_CHARS: usize = 512;
 const MAX_DEVELOPER_ARRAY_ITEMS: usize = 16;
+const MAX_EMAIL_MESSAGE_ID_CHARS: usize = 128;
+const MIN_EMAIL_ADDRESS_CHARS: usize = 3;
+const MAX_EMAIL_ADDRESS_CHARS: usize = 320;
+const MAX_EMAIL_LOCAL_PART_CHARS: usize = 64;
+const MAX_EMAIL_DOMAIN_CHARS: usize = 255;
+const MAX_EMAIL_CODE_REFS: usize = 12;
+const EMAIL_CODE_PURPOSES: [&str; 2] = ["signup", "email_sign_in"];
 
 pub const RPC_SCHEMA_ASSETS: &[(&str, &str)] = &[
     (
@@ -83,6 +90,10 @@ pub const RPC_SCHEMA_ASSETS: &[(&str, &str)] = &[
     (
         "browser_commit",
         include_str!("../../../../schemas/rpc/v1/browser-commit.schema.json"),
+    ),
+    (
+        "browser_credentials",
+        include_str!("../../../../schemas/rpc/v1/browser-credentials.schema.json"),
     ),
     (
         "browser_profile",
@@ -867,6 +878,16 @@ pub enum BrowserCredentialsParams {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         otp_ref: Option<String>,
     },
+    /// Brokered email verification code. Carries only non-secret routing
+    /// metadata; the host resolves the code from the managed mailbox grant.
+    FillEmail {
+        tab_id: u64,
+        expected_page_revision: u64,
+        message_id: String,
+        recipient: String,
+        purpose: String,
+        otp_refs: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1385,6 +1406,46 @@ impl MethodParams {
                     }
                 }
             }
+            Self::Credentials(BrowserCredentialsParams::FillEmail {
+                message_id,
+                recipient,
+                purpose,
+                otp_refs,
+                ..
+            }) => {
+                require(
+                    method,
+                    is_email_message_id(message_id),
+                    format!(
+                        "message_id must contain 1 to {MAX_EMAIL_MESSAGE_ID_CHARS} hexadecimal characters"
+                    ),
+                )?;
+                require(
+                    method,
+                    is_bounded_email_address(recipient),
+                    format!(
+                        "recipient must be one email address of {MIN_EMAIL_ADDRESS_CHARS} to {MAX_EMAIL_ADDRESS_CHARS} printable ASCII characters"
+                    ),
+                )?;
+                require(
+                    method,
+                    EMAIL_CODE_PURPOSES.contains(&purpose.as_str()),
+                    "purpose must be signup or email_sign_in",
+                )?;
+                require(
+                    method,
+                    (1..=MAX_EMAIL_CODE_REFS).contains(&otp_refs.len()),
+                    format!("otp_refs must contain 1 to {MAX_EMAIL_CODE_REFS} items"),
+                )?;
+                for (index, value) in otp_refs.iter().enumerate() {
+                    require_len(method, value, 1, MAX_REF_CHARS, "otp_refs item")?;
+                    require(
+                        method,
+                        !otp_refs[..index].contains(value),
+                        "otp_refs must not contain duplicates",
+                    )?;
+                }
+            }
             Self::Profile(params) => params.validate(method)?,
             Self::Commit(params) => require_len(
                 method,
@@ -1687,6 +1748,27 @@ fn is_challenge_id(value: &str) -> bool {
             && suffix
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+    })
+}
+
+fn is_email_message_id(value: &str) -> bool {
+    (1..=MAX_EMAIL_MESSAGE_ID_CHARS).contains(&value.len())
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// One addr-spec of printable ASCII without whitespace, control characters,
+/// or list/header delimiters. Mirrors the public `recipient` schema pattern.
+fn is_bounded_email_address(value: &str) -> bool {
+    let is_address_byte =
+        |byte: u8| matches!(byte, b'!'..=b'~') && !matches!(byte, b'@' | b'<' | b'>' | b',' | b';');
+    if !(MIN_EMAIL_ADDRESS_CHARS..=MAX_EMAIL_ADDRESS_CHARS).contains(&value.len()) {
+        return false;
+    }
+    value.split_once('@').is_some_and(|(local, domain)| {
+        (1..=MAX_EMAIL_LOCAL_PART_CHARS).contains(&local.len())
+            && (1..=MAX_EMAIL_DOMAIN_CHARS).contains(&domain.len())
+            && local.bytes().all(is_address_byte)
+            && domain.bytes().all(is_address_byte)
     })
 }
 
@@ -2635,6 +2717,7 @@ mod tests {
             "browser_tabs",
             "browser_handoff",
             "browser_commit",
+            "browser_credentials",
             "browser_profile",
             "browser_developer",
         ] {
@@ -3226,6 +3309,275 @@ mod tests {
                 Err(ProtocolError::InvalidParamConstraint { .. })
             ));
         }
+    }
+
+    fn fill_email_params() -> Value {
+        json!({
+            "action": "fill_email",
+            "tab_id": 4,
+            "expected_page_revision": 9,
+            "message_id": "18f2a9c4b7e1d03a",
+            "recipient": "member+signup@example.test",
+            "purpose": "signup",
+            "otp_refs": ["e1"],
+        })
+    }
+
+    #[test]
+    fn credential_fill_email_accepts_only_non_secret_routing_metadata() {
+        let (_, single) =
+            RpcRequest::parse(request("browser_credentials", fill_email_params(), true)).unwrap();
+        assert!(matches!(
+            &single,
+            MethodParams::Credentials(BrowserCredentialsParams::FillEmail {
+                tab_id: 4,
+                expected_page_revision: 9,
+                message_id,
+                recipient,
+                purpose,
+                otp_refs,
+            }) if message_id == "18f2a9c4b7e1d03a"
+                && recipient == "member+signup@example.test"
+                && purpose == "signup"
+                && otp_refs == &["e1"]
+        ));
+
+        let mut split = fill_email_params();
+        split["purpose"] = json!("email_sign_in");
+        split["message_id"] = json!("ABCDEF0123456789");
+        split["otp_refs"] = json!(["e1", "e2", "e3", "e4", "e5", "e6"]);
+        let (_, split) = RpcRequest::parse(request("browser_credentials", split, true)).unwrap();
+        assert!(matches!(
+            &split,
+            MethodParams::Credentials(BrowserCredentialsParams::FillEmail { otp_refs, .. })
+                if otp_refs.len() == 6
+        ));
+
+        let mut maximum = fill_email_params();
+        maximum["message_id"] = json!("f".repeat(MAX_EMAIL_MESSAGE_ID_CHARS));
+        maximum["recipient"] = json!(format!("{}@{}", "a".repeat(64), "b".repeat(255)));
+        maximum["otp_refs"] = json!((0..MAX_EMAIL_CODE_REFS)
+            .map(|index| format!("{index:0>256}"))
+            .collect::<Vec<_>>());
+        assert!(RpcRequest::parse(request("browser_credentials", maximum, true)).is_ok());
+
+        let mut minimum = fill_email_params();
+        minimum["recipient"] = json!("a@b");
+        minimum["message_id"] = json!("0");
+        assert!(RpcRequest::parse(request("browser_credentials", minimum, true)).is_ok());
+    }
+
+    #[test]
+    fn credential_fill_email_rejects_secrets_mixed_fields_and_unbounded_values() {
+        for (field, value) in [
+            ("credential_token", json!("t".repeat(32))),
+            ("username_ref", json!("e1")),
+            ("password_ref", json!("e2")),
+            ("otp_ref", json!("e3")),
+            ("code", json!("123456")),
+            ("value", json!("123456")),
+            ("origin", json!("https://example.test")),
+            ("query", json!("from:example.test")),
+            ("submit_ref", json!("e9")),
+        ] {
+            let mut params = fill_email_params();
+            params[field] = value;
+            assert!(
+                matches!(
+                    RpcRequest::parse(request("browser_credentials", params, true)),
+                    Err(ProtocolError::InvalidParams { .. })
+                ),
+                "fill_email accepted forbidden field {field}"
+            );
+        }
+        for field in [
+            "tab_id",
+            "expected_page_revision",
+            "message_id",
+            "recipient",
+            "purpose",
+            "otp_refs",
+        ] {
+            let mut params = fill_email_params();
+            params.as_object_mut().unwrap().remove(field);
+            assert!(
+                matches!(
+                    RpcRequest::parse(request("browser_credentials", params, true)),
+                    Err(ProtocolError::InvalidParams { .. })
+                ),
+                "fill_email accepted a request without {field}"
+            );
+        }
+        let oversized_refs = (0..=MAX_EMAIL_CODE_REFS)
+            .map(|index| format!("e{index}"))
+            .collect::<Vec<_>>();
+        for (field, value) in [
+            ("message_id", json!("")),
+            ("message_id", json!("18f2a9c4b7e1d03g")),
+            ("message_id", json!("18f2-a9c4")),
+            (
+                "message_id",
+                json!("f".repeat(MAX_EMAIL_MESSAGE_ID_CHARS + 1)),
+            ),
+            ("recipient", json!("ab")),
+            ("recipient", json!("member.example.test")),
+            ("recipient", json!("@example.test")),
+            ("recipient", json!("member@")),
+            ("recipient", json!("member@one@example.test")),
+            (
+                "recipient",
+                json!("member@example.test\r\nBcc: other@example.test"),
+            ),
+            ("recipient", json!("member@example.test\n")),
+            ("recipient", json!("member\0@example.test")),
+            ("recipient", json!("member @example.test")),
+            (
+                "recipient",
+                json!("member@example.test, other@example.test"),
+            ),
+            ("recipient", json!("Member <member@example.test>")),
+            ("recipient", json!("mémber@example.test")),
+            (
+                "recipient",
+                json!(format!("{}@example.test", "a".repeat(65))),
+            ),
+            ("recipient", json!(format!("a@{}", "b".repeat(256)))),
+            ("purpose", json!("mfa")),
+            ("purpose", json!("two_factor")),
+            ("purpose", json!("")),
+            ("otp_refs", json!([])),
+            ("otp_refs", json!(oversized_refs)),
+            ("otp_refs", json!(["e1", "e1"])),
+            ("otp_refs", json!(["e1", "e2", "e1"])),
+            ("otp_refs", json!([""])),
+            ("otp_refs", json!(["r".repeat(MAX_REF_CHARS + 1)])),
+        ] {
+            let mut params = fill_email_params();
+            params[field] = value;
+            assert!(
+                matches!(
+                    RpcRequest::parse(request("browser_credentials", params, true)),
+                    Err(ProtocolError::InvalidParams { .. }
+                        | ProtocolError::InvalidParamConstraint { .. })
+                ),
+                "fill_email accepted invalid {field}"
+            );
+        }
+        for (field, value) in [
+            ("purpose", json!(["signup"])),
+            ("otp_refs", json!("e1")),
+            ("otp_refs", json!([1, 2, 3, 4])),
+            ("message_id", json!(18)),
+        ] {
+            let mut params = fill_email_params();
+            params[field] = value;
+            assert!(matches!(
+                RpcRequest::parse(request("browser_credentials", params, true)),
+                Err(ProtocolError::InvalidParams { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn credential_one_password_actions_reject_email_code_fields() {
+        let (_, fill) = RpcRequest::parse(request(
+            "browser_credentials",
+            json!({
+                "action": "fill",
+                "tab_id": 4,
+                "expected_page_revision": 9,
+                "credential_token": "t".repeat(32),
+                "otp_ref": "e3",
+            }),
+            true,
+        ))
+        .unwrap();
+        assert!(matches!(
+            &fill,
+            MethodParams::Credentials(BrowserCredentialsParams::Fill { otp_ref: Some(value), .. })
+                if value == "e3"
+        ));
+        for (action, field, value) in [
+            ("prepare", "otp_refs", json!(["e1"])),
+            ("prepare", "recipient", json!("member@example.test")),
+            ("fill", "otp_refs", json!(["e1"])),
+            ("fill", "message_id", json!("18f2a9c4b7e1d03a")),
+            ("next", "purpose", json!("signup")),
+        ] {
+            let mut params = json!({
+                "action": action,
+                "tab_id": 4,
+                "expected_page_revision": 9,
+            });
+            if action != "prepare" {
+                params["credential_token"] = json!("t".repeat(32));
+                params["password_ref"] = json!("e2");
+            }
+            params[field] = value;
+            assert!(
+                matches!(
+                    RpcRequest::parse(request("browser_credentials", params, true)),
+                    Err(ProtocolError::InvalidParams { .. })
+                ),
+                "{action} accepted email-code field {field}"
+            );
+        }
+        assert!(matches!(
+            RpcRequest::parse(request("browser_credentials", fill_email_params(), false)),
+            Err(ProtocolError::MissingIdempotencyKey(
+                RpcMethod::BrowserCredentials
+            ))
+        ));
+    }
+
+    #[test]
+    fn credential_fill_email_schema_branch_matches_runtime_bounds() {
+        let schema: Value = serde_json::from_str(
+            RPC_SCHEMA_ASSETS
+                .iter()
+                .find_map(|(name, schema)| (*name == "browser_credentials").then_some(*schema))
+                .unwrap(),
+        )
+        .unwrap();
+        let branch = schema.pointer("/$defs/email_code").unwrap();
+        assert_eq!(branch["additionalProperties"], json!(false));
+        assert_eq!(
+            branch["required"],
+            json!([
+                "action",
+                "tab_id",
+                "expected_page_revision",
+                "message_id",
+                "recipient",
+                "purpose",
+                "otp_refs"
+            ])
+        );
+        let properties = branch["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 7);
+        assert_eq!(properties["action"], json!({"const": "fill_email"}));
+        assert_eq!(properties["purpose"]["enum"], json!(EMAIL_CODE_PURPOSES));
+        assert_eq!(
+            properties["message_id"]["maxLength"],
+            json!(MAX_EMAIL_MESSAGE_ID_CHARS)
+        );
+        assert_eq!(
+            properties["recipient"]["minLength"],
+            json!(MIN_EMAIL_ADDRESS_CHARS)
+        );
+        assert_eq!(
+            properties["recipient"]["maxLength"],
+            json!(MAX_EMAIL_ADDRESS_CHARS)
+        );
+        assert_eq!(
+            properties["otp_refs"]["maxItems"],
+            json!(MAX_EMAIL_CODE_REFS)
+        );
+        assert_eq!(properties["otp_refs"]["uniqueItems"], json!(true));
+        assert!(schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"$ref": "#/$defs/email_code"})));
     }
 
     #[test]

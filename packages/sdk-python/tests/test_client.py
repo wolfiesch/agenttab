@@ -178,6 +178,25 @@ class ClientTests(unittest.TestCase):
             ),
             DEFAULT_BROWSER_CREDENTIALS_TIMEOUT + LONG_OPERATION_TRANSPORT_GRACE,
         )
+        self.assertEqual(
+            resolve_transport_timeout(
+                "browser_credentials",
+                {
+                    "action": "fill_email",
+                    "tab_id": 1,
+                    "expected_page_revision": 1,
+                    "message_id": "abc123",
+                    "recipient": "user@service.example",
+                    "purpose": "signup",
+                    "otp_refs": ["e1@1"],
+                },
+            ),
+            150 + LONG_OPERATION_TRANSPORT_GRACE,
+        )
+        self.assertEqual(
+            resolve_transport_timeout("browser_commit", {"staged_token": "s" * 32}),
+            30.0,
+        )
         self.assertEqual(resolve_transport_timeout("browser_tabs", {}, 45), 45)
         self.assertEqual(
             resolve_transport_timeout(
@@ -188,7 +207,7 @@ class ClientTests(unittest.TestCase):
             45,
         )
 
-    def test_requested_browser_wait_outlives_shorter_generic_client_timeout(self) -> None:
+    def test_broker_operations_and_waits_outlive_shorter_generic_client_timeout(self) -> None:
         class DelayedResponseStream(io.RawIOBase):
             def __init__(self) -> None:
                 super().__init__()
@@ -197,6 +216,7 @@ class ClientTests(unittest.TestCase):
 
             def write(self, payload: bytes | bytearray) -> int:
                 request = read_frame(io.BytesIO(payload))
+                self.delayed = False
                 self.response = io.BytesIO(
                     encode_frame(
                         {
@@ -228,6 +248,21 @@ class ClientTests(unittest.TestCase):
                     "tab_id": 1,
                     "condition": {"kind": "load"},
                     "timeout_ms": 1,
+                },
+            ),
+            {"matched": True},
+        )
+        self.assertEqual(
+            client.call(
+                "browser_credentials",
+                {
+                    "action": "fill_email",
+                    "tab_id": 1,
+                    "expected_page_revision": 1,
+                    "message_id": "abc123",
+                    "recipient": "user@service.example",
+                    "purpose": "signup",
+                    "otp_refs": ["e1@1"],
                 },
             ),
             {"matched": True},

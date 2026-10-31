@@ -1,4 +1,5 @@
 import type { AccessibilityQuery } from "./accessibility-query";
+import type { EmailCodePageExpectation } from "./email-code-page";
 
 /**
  * Contract between the extension worker and the scripting page agent, the
@@ -8,7 +9,7 @@ import type { AccessibilityQuery } from "./accessibility-query";
  */
 
 /** Bump whenever a request or response shape changes, so a stale agent reinstalls. */
-export const PAGE_AGENT_VERSION = 3;
+export const PAGE_AGENT_VERSION = 5;
 /** Bundled agent script, injected with `chrome.scripting.executeScript({ files })`. */
 export const PAGE_AGENT_FILE = "page-agent.js";
 
@@ -26,6 +27,7 @@ export type PageAgentRequest =
   | { op: "inspect_selector"; selector: string }
   | { op: "geometry"; selector?: string }
   | { op: "fill_credential"; id: number; value: string; kind: string }
+  | { op: "email_code_fill"; ids: number[]; values: string[]; expectation: EmailCodePageExpectation }
   | { op: "surface"; id: number; selectors: string[] };
 
 export interface PageAgentError {

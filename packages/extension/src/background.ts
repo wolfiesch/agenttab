@@ -1,6 +1,7 @@
 import type { ChallengeEvent } from "./challenge";
 import { clearChallengeTask } from "./challenge-store";
 import { StandardBrowserRuntime } from "./browser";
+import { sanitizeEmailCodeFailure } from "./email-code-fill";
 import { HandoffController, HANDOFF_ALARM } from "./handoff";
 import { NativeBridge, RECONNECT_ALARM } from "./native";
 import { OwnershipLedger } from "./ownership";
@@ -10,6 +11,7 @@ import {
   completed,
   failed,
   needsUser,
+  parseEmailCodeFillParams,
   PROFILE_STAGE_TAB_ID,
   type NativeDispatchCommand,
   type NativeOriginPolicy,
@@ -436,7 +438,7 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
     }
   }
   const params = command.params;
-  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer" || command.method === "browser_credentials_fill" ||
+  const mutating = command.method === "browser_open" || command.method === "browser_act" || command.method === "browser_commit" || command.method === "browser_handoff" || command.method === "browser_developer" || command.method === "browser_credentials_fill" || command.method === "browser_email_code_fill" ||
     (command.method === "browser_profile" && PROFILE_READ_OPERATIONS[String(params.operation)] !== true);
   try {
     if (command.method === "commit_review_bind") {
@@ -574,6 +576,23 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         );
       });
       return completed(command.request_id, result);
+    }
+    if (command.method === "browser_email_code_fill") {
+      // The code is a secret: every failure is rebuilt from fixed text, never page or Chrome messages.
+      let invoked = false;
+      try {
+        const request = parseEmailCodeFillParams(params);
+        const targetTabId = request.tab_id;
+        const result = await scheduler.enqueueTab(command.task_id, targetTabId, async () => {
+          await ownership.assertOwned(command.task_id, targetTabId);
+          await assertCurrentOrigin(targetTabId, command.origin_policy);
+          invoked = true;
+          return browser.fillEmailCode(command.task_id, targetTabId, request);
+        });
+        return completed(command.request_id, result);
+      } catch (error) {
+        throw sanitizeEmailCodeFailure(error, invoked ? "unknown" : "not_started");
+      }
     }
     const targetTabId = tabId(params);
     if (command.method === "browser_snapshot" || command.method === "browser_wait") {
@@ -999,7 +1018,17 @@ chrome.alarms.onAlarm.addListener((alarm: { name: string }) => {
   });
 });
 
-async function handlePopupMessage(message: Record<string, unknown>): Promise<Record<string, unknown>> {
+/** Trusted fields Chrome sets on a runtime message; never taken from the message body. */
+interface PopupMessageSender {
+  id?: string;
+  url?: string;
+  tab?: unknown;
+}
+
+async function handlePopupMessage(
+  message: Record<string, unknown>,
+  sender: PopupMessageSender,
+): Promise<Record<string, unknown>> {
   if (message.kind === "wake") return { ready: true };
   if (message.kind === "runtime_instance") return { runtime_instance: RUNTIME_INSTANCE_ID };
   if (message.kind === "automation_revocation_state") {
@@ -1093,6 +1122,14 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
     (message.kind === "approve_popup_commit" || message.kind === "abandon_popup_commit") &&
     typeof message.review_handle === "string"
   ) {
+    // Only the extension's own popup page decides a review: not a tab, a page agent, or another extension page.
+    if (
+      sender.id !== chrome.runtime.id ||
+      sender.tab !== undefined ||
+      sender.url !== chrome.runtime.getURL("popup.html")
+    ) {
+      throw new Error("Commit reviews can only be decided in the AgentTab popup");
+    }
     const binding = await browser.reviewBinding(message.review_handle);
     const bridge = nativeBridge;
     if (!bridge) {
@@ -1137,12 +1174,12 @@ async function handlePopupMessage(message: Record<string, unknown>): Promise<Rec
 
 chrome.runtime.onMessage.addListener((
   message: unknown,
-  sender: { id?: string },
+  sender: PopupMessageSender,
   sendResponse: (response: Record<string, unknown>) => void,
 ) => {
   if (sender.id !== chrome.runtime.id || !isRecord(message) || typeof message.kind !== "string") return undefined;
   void start()
-    .then(() => handlePopupMessage(message))
+    .then(() => handlePopupMessage(message, sender))
     .then(
       sendResponse,
       (error: unknown) => sendResponse({

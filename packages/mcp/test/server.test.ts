@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   AgentTabTransportError,
+  EMAIL_CODE_MAX_REFS,
+  EMAIL_CODE_MESSAGE_ID_PATTERN,
+  EMAIL_CODE_PURPOSES,
+  EMAIL_CODE_RECIPIENT_PATTERN,
   FrameDecoder,
   encodeFrame,
   type AgentTabClient,
@@ -73,6 +77,50 @@ describe("AgentTab MCP surface", () => {
   test("browser_credentials fills only and cannot bypass Browser Act submission review", () => {
     const credentialTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_credentials")!;
     expect(JSON.stringify(credentialTool.inputSchema)).not.toContain("submit_ref");
+  });
+
+  test("browser_credentials advertises fill_email as a strict non-secret branch", () => {
+    const credentialTool = STANDARD_TOOLS.find((tool) => tool.name === "browser_credentials")!;
+    const definitions = credentialTool.inputSchema.$defs as Record<string, any>;
+    expect(credentialTool.inputSchema.oneOf).toContainEqual({ $ref: "#/$defs/email_code" });
+    const branch = definitions.email_code;
+    expect(branch.additionalProperties).toBe(false);
+    expect(Object.keys(branch.properties).sort()).toEqual(
+      ["action", "expected_page_revision", "message_id", "otp_refs", "purpose", "recipient", "tab_id"],
+    );
+    expect([...branch.required].sort()).toEqual(Object.keys(branch.properties).sort());
+    expect(branch.properties.action).toEqual({ const: "fill_email" });
+    expect(branch.properties.purpose.enum).toEqual([...EMAIL_CODE_PURPOSES]);
+    expect(branch.properties.otp_refs).toMatchObject({ minItems: 1, maxItems: EMAIL_CODE_MAX_REFS, uniqueItems: true });
+    expect(branch.properties.message_id.pattern).toBe(EMAIL_CODE_MESSAGE_ID_PATTERN);
+    expect(branch.properties.recipient.pattern).toBe(EMAIL_CODE_RECIPIENT_PATTERN);
+    expect(definitions.target.properties.action.enum).toEqual(["fill", "next"]);
+    expect(definitions.target.properties.otp_refs).toBeUndefined();
+
+    // JSON Schema validators compile `pattern` as ECMA-262 regular expressions.
+    const recipient = new RegExp(branch.properties.recipient.pattern, "u");
+    for (const value of ["a@b", "member+signup@example.test", `${"a".repeat(64)}@${"b".repeat(255)}`]) {
+      expect({ value, valid: recipient.test(value) }).toEqual({ value, valid: true });
+    }
+    for (const value of [
+      "member.example.test",
+      "@example.test",
+      "member@",
+      "member@one@example.test",
+      "member@example.test\r\nBcc: other@example.test",
+      "member\u0000@example.test",
+      "member @example.test",
+      "member@example.test, other@example.test",
+      "Member <member@example.test>",
+      "mémber@example.test",
+      `${"a".repeat(65)}@example.test`,
+    ]) {
+      expect({ value, valid: recipient.test(value) }).toEqual({ value, valid: false });
+    }
+    const messageId = new RegExp(branch.properties.message_id.pattern, "u");
+    expect(messageId.test("18f2a9c4b7e1d03A")).toBe(true);
+    expect(messageId.test("18f2a9c4b7e1d03g")).toBe(false);
+    expect(messageId.test("f".repeat(129))).toBe(false);
   });
 
   test("browser_profile advertises the profile params schema with its definitions", async () => {

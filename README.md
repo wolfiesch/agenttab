@@ -54,8 +54,8 @@ Standard mode exposes exactly ten tools:
 | `browser_wait` | Wait for load, URL, text, selector, network-idle, task-attributed download, or challenge-cleared conditions supported by the tab's route. |
 | `browser_tabs` | List only tabs owned by the current task, including each tab's automation route. |
 | `browser_handoff` | Post a non-blocking attention notice asking the user to complete human-only input, then verify the page and resolve or dismiss it by notice ID. A `challenge_cleared` completion ties the notice to a detected bot challenge. |
-| `browser_commit` | Execute one staged consequential action, including an approved bookmark removal. |
-| `browser_credentials` | Prepare and fill an origin-matching 1Password login through opaque, short-lived host tokens. Available by default when the local `op` CLI is usable; owner-only policy can disable or constrain it. |
+| `browser_commit` | Execute one human-approved staged action, including bookmark removal. |
+| `browser_credentials` | Prepare and fill an origin-matching 1Password login through opaque, short-lived host tokens, or enter a policy-approved signup or email sign-in code privately. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. |
 | `browser_profile` | Search and organize bookmarks, search history, list recently closed or synced sessions and reopen one as background task tabs, and find, cancel, pause, or resume downloads. Works on the Chrome profile rather than a task tab and never focuses Chrome. Bookmark removal always stages for popup review; history is read-only. |
 | `browser_finish` | Finish the task, apply its cleanup policy, return closed and retained tab receipts, and release ownership. |
 

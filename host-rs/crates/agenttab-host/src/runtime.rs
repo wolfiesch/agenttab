@@ -2,6 +2,7 @@ use crate::audit::{canonicalize, now_ms, AuditEntry, AuditLog};
 use crate::credentials::{
     BrokerError, CredentialBroker, NeedsUserReason, PrepareResult, SelectResult,
 };
+use crate::email_codes::{EmailCodeBroker, EmailCodePolicy, EmailCodeRequest};
 use crate::guardrails::{GuardrailLoadError, Guardrails, STALE_UPLOAD_AGE};
 use crate::journal::{
     BeginDecision, InventoryReconciliation, Journal, JournalError, StagedCommitApproval,
@@ -32,6 +33,7 @@ use uuid::Uuid;
 const RESPONSE_TASK_BINDING_RESERVE: usize = 512;
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TAB_STAGED_EFFECT: &str = "Close an AgentTab-owned browser tab";
+const EMAIL_CODE_NATIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum RuntimeBuildError {
@@ -157,6 +159,7 @@ pub struct Runtime {
     audit: Arc<AuditLog>,
     native: Arc<dyn NativeTransport>,
     credentials: Arc<CredentialBroker>,
+    email_codes: Arc<EmailCodeBroker>,
     task_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     tab_urls: Arc<RwLock<HashMap<u64, String>>>,
     upload_staging_dir: PathBuf,
@@ -176,6 +179,17 @@ impl Runtime {
         paths: &AgentTabPaths,
         lifecycle: Arc<Lifecycle>,
         native: Arc<dyn NativeTransport>,
+    ) -> Result<Arc<Self>, RuntimeBuildError> {
+        Self::open_with(paths, lifecycle, native, |policy| {
+            EmailCodeBroker::new(policy.clone())
+        })
+    }
+
+    fn open_with(
+        paths: &AgentTabPaths,
+        lifecycle: Arc<Lifecycle>,
+        native: Arc<dyn NativeTransport>,
+        email_code_broker: impl FnOnce(&EmailCodePolicy) -> EmailCodeBroker,
     ) -> Result<Arc<Self>, RuntimeBuildError> {
         paths.prepare()?;
         // Delivered uploads outlive their deferred cleanup thread when the host
@@ -197,6 +211,7 @@ impl Runtime {
         let credentials = Arc::new(CredentialBroker::new(
             guardrails.one_password_policy().clone(),
         ));
+        let email_codes = Arc::new(email_code_broker(guardrails.email_code_policy()));
         let runtime = Arc::new(Self {
             lifecycle,
             journal,
@@ -204,6 +219,7 @@ impl Runtime {
             audit,
             native,
             credentials,
+            email_codes,
             task_locks: Mutex::new(HashMap::new()),
             tab_urls,
             upload_staging_dir: paths.upload_staging_dir.clone(),
@@ -1402,6 +1418,11 @@ impl Runtime {
                 tab_id,
                 expected_page_revision,
             }
+            | BrowserCredentialsParams::FillEmail {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
             | BrowserCredentialsParams::Fill {
                 tab_id,
                 expected_page_revision,
@@ -1413,6 +1434,9 @@ impl Runtime {
                 ..
             } => (*tab_id, *expected_page_revision),
         };
+        if matches!(params, BrowserCredentialsParams::FillEmail { .. }) {
+            return self.dispatch_email_code(connection_id, task_id, request_id, params);
+        }
         let host = match self.credential_host(tab_id) {
             Ok(host) => host,
             Err(error) => {
@@ -1457,7 +1481,8 @@ impl Runtime {
                 otp_ref,
                 ..
             } => (credential_token, username_ref, password_ref, otp_ref, true),
-            BrowserCredentialsParams::Prepare { .. } => unreachable!(),
+            BrowserCredentialsParams::Prepare { .. }
+            | BrowserCredentialsParams::FillEmail { .. } => unreachable!(),
         };
         let selection = match self.credentials.select(
             credential_token,
@@ -1555,7 +1580,123 @@ impl Runtime {
         }
     }
 
+    fn dispatch_email_code(
+        &self,
+        connection_id: Uuid,
+        task_id: Uuid,
+        request_id: &str,
+        params: &BrowserCredentialsParams,
+    ) -> RpcResponse {
+        let BrowserCredentialsParams::FillEmail {
+            tab_id,
+            expected_page_revision,
+            message_id,
+            recipient,
+            purpose,
+            otp_refs,
+        } = params
+        else {
+            unreachable!()
+        };
+        let url = match self.credential_url(*tab_id) {
+            Ok(url) => url,
+            Err(error) => {
+                return RpcResponse::failure(request_id, Outcome::NotStarted, error);
+            }
+        };
+        let origin = url.origin().ascii_serialization();
+        // The broker checks the exact grant, mailbox, freshness, sender
+        // authentication, and recipient. Errors carry fixed broker text only.
+        let code = match self.email_codes.resolve(EmailCodeRequest {
+            origin: &origin,
+            path: url.path(),
+            recipient,
+            purpose,
+            message_id,
+        }) {
+            Ok(code) => code,
+            Err(error) => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::NotStarted,
+                    RpcError::new(error.code(), error.to_string()).with_recovery(error.recovery()),
+                );
+            }
+        };
+        if !(4..=12).contains(&code.len()) || !code.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return RpcResponse::failure(
+                request_id,
+                Outcome::NotStarted,
+                RpcError::new(
+                    "email_code_material_invalid",
+                    "Email verification requires a 4 to 12 character ASCII alphanumeric code",
+                ),
+            );
+        }
+        if otp_refs.len() != 1 && otp_refs.len() != code.len() {
+            return RpcResponse::failure(
+                request_id,
+                Outcome::NotStarted,
+                RpcError::new(
+                    "email_code_field_count_mismatch",
+                    "Use one complete-code input or one verification input per code character",
+                )
+                .with_recovery("Refresh the verification controls and provide their ordered refs."),
+            );
+        }
+        let fields = if otp_refs.len() == 1 {
+            vec![json!({"kind": "otp", "ref": otp_refs[0], "value": code})]
+        } else {
+            otp_refs
+                .iter()
+                .zip(code.chars())
+                .map(|(field_ref, character)| {
+                    json!({"kind": "otp", "ref": field_ref, "value": character.to_string()})
+                })
+                .collect()
+        };
+        let native_params = json!({
+            "tab_id": tab_id,
+            "expected_page_revision": expected_page_revision,
+            "expected_origin": origin,
+            "expected_path": url.path(),
+            "recipient": recipient,
+            "purpose": purpose,
+            "fields": fields,
+        });
+        match self.native.dispatch(
+            connection_id,
+            task_id,
+            "browser_email_code_fill",
+            native_params,
+            self.guardrails.native_origin_policy(*tab_id),
+            EMAIL_CODE_NATIVE_TIMEOUT,
+        ) {
+            Ok(native) => email_code_fill_response(
+                request_id,
+                native,
+                otp_refs.len(),
+                *expected_page_revision,
+            ),
+            Err(error) => RpcResponse::failure(
+                request_id,
+                Outcome::Unknown,
+                email_code_input_error(native_error_code(&error)),
+            ),
+        }
+    }
+
     fn credential_host(&self, tab_id: u64) -> Result<String, RpcError> {
+        let url = self.credential_url(tab_id)?;
+        Ok(url
+            .host_str()
+            .expect("credential_url verifies the hostname")
+            .trim_end_matches('.')
+            .to_ascii_lowercase())
+    }
+
+    fn credential_url(&self, tab_id: u64) -> Result<Url, RpcError> {
         let tab_url = self.tab_urls.read().get(&tab_id).cloned().ok_or_else(|| {
             RpcError::new(
                 "tab_origin_unverified",
@@ -1583,7 +1724,7 @@ impl Runtime {
             )
             .with_recovery("Use HTTPS or sign in manually after verifying the site."));
         }
-        Ok(host.trim_end_matches('.').to_ascii_lowercase())
+        Ok(url)
     }
 
     fn attach_task_binding(
@@ -1663,6 +1804,11 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
             BrowserCredentialsParams::Prepare {
                 tab_id,
                 expected_page_revision,
+            }
+            | BrowserCredentialsParams::FillEmail {
+                tab_id,
+                expected_page_revision,
+                ..
             }
             | BrowserCredentialsParams::Fill {
                 tab_id,
@@ -1823,6 +1969,117 @@ fn native_event_result(response: RpcResponse) -> NativeEventResult {
             ),
         ),
     }
+}
+
+fn native_error_code(error: &NativeError) -> &str {
+    match error {
+        NativeError::Disconnected => "extension_disconnected",
+        NativeError::Timeout => "extension_timeout",
+        NativeError::Protocol(_) => "native_protocol_error",
+        NativeError::Transport(_) => "native_transport_error",
+        NativeError::Extension(refusal) => &refusal.code,
+    }
+}
+
+fn email_code_fill_response(
+    request_id: &str,
+    native: NativeResponse,
+    filled_fields: usize,
+    expected_page_revision: u64,
+) -> RpcResponse {
+    match (native.outcome, native.result, native.error) {
+        (Outcome::Completed, Some(result), None)
+            if result.get("filled_fields").and_then(Value::as_u64)
+                == Some(filled_fields as u64) =>
+        {
+            RpcResponse::success(
+                request_id,
+                Outcome::Completed,
+                json!({
+                    "status": "filled",
+                    "filled_email_code": true,
+                    "filled_fields": filled_fields,
+                    "page_revision": result
+                        .get("page_revision")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(expected_page_revision),
+                }),
+            )
+        }
+        (outcome, None, Some(error)) => {
+            RpcResponse::failure(request_id, outcome, email_code_input_error(&error.code))
+        }
+        _ => RpcResponse::failure(
+            request_id,
+            Outcome::Unknown,
+            email_code_input_error("email_code_fill_failed"),
+        ),
+    }
+}
+
+// Only codes cross this boundary. Native messages, recovery text, and details may echo the code.
+fn email_code_input_error(code: &str) -> RpcError {
+    let code = match code {
+        "invalid_request"
+        | "stale_revision"
+        | "stale_ref"
+        | "email_code_page_mismatch"
+        | "email_code_target_invalid"
+        | "email_code_context_unverified"
+        | "email_code_recipient_unverified"
+        | "email_code_context_forbidden"
+        | "email_code_fill_failed"
+        | "challenge_active"
+        | "cross_origin_credentials_forbidden"
+        | "browser_restricted_origin"
+        | "debugger_unavailable"
+        | "frame_unavailable"
+        | "frame_not_found"
+        | "debugger_detached"
+        | "extension_disconnected"
+        | "ownership_denied"
+        | "ownership_revoked"
+        | "permissions_required"
+        | "paused"
+        | "origin_denied"
+        | "origin_not_allowed"
+        | "origin_unavailable"
+        | "origin_policy_mismatch"
+        | "scheme_denied"
+        | "origin_policy_unverifiable"
+        | "extension_timeout"
+        | "native_protocol_error"
+        | "native_transport_error" => code,
+        _ => "email_code_fill_failed",
+    };
+    let recovery = match code {
+        "email_code_context_forbidden" | "challenge_active" => {
+            "Do not retry this fill. Start browser_handoff for this tab and let the human complete verification."
+        }
+        "email_code_context_unverified" => {
+            "Confirm this exact page shows email verification for the intended recipient. Do not submit unconfirmed input."
+        }
+        "email_code_recipient_unverified" => {
+            "Use a verification page that identifies the full recipient or one compatible masked recipient, or let the human complete this step."
+        }
+        "extension_disconnected" | "extension_timeout" | "native_transport_error" => {
+            "Repair the AgentTab connection, then inspect this exact verification tab before retrying. Do not submit unconfirmed input."
+        }
+        "native_protocol_error" => {
+            "Update AgentTab so the host and extension protocol versions match, then inspect the verification tab."
+        }
+        _ => {
+            "Inspect this exact verification tab and refresh its refs before retrying. Do not submit unconfirmed input."
+        }
+    };
+    let message = match code {
+        "email_code_context_unverified" => "The page does not show an email code verification",
+        "email_code_recipient_unverified" => {
+            "The verification page does not identify the exact intended email recipient"
+        }
+        _ => "Email verification input did not return a confirmed complete result",
+    };
+    RpcError::new(code, message).with_recovery(recovery)
 }
 
 fn native_failure(request_id: &str, error: NativeError) -> RpcResponse {
@@ -1999,6 +2256,10 @@ fn enforce_response_limit(response: RpcResponse) -> RpcResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::email_codes::tests::{
+        broker_with, direct_message, grant, policy, provider_for, FakeProvider, DIRECT_RECIPIENT,
+        MESSAGE_ID, ORIGIN, PATH,
+    };
     use crate::native::NativeTaskFinish;
     use agenttab_protocol::{
         ConnectKind, FinishDisposition, NativeInventoryEvent, NativeOriginPolicy, NativeResponse,
@@ -4482,6 +4743,334 @@ mod tests {
                     .any(|window| window == private.as_bytes()),
                 "host state leaked {private}"
             );
+        }
+    }
+
+    #[test]
+    fn email_code_input_errors_preserve_safe_diagnostics_without_secret_text() {
+        for code in [
+            "email_code_context_unverified",
+            "email_code_recipient_unverified",
+            "email_code_target_invalid",
+            "stale_ref",
+            "debugger_unavailable",
+            "extension_timeout",
+            "native_protocol_error",
+        ] {
+            let error = email_code_input_error(code);
+            assert_eq!(error.code, code);
+        }
+        for code in ["verification code 739184", "email_code_739184", ""] {
+            let error = email_code_input_error(code);
+            assert_eq!(error.code, "email_code_fill_failed");
+            assert!(!serde_json::to_string(&error).unwrap().contains("739184"));
+        }
+        for code in ["challenge_active", "email_code_context_forbidden"] {
+            let error = email_code_input_error(code);
+            assert_eq!(error.code, code);
+            assert!(error.recovery.unwrap().contains("browser_handoff"));
+        }
+    }
+
+    /// One scripted answer from the extension's private email-code channel.
+    #[derive(Debug)]
+    enum EmailCodeReply {
+        Filled,
+        Refused(Outcome, &'static str),
+        Failed(NativeError),
+    }
+
+    #[derive(Debug)]
+    struct EmailCodeNative {
+        calls: Mutex<Vec<(String, Value)>>,
+        reply: EmailCodeReply,
+    }
+
+    impl EmailCodeNative {
+        fn new(reply: EmailCodeReply) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                reply,
+            })
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .iter()
+                .map(|(method, _)| method.clone())
+                .collect()
+        }
+    }
+
+    impl NativeTransport for EmailCodeNative {
+        fn dispatch(
+            &self,
+            _connection_id: Uuid,
+            _task_id: Uuid,
+            method: &str,
+            params: Value,
+            _origin_policy: Option<NativeOriginPolicy>,
+            _timeout: Duration,
+        ) -> Result<NativeResponse, NativeError> {
+            self.calls.lock().push((method.to_owned(), params.clone()));
+            let (outcome, result, error) = match (method, &self.reply) {
+                ("browser_email_code_fill", EmailCodeReply::Filled) => (
+                    Outcome::Completed,
+                    Some(json!({
+                        "filled_fields": params["fields"].as_array().map_or(0, Vec::len),
+                        "page_revision": 8,
+                    })),
+                    None,
+                ),
+                ("browser_email_code_fill", EmailCodeReply::Refused(outcome, code)) => (
+                    *outcome,
+                    None,
+                    Some(
+                        RpcError::new(*code, "page echoed QX7K2M near the recipient")
+                            .with_recovery("Type QX7K2M manually"),
+                    ),
+                ),
+                ("browser_email_code_fill", EmailCodeReply::Failed(error)) => {
+                    return Err(error.clone())
+                }
+                _ => (Outcome::Completed, Some(json!({})), None),
+            };
+            Ok(NativeResponse {
+                protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: NativeResponseKind::Response,
+                request_id: Uuid::new_v4(),
+                outcome,
+                result,
+                error,
+                staged: None,
+            })
+        }
+    }
+
+    /// A runtime whose email-code broker reads one fresh synthetic message
+    /// carrying code QX7K2M, with the verification tab on the granted page.
+    fn email_code_runtime(
+        native: Arc<dyn NativeTransport>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Runtime>,
+        Arc<ConnectionContext>,
+        Arc<FakeProvider>,
+    ) {
+        let provider = provider_for(direct_message("Your code is QX7K2M", "Your code is QX7K2M"));
+        let broker_provider = provider.clone();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
+        let configured_policy = policy(vec![grant()]);
+        let configured_grant = &configured_policy.grants[0];
+        paths.prepare().unwrap();
+        std::fs::write(
+            &paths.policy_file,
+            serde_json::to_vec(&json!({
+                "email_codes": {
+                    "enabled": configured_policy.enabled,
+                    "executable": configured_policy.executable,
+                    "mailbox": configured_policy.mailbox,
+                    "grants": [{
+                        "origin": configured_grant.origin,
+                        "paths": configured_grant.paths,
+                        "recipient": configured_grant.recipient,
+                        "purposes": configured_grant.purposes,
+                        "sender_domains": configured_grant.sender_domains,
+                        "code_pattern": configured_grant.code_pattern,
+                    }],
+                },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.begin_reconciliation();
+        lifecycle.complete_reconciliation(false);
+        let runtime = Runtime::open_with(&paths, lifecycle, native, move |policy| {
+            broker_with(policy.clone(), broker_provider)
+        })
+        .unwrap();
+        let (connection, _) = runtime
+            .connect(ConnectionInit {
+                protocol: RPC_PROTOCOL.into(),
+                version: PROTOCOL_VERSION,
+                kind: ConnectKind::Connect,
+                conversation_id: None,
+                resume_capability: None,
+            })
+            .unwrap();
+        own_tab(&runtime, &connection, 7);
+        runtime
+            .tab_urls
+            .write()
+            .insert(3, format!("{ORIGIN}{PATH}"));
+        (temp, runtime, connection, provider)
+    }
+
+    fn fill_email_request(request_id: &str, key: Uuid) -> Value {
+        json!({
+            "protocol": RPC_PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "idempotency_key": key,
+            "method": "browser_credentials",
+            "params": {
+                "action": "fill_email",
+                "tab_id": 3,
+                "expected_page_revision": 7,
+                "message_id": MESSAGE_ID,
+                "recipient": DIRECT_RECIPIENT,
+                "purpose": "signup",
+                "otp_refs": ["e1"],
+            }
+        })
+    }
+
+    fn staged_row_count(temp: &tempfile::TempDir) -> i64 {
+        rusqlite::Connection::open(temp.path().join("agenttab/state.sqlite3"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM staged_commits", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn tree_contains(dir: &std::path::Path, needle: &[u8]) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                tree_contains(&path, needle)
+            } else {
+                std::fs::read(&path)
+                    .map(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+                    .unwrap_or(false)
+            }
+        })
+    }
+
+    #[test]
+    fn email_code_fill_writes_directly_without_a_staged_review() {
+        let native = EmailCodeNative::new(EmailCodeReply::Filled);
+        let (temp, runtime, connection, provider) = email_code_runtime(native.clone());
+
+        let response = runtime.handle(
+            &connection,
+            fill_email_request("fill-direct", Uuid::now_v7()),
+        );
+        assert_eq!(response["outcome"], "completed", "{response}");
+        assert_eq!(response["result"]["status"], "filled");
+        assert_eq!(response["result"]["filled_email_code"], true);
+        assert_eq!(response["result"]["filled_fields"], 1);
+        assert_eq!(response["result"]["page_revision"], 8);
+        assert!(response["result"].get("staged_token").is_none());
+        assert!(!response.to_string().contains("QX7K2M"));
+
+        // One verified mailbox read and one private-channel write, never a stage.
+        assert_eq!(
+            *provider.calls.lock(),
+            vec!["profile".to_owned(), format!("message:{MESSAGE_ID}")]
+        );
+        assert_eq!(native.methods(), vec!["browser_email_code_fill"]);
+        let fill = native.calls.lock()[0].1.clone();
+        assert_eq!(
+            fill,
+            json!({
+                "tab_id": 3,
+                "expected_page_revision": 7,
+                "expected_origin": ORIGIN,
+                "expected_path": PATH,
+                "recipient": DIRECT_RECIPIENT,
+                "purpose": "signup",
+                "fields": [{"kind": "otp", "ref": "e1", "value": "QX7K2M"}],
+            })
+        );
+        assert_eq!(staged_row_count(&temp), 0);
+        assert!(!tree_contains(temp.path(), b"QX7K2M"));
+    }
+
+    #[test]
+    fn email_code_fill_outside_the_exact_grant_never_reads_mail_or_writes() {
+        let native = EmailCodeNative::new(EmailCodeReply::Filled);
+        let (temp, runtime, connection, provider) = email_code_runtime(native.clone());
+        runtime
+            .tab_urls
+            .write()
+            .insert(3, format!("{ORIGIN}/account/security"));
+
+        let response = runtime.handle(
+            &connection,
+            fill_email_request("fill-ungranted", Uuid::now_v7()),
+        );
+        assert_eq!(response["outcome"], "not_started", "{response}");
+        assert_eq!(response["error"]["code"], "email_code_grant_not_found");
+        assert!(provider.calls.lock().is_empty());
+        assert!(native.methods().is_empty());
+        assert_eq!(staged_row_count(&temp), 0);
+    }
+
+    #[test]
+    fn email_code_refusals_return_fixed_diagnostics_without_staging() {
+        for (reply, expected_outcome, expected_code) in [
+            (
+                EmailCodeReply::Refused(Outcome::NotStarted, "email_code_recipient_unverified"),
+                "not_started",
+                "email_code_recipient_unverified",
+            ),
+            (
+                EmailCodeReply::Refused(Outcome::NotStarted, "email_code_context_forbidden"),
+                "not_started",
+                "email_code_context_forbidden",
+            ),
+            (
+                EmailCodeReply::Refused(Outcome::NotStarted, "challenge_active"),
+                "not_started",
+                "challenge_active",
+            ),
+            (
+                EmailCodeReply::Refused(Outcome::Unknown, "page said QX7K2M"),
+                "unknown",
+                "email_code_fill_failed",
+            ),
+            (
+                EmailCodeReply::Failed(NativeError::Extension(RpcError::new(
+                    "ownership_revoked",
+                    "tab QX7K2M was released",
+                ))),
+                "unknown",
+                "ownership_revoked",
+            ),
+            (
+                EmailCodeReply::Failed(NativeError::Timeout),
+                "unknown",
+                "extension_timeout",
+            ),
+        ] {
+            let native = EmailCodeNative::new(reply);
+            let (temp, runtime, connection, _provider) = email_code_runtime(native.clone());
+            let response = runtime.handle(
+                &connection,
+                fill_email_request("fill-refused", Uuid::now_v7()),
+            );
+            let expected = email_code_input_error(expected_code);
+            assert_eq!(response["outcome"], expected_outcome, "{expected_code}");
+            assert_eq!(response["error"]["code"], expected_code, "{expected_code}");
+            assert_eq!(
+                response["error"]["message"], expected.message,
+                "{expected_code}"
+            );
+            assert_eq!(
+                response["error"]["recovery"],
+                expected.recovery.unwrap(),
+                "{expected_code}"
+            );
+            assert!(!response.to_string().contains("QX7K2M"), "{expected_code}");
+            assert_eq!(
+                native.methods(),
+                vec!["browser_email_code_fill"],
+                "{expected_code}"
+            );
+            assert_eq!(staged_row_count(&temp), 0, "{expected_code}");
         }
     }
 

@@ -19,6 +19,7 @@ export type NativeMethod =
   | "browser_developer"
   | "agenttab.close"
   | "browser_credentials_fill"
+  | "browser_email_code_fill"
   | "commit_review_bind"
   | "commit_review_abandon";
 
@@ -34,6 +35,7 @@ const CORE_METHODS: Record<NativeMethod, true> = {
   browser_developer: true,
   "agenttab.close": true,
   browser_credentials_fill: true,
+  browser_email_code_fill: true,
   commit_review_bind: true,
   commit_review_abandon: true,
 };
@@ -618,6 +620,95 @@ function assertCredentialFillParams(value: unknown): Record<string, unknown> {
   return params;
 }
 
+export type EmailCodeFillRequest = {
+  tab_id: number;
+  expected_page_revision: number;
+  expected_origin: string;
+  expected_path: string;
+  recipient: string;
+  purpose: "signup" | "email_sign_in";
+  fields: Array<{ kind: "otp"; ref: string; value: string }>;
+};
+
+const EMAIL_CODE_MAX_FIELDS = 12;
+const EMAIL_CODE_LOOPBACK_HOSTS: Readonly<Record<string, true>> = { localhost: true, "127.0.0.1": true, "[::1]": true };
+// Mirrors the host's bounded addr-spec: printable ASCII without whitespace or list/header delimiters.
+const EMAIL_CODE_RECIPIENT_PATTERN =
+  /^[\x21-\x2b\x2d-\x3a\x3d\x3f\x41-\x7e]{1,64}@[\x21-\x2b\x2d-\x3a\x3d\x3f\x41-\x7e]{1,255}$/;
+const EMAIL_CODE_PATH_PATTERN = /^\/[^\s?#\u0000-\u001f\u007f]*$/;
+
+/**
+ * Validates the internal email code fill. Values are checked for shape only and
+ * no failure message names a value: one field takes the whole 4..12 character
+ * code, or 4..12 fields take one character each.
+ */
+export function parseEmailCodeFillParams(value: unknown): EmailCodeFillRequest {
+  const params = assertExactObject(
+    value,
+    ["tab_id", "expected_page_revision", "expected_origin", "expected_path", "recipient", "purpose", "fields"],
+    [],
+    "browser_email_code_fill parameters",
+  );
+  const tabId = assertTabId(params.tab_id);
+  const revision = assertRevision(params.expected_page_revision);
+  const origin = assertBoundedString(params.expected_origin, "expected_origin", 8, 2_048);
+  let parsedOrigin: URL | null = null;
+  try {
+    parsedOrigin = new URL(origin);
+  } catch {
+    parsedOrigin = null;
+  }
+  if (
+    parsedOrigin === null ||
+    parsedOrigin.origin !== origin ||
+    !(parsedOrigin.protocol === "https:" ||
+      (parsedOrigin.protocol === "http:" && EMAIL_CODE_LOOPBACK_HOSTS[parsedOrigin.hostname] === true))
+  ) {
+    commandError("expected_origin must be an HTTPS or loopback HTTP origin");
+  }
+  const path = assertBoundedString(params.expected_path, "expected_path", 1, 2_048);
+  if (!EMAIL_CODE_PATH_PATTERN.test(path) || new URL(path, origin).pathname !== path) {
+    commandError("expected_path must be an exact URL pathname");
+  }
+  const recipient = assertBoundedString(params.recipient, "recipient", 3, 320);
+  if (!EMAIL_CODE_RECIPIENT_PATTERN.test(recipient)) commandError("recipient must be one bounded email address");
+  const purpose = params.purpose;
+  if (purpose !== "signup" && purpose !== "email_sign_in") commandError("purpose must be signup or email_sign_in");
+  if (!Array.isArray(params.fields) || params.fields.length === 0 || params.fields.length > EMAIL_CODE_MAX_FIELDS) {
+    commandError(`email code fields must contain between 1 and ${EMAIL_CODE_MAX_FIELDS} entries`);
+  }
+  const refs = new Set<string>();
+  const fields: EmailCodeFillRequest["fields"] = [];
+  for (const field of params.fields) {
+    const parsed = assertExactObject(field, ["kind", "ref", "value"], [], "email code field");
+    if (parsed.kind !== "otp") commandError("email code field kind must be otp");
+    const ref = assertBoundedString(parsed.ref, "email code field ref", 1, 256);
+    if (refs.has(ref)) commandError("email code field refs must be unique");
+    refs.add(ref);
+    if (typeof parsed.value !== "string") commandError("email code field value must be a string");
+    fields.push({ kind: "otp", ref, value: parsed.value });
+  }
+  const single = fields.length === 1;
+  if (
+    single
+      ? !/^[A-Za-z0-9]{4,12}$/.test(fields[0].value)
+      : fields.length < 4 || fields.some((field) => !/^[A-Za-z0-9]$/.test(field.value))
+  ) {
+    commandError(
+      "email code fields must be one field with a 4 to 12 character alphanumeric code, or 4 to 12 fields with one alphanumeric character each",
+    );
+  }
+  return {
+    tab_id: tabId,
+    expected_page_revision: revision,
+    expected_origin: origin,
+    expected_path: path,
+    recipient,
+    purpose,
+    fields,
+  };
+}
+
 const BOOKMARK_ID_PATTERN = /^[0-9]{1,20}$/;
 const BOOKMARK_URL_PATTERN = /^(?:https?|file|chrome):\/\/\S+$/i;
 
@@ -784,6 +875,8 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
       return assertDeveloperParams(value);
     case "browser_credentials_fill":
       return assertCredentialFillParams(value);
+    case "browser_email_code_fill":
+      return parseEmailCodeFillParams(value);
     case "commit_review_bind":
     case "commit_review_abandon":
       return assertCommitReviewParams(value, method);

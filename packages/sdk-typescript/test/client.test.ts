@@ -127,6 +127,22 @@ describe("Core RPC transport deadlines", () => {
       "browser_credentials",
       { action: "prepare", tab_id: 1, expected_page_revision: 1 },
     )).toBe(DEFAULT_BROWSER_CREDENTIALS_TIMEOUT_MS + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs(
+      "browser_credentials",
+      {
+        action: "fill_email",
+        tab_id: 1,
+        expected_page_revision: 1,
+        message_id: "abc123",
+        recipient: "user@service.example",
+        purpose: "signup",
+        otp_refs: ["e1@1"],
+      },
+    )).toBe(150_000 + LONG_OPERATION_TRANSPORT_GRACE_MS);
+    expect(resolveTransportTimeoutMs(
+      "browser_commit",
+      { staged_token: "s".repeat(32) },
+    )).toBe(30_000);
     expect(resolveTransportTimeoutMs("browser_tabs", {}, 45_000)).toBe(45_000);
     expect(resolveTransportTimeoutMs(
       "browser_wait",
@@ -135,7 +151,7 @@ describe("Core RPC transport deadlines", () => {
     )).toBe(45_000);
   });
 
-  test("lets a requested browser_wait outlive a shorter generic client timeout", async () => {
+  test("lets broker operations and requested waits outlive a shorter generic client timeout", async () => {
     const endpoint = await listen((socket) => {
       const decoder = new FrameDecoder(1024 * 1024);
       socket.on("data", (chunk) => {
@@ -168,6 +184,15 @@ describe("Core RPC transport deadlines", () => {
       tab_id: 1,
       condition: { kind: "load" },
       timeout_ms: 1,
+    })).resolves.toEqual({ matched: true });
+    await expect(client.call("browser_credentials", {
+      action: "fill_email",
+      tab_id: 1,
+      expected_page_revision: 1,
+      message_id: "abc123",
+      recipient: "user@service.example",
+      purpose: "signup",
+      otp_refs: ["e1@1"],
     })).resolves.toEqual({ matched: true });
     client.close();
   });

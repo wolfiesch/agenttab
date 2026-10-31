@@ -16,6 +16,7 @@ import {
 } from "./page-agent-protocol";
 import { sensitiveFieldState } from "./sensitive-field";
 import { accessibilityMatcher, type AccessibilityQuery } from "./accessibility-query";
+import { fillEmailCodeInPage } from "./email-code-page";
 
 // Work bound so a snapshot of a pathological document stays responsive.
 const SNAPSHOT_INSPECT_LIMIT = 25_000;
@@ -459,6 +460,16 @@ async function run(registry: Registry, request: PageAgentRequest): Promise<unkno
     case "fill_credential": {
       const element = lookup(registry, request.id);
       return isAgentError(element) ? element : fillCredential(element, request.value, request.kind);
+    }
+    case "email_code_fill": {
+      // Every ref must resolve before the page function checks or writes anything.
+      const elements: Element[] = [];
+      for (const id of request.ids) {
+        const element = lookup(registry, id);
+        if (isAgentError(element)) return element;
+        elements.push(element);
+      }
+      return fillEmailCodeInPage(elements, request.values, request.expectation, sensitiveFieldState);
     }
     case "surface": {
       const element = lookup(registry, request.id);

@@ -5,6 +5,12 @@ import {
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
+  EMAIL_CODE_MAX_REFS,
+  EMAIL_CODE_MESSAGE_ID_PATTERN,
+  EMAIL_CODE_PURPOSES,
+  EMAIL_CODE_RECIPIENT_MAX_CHARS,
+  EMAIL_CODE_RECIPIENT_MIN_CHARS,
+  EMAIL_CODE_RECIPIENT_PATTERN,
   SCREENSHOT_MAX_BYTES,
   SCREENSHOT_MAX_DIMENSION,
   CHALLENGE_GUIDANCE,
@@ -312,17 +318,31 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_credentials",
       label: "Browser Credentials",
-      description: "Prefer this before human handoff: use a URL-matching 1Password Login without exposing its values. Prepare first; more than three matches require the user. Fill only, then submit through Browser Act.",
+      description: "Prefer this before human handoff. 1Password: prepare, then fill or next with a URL-matching Login without exposing its values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use Browser Act for explicit submission; you may complete verification on entering the final character.",
       approval: "write",
-      // One flat object covers every action; Core enforces credential_token for fill and next.
+      // One flat object covers every action: OpenAI-compatible providers reject a root union.
+      // Core enforces each action's exact fields: credential_token for fill and next, and only
+      // message_id, recipient, purpose, and unique otp_refs for fill_email.
       schema: (z) => z.object({
-        action: z.enum(["prepare", "fill", "next"]),
+        action: z.enum(["prepare", "fill", "next", "fill_email"]),
         tab_id: z.number().int().min(0),
         expected_page_revision: z.number().int().min(0),
         credential_token: z.string().min(32).max(256).optional(),
         username_ref: z.string().min(1).max(256).optional(),
         password_ref: z.string().min(1).max(256).optional(),
         otp_ref: z.string().min(1).max(256).optional(),
+        message_id: z.string().regex(new RegExp(EMAIL_CODE_MESSAGE_ID_PATTERN)).optional(),
+        recipient: z.string()
+          .min(EMAIL_CODE_RECIPIENT_MIN_CHARS)
+          .max(EMAIL_CODE_RECIPIENT_MAX_CHARS)
+          .regex(new RegExp(EMAIL_CODE_RECIPIENT_PATTERN))
+          .optional(),
+        purpose: z.enum(EMAIL_CODE_PURPOSES).optional(),
+        otp_refs: z.array(z.string().min(1).max(256))
+          .min(1)
+          .max(EMAIL_CODE_MAX_REFS)
+          .refine((values) => new Set(values).size === values.length, "otp_refs must be unique")
+          .optional(),
       }).strict(),
     },
     {
@@ -374,7 +394,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_commit",
       label: "Browser Commit",
-      description: "Execute one previously staged consequential action after semantic review.",
+      description: "Execute one staged action after human popup approval, including bookmark removal.",
       approval: "write",
       schema: (z) => z.object({ staged_token: z.string().min(32).max(256) }).strict(),
     },

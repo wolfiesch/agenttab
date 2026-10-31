@@ -892,6 +892,68 @@ test("Pi browser_profile schema accepts each operation and rejects unknown field
   expect(Value.Check(schema, { operation: "bookmarks_wipe" })).toBe(false);
 });
 
+const FILL_EMAIL_PARAMS = {
+  action: "fill_email",
+  tab_id: 4,
+  expected_page_revision: 9,
+  message_id: "18f2a9c4b7e1d03a",
+  recipient: "member+signup@example.test",
+  purpose: "signup",
+  otp_refs: ["e1"],
+} as const;
+
+test("OMP browser_credentials stays one strict flat object that admits fill_email", () => {
+  const credentials = register(false).tools.find((tool) => tool.name === "browser_credentials");
+  expect(credentials).toMatchObject({ approval: "write", parameters: { kind: "object" } });
+  const state = stubState(credentials?.parameters);
+  expect(state.strict).toBe(true);
+  for (const action of ["prepare", "fill", "next", "fill_email"]) expect(state.vocabulary.values).toContain(action);
+  for (const field of Object.keys(FILL_EMAIL_PARAMS)) expect(state.vocabulary.names).toContain(field);
+  expect(state.vocabulary.values).toContain("email_sign_in");
+  expect(state.vocabulary.limits.get("otp_refs")).toBe(12);
+  expect(state.vocabulary.unique).toContain("otp_refs");
+  expect(state.vocabulary.names).not.toContain("code");
+  expect(state.vocabulary.names).not.toContain("query");
+  expect(state.vocabulary.names).not.toContain("origin");
+});
+
+test("Pi browser_credentials schema accepts fill_email routing metadata and rejects secrets or mixed fields", () => {
+  // piSchema returns the TypeBox schema typed as unknown so the Pi registration map stays uniform.
+  const schema = piSchema("browser_credentials") as Parameters<typeof Value.Check>[0];
+  const accepted: ReadonlyArray<Record<string, unknown>> = [
+    FILL_EMAIL_PARAMS,
+    { ...FILL_EMAIL_PARAMS, purpose: "email_sign_in", otp_refs: ["e1", "e2", "e3", "e4", "e5", "e6"] },
+    { ...FILL_EMAIL_PARAMS, message_id: "f".repeat(128), recipient: `${"a".repeat(64)}@${"b".repeat(255)}` },
+    { action: "prepare", tab_id: 4, expected_page_revision: 9 },
+    { action: "fill", tab_id: 4, expected_page_revision: 9, credential_token: "t".repeat(32), otp_ref: "e3" },
+  ];
+  for (const params of accepted) expect({ params, valid: Value.Check(schema, params) }).toEqual({ params, valid: true });
+  const rejected: ReadonlyArray<Record<string, unknown>> = [
+    { ...FILL_EMAIL_PARAMS, credential_token: "t".repeat(32) },
+    { ...FILL_EMAIL_PARAMS, password_ref: "e2" },
+    { ...FILL_EMAIL_PARAMS, username_ref: "e2" },
+    { ...FILL_EMAIL_PARAMS, otp_ref: "e2" },
+    { ...FILL_EMAIL_PARAMS, code: "123456" },
+    { ...FILL_EMAIL_PARAMS, origin: "https://example.test" },
+    { ...FILL_EMAIL_PARAMS, query: "from:example.test" },
+    { ...FILL_EMAIL_PARAMS, purpose: "mfa" },
+    { ...FILL_EMAIL_PARAMS, message_id: "not-hex" },
+    { ...FILL_EMAIL_PARAMS, message_id: "f".repeat(129) },
+    { ...FILL_EMAIL_PARAMS, recipient: "member@example.test\r\nBcc: other@example.test" },
+    { ...FILL_EMAIL_PARAMS, recipient: "member@one@example.test" },
+    { ...FILL_EMAIL_PARAMS, recipient: "Member <member@example.test>" },
+    { ...FILL_EMAIL_PARAMS, otp_refs: [] },
+    { ...FILL_EMAIL_PARAMS, otp_refs: ["e1", "e1"] },
+    { ...FILL_EMAIL_PARAMS, otp_refs: Array.from({ length: 13 }, (_, index) => `e${index}`) },
+    { ...FILL_EMAIL_PARAMS, otp_refs: [""] },
+    { action: "fill", tab_id: 4, expected_page_revision: 9, credential_token: "t".repeat(32), otp_refs: ["e1"] },
+    { action: "prepare", tab_id: 4, expected_page_revision: 9, recipient: "member@example.test" },
+  ];
+  for (const params of rejected) expect({ params, valid: Value.Check(schema, params) }).toEqual({ params, valid: false });
+  const { message_id: _messageId, ...withoutMessage } = FILL_EMAIL_PARAMS;
+  expect(Value.Check(schema, withoutMessage)).toBe(false);
+});
+
 test("OMP sends an invocation idempotency key for browser_profile writes only", async () => {
   const tools: Array<Record<string, unknown>> = [];
   const requests: Array<{ operation: unknown; key: unknown }> = [];

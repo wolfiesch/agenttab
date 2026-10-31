@@ -28,6 +28,8 @@ A task workspace is visible in Chrome. Task-owned tabs are grouped for display, 
 
 **Needs your attention** is the human-only input boundary. AgentTab MUST route passkeys, security keys, CAPTCHA, payment secrets, account recovery, unsupported verification, and any credential workflow that returns `needs_user` to an advisory attention notice. The managed 1Password broker is available by default and MAY fill an origin-matching Login item through the private host-to-extension path, but MUST NOT expose the value to an agent or submit the form. Owner-only policy MAY disable or constrain the broker.
 
+*Amended 2026-10-30:* An explicitly enabled email-verification broker MAY fill signup or email-sign-in codes through the same private host-to-extension boundary. It MUST bind an exact managed origin, pathname, recipient, purpose, and authenticated Gmail message, return metadata only, and leave password, MFA, passkey, recovery, human-verification, and Commit safeguards unchanged.
+
 *Amended 2026-09-07:* Notices are non-blocking display metadata. A request MUST NOT pause the scheduler, gate command admission, focus a tab, activate a window, or open the popup; no global observation blackout or host handoff admission state exists. The agent asks the user in chat, the user reports back, and the agent MUST verify the page itself before resolving or dismissing the notice by ID. AgentTab MUST NOT capture human keystrokes, and no tool result may report the user's work as completed on creation. Only the user's explicit popup Open tab action may focus the noticed tab.
 
 ### Commit
@@ -47,7 +49,7 @@ Task ownership is an execution and coordination boundary. It is not cookie, iden
 Standard mode MUST NOT expose:
 
 - raw cookies or browser storage
-- credential values, saved-item lists, passkeys, payment secrets, or human-only input; an explicitly enabled managed broker MAY fill one origin-matching Login item without returning its value
+- credential values, saved-item lists, passkeys, payment secrets, or human-only input; a managed broker MAY privately fill an origin-matching Login item or an explicitly granted email-verification code without returning its value
 - arbitrary JavaScript execution
 - raw Chrome DevTools Protocol access
 - coordinate-based actions
@@ -93,7 +95,9 @@ MCP, OMP, CLI, TypeScript, and Python are adapters over Core RPC. They are not a
 9. `browser_profile`
 10. `browser_finish`
 
-`browser_credentials` is enabled by default. Managed policy MAY disable or constrain it. It MUST derive the page origin and task ownership in the host, enforce a candidate and attempt limit no greater than three, use one-use short-lived tokens, and keep credential values out of Core RPC, adapters, responses, and audit output.
+The 1Password actions of `browser_credentials` are enabled by default. Managed policy MAY disable or constrain them. They MUST derive the page origin and task ownership in the host, enforce a candidate and attempt limit no greater than three, use one-use short-lived tokens, and keep credential values out of Core RPC, adapters, responses, and audit output. The separate `fill_email` action MUST be disabled by default and require an exact email-code grant, fresh authenticated mail, and the same ownership, revision, and private-value boundaries.
+
+On a compatible masked-recipient form, `fill_email` MUST enter the code directly when the bounded ASCII `*` mask fits the exact granted recipient and no conflicting address is shown. Every mask on the page MUST be the same bounded mask. An absent or incompatible recipient MUST fail before any write. No email-specific stage, popup approval, or `browser_commit` step is required. Retain every password, MFA, passkey, and human-challenge safeguard.
 
 `browser_profile` operates on the Chrome profile rather than a task tab. Its read operations MUST NOT carry an idempotency key and its write operations MUST. Bookmark removal MUST always stage for popup review regardless of YOLO mode, session restore MUST open owned background tabs instead of calling `chrome.sessions.restore`, and the host MUST refuse session restore while origin policy is constrained. Audit MUST NOT record its titles, URLs, or query text.
 

@@ -189,7 +189,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_credentials",
-    description: "Prefer this before human handoff: use an origin-matching 1Password Login without exposing values; more than three matches require the user.",
+    description: "Prefer this before human handoff. 1Password: prepare, then fill or next with an origin-matching Login without exposing values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use browser_act for explicit submission; you may complete verification on entering the final character.",
     inputSchema: schema(credentialsSchema),
   },
   {
@@ -199,7 +199,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_commit",
-    description: "Execute one previously staged consequential action after semantic review.",
+    description: "Execute one staged action after human popup approval, including bookmark removal.",
     inputSchema: schema(commitSchema),
   },
   {

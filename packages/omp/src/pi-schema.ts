@@ -1,6 +1,12 @@
 import { Type } from "typebox";
 import {
   ACT_INTENT_MAX_CHARS,
+  EMAIL_CODE_MAX_REFS,
+  EMAIL_CODE_MESSAGE_ID_PATTERN,
+  EMAIL_CODE_PURPOSES,
+  EMAIL_CODE_RECIPIENT_MAX_CHARS,
+  EMAIL_CODE_RECIPIENT_MIN_CHARS,
+  EMAIL_CODE_RECIPIENT_PATTERN,
   SCREENSHOT_MAX_BYTES,
   SCREENSHOT_MAX_DIMENSION,
   SNAPSHOT_TEXT_MAX_BYTES,
@@ -125,6 +131,19 @@ const schemas: Record<ToolMethod, unknown> = {
       username_ref: Type.Optional(ref()),
       password_ref: Type.Optional(ref()),
       otp_ref: Type.Optional(ref()),
+    }),
+    object({
+      action: Type.Literal("fill_email"),
+      tab_id: Type.Integer({ minimum: 0 }),
+      expected_page_revision: Type.Integer({ minimum: 0 }),
+      message_id: Type.String({ minLength: 1, maxLength: 128, pattern: EMAIL_CODE_MESSAGE_ID_PATTERN }),
+      recipient: Type.String({
+        minLength: EMAIL_CODE_RECIPIENT_MIN_CHARS,
+        maxLength: EMAIL_CODE_RECIPIENT_MAX_CHARS,
+        pattern: EMAIL_CODE_RECIPIENT_PATTERN,
+      }),
+      purpose: stringEnum(EMAIL_CODE_PURPOSES),
+      otp_refs: Type.Array(ref(), { minItems: 1, maxItems: EMAIL_CODE_MAX_REFS, uniqueItems: true }),
     }),
   ]),
   browser_profile: Type.Union([

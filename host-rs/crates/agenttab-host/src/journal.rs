@@ -2133,6 +2133,73 @@ mod tests {
     }
 
     #[test]
+    fn opens_a_state_store_with_a_retired_staged_commit_column() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.sqlite3");
+        let staged = |native_token: &str, task_id: Uuid| NativeStagedCommit {
+            native_token: native_token.into(),
+            task_id,
+            tab_id: 7,
+            page_revision: 9,
+            effect: "submit order".into(),
+            fingerprint: "d".repeat(64),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        // A store written by an earlier host version carries one more nullable
+        // column, populated on its pending stage.
+        let (task_id, earlier) = {
+            let journal = Journal::open(&path).unwrap();
+            let task = journal.create_task(None).unwrap();
+            journal
+                .reconcile_inventory(&[owned_tab(task.task_id, 9)])
+                .unwrap();
+            let handles = journal
+                .store_staged_commit(&staged("native-token-earlier-host", task.task_id), &[])
+                .unwrap();
+            journal
+                .connection
+                .lock()
+                .execute_batch(
+                    "ALTER TABLE staged_commits ADD COLUMN retired_scope_json TEXT;
+                     UPDATE staged_commits SET retired_scope_json = '{\"scope\":\"retired\"}';",
+                )
+                .unwrap();
+            (task.task_id, handles)
+        };
+
+        let reopened = Journal::open(&path).unwrap();
+        reopened
+            .reconcile_inventory(&[owned_tab(task_id, 9)])
+            .unwrap();
+        let current = reopened
+            .store_staged_commit(&staged("native-token-current-host", task_id), &[])
+            .unwrap();
+        for (handles, native_token) in [
+            (&earlier, "native-token-earlier-host"),
+            (&current, "native-token-current-host"),
+        ] {
+            assert!(matches!(
+                reopened.consume_staged_commit(task_id, &handles.staged_token, Uuid::now_v7()),
+                Ok(StagedCommitConsumption::ApprovalRequired)
+            ));
+            assert!(matches!(
+                reopened.approve_popup_staged_commit(task_id, 7, &handles.review_handle),
+                Ok(StagedCommitApproval::Approved)
+            ));
+            let StagedCommitConsumption::Ready(consumed) = reopened
+                .consume_staged_commit(task_id, &handles.staged_token, Uuid::now_v7())
+                .unwrap()
+            else {
+                panic!("an approved stage must be consumable despite a retired column");
+            };
+            assert_eq!(consumed.native_token, native_token);
+            assert_eq!(consumed.effect, "submit order");
+            assert!(consumed.upload_paths.is_empty());
+            reopened.finish_staged_commit(native_token).unwrap();
+        }
+    }
+
+    #[test]
     fn abandoning_popup_review_returns_uploads_and_removes_host_record() {
         let temp = tempfile::tempdir().unwrap();
         let journal = open_journal(&temp);
