@@ -1589,6 +1589,12 @@ pub(crate) mod tests {
     const CODE_PATTERN: &str = r"(?i:code)(?: is)?:?\s+([A-Z0-9]{6})\b";
     const AUTH_PASS_SERVICE: &str = "mx.google.com; dkim=pass header.i=@service.example header.s=s1 header.b=AbCdEf; spf=pass (google.com: domain of bounce@service.example designates 192.0.2.1 as permitted sender; extra) smtp.mailfrom=bounce@service.example; dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=service.example";
     const AUTH_PASS_RELAY: &str = "mx.google.com; dkim=pass header.i=@relay.example header.s=s1 header.b=XyZ; spf=pass smtp.mailfrom=bounce@relay.example; dmarc=pass (p=QUARANTINE) header.from=relay.example";
+    /// Absolute on every platform so policy validation accepts it on Windows too.
+    pub(crate) const FIXTURE_GWS: &str = if cfg!(windows) {
+        r"C:\fixture\bin\gws.exe"
+    } else {
+        "/opt/fixture/bin/gws"
+    };
 
     fn fixed_now() -> u64 {
         NOW_MS
@@ -1636,7 +1642,7 @@ pub(crate) mod tests {
     pub(crate) fn policy(grants: Vec<EmailCodeGrant>) -> EmailCodePolicy {
         EmailCodePolicy {
             enabled: true,
-            executable: Some(PathBuf::from("/opt/fixture/bin/gws")),
+            executable: Some(PathBuf::from(FIXTURE_GWS)),
             mailbox: Some(MAILBOX.into()),
             grants,
             ..EmailCodePolicy::default()
@@ -2644,7 +2650,7 @@ pub(crate) mod tests {
             MAILBOX,
             RELAY_RECIPIENT,
             RELAY_SENDER,
-            "/opt/fixture",
+            FIXTURE_GWS,
             CODE_PATTERN,
         ] {
             assert!(!rendered.contains(private), "{rendered}");

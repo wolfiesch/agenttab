@@ -774,7 +774,7 @@ mod tests {
     fn email_code_policy_json(enabled: bool) -> Value {
         json!({
             "enabled": enabled,
-            "executable": "/opt/fixture/bin/gws",
+            "executable": crate::email_codes::tests::FIXTURE_GWS,
             "mailbox": "synthetic.owner@gmail.com",
             "grants": [{
                 "origin": "https://id.service.example",
