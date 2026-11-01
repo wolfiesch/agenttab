@@ -3,7 +3,7 @@ name: Nightly release compatibility
 on:
   workflow_dispatch:
   schedule:
-    - cron: "37 2 * * 2,4,6"
+    - cron: "37 7 * * 2,4,6"
       timezone: "America/Los_Angeles"
 
 permissions:
