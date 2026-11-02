@@ -675,7 +675,7 @@ export class StandardBrowserRuntime {
           typeof params.targetInfo.targetId === "string"
         ) {
           session.frameSessions.set(params.targetInfo.targetId, params.sessionId);
-          void this.initializeChildFrameSession(source.tabId, params.sessionId);
+          void this.initializeChildFrameSession(source.tabId, params.sessionId).catch(() => undefined);
         } else if (method === "Target.detachedFromTarget" && typeof params.sessionId === "string") {
           for (const [frameId, sessionId] of session.frameSessions) {
             if (sessionId !== params.sessionId) continue;
@@ -2755,6 +2755,8 @@ export class StandardBrowserRuntime {
       });
     } catch (error) {
       if (error instanceof Error && /no dialog is showing/i.test(error.message)) {
+        const session = this.sessions.get(tabId);
+        if (session && dialog !== undefined && session.dialog === dialog) this.#forgetDialog(tabId, session);
         throw Object.assign(new Error("No JavaScript dialog AgentTab can answer is open on this tab"), {
           code: "invalid_request",
           outcome: "not_started",
@@ -4044,6 +4046,7 @@ export class StandardBrowserRuntime {
             ),
             {
               code: "page_unresponsive",
+              outcome: "not_started",
               recovery: "AgentTab cannot answer a dialog it did not see open. Start browser_handoff so the human can answer it, or close the tab with browser_act close, then continue.",
             },
           );

@@ -5521,6 +5521,25 @@ describe("consequential action staging", () => {
     await expect(runtime.snapshot(TASK_A, 18, { mode: "accessibility" })).resolves.toMatchObject({ tab_id: 18 });
   });
 
+  test("forgets a dialog Chrome reports was already answered", async () => {
+    await mutateState((state) => { state.skipCommitReview = true; });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(23);
+    await runtime.snapshot(TASK_A, 23, { mode: "accessibility" });
+    emitDebuggerEvent(23, "Page.javascriptDialogOpening", { type: "alert", message: "Finished" });
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.handleJavaScriptDialog") throw new Error("No dialog is showing");
+      return undefined;
+    };
+
+    await expect(runtime.act(TASK_A, 23, pageRevision, [{ kind: "dialog", decision: "dismiss" }])).rejects
+      .toMatchObject({ code: "invalid_request", outcome: "not_started" });
+    expect(runtime.openDialog(23)).toBeUndefined();
+    debuggerCommandOverride = null;
+    await expect(runtime.snapshot(TASK_A, 23, { mode: "accessibility" })).resolves.toMatchObject({ tab_id: 23 });
+  });
+
   test("fails page work fast while a dialog is open and releases a command the dialog interrupts", async () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
@@ -5581,7 +5600,7 @@ describe("consequential action staging", () => {
       snapshot.catch(() => undefined);
       await waitForCondition(() => debuggerCalls.includes("Page.enable"));
       await advanceTimers(10_000);
-      await expect(snapshot).rejects.toMatchObject({ code: "page_unresponsive" });
+      await expect(snapshot).rejects.toMatchObject({ code: "page_unresponsive", outcome: "not_started" });
       expect(debuggerAttachedTabIds.has(21)).toBe(false);
     } finally {
       vi.useRealTimers();
@@ -5605,6 +5624,21 @@ describe("consequential action staging", () => {
       method: "Page.handleJavaScriptDialog",
       params: { accept: false },
     });
+  });
+
+  test("handles child-frame initialization while a top-frame dialog is open", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(24);
+    await runtime.snapshot(TASK_A, 24, { mode: "accessibility" });
+    emitDebuggerEvent(24, "Page.javascriptDialogOpening", { type: "alert", message: "Paused" });
+
+    emitDebuggerEvent(24, "Target.attachedToTarget", {
+      sessionId: "child-session",
+      targetInfo: { type: "iframe", targetId: "child-frame" },
+    });
+    await flushPromiseQueue();
+    await runtime.act(TASK_A, 24, pageRevision, [{ kind: "dialog", decision: "dismiss" }]);
   });
 
   test("accepts a staged dialog only while the same dialog remains open", async () => {
