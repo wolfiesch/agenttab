@@ -293,6 +293,8 @@ interface DebugSession {
   pendingWindowOpen?: PendingWindowOpen;
   frameContexts: Map<string, number>;
   frameSessions: Map<string, string>;
+  /** Child frame sessions that attached while a dialog paused the page; initialized once it closes. */
+  pendingFrameSessions: Set<string>;
   documentResponses: DocumentResponse[];
 }
 
@@ -675,8 +677,9 @@ export class StandardBrowserRuntime {
           typeof params.targetInfo.targetId === "string"
         ) {
           session.frameSessions.set(params.targetInfo.targetId, params.sessionId);
-          void this.initializeChildFrameSession(source.tabId, params.sessionId);
+          this.#initializeChildFrame(source.tabId, session, params.sessionId);
         } else if (method === "Target.detachedFromTarget" && typeof params.sessionId === "string") {
+          session.pendingFrameSessions.delete(params.sessionId);
           for (const [frameId, sessionId] of session.frameSessions) {
             if (sessionId !== params.sessionId) continue;
             session.frameSessions.delete(frameId);
@@ -2755,6 +2758,10 @@ export class StandardBrowserRuntime {
       });
     } catch (error) {
       if (error instanceof Error && /no dialog is showing/i.test(error.message)) {
+        // Chrome has no dialog to answer, so the one AgentTab remembers closed without a closed
+        // event. Forget it so it stops blocking page work.
+        const session = this.sessions.get(tabId);
+        if (session && dialog !== undefined && session.dialog === dialog) this.#forgetDialog(tabId, session);
         throw Object.assign(new Error("No JavaScript dialog AgentTab can answer is open on this tab"), {
           code: "invalid_request",
           outcome: "not_started",
@@ -2770,7 +2777,11 @@ export class StandardBrowserRuntime {
     session.dialogGeneration += 1;
     session.dialog = undefined;
     void this.invalidateStagedDialogs(tabId);
-    if (this.sessions.get(tabId) === session && session.attached) this.scheduleIdleDetach(tabId, session);
+    if (this.sessions.get(tabId) !== session || !session.attached) return;
+    this.scheduleIdleDetach(tabId, session);
+    const pending = [...session.pendingFrameSessions];
+    session.pendingFrameSessions.clear();
+    for (const sessionId of pending) this.#initializeChildFrame(tabId, session, sessionId);
   }
 
   /** The tab's open JavaScript dialog as results report it, if the debugger observed one. */
@@ -3932,6 +3943,25 @@ export class StandardBrowserRuntime {
     };
   }
 
+  /**
+   * Enables a child frame session in the background. A dialog pauses the page, so a frame that
+   * attaches while one is open, or whose setup a dialog interrupts, is initialized after it closes.
+   */
+  #initializeChildFrame(tabId: number, session: DebugSession, sessionId: string): void {
+    if (session.dialog !== undefined) {
+      session.pendingFrameSessions.add(sessionId);
+      return;
+    }
+    this.initializeChildFrameSession(tabId, sessionId).catch((error: unknown) => {
+      if (
+        isRecord(error) && error.code === "dialog_open" && this.sessions.get(tabId) === session &&
+        [...session.frameSessions.values()].includes(sessionId)
+      ) {
+        this.#initializeChildFrame(tabId, session, sessionId);
+      }
+    });
+  }
+
   private async initializeChildFrameSession(tabId: number, sessionId: string): Promise<void> {
     for (const method of ["Page.enable", "DOM.enable", "Accessibility.enable", "Runtime.enable"]) {
       await this.send(tabId, method, {}, false, sessionId);
@@ -3965,6 +3995,7 @@ export class StandardBrowserRuntime {
         dialogWaiters: new Set(),
         frameContexts: new Map(),
         frameSessions: new Map(),
+        pendingFrameSessions: new Set(),
         documentResponses: [],
       };
       this.sessions.set(tabId, session);
@@ -4044,6 +4075,7 @@ export class StandardBrowserRuntime {
             ),
             {
               code: "page_unresponsive",
+              outcome: "not_started",
               recovery: "AgentTab cannot answer a dialog it did not see open. Start browser_handoff so the human can answer it, or close the tab with browser_act close, then continue.",
             },
           );

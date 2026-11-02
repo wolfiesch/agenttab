@@ -5574,7 +5574,9 @@ describe("consequential action staging", () => {
   test("fails an attach the paused page never answers instead of holding the tab", async () => {
     vi.useFakeTimers();
     try {
-      const runtime = new StandardBrowserRuntime(new RevisionTracker(), async () => undefined, () => undefined, async () => undefined);
+      const revisions = new RevisionTracker();
+      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+      const pageRevision = await revisions.ensure(21);
       debuggerCommandOverride = (method) =>
         method === "Page.enable" ? { result: { value: new Promise(() => undefined) } } : undefined;
       const snapshot = runtime.snapshot(TASK_A, 21, { mode: "accessibility" });
@@ -5583,6 +5585,14 @@ describe("consequential action staging", () => {
       await advanceTimers(10_000);
       await expect(snapshot).rejects.toMatchObject({ code: "page_unresponsive" });
       expect(debuggerAttachedTabIds.has(21)).toBe(false);
+
+      // An action that never reached the page did not run, so retrying it is safe.
+      await mutateState((state) => { state.skipCommitReview = true; });
+      const acting = runtime.act(TASK_A, 21, pageRevision, [{ kind: "click", selector: "button" }]);
+      acting.catch(() => undefined);
+      await waitForCondition(() => debuggerCalls.filter((call) => call === "Page.enable").length === 2);
+      await advanceTimers(10_000);
+      await expect(acting).rejects.toMatchObject({ code: "page_unresponsive", outcome: "not_started" });
     } finally {
       vi.useRealTimers();
     }
@@ -5605,6 +5615,46 @@ describe("consequential action staging", () => {
       method: "Page.handleJavaScriptDialog",
       params: { accept: false },
     });
+  });
+
+  test("forgets a dialog Chrome no longer shows so page work resumes", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(23);
+    await runtime.snapshot(TASK_A, 23, { mode: "accessibility" });
+    emitDebuggerEvent(23, "Page.javascriptDialogOpening", { type: "alert", message: "Saved" });
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.handleJavaScriptDialog") throw new Error("No dialog is showing");
+      return undefined;
+    };
+
+    await expect(runtime.act(TASK_A, 23, pageRevision, [{ kind: "dialog", decision: "dismiss" }])).rejects
+      .toMatchObject({ code: "invalid_request", outcome: "not_started" });
+    expect(runtime.openDialog(23)).toBeUndefined();
+    await expect(runtime.snapshot(TASK_A, 23, { mode: "accessibility" })).resolves.toMatchObject({ tab_id: 23 });
+  });
+
+  test("initializes a child frame that attaches during a dialog once the dialog closes", async () => {
+    const runtime = new StandardBrowserRuntime(new RevisionTracker(), async () => undefined, () => undefined, async () => undefined);
+    await runtime.snapshot(TASK_A, 24, { mode: "accessibility" });
+    emitDebuggerEvent(24, "Page.javascriptDialogOpening", { type: "beforeunload", message: "" });
+    const sent = debuggerCalls.length;
+    emitDebuggerEvent(24, "Target.attachedToTarget", {
+      sessionId: "child-1",
+      targetInfo: { type: "iframe", targetId: "frame-1" },
+    });
+    await flushPromiseQueue();
+    expect(debuggerCalls.slice(sent)).toEqual([]);
+
+    emitDebuggerEvent(24, "Page.javascriptDialogClosed", { result: false });
+    await waitForCondition(() => debuggerCalls.slice(sent).includes("Target.setAutoAttach"));
+    expect(debuggerCalls.slice(sent)).toEqual([
+      "Page.enable",
+      "DOM.enable",
+      "Accessibility.enable",
+      "Runtime.enable",
+      "Target.setAutoAttach",
+    ]);
   });
 
   test("accepts a staged dialog only while the same dialog remains open", async () => {
