@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  ACT_DIALOG_GUIDANCE,
   ACT_INTENT_GUIDANCE,
   ACT_INTENT_MAX_CHARS,
   AgentTabClient,
@@ -193,7 +194,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_act",
       label: "Browser Act",
-      description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${ACT_INTENT_GUIDANCE} ${CHALLENGE_GUIDANCE.summary}`,
+      description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${ACT_INTENT_GUIDANCE} ${ACT_DIALOG_GUIDANCE} ${CHALLENGE_GUIDANCE.summary}`,
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);

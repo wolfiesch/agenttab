@@ -16,6 +16,8 @@ export const STANDARD_ACTION_VALUE_MAX_CHARS = 2048;
 export const ACT_INTENT_MAX_CHARS = 120;
 /** Tool-description sentence that teaches agents the `browser_act` intent contract. */
 export const ACT_INTENT_GUIDANCE = `Optional \`intent\` (one line, up to ${ACT_INTENT_MAX_CHARS} characters) states the batch's purpose and becomes the on-screen pointer caption, for example "Open the bookmarks folder"; never put secrets or field values in it.`;
+/** Tool-description sentence that teaches agents to answer an open JavaScript dialog, such as "Leave site?". */
+export const ACT_DIALOG_GUIDANCE = "A result, or a dialog_open error's details, may carry `dialog` (type beforeunload is Chrome's \"Leave site?\" prompt); the page stays paused until a dialog action answers it: accept to leave or confirm, dismiss to stay or cancel.";
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_WAIT_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;

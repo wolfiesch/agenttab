@@ -84,6 +84,8 @@ export async function removeTabIfPresent(tabId: number): Promise<boolean> {
 
 const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
+/** Page.enable and its siblings answer in milliseconds unless the renderer is paused or wedged. */
+const DEBUGGER_INIT_TIMEOUT_MS = 10_000;
 // A refused debugger is retried after this interval or the tab's next navigation.
 const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
 // Scripting-route refs always name the tab's top document.
@@ -202,7 +204,32 @@ const MAX_WINDOW_REQUESTS_PER_ACTION = 8;
 interface JavaScriptDialog {
   generation: number;
   type: string | null;
+  message: string | null;
   fingerprint: Promise<string>;
+}
+
+const DIALOG_MESSAGE_LIMIT = 500;
+
+/** The open dialog as results and errors report it. */
+function dialogSummary(dialog: JavaScriptDialog): Record<string, unknown> {
+  return { status: "open", type: dialog.type, message: dialog.message };
+}
+
+/**
+ * A JavaScript dialog blocks the page's renderer, so page commands cannot complete until it is
+ * answered. Only the dialog decision itself runs; everything else fails fast with this error.
+ */
+function dialogOpenError(dialog: JavaScriptDialog, outcome?: "not_started"): Error {
+  const kind = dialog.type === "beforeunload" ? "leave-page (beforeunload)" : (dialog.type ?? "JavaScript");
+  return Object.assign(
+    new Error(`A ${kind} dialog is open on this tab; the page is paused until the dialog is answered`),
+    {
+      code: "dialog_open",
+      dialog: dialogSummary(dialog),
+      recovery: 'Answer it with browser_act action { kind: "dialog", decision: "accept" } (for a leave-page prompt, leave the page) or decision "dismiss" (stay), then retry.',
+      ...(outcome !== undefined ? { outcome } : {}),
+    },
+  );
 }
 
 interface PendingWindowOpen {
@@ -261,6 +288,8 @@ interface DebugSession {
   downloads: Map<string, TrackedDownload>;
   dialogGeneration: number;
   dialog?: JavaScriptDialog;
+  /** Called when a dialog opens, so in-flight page commands stop waiting on the paused renderer. */
+  dialogWaiters: Set<() => void>;
   pendingWindowOpen?: PendingWindowOpen;
   frameContexts: Map<string, number>;
   frameSessions: Map<string, string>;
@@ -695,15 +724,18 @@ export class StandardBrowserRuntime {
           this.trackDownloadProgress(session, params.guid, params.state);
         } else if (method === "Page.javascriptDialogOpening") {
           session.dialogGeneration += 1;
+          const message = typeof params.message === "string" ? params.message : null;
           session.dialog = {
             generation: session.dialogGeneration,
             type: typeof params.type === "string" ? params.type : null,
+            message: message === null ? null : message.slice(0, DIALOG_MESSAGE_LIMIT),
             fingerprint: sha256Hex({
               type: typeof params.type === "string" ? params.type : null,
-              message: typeof params.message === "string" ? params.message : null,
+              message,
               default_prompt: typeof params.defaultPrompt === "string" ? params.defaultPrompt : null,
             }),
           };
+          for (const wake of session.dialogWaiters) wake();
           void this.invalidateStagedDialogs(source.tabId);
         } else if (method === "Page.windowOpen") {
           const pending = session.pendingWindowOpen;
@@ -717,9 +749,7 @@ export class StandardBrowserRuntime {
             void this.adoptWindowOpenChild(source.tabId, params.url, pending);
           }
         } else if (method === "Page.javascriptDialogClosed") {
-          session.dialogGeneration += 1;
-          session.dialog = undefined;
-          void this.invalidateStagedDialogs(source.tabId);
+          this.#forgetDialog(source.tabId, session);
         }
       },
     );
@@ -1369,6 +1399,8 @@ export class StandardBrowserRuntime {
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     await this.authorizeDebuggerUse(tabId);
+    const openDialog = this.sessions.get(tabId)?.dialog;
+    if (openDialog !== undefined) throw dialogOpenError(openDialog);
     const mode = params.mode;
     if (mode !== "text" && mode !== "html" && mode !== "screenshot" && mode !== "accessibility") {
       throw Object.assign(new Error("Unsupported snapshot mode"), { code: "invalid_request" });
@@ -1571,6 +1603,10 @@ export class StandardBrowserRuntime {
         throw Object.assign(new Error("Each browser action requires a kind"), { code: "invalid_request" });
       }
       validated.push(action);
+    }
+    const openDialog = this.sessions.get(tabId)?.dialog;
+    if (openDialog !== undefined && validated[0]?.kind !== "dialog") {
+      throw dialogOpenError(openDialog, "not_started");
     }
     if (validated.some((action) => TAB_ONLY_ACTIONS[String(action.kind)] !== true)) {
       await this.requireFullAutomationRoute(tabId, "perform page actions");
@@ -2211,6 +2247,8 @@ export class StandardBrowserRuntime {
         ) {
           debuggerSession = await this.acquireDebuggerBusyLease(tabId, debuggerSession);
         }
+        const openDialog = this.sessions.get(tabId)?.dialog;
+        if (openDialog !== undefined) throw dialogOpenError(openDialog);
         if (observation?.error !== undefined) break;
         const observed = observation !== undefined && (conditionKind === "load"
           ? observation.loaded
@@ -2699,11 +2737,76 @@ export class StandardBrowserRuntime {
     }
     this.assertDialogPrompt(action, dialog, "staged_commit_mismatch");
     const promptText = typeof action.prompt_text === "string" ? action.prompt_text : undefined;
-    await this.send(tabId, "Page.handleJavaScriptDialog", {
-      accept: true,
-      ...(promptText !== undefined ? { promptText } : {}),
-    });
+    await this.#answerDialog(tabId, true, promptText);
     return { kind: "dialog", completed: true };
+  }
+
+  /**
+   * Sends the dialog decision. Chrome handles it in the browser process, so it runs while the
+   * renderer is paused. The answered dialog is forgotten at once so later steps of the same batch
+   * do not wait for Chrome's closed event.
+   */
+  async #answerDialog(tabId: number, accept: boolean, promptText?: string): Promise<void> {
+    const dialog = this.sessions.get(tabId)?.dialog;
+    try {
+      await this.send(tabId, "Page.handleJavaScriptDialog", {
+        accept,
+        ...(promptText !== undefined ? { promptText } : {}),
+      });
+    } catch (error) {
+      if (error instanceof Error && /no dialog is showing/i.test(error.message)) {
+        throw Object.assign(new Error("No JavaScript dialog AgentTab can answer is open on this tab"), {
+          code: "invalid_request",
+          outcome: "not_started",
+        });
+      }
+      throw error;
+    }
+    const session = this.sessions.get(tabId);
+    if (session && dialog !== undefined && session.dialog === dialog) this.#forgetDialog(tabId, session);
+  }
+
+  #forgetDialog(tabId: number, session: DebugSession): void {
+    session.dialogGeneration += 1;
+    session.dialog = undefined;
+    void this.invalidateStagedDialogs(tabId);
+    if (this.sessions.get(tabId) === session && session.attached) this.scheduleIdleDetach(tabId, session);
+  }
+
+  /** The tab's open JavaScript dialog as results report it, if the debugger observed one. */
+  openDialog(tabId: number): Record<string, unknown> | undefined {
+    const dialog = this.sessions.get(tabId)?.dialog;
+    return dialog === undefined ? undefined : dialogSummary(dialog);
+  }
+
+  /** Resolves when a JavaScript dialog opens on the tab's current debugger session. */
+  whenDialogOpens(tabId: number): { opened: Promise<void>; cancel(): void } {
+    const session = this.sessions.get(tabId);
+    const opened = Promise.withResolvers<void>();
+    if (session === undefined) return { opened: opened.promise, cancel: () => undefined };
+    if (session.dialog !== undefined) {
+      opened.resolve();
+      return { opened: opened.promise, cancel: () => undefined };
+    }
+    const wake = () => opened.resolve();
+    session.dialogWaiters.add(wake);
+    return { opened: opened.promise, cancel: () => session.dialogWaiters.delete(wake) };
+  }
+
+  /**
+   * Attaches the debugger, best effort, before a navigation so a leave-page prompt the navigation
+   * raises is observed and can be answered. Without a debugger session the prompt is invisible to
+   * AgentTab and blocks every later page command.
+   */
+  async #observeLeavePrompt(tabId: number): Promise<void> {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") return;
+      const session = await this.acquireDebuggerBusyLease(tabId);
+      this.releaseDebuggerBusyLease(tabId, session);
+    } catch {
+      // A refused or unavailable debugger leaves the navigation to run unobserved, as before.
+    }
   }
 
   private assertDialogPrompt(
@@ -2795,6 +2898,9 @@ export class StandardBrowserRuntime {
       ? await this.armDownload(taskId, tabId)
       : undefined;
     const downloadResult = downloadCursor === undefined ? {} : { download_cursor: downloadCursor };
+    if (kind === "navigate" || kind === "go_back" || kind === "go_forward" || kind === "reload") {
+      await this.#observeLeavePrompt(tabId);
+    }
     if (kind === "navigate") {
       if (typeof action.url !== "string") throw Object.assign(new Error("navigate requires url"), { code: "invalid_request" });
       await chrome.tabs.update(tabId, { url: action.url });
@@ -2823,13 +2929,16 @@ export class StandardBrowserRuntime {
       });
     }
     if (kind === "dialog") {
-      if (action.decision === "accept") {
-        throw Object.assign(new Error("Accepting a dialog requires a staged Commit"), {
-          code: "invalid_request",
-        });
-      }
-      await this.send(tabId, "Page.handleJavaScriptDialog", { accept: false });
-      return { kind, completed: true };
+      // Reached for acceptance only when commit review is off; review mode accepts through Commit.
+      const accept = action.decision === "accept";
+      const dialog = this.sessions.get(tabId)?.dialog;
+      if (accept && dialog !== undefined) this.assertDialogPrompt(action, dialog, "invalid_request");
+      await this.#answerDialog(
+        tabId,
+        accept,
+        accept && typeof action.prompt_text === "string" ? action.prompt_text : undefined,
+      );
+      return { kind, completed: true, ...(dialog !== undefined ? { dialog_type: dialog.type } : {}) };
     }
     if (kind === "scroll" && action.ref === undefined && action.frame_id === undefined) {
       await this.pointer.announce(tabId, intent ?? "Scroll page");
@@ -3853,6 +3962,7 @@ export class StandardBrowserRuntime {
         pageLoadInFlight: false,
         downloads: new Map(),
         dialogGeneration: 0,
+        dialogWaiters: new Set(),
         frameContexts: new Map(),
         frameSessions: new Map(),
         documentResponses: [],
@@ -3882,7 +3992,10 @@ export class StandardBrowserRuntime {
         throw this.refuseDebugger(tabId, error);
       }
       session.attached = true;
-      try {
+      // A renderer paused by a JavaScript dialog that opened while no session was attached never
+      // answers Page.enable, and Chrome reports that dialog only to sessions attached when it opened.
+      // Bounding initialization keeps the tab's queue moving; a dialog seen meanwhile stays answerable.
+      const initialized = (async () => {
         for (const method of [
           "Page.enable",
           "DOM.enable",
@@ -3913,6 +4026,28 @@ export class StandardBrowserRuntime {
         // Chrome (tab-session and browser-target commands are rejected or
         // ineffective), so waits diagnose the throttle instead of lifting it;
         // see the wait timeout path.
+        return "ready" as const;
+      })();
+      // Once a dialog interrupts, the remaining steps finish after it is answered; their failure is moot.
+      initialized.catch(() => undefined);
+      const dialogOpened = Promise.withResolvers<"dialog">();
+      const wake = () => dialogOpened.resolve("dialog");
+      session.dialogWaiters.add(wake);
+      const timedOut = Promise.withResolvers<"timeout">();
+      const timer = setTimeout(() => timedOut.resolve("timeout"), DEBUGGER_INIT_TIMEOUT_MS);
+      try {
+        const outcome = await Promise.race([initialized, dialogOpened.promise, timedOut.promise]);
+        if (outcome === "timeout") {
+          throw Object.assign(
+            new Error(
+              "The page did not respond to the debugger. A busy script, or a JavaScript dialog such as Leave site? that opened while AgentTab was not attached, is blocking it",
+            ),
+            {
+              code: "page_unresponsive",
+              recovery: "AgentTab cannot answer a dialog it did not see open. Start browser_handoff so the human can answer it, or close the tab with browser_act close, then continue.",
+            },
+          );
+        }
       } catch (error) {
         try {
           await this.detachTrackedSession(tabId, session);
@@ -3925,6 +4060,9 @@ export class StandardBrowserRuntime {
         // AgentTab's own coded failures, such as a revoked task binding, keep their meaning.
         if (isRecord(error) && typeof error.code === "string") throw error;
         throw this.refuseDebugger(tabId, error);
+      } finally {
+        clearTimeout(timer);
+        session.dialogWaiters.delete(wake);
       }
     })();
     session.attachPromise = attaching;
@@ -3964,6 +4102,9 @@ export class StandardBrowserRuntime {
     clearTimeout(session.idleTimer);
     session.idleTimer = setTimeout(() => {
       if (session.busyCount > 0) return;
+      // Detaching would leave an open dialog unanswerable: Chrome only lets the session that saw it
+      // open answer it. Closing the dialog schedules the idle detach again.
+      if (session.dialog !== undefined) return;
       void this.detach(tabId).catch(() => {
         if (this.sessions.get(tabId) === session) this.scheduleIdleDetach(tabId, session);
       });
@@ -4350,10 +4491,36 @@ export class StandardBrowserRuntime {
     try {
       await this.authorizeDebuggerUse(tabId);
       const target: chrome.debugger.DebuggerSession = sessionId === undefined ? { tabId } : { tabId, sessionId };
-      const result: unknown = await chrome.debugger.sendCommand(target, method, params);
+      const result: unknown = await this.#commandUnlessDialog(session, target, method, params);
       return isRecord(result) ? result : {};
     } finally {
       this.releaseDebuggerBusyLease(tabId, session);
+    }
+  }
+
+  /**
+   * Runs a CDP command unless a JavaScript dialog pauses the page. Page commands sent while a dialog
+   * is open never complete, and one in flight when a dialog opens stalls until the dialog closes, so
+   * both fail with `dialog_open` instead of holding the tab's queue. The dialog decision itself is
+   * handled by the browser process and always runs.
+   */
+  async #commandUnlessDialog(
+    session: DebugSession,
+    target: chrome.debugger.DebuggerSession,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    if (method === "Page.handleJavaScriptDialog") return chrome.debugger.sendCommand(target, method, params);
+    if (session.dialog !== undefined) throw dialogOpenError(session.dialog, "not_started");
+    const interrupted = Promise.withResolvers<never>();
+    const wake = () => {
+      if (session.dialog !== undefined) interrupted.reject(dialogOpenError(session.dialog));
+    };
+    session.dialogWaiters.add(wake);
+    try {
+      return await Promise.race([chrome.debugger.sendCommand(target, method, params), interrupted.promise]);
+    } finally {
+      session.dialogWaiters.delete(wake);
     }
   }
 
@@ -4369,7 +4536,7 @@ export class StandardBrowserRuntime {
     try {
       await this.authorizeDebuggerUse(tabId);
       const target: chrome.debugger.DebuggerSession = sessionId === undefined ? { tabId } : { tabId, sessionId };
-      const result: unknown = await chrome.debugger.sendCommand(target, method, params);
+      const result: unknown = await this.#commandUnlessDialog(session, target, method, params);
       return isRecord(result) ? result : {};
     } catch (error) {
       if (
