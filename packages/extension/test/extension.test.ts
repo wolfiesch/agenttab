@@ -5501,6 +5501,112 @@ describe("consequential action staging", () => {
     expect(debuggerCalls).not.toContain("Page.handleJavaScriptDialog");
   });
 
+  test("answers a leave-page dialog directly when commit review is off", async () => {
+    await mutateState((state) => { state.skipCommitReview = true; });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(18);
+    await runtime.snapshot(TASK_A, 18, { mode: "accessibility" });
+    emitDebuggerEvent(18, "Page.javascriptDialogOpening", { type: "beforeunload", message: "" });
+    expect(runtime.openDialog(18)).toEqual({ status: "open", type: "beforeunload", message: "" });
+
+    await expect(runtime.act(TASK_A, 18, pageRevision, [{ kind: "dialog", decision: "accept" }])).resolves
+      .toMatchObject({ result: { actions: [{ kind: "dialog", completed: true, dialog_type: "beforeunload" }] } });
+    expect(debuggerCommands.findLast(({ method }) => method === "Page.handleJavaScriptDialog")).toEqual({
+      method: "Page.handleJavaScriptDialog",
+      params: { accept: true },
+    });
+    expect(runtime.openDialog(18)).toBeUndefined();
+    // The answered dialog no longer blocks page work, even before Chrome's closed event arrives.
+    await expect(runtime.snapshot(TASK_A, 18, { mode: "accessibility" })).resolves.toMatchObject({ tab_id: 18 });
+  });
+
+  test("fails page work fast while a dialog is open and releases a command the dialog interrupts", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(19);
+    await runtime.snapshot(TASK_A, 19, { mode: "accessibility" });
+    debuggerCommandOverride = (method) =>
+      method === "Accessibility.getFullAXTree" ? { result: { value: new Promise(() => undefined) } } : undefined;
+    const stalled = runtime.snapshot(TASK_A, 19, { mode: "accessibility" });
+    await waitForCondition(() => debuggerCalls.filter((call) => call === "Accessibility.getFullAXTree").length === 2);
+
+    emitDebuggerEvent(19, "Page.javascriptDialogOpening", { type: "confirm", message: "Discard changes?" });
+    const dialog = { status: "open", type: "confirm", message: "Discard changes?" };
+    await expect(stalled).rejects.toMatchObject({ code: "dialog_open", dialog });
+    debuggerCommandOverride = null;
+    const sent = debuggerCalls.length;
+    await expect(runtime.snapshot(TASK_A, 19, { mode: "text" })).rejects.toMatchObject({ code: "dialog_open", dialog });
+    await expect(runtime.act(TASK_A, 19, pageRevision, [{ kind: "navigate", url: "https://example.test/next" }]))
+      .rejects.toMatchObject({ code: "dialog_open", outcome: "not_started", dialog });
+    await expect(runtime.wait(19, { condition: { kind: "url", value: "https://example.test/next" }, timeout_ms: 5_000 }))
+      .rejects.toMatchObject({ code: "dialog_open", dialog });
+    expect(debuggerCalls.slice(sent)).toEqual([]);
+
+    await runtime.act(TASK_A, 19, pageRevision, [{ kind: "dialog", decision: "dismiss" }]);
+    expect(debuggerCalls.slice(sent)).toEqual(["Page.handleJavaScriptDialog"]);
+    expect(runtime.openDialog(19)).toBeUndefined();
+  });
+
+  test("attaches before navigating and stays attached while the leave-page dialog is open", async () => {
+    vi.useFakeTimers();
+    try {
+      const revisions = new RevisionTracker();
+      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+      const pageRevision = await revisions.ensure(20);
+      const navigating = runtime.act(TASK_A, 20, pageRevision, [{ kind: "navigate", url: "https://example.test/next" }]);
+      await advanceTimers(0);
+      await navigating;
+      expect(debuggerAttachedTabIds.has(20)).toBe(true);
+
+      emitDebuggerEvent(20, "Page.javascriptDialogOpening", { type: "beforeunload", message: "" });
+      await advanceTimers(90_000);
+      expect(debuggerAttachedTabIds.has(20)).toBe(true);
+
+      emitDebuggerEvent(20, "Page.javascriptDialogClosed", { result: true });
+      await advanceTimers(30_000);
+      expect(debuggerAttachedTabIds.has(20)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("fails an attach the paused page never answers instead of holding the tab", async () => {
+    vi.useFakeTimers();
+    try {
+      const runtime = new StandardBrowserRuntime(new RevisionTracker(), async () => undefined, () => undefined, async () => undefined);
+      debuggerCommandOverride = (method) =>
+        method === "Page.enable" ? { result: { value: new Promise(() => undefined) } } : undefined;
+      const snapshot = runtime.snapshot(TASK_A, 21, { mode: "accessibility" });
+      snapshot.catch(() => undefined);
+      await waitForCondition(() => debuggerCalls.includes("Page.enable"));
+      await advanceTimers(10_000);
+      await expect(snapshot).rejects.toMatchObject({ code: "page_unresponsive" });
+      expect(debuggerAttachedTabIds.has(21)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("keeps a session whose initialization a dialog interrupts so the dialog can be answered", async () => {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(22);
+    debuggerCommandOverride = (method) =>
+      method === "DOM.enable" ? { result: { value: new Promise(() => undefined) } } : undefined;
+    const snapshot = runtime.snapshot(TASK_A, 22, { mode: "accessibility" });
+    await waitForCondition(() => debuggerCalls.includes("DOM.enable"));
+    emitDebuggerEvent(22, "Page.javascriptDialogOpening", { type: "alert", message: "Saved" });
+    await expect(snapshot).rejects.toMatchObject({ code: "dialog_open" });
+    expect(debuggerAttachedTabIds.has(22)).toBe(true);
+
+    await runtime.act(TASK_A, 22, pageRevision, [{ kind: "dialog", decision: "dismiss" }]);
+    expect(debuggerCommands.findLast(({ method }) => method === "Page.handleJavaScriptDialog")).toEqual({
+      method: "Page.handleJavaScriptDialog",
+      params: { accept: false },
+    });
+  });
+
   test("accepts a staged dialog only while the same dialog remains open", async () => {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);

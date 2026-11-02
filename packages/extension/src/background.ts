@@ -660,6 +660,9 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
             execution.endedChallenge,
           );
         }
+        // A leave-page prompt raised by the navigation, or a dialog the batch opened, needs an answer first.
+        const dialog = browser.openDialog(targetTabId);
+        if (dialog !== undefined) execution.result = { ...execution.result, dialog };
         if (execution.staged) {
           return commitRequired(command.request_id, execution.result ?? {}, execution.staged);
         }
@@ -761,6 +764,7 @@ function errorDetails(error: unknown): Record<string, unknown> | undefined {
     ...(typeof error.failedActionIndex === "number" ? { failed_action_index: error.failedActionIndex } : {}),
     ...(Array.isArray(error.completedActions) ? { completed_actions: error.completedActions } : {}),
     ...(isRecord(error.challengeEvent) ? { challenge: error.challengeEvent } : {}),
+    ...(isRecord(error.dialog) ? { dialog: error.dialog } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
 }
@@ -848,10 +852,13 @@ function navigationStarted(result: Record<string, unknown> | undefined): boolean
  * page. Chrome marks a tab `loading` when a cross-document navigation starts, so when the tab is loading
  * or the queue already processed its `loading` event, this waits until the queue has processed the
  * `complete` event, bounded like `browser_open`. A same-document navigation never starts a load and
- * returns at once. The wait runs outside the scheduler for the reason `settleOpenedTab` does.
+ * returns at once. A JavaScript dialog, such as the leave-page prompt, ends the wait early: the load
+ * cannot proceed until the dialog is answered. The wait runs outside the scheduler for the reason
+ * `settleOpenedTab` does.
  */
 async function settleNavigation(watch: NavigationWatch, tabId: number): Promise<void> {
   let cancelDeadline: () => void = () => undefined;
+  const dialog = browser.whenDialogOpens(tabId);
   const deadline = new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, LOAD_SETTLE_TIMEOUT_MS);
     cancelDeadline = () => clearTimeout(timer);
@@ -862,10 +869,11 @@ async function settleNavigation(watch: NavigationWatch, tabId: number): Promise<
     await drained();
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab?.status !== "loading" && !watch.started) return;
-    await Promise.race([watch.loaded, deadline]);
+    await Promise.race([watch.loaded, deadline, dialog.opened]);
     await drained();
   } finally {
     cancelDeadline();
+    dialog.cancel();
   }
 }
 
