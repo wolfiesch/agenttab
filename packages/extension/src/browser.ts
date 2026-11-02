@@ -749,7 +749,7 @@ export class StandardBrowserRuntime {
             void this.adoptWindowOpenChild(source.tabId, params.url, pending);
           }
         } else if (method === "Page.javascriptDialogClosed") {
-          this.forgetDialog(source.tabId, session);
+          this.#forgetDialog(source.tabId, session);
         }
       },
     );
@@ -2737,7 +2737,7 @@ export class StandardBrowserRuntime {
     }
     this.assertDialogPrompt(action, dialog, "staged_commit_mismatch");
     const promptText = typeof action.prompt_text === "string" ? action.prompt_text : undefined;
-    await this.answerDialog(tabId, true, promptText);
+    await this.#answerDialog(tabId, true, promptText);
     return { kind: "dialog", completed: true };
   }
 
@@ -2746,7 +2746,7 @@ export class StandardBrowserRuntime {
    * renderer is paused. The answered dialog is forgotten at once so later steps of the same batch
    * do not wait for Chrome's closed event.
    */
-  private async answerDialog(tabId: number, accept: boolean, promptText?: string): Promise<void> {
+  async #answerDialog(tabId: number, accept: boolean, promptText?: string): Promise<void> {
     const dialog = this.sessions.get(tabId)?.dialog;
     try {
       await this.send(tabId, "Page.handleJavaScriptDialog", {
@@ -2763,10 +2763,10 @@ export class StandardBrowserRuntime {
       throw error;
     }
     const session = this.sessions.get(tabId);
-    if (session && dialog !== undefined && session.dialog === dialog) this.forgetDialog(tabId, session);
+    if (session && dialog !== undefined && session.dialog === dialog) this.#forgetDialog(tabId, session);
   }
 
-  private forgetDialog(tabId: number, session: DebugSession): void {
+  #forgetDialog(tabId: number, session: DebugSession): void {
     session.dialogGeneration += 1;
     session.dialog = undefined;
     void this.invalidateStagedDialogs(tabId);
@@ -2798,7 +2798,7 @@ export class StandardBrowserRuntime {
    * raises is observed and can be answered. Without a debugger session the prompt is invisible to
    * AgentTab and blocks every later page command.
    */
-  private async observeLeavePrompt(tabId: number): Promise<void> {
+  async #observeLeavePrompt(tabId: number): Promise<void> {
     try {
       const tab = await chrome.tabs.get(tabId);
       if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") return;
@@ -2899,7 +2899,7 @@ export class StandardBrowserRuntime {
       : undefined;
     const downloadResult = downloadCursor === undefined ? {} : { download_cursor: downloadCursor };
     if (kind === "navigate" || kind === "go_back" || kind === "go_forward" || kind === "reload") {
-      await this.observeLeavePrompt(tabId);
+      await this.#observeLeavePrompt(tabId);
     }
     if (kind === "navigate") {
       if (typeof action.url !== "string") throw Object.assign(new Error("navigate requires url"), { code: "invalid_request" });
@@ -2933,7 +2933,7 @@ export class StandardBrowserRuntime {
       const accept = action.decision === "accept";
       const dialog = this.sessions.get(tabId)?.dialog;
       if (accept && dialog !== undefined) this.assertDialogPrompt(action, dialog, "invalid_request");
-      await this.answerDialog(
+      await this.#answerDialog(
         tabId,
         accept,
         accept && typeof action.prompt_text === "string" ? action.prompt_text : undefined,
@@ -4033,12 +4033,10 @@ export class StandardBrowserRuntime {
       const dialogOpened = Promise.withResolvers<"dialog">();
       const wake = () => dialogOpened.resolve("dialog");
       session.dialogWaiters.add(wake);
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timedOut = new Promise<"timeout">((resolve) => {
-        timer = setTimeout(() => resolve("timeout"), DEBUGGER_INIT_TIMEOUT_MS);
-      });
+      const timedOut = Promise.withResolvers<"timeout">();
+      const timer = setTimeout(() => timedOut.resolve("timeout"), DEBUGGER_INIT_TIMEOUT_MS);
       try {
-        const outcome = await Promise.race([initialized, dialogOpened.promise, timedOut]);
+        const outcome = await Promise.race([initialized, dialogOpened.promise, timedOut.promise]);
         if (outcome === "timeout") {
           throw Object.assign(
             new Error(
@@ -4493,7 +4491,7 @@ export class StandardBrowserRuntime {
     try {
       await this.authorizeDebuggerUse(tabId);
       const target: chrome.debugger.DebuggerSession = sessionId === undefined ? { tabId } : { tabId, sessionId };
-      const result: unknown = await this.commandUnlessDialog(session, target, method, params);
+      const result: unknown = await this.#commandUnlessDialog(session, target, method, params);
       return isRecord(result) ? result : {};
     } finally {
       this.releaseDebuggerBusyLease(tabId, session);
@@ -4506,7 +4504,7 @@ export class StandardBrowserRuntime {
    * both fail with `dialog_open` instead of holding the tab's queue. The dialog decision itself is
    * handled by the browser process and always runs.
    */
-  private async commandUnlessDialog(
+  async #commandUnlessDialog(
     session: DebugSession,
     target: chrome.debugger.DebuggerSession,
     method: string,
@@ -4538,7 +4536,7 @@ export class StandardBrowserRuntime {
     try {
       await this.authorizeDebuggerUse(tabId);
       const target: chrome.debugger.DebuggerSession = sessionId === undefined ? { tabId } : { tabId, sessionId };
-      const result: unknown = await this.commandUnlessDialog(session, target, method, params);
+      const result: unknown = await this.#commandUnlessDialog(session, target, method, params);
       return isRecord(result) ? result : {};
     } catch (error) {
       if (
