@@ -32,6 +32,8 @@ A task workspace is visible in Chrome. Task-owned tabs are grouped for display, 
 
 *Amended 2026-09-07:* Notices are non-blocking display metadata. A request MUST NOT pause the scheduler, gate command admission, focus a tab, activate a window, or open the popup; no global observation blackout or host handoff admission state exists. The agent asks the user in chat, the user reports back, and the agent MUST verify the page itself before resolving or dismissing the notice by ID. AgentTab MUST NOT capture human keystrokes, and no tool result may report the user's work as completed on creation. Only the user's explicit popup Open tab action may focus the noticed tab.
 
+*Amended 2026-11-03:* A request MAY show one Chrome system notification per notice, carrying the prompt and the tab's host. The notification MUST NOT take focus, and AgentTab MUST remove it once the notice is no longer open. A user's click on that notification is a second explicit focus action: it MUST focus only the noticed tab, through the same ownership check as the popup's Open tab.
+
 ### Commit
 
 **Commit** is an optional, best-effort semantic review barrier for recognizable consequential controls, including send, publish, purchase, delete, upload, authorization, and permission grants.
@@ -166,6 +168,8 @@ Debugger attachment MUST be lazy and limited to task-owned tabs, and the task co
 The stable target requires `nativeMessaging`, `tabs`, `tabGroups`, `storage`, `alarms`, and `debugger`, with exactly `scripting` optional and `<all_urls>` host access. `cookies`, `history`, `bookmarks`, `contentSettings`, `activeTab`, and browser-global `downloads` access are absent from that target. PR1 locks and statically verifies this transformation without changing or reloading the installed v1 extension.
 
 Amendment (profile capabilities): the owner approved six further required permissions for the profile-scoped `browser_profile` method and two internal signals: `bookmarks`, `history`, `sessions`, `downloads`, `webNavigation`, and `idle`. History is read-only (no delete calls), downloads expose search, cancel, pause, and resume only (no open, show, file removal, or erase), session restore never calls `chrome.sessions.restore` because it activates the restored tab or window, and bookmark removal always passes the popup Commit review. `webNavigation` hardens `browser_wait` load and URL conditions, and `idle` lets handoff status report whether the human is at the machine. `cookies`, `contentSettings`, and `activeTab` remain absent.
+
+Amendment (handoff notification, 2026-11-03): one further required permission, `notifications`, is used only for the system notification of an open attention notice.
 
 Permission evidence follows the implementation boundary. PR1 proves the deterministic required/optional manifest split, the installed-debugger versus live-attachment boundary, and the platform IPC security primitives. Its three-run live matrix varies optional scripting while requiring debugger to remain granted; it verifies zero AgentTab debugger attachments when scripting is off or revoked, then preserves denial, re-grant, Pause, reload, disable, and cleanup checks. PR2 verifies the production host lifecycle and IPC implementation. PR3 implements the full ownership/UI lifecycle. A failed `activeTab` matrix run records the exact Chrome API call before retention. The live probe never changes Chrome permissions itself, rejects raw CDP at the non-configurable Standard boundary, and cleans only task-owned tabs plus its exact fixture download.
 

@@ -61,7 +61,7 @@ Trusted forwarding requires an exact `relay_senders` address and an allowed orig
 
 ## Permissions
 
-The manifest declares `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, `alarms`, `bookmarks`, `history`, `sessions`, `downloads`, `webNavigation`, and `idle`, with `<all_urls>` host access. Chrome does not permit `debugger` in `optional_permissions`, so it is a required install-time permission. `scripting` remains optional: the popup requests it when automation is enabled and removes it when automation is turned off. `cookies`, `contentSettings`, and `activeTab` are not requested.
+The manifest declares `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, `alarms`, `bookmarks`, `history`, `sessions`, `downloads`, `webNavigation`, `idle`, and `notifications`, with `<all_urls>` host access. Chrome does not permit `debugger` in `optional_permissions`, so it is a required install-time permission. `scripting` remains optional: the popup requests it when automation is enabled and removes it when automation is turned off. `cookies`, `contentSettings`, and `activeTab` are not requested.
 
 `debugger` is retained because the current task-scoped implementation needs Chrome's accessibility tree, ref-based action support, inactive captures, dialog handling, network-idle observation, and exact download completion attribution. Attachments are lazy, limited to owned tabs, reused briefly, and detached after idle work or optional `scripting` revocation. The permission is not evidence that Standard mode grants generic debugging access.
 
@@ -112,6 +112,8 @@ YOLO mode is enabled by default. It bypasses only optional Commit review. Task o
 ## Attention notices
 
 A `browser_handoff` request records an advisory attention notice for one task tab. Notices never gate command admission, scheduling, Pause, or finalization, and a request never focuses a tab, activates a window, or opens the popup by itself. The human completes the step in Chrome and tells the agent; the agent then verifies the page itself before resolving or dismissing the notice. The popup can explicitly focus the exact noticed tab when the user clicks Open tab, and Dismiss only hides the reminder.
+
+Each request also shows a Chrome system notification carrying the agent's prompt and the tab's host. The notification takes no focus. Clicking it focuses the exact noticed tab through the same ownership check as Open tab, and AgentTab removes it once the notice is resolved, dismissed, replaced, expired, cancelled with its tab, or cleared with its task. The `notifications` permission serves only this.
 
 Notice `status` also reports `user_idle_state` as `active`, `idle`, or `locked`, taken from Chrome's idle detection with a 60-second threshold, so an agent can tell whether the human is likely at the machine. The value carries no input or activity detail, and it never gates or schedules work.
 

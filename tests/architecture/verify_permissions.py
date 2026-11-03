@@ -60,6 +60,7 @@ REQUIRED_PERMISSIONS = (
     "downloads",
     "webNavigation",
     "idle",
+    "notifications",
 )
 OPTIONAL_PERMISSIONS = ("scripting",)
 REMOVED_PERMISSIONS = (

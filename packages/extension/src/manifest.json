@@ -18,7 +18,8 @@
     "sessions",
     "downloads",
     "webNavigation",
-    "idle"
+    "idle",
+    "notifications"
   ],
   "optional_permissions": [
     "scripting"

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test, vi } from "bun:test";
 import { removeTabIfPresent, StandardBrowserRuntime } from "../src/browser";
-import { HandoffController, HANDOFF_ALARM } from "../src/handoff";
+import { HandoffController, HANDOFF_ALARM, handoffNoticeIdFromNotification } from "../src/handoff";
 import { NativeBridge, RECONNECT_ALARM } from "../src/native";
 import { BoundedChain } from "../src/bounded";
 import { OWNERSHIP_OPERATION_HOLD_MS, OwnershipLedger } from "../src/ownership";
@@ -109,6 +109,8 @@ let tabRemovalProbe: (() => void | Promise<void>) | null;
 let nativePostProbe: ((message: unknown) => void) | null;
 let normalizeStoredObjectKeys: boolean;
 let focusedWindowUpdates: number[];
+let shownNotifications: Map<string, Record<string, unknown>>;
+let notificationClickListeners: Array<(notificationId: string) => void>;
 let activeWindowId: number;
 let createdWindowOptions: Array<Record<string, unknown>>;
 let windowUpdates: Array<{ windowId: number; changes: Record<string, unknown> }>;
@@ -379,6 +381,8 @@ function installChromeMock(): void {
   nativePostProbe = null;
   normalizeStoredObjectKeys = false;
   focusedWindowUpdates = [];
+  shownNotifications = new Map();
+  notificationClickListeners = [];
   activeWindowId = 1;
   createdWindowOptions = [];
   windowUpdates = [];
@@ -703,6 +707,23 @@ function installChromeMock(): void {
         },
       },
       downloads: { async search() { return clone(completedDownloads); } },
+      notifications: {
+        async create(notificationId: string, options: Record<string, unknown>) {
+          shownNotifications.set(notificationId, clone(options));
+          return notificationId;
+        },
+        async clear(notificationId: string) {
+          return shownNotifications.delete(notificationId);
+        },
+        async getAll() {
+          return Object.fromEntries([...shownNotifications.keys()].map((notificationId) => [notificationId, true]));
+        },
+        onClicked: {
+          addListener(listener: (notificationId: string) => void) {
+            notificationClickListeners.push(listener);
+          },
+        },
+      },
       alarms: {
         create(name: string, options: { when: number }) {
           alarmCreates.push({ name, when: options.when });
@@ -4486,6 +4507,106 @@ describe("advisory handoff notices", () => {
     expect(await handoff.clearForTask(TASK_A)).toBe(true);
     expect(Object.values((await readState()).notices)).toEqual([]);
   });
+
+  test("shows a system notification that focuses the noticed tab only when the user clicks it", async () => {
+    await seedTask(TASK_A, [38]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+    const notice = await handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 38,
+      expected_page_revision: await revisions.ensure(38),
+      prompt: "Approve the sign-in on your phone",
+    });
+    const noticeId = String(notice.notice_id);
+    const notificationId = `agenttab-handoff:${noticeId}`;
+
+    expect(shownNotifications.get(notificationId)).toMatchObject({
+      message: "Approve the sign-in on your phone",
+      contextMessage: "Click to open the example.test tab",
+      requireInteraction: true,
+    });
+    expect(handoffNoticeIdFromNotification(notificationId)).toBe(noticeId);
+    expect(handoffNoticeIdFromNotification("agenttab-handoff:")).toBeUndefined();
+    expect(handoffNoticeIdFromNotification("other-extension-notice")).toBeUndefined();
+    expect(focusedWindowUpdates).toEqual([]);
+    expect(tabStore.get(38)?.active).not.toBe(true);
+
+    expect(await handoff.openFromNotification(noticeId)).toMatchObject({ status: "open", focused: true });
+    expect(tabStore.get(38)?.active).toBe(true);
+    expect(focusedWindowUpdates).toEqual([1]);
+    expect(shownNotifications.has(notificationId)).toBe(false);
+    expect((await handoff.status(TASK_A, noticeId)).status).toBe("open");
+  });
+
+  test("retires the notification of every notice that stops being open", async () => {
+    await seedTask(TASK_A, [39, 40, 41, 42]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+    const request = async (tabId: number) =>
+      String((await handoff.request(TASK_A, {
+        operation: "request",
+        tab_id: tabId,
+        expected_page_revision: await revisions.ensure(tabId),
+        prompt: `Tab ${tabId}`,
+      })).notice_id);
+    const shown = () => [...shownNotifications.keys()].sort();
+
+    const replaced = await request(39);
+    const replacement = await request(39);
+    expect(shown()).toEqual([`agenttab-handoff:${replacement}`]);
+    expect((await handoff.status(TASK_A, replaced)).status).toBe("dismissed");
+
+    await handoff.dismiss(TASK_A, replacement);
+    expect(shown()).toEqual([]);
+
+    const resolved = await request(40);
+    await handoff.resolve(TASK_A, resolved);
+    const cancelled = await request(41);
+    await handoff.cancelForTab(41);
+    expect((await handoff.status(TASK_A, cancelled)).status).toBe("dismissed");
+    expect(shown()).toEqual([]);
+
+    const expiring = await request(42);
+    await mutateState((state) => {
+      const stored = state.notices[expiring];
+      if (stored) stored.expiresAtMs = stored.startedAtMs;
+    });
+    await handoff.expire();
+    expect((await handoff.status(TASK_A, expiring)).status).toBe("expired");
+    expect(shown()).toEqual([]);
+
+    const finished = await request(40);
+    expect(shown()).toEqual([`agenttab-handoff:${finished}`]);
+    await handoff.clearForTask(TASK_A);
+    expect(shown()).toEqual([]);
+  });
+
+  test("clicking an ended notice's notification retires it without focusing anything", async () => {
+    await seedTask(TASK_A, [43]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+    const noticeId = String((await handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 43,
+      expected_page_revision: await revisions.ensure(43),
+      prompt: "Solve the puzzle",
+    })).notice_id);
+    await mutateState((state) => {
+      const stored = state.notices[noticeId];
+      if (stored) stored.status = "dismissed";
+    });
+
+    expect(await handoff.openFromNotification(noticeId)).toMatchObject({ status: "dismissed" });
+    expect(focusedWindowUpdates).toEqual([]);
+    expect(shownNotifications.size).toBe(0);
+  });
 });
 
 describe("tab removal", () => {
@@ -6124,6 +6245,15 @@ describe("extension entrypoint admission boundaries", () => {
     expect(Object.values((await readState()).notices)).toContainEqual(
       expect.objectContaining({ noticeId, taskId: TASK_A, tabId: 100, status: "open" }),
     );
+    expect(focusedWindowUpdates).toEqual([]);
+    expect(shownNotifications.has(`agenttab-handoff:${noticeId}`)).toBe(true);
+    for (const listener of notificationClickListeners) listener("unrelated-notification");
+    await flushPromiseQueue();
+    expect(focusedWindowUpdates).toEqual([]);
+    for (const listener of notificationClickListeners) listener(`agenttab-handoff:${noticeId}`);
+    await waitForCondition(() => !shownNotifications.has(`agenttab-handoff:${noticeId}`));
+    expect(focusedWindowUpdates).toEqual([1]);
+    expect(tabStore.get(100)?.active).toBe(true);
     const allowedDuringHandoff = await sendNativeCommand(
       "018f47b8-2f80-7c20-9c77-f8a38c9e6226",
       TASK_A,

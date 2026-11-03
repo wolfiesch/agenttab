@@ -299,7 +299,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_handoff",
       label: "Browser Handoff",
-      description: `Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id. ${CHALLENGE_GUIDANCE.handoff}`,
+      description: `Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id. The user also gets a Chrome notification; if they cannot find the tab, tell them to click it. ${CHALLENGE_GUIDANCE.handoff}`,
       approval: "write",
       // One flat object covers every operation: OpenAI-compatible providers reject a root union.
       // Core enforces which fields each operation requires.

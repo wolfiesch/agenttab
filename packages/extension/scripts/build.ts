@@ -111,6 +111,7 @@ const required = [
   "downloads",
   "webNavigation",
   "idle",
+  "notifications",
 ];
 const optional = ["scripting"];
 const forbiddenKeys = ["content_scripts", "web_accessible_resources", "externally_connectable", "side_panel", "commands"];

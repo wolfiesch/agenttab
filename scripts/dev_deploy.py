@@ -48,6 +48,7 @@ REQUIRED_PERMISSIONS: tuple[str, ...] = (
     "history",
     "idle",
     "nativeMessaging",
+    "notifications",
     "sessions",
     "storage",
     "tabGroups",
