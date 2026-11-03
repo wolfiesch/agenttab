@@ -2,7 +2,7 @@ import type { ChallengeEvent } from "./challenge";
 import { clearChallengeTask } from "./challenge-store";
 import { StandardBrowserRuntime } from "./browser";
 import { sanitizeEmailCodeFailure } from "./email-code-fill";
-import { HandoffController, HANDOFF_ALARM } from "./handoff";
+import { HandoffController, HANDOFF_ALARM, handoffNoticeIdFromNotification } from "./handoff";
 import { NativeBridge, RECONNECT_ALARM } from "./native";
 import { OwnershipLedger } from "./ownership";
 import { ProfileRuntime, profileReviewDetail } from "./profile";
@@ -1023,6 +1023,15 @@ chrome.alarms.onAlarm.addListener((alarm: { name: string }) => {
       await queueAutomationCleanup().catch(() => undefined);
     }
     await browser.expireCommits();
+  });
+});
+chrome.notifications?.onClicked.addListener((notificationId: string) => {
+  const noticeId = handoffNoticeIdFromNotification(notificationId);
+  if (noticeId === undefined) return;
+  runAfterStart(async () => {
+    await handoff.openFromNotification(noticeId).catch((error) => {
+      console.warn("AgentTab could not open the noticed tab", error);
+    });
   });
 });
 

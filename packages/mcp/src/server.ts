@@ -185,7 +185,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_handoff",
-    description: `Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id. ${CHALLENGE_GUIDANCE.handoff}`,
+    description: `Request user attention for credentials, MFA, CAPTCHA, or other human-only input. Non-blocking: post a notice, tell the user in chat, then verify the page yourself and resolve or dismiss it by notice_id. The user also gets a Chrome notification; if they cannot find the tab, tell them to click it. ${CHALLENGE_GUIDANCE.handoff}`,
     inputSchema: schema(handoffSchema),
   },
   {

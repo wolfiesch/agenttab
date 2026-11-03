@@ -8,6 +8,8 @@ import { CHALLENGE_ID_PATTERN, episodeEvent, findEpisode, type ChallengeEpisode,
 import { bindChallengeNotice, challengeStoreAvailable, readTaskEpisodes } from "./challenge-store";
 
 const HANDOFF_ALARM = "agenttab-handoff-timeout";
+/** System notification ids are this prefix plus the notice id, so a click maps back to its notice. */
+const NOTIFICATION_PREFIX = "agenttab-handoff:";
 const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_NOTICES = 100;
 /** Seconds without input before Chrome reports the user as idle. */
@@ -50,6 +52,13 @@ function isChallengeCompletion(
 
 function terminal(status: NoticeStatus): boolean {
   return status !== "open";
+}
+
+/** The notice id a handoff system notification names, or undefined for any other notification. */
+export function handoffNoticeIdFromNotification(notificationId: string): string | undefined {
+  return notificationId.startsWith(NOTIFICATION_PREFIX) && notificationId.length > NOTIFICATION_PREFIX.length
+    ? notificationId.slice(NOTIFICATION_PREFIX.length)
+    : undefined;
 }
 
 export class HandoffController {
@@ -115,14 +124,17 @@ export class HandoffController {
   }
 
   openFromPopup(noticeId: string): Promise<Record<string, unknown>> {
+    return this.serialize(() => this.openNow(noticeId));
+  }
+
+  /** The user clicked a notice's system notification: focus its tab as Open tab does, then retire the notification. */
+  openFromNotification(noticeId: string): Promise<Record<string, unknown>> {
     return this.serialize(async () => {
-      await this.expireNow();
-      const notice = await this.noticeForTask(undefined, noticeId);
-      if (notice.status !== "open") return noticeResult(notice);
-      await this.ownership.assertOwned(notice.taskId, notice.tabId);
-      const tab = await chrome.tabs.update(notice.tabId, { active: true });
-      if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
-      return { ...noticeResult(notice), focused: true };
+      try {
+        return await this.openNow(noticeId);
+      } finally {
+        await this.clearNotification(noticeId);
+      }
     });
   }
 
@@ -143,7 +155,7 @@ export class HandoffController {
         for (const noticeId of noticeIds) delete state.notices[noticeId];
         return noticeIds.length > 0;
       });
-      if (cleared) await this.scheduleExpiry();
+      if (cleared) await this.settle();
       return cleared;
     });
   }
@@ -173,6 +185,16 @@ export class HandoffController {
 
   private async restoreNow(): Promise<void> {
     await this.expireNow();
+  }
+
+  private async openNow(noticeId: string): Promise<Record<string, unknown>> {
+    await this.expireNow();
+    const notice = await this.noticeForTask(undefined, noticeId);
+    if (notice.status !== "open") return noticeResult(notice);
+    await this.ownership.assertOwned(notice.taskId, notice.tabId);
+    const tab = await chrome.tabs.update(notice.tabId, { active: true });
+    if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
+    return { ...noticeResult(notice), focused: true };
   }
 
   private async requestNow(
@@ -236,7 +258,8 @@ export class HandoffController {
       state.notices[notice.noticeId] = notice;
       this.trimNotices(state.notices);
     });
-    await this.scheduleExpiry();
+    await this.settle();
+    await this.announce(notice);
     if (isChallengeCompletion(completion)) {
       await bindChallengeNotice(taskId, completion.value, notice.noticeId).catch(() => false);
     }
@@ -318,7 +341,7 @@ export class HandoffController {
       }
       this.trimNotices(state.notices);
     });
-    await this.scheduleExpiry();
+    await this.settle();
   }
 
   private async dismissMatchingNow(matches: (notice: HandoffNotice) => boolean): Promise<boolean> {
@@ -333,7 +356,7 @@ export class HandoffController {
       this.trimNotices(state.notices);
       return dismissed;
     });
-    if (changed) await this.scheduleExpiry();
+    if (changed) await this.settle();
     return changed;
   }
 
@@ -345,7 +368,7 @@ export class HandoffController {
       this.trimNotices(state.notices);
       return structuredClone(notice);
     });
-    await this.scheduleExpiry();
+    await this.settle();
     return noticeResult(next);
   }
 
@@ -361,14 +384,52 @@ export class HandoffController {
     return notice;
   }
 
-  private async scheduleExpiry(): Promise<void> {
-    const nextExpiry = Object.values((await readState()).notices)
+  /**
+   * Runs after every notice transition: arms the alarm for the next expiry and retires the system
+   * notification of every notice that is no longer open, including notices removed from storage.
+   */
+  private async settle(): Promise<void> {
+    const notices = (await readState()).notices;
+    const nextExpiry = Object.values(notices)
       .filter((notice) => notice.status === "open")
       .reduce<number | undefined>((earliest, notice) =>
         earliest === undefined || notice.expiresAtMs < earliest ? notice.expiresAtMs : earliest,
       undefined);
     await chrome.alarms.clear(HANDOFF_ALARM);
     if (nextExpiry !== undefined) chrome.alarms.create(HANDOFF_ALARM, { when: nextExpiry });
+    const shown = await chrome.notifications?.getAll().catch(() => undefined);
+    for (const notificationId of Object.keys(shown ?? {})) {
+      const noticeId = handoffNoticeIdFromNotification(notificationId);
+      if (noticeId !== undefined && notices[noticeId]?.status !== "open") await this.clearNotification(noticeId);
+    }
+  }
+
+  /**
+   * Shows a system notification for a new notice so the user can find it outside the popup. A click
+   * focuses the noticed tab. It never takes focus itself, and a failure leaves the recorded notice intact.
+   */
+  private async announce(notice: HandoffNotice): Promise<void> {
+    const notifications = chrome.notifications;
+    if (!notifications) return;
+    try {
+      const tab = (await chrome.tabs.get(notice.tabId).catch(() => null)) as { url?: string } | null;
+      const host = tab?.url && URL.canParse(tab.url) ? new URL(tab.url).host : undefined;
+      await notifications.create(`${NOTIFICATION_PREFIX}${notice.noticeId}`, {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+        title: "AgentTab needs you",
+        message: notice.prompt,
+        contextMessage: host ? `Click to open the ${host} tab` : "Click to open the tab",
+        requireInteraction: true,
+        priority: 2,
+      });
+    } catch (error) {
+      console.warn("AgentTab could not show the handoff notification", error);
+    }
+  }
+
+  private async clearNotification(noticeId: string): Promise<void> {
+    await chrome.notifications?.clear(`${NOTIFICATION_PREFIX}${noticeId}`).catch(() => false);
   }
 
   private async completionMatched(notice: HandoffNotice): Promise<boolean> {
