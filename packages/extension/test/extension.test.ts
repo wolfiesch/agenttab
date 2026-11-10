@@ -92,6 +92,7 @@ class MockNativePort {
 }
 
 let persisted: Record<string, unknown>;
+let webNavigationFrames: Array<{ frameId: number; url: string }>;
 let debuggerCalls: string[];
 let tabStore: Map<number, MockTab>;
 let removedTabIds: number[];
@@ -364,6 +365,7 @@ function emitDebuggerDetach(tabId: number): void {
 
 function installChromeMock(): void {
   persisted = {};
+  webNavigationFrames = [];
   debuggerCalls = [];
   tabStore = new Map();
   removedTabIds = [];
@@ -524,6 +526,16 @@ function installChromeMock(): void {
             }
           }
           return {};
+        },
+      },
+      webNavigation: {
+        onCommitted: { addListener() { } },
+        onCompleted: { addListener() { } },
+        onErrorOccurred: { addListener() { } },
+        onHistoryStateUpdated: { addListener() { } },
+        onReferenceFragmentUpdated: { addListener() { } },
+        async getAllFrames() {
+          return clone(webNavigationFrames);
         },
       },
       tabs: {
@@ -6933,6 +6945,51 @@ describe("scripting route when Chrome refuses the debugger", () => {
     expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([{ op: "act", id: 3, kind: "click" }]);
     expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
     expect(debuggerCalls).not.toContain("Runtime.callFunctionOn");
+  });
+
+  test("names only the origin of the embedded foreign extension frame blocking the debugger", async () => {
+    webNavigationFrames.push(
+      { frameId: 1, url: `chrome-extension://foreignpasswordmgr/inline/menu.html?token=secret#field` },
+      { frameId: 2, url: `chrome-extension://foreignpasswordmgr/inject.html` },
+    );
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = () => ({ nodes: [], truncated: false });
+    await revisions.ensure(7);
+    const snapshot = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(snapshot.debugger_unavailable_reason).toBe(
+      `${REFUSAL} (blocked by embedded extension frame: chrome-extension://foreignpasswordmgr)`,
+    );
+  });
+
+  test("reattaches immediately once the foreign extension frame disappears", async () => {
+    webNavigationFrames.push({ frameId: 1, url: `chrome-extension://foreignpasswordmgr/inject.html` });
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = () => ({ nodes: [], truncated: false });
+    await revisions.ensure(7);
+    await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+
+    webNavigationFrames.length = 0;
+    debuggerAttachError = null;
+    debuggerCommandOverride = (method) =>
+      method === "Accessibility.getFullAXTree" ? { nodes: [] } : undefined;
+
+    const second = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
+    expect(second).not.toHaveProperty("debugger_unavailable_reason");
+  });
+
+  test("keeps a refusal without a foreign extension frame for the full retry interval", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    debuggerAttachError = "Another debugger is already attached to the tab with id: 7.";
+    pageAgentReply = () => ({ nodes: [], truncated: false });
+    await revisions.ensure(7);
+    await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+
+    debuggerAttachError = null;
+    const second = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(1);
+    expect(second.debugger_unavailable_reason).toBe("Another debugger is already attached to the tab with id: 7.");
   });
 
   test("refuses debugger-only actions before touching the page", async () => {

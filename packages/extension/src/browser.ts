@@ -86,7 +86,8 @@ const DEBUGGER_VERSION = "1.3";
 const DEBUGGER_IDLE_MS = 30_000;
 /** Page.enable and its siblings answer in milliseconds unless the renderer is paused or wedged. */
 const DEBUGGER_INIT_TIMEOUT_MS = 10_000;
-// A refused debugger is retried after this interval or the tab's next navigation.
+// A refused debugger is retried after this interval or the tab's next navigation. A refusal caused
+// by an embedded foreign-extension frame is also retried as soon as that frame is gone.
 const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
 // Scripting-route refs always name the tab's top document.
 const SCRIPTING_FRAME_ID = "scripting:top";
@@ -632,7 +633,7 @@ export class StandardBrowserRuntime {
   private readonly pointer = new AgentPointer(
     (tabId, method, params, sessionId) => this.send(tabId, method, params, false, sessionId),
   );
-  private readonly debuggerRefusals = new Map<number, { reason: string; until: number }>();
+  private readonly debuggerRefusals = new Map<number, { reason: string; until: number; frameCaused: boolean }>();
   /** Page revision of the last completed challenge scan, per tab. */
   private readonly challengeScanRevisions = new Map<number, number>();
   /** Live `load`/`url` waits per tab; navigation events are recorded only for these tabs. */
@@ -1019,11 +1020,20 @@ export class StandardBrowserRuntime {
   /**
    * Records a debugger refusal so later commands use the scripting route
    * without re-attaching, which would flash Chrome's debugging banner on every
-   * call. A navigation or the retry interval clears it.
+   * call. A navigation or the retry interval clears it; a refusal caused by a
+   * foreign-extension frame also clears once that frame leaves the tab.
    */
-  private refuseDebugger(tabId: number, cause: unknown): Error {
-    const reason = cause instanceof Error ? cause.message : String(cause);
-    this.debuggerRefusals.set(tabId, { reason, until: Date.now() + DEBUGGER_REFUSAL_RETRY_MS });
+  private async refuseDebugger(tabId: number, cause: unknown): Promise<Error> {
+    let reason = cause instanceof Error ? cause.message : String(cause);
+    let frameCaused = false;
+    if (/extension/i.test(reason)) {
+      const origins = await this.foreignExtensionFrameOrigins(tabId);
+      if (origins !== undefined && origins.length > 0) {
+        frameCaused = true;
+        reason += ` (blocked by embedded extension frame${origins.length === 1 ? "" : "s"}: ${origins.join(", ")})`;
+      }
+    }
+    this.debuggerRefusals.set(tabId, { reason, until: Date.now() + DEBUGGER_REFUSAL_RETRY_MS, frameCaused });
     return debuggerUnavailableError(reason);
   }
 
@@ -3971,11 +3981,41 @@ export class StandardBrowserRuntime {
     }, false, sessionId);
   }
 
+  /**
+   * Distinct origins of chrome-extension frames embedded in a tab, excluding this extension's own
+   * pages. Only the origin is kept: frame paths and queries can carry the other extension's state.
+   * Undefined when the frame list cannot be read.
+   */
+  private async foreignExtensionFrameOrigins(tabId: number): Promise<string[] | undefined> {
+    const webNavigation = chrome.webNavigation;
+    if (webNavigation === undefined) return undefined;
+    let frames: chrome.webNavigation.GetAllFrameResultDetails[] | null;
+    try {
+      frames = await webNavigation.getAllFrames({ tabId });
+    } catch {
+      return undefined;
+    }
+    const ownOrigin = chrome.runtime.getURL("/").replace(/\/$/, "");
+    const origins = new Set<string>();
+    for (const frame of frames ?? []) {
+      const origin = typeof frame.url === "string" ? /^chrome-extension:\/\/[^/?#]+/.exec(frame.url)?.[0] : undefined;
+      if (origin !== undefined && origin !== ownOrigin) origins.add(origin);
+    }
+    return [...origins];
+  }
+
   private async ensureAttached(tabId: number): Promise<void> {
     await this.authorizeDebuggerUse(tabId);
     const refusal = this.debuggerRefusals.get(tabId);
     if (refusal !== undefined) {
-      if (refusal.until > Date.now()) throw debuggerUnavailableError(refusal.reason);
+      // A foreign-extension frame blocks the debugger only while it lives. A transient frame, such
+      // as a password-manager autofill menu, often disappears in well under the retry interval, so a
+      // frame-caused refusal is re-checked against the live frame list. Other refusals, such as open
+      // DevTools, and an unreadable frame list keep the refusal for the full interval.
+      if (refusal.until > Date.now()) {
+        const origins = refusal.frameCaused ? await this.foreignExtensionFrameOrigins(tabId) : undefined;
+        if (origins === undefined || origins.length > 0) throw debuggerUnavailableError(refusal.reason);
+      }
       this.debuggerRefusals.delete(tabId);
     }
     let session = this.sessions.get(tabId);
@@ -4020,7 +4060,7 @@ export class StandardBrowserRuntime {
         if (error instanceof Error && /no tab with given id/i.test(error.message)) throw error;
         // Chrome refuses the debugger when another extension's frame is on the
         // page or another client, such as open DevTools, holds the tab.
-        throw this.refuseDebugger(tabId, error);
+        throw await this.refuseDebugger(tabId, error);
       }
       session.attached = true;
       // A renderer paused by a JavaScript dialog that opened while no session was attached never
@@ -4091,7 +4131,7 @@ export class StandardBrowserRuntime {
         }
         // AgentTab's own coded failures, such as a revoked task binding, keep their meaning.
         if (isRecord(error) && typeof error.code === "string") throw error;
-        throw this.refuseDebugger(tabId, error);
+        throw await this.refuseDebugger(tabId, error);
       } finally {
         clearTimeout(timer);
         session.dialogWaiters.delete(wake);
