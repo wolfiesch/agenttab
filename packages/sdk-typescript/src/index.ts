@@ -66,6 +66,11 @@ export type BrowserOpenParams =
 type FrameScoped = { frame_id?: string };
 type Target = ({ ref: string; selector?: never } | { ref?: never; selector: string }) & FrameScoped;
 type DownloadTarget = Target & { expect_download?: boolean };
+/**
+ * Canvas-relative click target: `x` and `y` are CSS fractions (0 <= value < 1) of the
+ * width and height of the element `selector` resolves to, measured within its content box.
+ */
+type CanvasRelativeTarget = { selector: string; ref?: never; frame_id?: never; x: number; y: number };
 
 export type BrowserSnapshotParams =
   | ({ tab_id: number; mode: "accessibility"; root_ref?: string; max_depth?: number; max_nodes?: number; query?: { role?: string; name?: string } } & FrameScoped)
@@ -158,6 +163,7 @@ export type BrowserPressModifier = "Alt" | "Control" | "Meta" | "Shift";
 
 export type BrowserAction =
   | ({ kind: "click" | "double_click" | "context_click" } & DownloadTarget)
+  | ({ kind: "click" } & CanvasRelativeTarget)
   | ({ kind: "hover" } & Target)
   | ({ kind: "press"; key: BrowserPressKey; modifiers?: BrowserPressModifier[] } & DownloadTarget)
   | ({ kind: "type" | "fill"; text: string } & Target)

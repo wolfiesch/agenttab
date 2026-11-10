@@ -70,16 +70,32 @@ interface StubState {
   strict?: boolean;
 }
 
+/**
+ * Methods OMP's injected `pi.zod` (omptype's Zod-like builder, `ZodLikeSchema`) implements.
+ * Real Zod has more (`lt`, `gt`, `length`, ...); calling one of those throws at extension load in
+ * OMP, so the stub refuses them too.
+ */
+const OMP_SCHEMA_METHODS: Record<string, true> = {
+  parse: true, safeParse: true, min: true, max: true, int: true, positive: true, nonnegative: true,
+  regex: true, url: true, optional: true, nullable: true, default: true, describe: true, refine: true,
+  superRefine: true, trim: true, transform: true, catch: true, strict: true, passthrough: true,
+  strip: true, partial: true,
+};
+
 function stubSchema(kind: string, state: StubState): Record<string, unknown> {
   return new Proxy({ kind, state }, {
-    get: (target, property) => property in target
-      ? Reflect.get(target, property)
-      : (...args: unknown[]) => stubSchema(kind, {
+    get: (target, property) => {
+      if (property in target) return Reflect.get(target, property);
+      if (typeof property === "string" && !Object.hasOwn(OMP_SCHEMA_METHODS, property)) {
+        throw new TypeError(`OMP's pi.zod has no .${property}(); use a method from OMP_SCHEMA_METHODS`);
+      }
+      return (...args: unknown[]) => stubSchema(kind, {
         ...state,
         ...(property === "max" ? { max: Number(args[0]) } : {}),
         ...(property === "refine" ? { refined: true } : {}),
         ...(property === "strict" ? { strict: true } : {}),
-      }),
+      });
+    },
   });
 }
 

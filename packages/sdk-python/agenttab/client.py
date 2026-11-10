@@ -78,6 +78,15 @@ class _DownloadGestureOptions(_ElementTarget, total=False):
     expect_download: bool
 
 
+class _CanvasRelativeClickAction(TypedDict):
+    """Normalized fractions of a unique top-frame element's CSS content box."""
+
+    kind: Literal["click"]
+    selector: str
+    x: float
+    y: float
+
+
 class BrowserDownloadGestureAction(_DownloadGestureOptions):
     kind: Literal["click", "double_click", "context_click"]
 
@@ -135,8 +144,7 @@ class BrowserDownloadNavigationAction(_DownloadNavigationOptions):
     kind: Literal["navigate", "go_back", "go_forward", "reload"]
 
 
-BrowserAction = BrowserGestureAction | BrowserDownloadGestureAction | BrowserPressAction | BrowserTextAction | BrowserDialogAction | BrowserNavigationAction | BrowserDownloadNavigationAction
-
+BrowserAction = BrowserGestureAction | BrowserDownloadGestureAction | BrowserPressAction | BrowserTextAction | BrowserDialogAction | BrowserNavigationAction | BrowserDownloadNavigationAction | _CanvasRelativeClickAction
 
 class _WaitConditionOptions(TypedDict, total=False):
     value: str
