@@ -299,6 +299,22 @@ function assertExpectDownload(action: Record<string, unknown>, kind: string): vo
   }
 }
 
+function assertCoordinateTarget(action: Record<string, unknown>): void {
+  if (action.x === undefined && action.y === undefined) {
+    assertTarget(action, String(action.kind));
+    return;
+  }
+  if (action.frame_id !== undefined) commandError("Relative points are supported only in the top frame");
+  if (action.ref !== undefined || typeof action.selector !== "string") {
+    commandError("relative coordinates require click with selector and no ref");
+  }
+  if (action.x === undefined || action.y === undefined) commandError("click requires both x and y");
+  if (typeof action.x !== "number" || !Number.isFinite(action.x) || action.x < 0 || action.x >= 1 ||
+      typeof action.y !== "number" || !Number.isFinite(action.y) || action.y < 0 || action.y >= 1) {
+    commandError("click.x and click.y must be finite fractions between 0 inclusive and 1 exclusive");
+  }
+}
+
 function assertPressChord(action: Record<string, unknown>): void {
   const keys = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "Escape", "Tab", "Home", "End", "Space", "Backspace", "Delete", "a", "z", "y"];
   if (typeof action.key !== "string" || !keys.includes(action.key)) commandError("press.key must be a supported standard key");
@@ -323,6 +339,10 @@ function assertAction(value: unknown): Record<string, unknown> {
   const action = value;
   switch (action.kind) {
     case "click":
+      assertExactObject(action, ["kind"], ["ref", "selector", "frame_id", "expect_download", "x", "y"], "click action");
+      assertCoordinateTarget(action);
+      assertExpectDownload(action, action.kind);
+      return action;
     case "double_click":
     case "context_click":
       assertExactObject(action, ["kind"], ["ref", "selector", "frame_id", "expect_download"], `${action.kind} action`);

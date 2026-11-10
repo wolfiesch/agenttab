@@ -419,6 +419,8 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
     };
     let target: string | undefined;
     const targetRefOrSelector = fieldString(action, "ref") ?? fieldString(action, "selector");
+    const canvasX = fieldNumber(action, "x");
+    const canvasY = fieldNumber(action, "y");
     if (kind === "press") {
       const modifiers = Array.isArray(action.modifiers)
         ? action.modifiers.filter((value): value is string => typeof value === "string").join("+")
@@ -448,6 +450,8 @@ function actionDescriptions(args: Record<string, unknown>): string[] {
         selectorMeta(targetRefOrSelector),
         countSummary(Array.isArray(action.files) ? action.files : [], "file"),
       );
+    } else if (kind === "click" && canvasX !== undefined && canvasY !== undefined) {
+      target = joinMeta(selectorMeta(targetRefOrSelector), `canvas-relative x=${percent(canvasX)} y=${percent(canvasY)}`);
     } else {
       target = selectorMeta(targetRefOrSelector);
     }
@@ -905,6 +909,10 @@ function fieldString(value: Record<string, unknown>, key: string): string | unde
 
 function fieldNumber(value: Record<string, unknown>, key: string): number | undefined {
   return typeof value[key] === "number" && Number.isFinite(value[key]) ? value[key] : undefined;
+}
+
+function percent(fraction: number): string {
+  return `${Math.round(fraction * 1000) / 10}%`;
 }
 
 function fieldBoolean(value: Record<string, unknown>, key: string): boolean | undefined {

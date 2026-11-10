@@ -6950,6 +6950,15 @@ describe("scripting route when Chrome refuses the debugger", () => {
     expect(debuggerCalls).not.toContain("Runtime.callFunctionOn");
   });
 
+  test("rejects a canvas-relative click instead of discarding its fractions", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = (request) => request.op === "describe" ? { tag: "CANVAS" } : { id: 9 };
+    const revision = await revisions.ensure(7);
+    await expect(runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]))
+      .rejects.toMatchObject({ code: "debugger_unavailable" });
+    expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([]);
+  });
+
   test("names only the origin of the embedded foreign extension frame blocking the debugger", async () => {
     webNavigationFrames.push(
       { frameId: 1, url: `chrome-extension://foreignpasswordmgr/inline/menu.html?token=secret#field` },
@@ -7230,6 +7239,81 @@ describe("mouse gestures on targets outside the viewport", () => {
       }]),
     ).rejects.toMatchObject({ code: "action_failed", message: expect.stringContaining("do not fit in the viewport together") });
     expect(calls.some((call) => call.startsWith("Input.dispatchMouseEvent"))).toBe(false);
+  });
+});
+
+describe("normalized selector-point clicks", () => {
+  function pointRuntime(content = [10, 20, 30, 20, 30, 40, 10, 40], onRelease?: () => void) {
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const dispatched: Array<number | string | undefined> = [];
+    let syntheticClicks = 0;
+    let obscured = false;
+    debuggerCommandOverride = (method, params) => {
+      if (method === "DOM.querySelectorAll") return { nodeIds: [22] };
+      if (method === "DOM.getBoxModel") return { model: { content } };
+      if (method === "Page.getLayoutMetrics") return { cssLayoutViewport: { clientWidth: 200, clientHeight: 150, pageX: 10, pageY: 40 } };
+      if (method === "DOM.describeNode") return { node: { backendNodeId: 22 } };
+      if (method === "Input.dispatchMouseEvent") {
+        dispatched.push(String(params.type), params.x as number, params.y as number);
+        if (params.type === "mouseReleased") onRelease?.();
+        return {};
+      }
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes(".click()")) syntheticClicks += 1;
+      if (method === "DOM.getNodeForLocation") return { backendNodeId: obscured ? 23 : 22 };
+      if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes("isConnected")) return { result: { value: true } };
+      return undefined;
+    };
+    return { runtime, revisions, dispatched, syntheticClicks: () => syntheticClicks, obscure: () => { obscured = true; } };
+  }
+
+  test("maps CSS content fractions to trusted input without a synthetic DOM click", async () => {
+    const { runtime, revisions, dispatched } = pointRuntime();
+    const revision = await revisions.ensure(7);
+    await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]);
+    expect(dispatched).toEqual(["mouseMoved", 15, 35, "mousePressed", 15, 35, "mouseReleased", 15, 35]);
+  });
+
+  test("maps fractions along a reflected content box's own edges", async () => {
+    const { runtime, revisions, dispatched } = pointRuntime([30, 20, 10, 20, 10, 40, 30, 40]);
+    const revision = await revisions.ensure(7);
+    await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]);
+    expect(dispatched).toEqual(["mouseMoved", 25, 35, "mousePressed", 25, 35, "mouseReleased", 25, 35]);
+  });
+
+  test("restores the human's tab when a relative click opens a foreground popup", async () => {
+    const popupUrl = "https://example.test/popup";
+    tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    const { runtime, revisions } = pointRuntime(undefined, () => {
+      for (const tab of tabStore.values()) {
+        if (tab.windowId === 1) tab.active = false;
+      }
+      tabStore.set(91, { id: 91, windowId: 1, groupId: -1, active: true, openerTabId: 7, url: popupUrl });
+      emitDebuggerEvent(7, "Page.windowOpen", { url: popupUrl, userGesture: true });
+    });
+    const revision = await revisions.ensure(7);
+    await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]);
+    expect(tabStore.get(90)?.active).toBe(true);
+    expect(tabStore.get(91)?.active).toBe(false);
+    expect(focusedWindowUpdates).toEqual([1]);
+  });
+
+  test("refuses an obscured point before dispatching mouse input", async () => {
+    const { runtime, revisions, dispatched, obscure } = pointRuntime();
+    const revision = await revisions.ensure(7);
+    obscure();
+    await expect(runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]))
+      .rejects.toMatchObject({ code: "action_failed", message: expect.stringContaining("obscures") });
+    expect(dispatched).toEqual([]);
+  });
+
+  test("refuses a child-frame point rather than mis-mapping its coordinates", async () => {
+    const { runtime, revisions, dispatched } = pointRuntime();
+    const revision = await revisions.ensure(7);
+    await expect(runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", frame_id: "frame-1", x: 0.5, y: 0.5 }]))
+      .rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("top frame") });
+    expect(dispatched).toEqual([]);
   });
 });
 
