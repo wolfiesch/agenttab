@@ -3061,20 +3061,18 @@ export class StandardBrowserRuntime {
     });
     // Relative selector points use trusted input; DOM synthetic clicks are not allowed.
     const fraction = relativePoint(action);
-    if (fraction !== undefined) {
-      if (target.route === "scripting") {
-        throw Object.assign(new Error("Relative points require debugger mouse input; no synthetic click fallback"), { code: "debugger_unavailable" });
-      }
-      await this.revealTarget(tabId, target);
-      await this.pointer.announce(tabId, intent ?? "Click at canvas-relative point");
-      await this.clickRelativeTarget(tabId, target, fraction);
-      return { kind, completed: true, ...downloadResult };
+    if (fraction !== undefined && target.route === "scripting") {
+      throw Object.assign(new Error("Relative points require debugger mouse input; no synthetic click fallback"), { code: "debugger_unavailable" });
     }
     const backendNodeId = target.backendNodeId;
     // Mouse gestures land at the target's on-screen point, so bring it into view first.
-    if (POINTER_GESTURE_KINDS.has(String(kind)) && target.route !== "scripting") await this.revealTarget(tabId, target);
+    if ((fraction !== undefined || POINTER_GESTURE_KINDS.has(String(kind))) && target.route !== "scripting") await this.revealTarget(tabId, target);
     const pointerCue = ACTION_POINTER_CUES[String(kind)];
-    if (pointerCue && target.route !== "scripting") await this.pointer.point(tabId, target, pointerCue, intent);
+    if (fraction !== undefined) {
+      await this.pointer.announce(tabId, intent ?? "Click at canvas-relative point");
+    } else if (pointerCue && target.route !== "scripting") {
+      await this.pointer.point(tabId, target, pointerCue, intent);
+    }
     let windowRequests: Array<Record<string, unknown>> = [];
     if (kind === "click" || kind === "press") {
       const [activeTab, existingTabs] = await Promise.all([
@@ -3095,7 +3093,9 @@ export class StandardBrowserRuntime {
       if (session) session.pendingWindowOpen = pendingWindowOpen;
       try {
         let requested: unknown[] = [];
-        if (target.route === "scripting") {
+        if (fraction !== undefined) {
+          await this.clickRelativeTarget(tabId, target, fraction);
+        } else if (target.route === "scripting") {
           requested = await this.scriptingGesture(tabId, target, action);
         } else {
           const value = await this.callOnNode(
@@ -3835,14 +3835,18 @@ export class StandardBrowserRuntime {
     if (content.length !== 8 || content.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
       throw Object.assign(new Error("Relative target has no visible content box"), { code: "action_failed" });
     }
-    const left = Math.min(content[0], content[6]);
-    const top = Math.min(content[1], content[3]);
-    const width = Math.abs(content[2] - content[0]);
-    const height = Math.abs(content[7] - content[1]);
-    if (!(width > 0 && height > 0)) {
+    // Interpolate along the quad's own edges so rotated or reflected boxes map
+    // fractions in the element's orientation: p0 + (p1 - p0) * x + (p3 - p0) * y.
+    const [x0, y0, x1, y1, , , x3, y3] = content as number[];
+    const across = { x: x1 - x0, y: y1 - y0 };
+    const down = { x: x3 - x0, y: y3 - y0 };
+    if (!(Math.abs(across.x * down.y - across.y * down.x) > 0)) {
       throw Object.assign(new Error("Relative target has no visible content box"), { code: "action_failed" });
     }
-    const point = { x: left + width * fraction.x, y: top + height * fraction.y };
+    const point = {
+      x: x0 + across.x * fraction.x + down.x * fraction.y,
+      y: y0 + across.y * fraction.x + down.y * fraction.y,
+    };
     const metrics = await this.send(tabId, "Page.getLayoutMetrics", {});
     const viewport = isRecord(metrics.cssLayoutViewport) ? metrics.cssLayoutViewport : {};
     const scrollX = typeof viewport.pageX === "number" ? viewport.pageX : 0;

@@ -7243,7 +7243,7 @@ describe("mouse gestures on targets outside the viewport", () => {
 });
 
 describe("normalized selector-point clicks", () => {
-  function pointRuntime() {
+  function pointRuntime(content = [10, 20, 30, 20, 30, 40, 10, 40], onRelease?: () => void) {
     const revisions = new RevisionTracker();
     const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
     const dispatched: Array<number | string | undefined> = [];
@@ -7251,10 +7251,12 @@ describe("normalized selector-point clicks", () => {
     let obscured = false;
     debuggerCommandOverride = (method, params) => {
       if (method === "DOM.querySelectorAll") return { nodeIds: [22] };
+      if (method === "DOM.getBoxModel") return { model: { content } };
       if (method === "Page.getLayoutMetrics") return { cssLayoutViewport: { clientWidth: 200, clientHeight: 150, pageX: 10, pageY: 40 } };
       if (method === "DOM.describeNode") return { node: { backendNodeId: 22 } };
       if (method === "Input.dispatchMouseEvent") {
         dispatched.push(String(params.type), params.x as number, params.y as number);
+        if (params.type === "mouseReleased") onRelease?.();
         return {};
       }
       if (method === "Runtime.callFunctionOn" && String(params.functionDeclaration).includes(".click()")) syntheticClicks += 1;
@@ -7270,6 +7272,31 @@ describe("normalized selector-point clicks", () => {
     const revision = await revisions.ensure(7);
     await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]);
     expect(dispatched).toEqual(["mouseMoved", 15, 35, "mousePressed", 15, 35, "mouseReleased", 15, 35]);
+  });
+
+  test("maps fractions along a reflected content box's own edges", async () => {
+    const { runtime, revisions, dispatched } = pointRuntime([30, 20, 10, 20, 10, 40, 30, 40]);
+    const revision = await revisions.ensure(7);
+    await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]);
+    expect(dispatched).toEqual(["mouseMoved", 25, 35, "mousePressed", 25, 35, "mouseReleased", 25, 35]);
+  });
+
+  test("restores the human's tab when a relative click opens a foreground popup", async () => {
+    const popupUrl = "https://example.test/popup";
+    tabStore.set(90, { id: 90, windowId: 1, groupId: -1, active: true });
+    tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: false });
+    const { runtime, revisions } = pointRuntime(undefined, () => {
+      for (const tab of tabStore.values()) {
+        if (tab.windowId === 1) tab.active = false;
+      }
+      tabStore.set(91, { id: 91, windowId: 1, groupId: -1, active: true, openerTabId: 7, url: popupUrl });
+      emitDebuggerEvent(7, "Page.windowOpen", { url: popupUrl, userGesture: true });
+    });
+    const revision = await revisions.ensure(7);
+    await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "canvas", x: 0.25, y: 0.75 }]);
+    expect(tabStore.get(90)?.active).toBe(true);
+    expect(tabStore.get(91)?.active).toBe(false);
+    expect(focusedWindowUpdates).toEqual([1]);
   });
 
   test("refuses an obscured point before dispatching mouse input", async () => {
