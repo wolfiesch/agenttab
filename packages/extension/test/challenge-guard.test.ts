@@ -192,8 +192,22 @@ function installChromeMock(): void {
       },
       action: { async setBadgeText() {}, async setBadgeBackgroundColor() {} },
       windows: { async update() { return {}; } },
+      runtime: { getURL: (path: string) => `chrome-extension://agenttab-test${path}` },
+      webNavigation: {
+        onCommitted: { addListener() {} },
+        onCompleted: { addListener() {} },
+        onErrorOccurred: { addListener() {} },
+        onHistoryStateUpdated: { addListener() {} },
+        onReferenceFragmentUpdated: { addListener() {} },
+        async getAllFrames() {
+          return [
+            { frameId: 0, parentFrameId: -1, url: `${ORIGIN}/`, documentId: "doc-top" },
+            { frameId: 2, parentFrameId: 0, url: "https://www.google.com/recaptcha/api2/anchor", documentId: "doc-2" },
+          ];
+        },
+      },
       scripting: {
-        async executeScript(details: { func: { name: string }; args?: unknown[] }) {
+        async executeScript(details: { func: { name: string }; args?: unknown[]; target?: { documentIds?: string[] } }) {
           if (details.func.name === "runPageAgentRequest") {
             const request = details.args?.[0] as Record<string, unknown>;
             pageAgentRequests.push(structuredClone(request));
@@ -204,7 +218,7 @@ function installChromeMock(): void {
               : request.op === "describe"
               ? { tag: "BUTTON", text: "Buy" }
               : undefined;
-            return [{ result: structuredClone(result), documentId: "doc-1" }];
+            return [{ result: structuredClone(result), documentId: details.target?.documentIds?.[0] ?? "doc-1" }];
           }
           if (details.func.name === "collectChallengeFacts") {
             factsScans += 1;
@@ -542,6 +556,17 @@ describe("browser_act challenge guard", () => {
     ]);
     expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([{ op: "act", id: 3, kind: "click" }]);
     expect(commands.map((command) => command.method)).not.toContain("Page.getFrameTree");
+  });
+
+  test("on the scripting route, a click in an iframe is refused because its ancestry cannot be known", async () => {
+    debuggerRefused = true;
+    const runtime = newRuntime();
+    await openEpisode(runtime, turnstileActive());
+    agentSurface = () => ({ hit: false, frames: [] });
+
+    const inFrame = await runtime.act(TASK, TAB, 1, [{ kind: "click", selector: "#checkbox", frame_id: "scripting:2" }]);
+    expect(inFrame).toMatchObject({ needsUser: true, result: { status: "challenge_active", actions: [] } });
+    expect(pageAgentRequests.filter((request) => request.op === "act")).toEqual([]);
   });
 
   test("a batch runs its prefix, stops before the refused action, and dispatches no input for it", async () => {

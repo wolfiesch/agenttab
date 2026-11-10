@@ -62,7 +62,7 @@ export function debuggerUnavailableError(cause: unknown, operation?: string): Er
       outcome: "not_started",
       reason,
       cause,
-      recovery: "Snapshots, element actions, credential and email code fills, and load, URL, text, selector, and value waits use AgentTab's scripting route on this tab. Frame-scoped control, drag, file upload, dialogs, downloads, network-idle waits, and full-page or background-tab screenshots need the debugger; they work again once the condition Chrome reports clears, such as another extension's frame on the page or open DevTools.",
+      recovery: "Snapshots, element actions, credential and email code fills, and load, URL, text, selector, and value waits use AgentTab's scripting route on this tab. Use the web frame IDs from an accessibility snapshot for frame-scoped page work. Drag, file upload, dialogs, downloads, network-idle waits, and full-page or background-tab screenshots need the debugger; they work again once the condition Chrome reports clears, such as another extension's frame on the page or open DevTools.",
     },
   );
 }
@@ -71,6 +71,9 @@ export function debuggerUnavailableError(cause: unknown, operation?: string): Er
 export function normalizeRestrictedOriginError(error: unknown, operation: string): unknown {
   if (typeof error === "object" && error !== null && typeof Reflect.get(error, "code") === "string") return error;
   const message = error instanceof Error ? error.message : String(error);
+  if (/cannot access a chrome-extension:\/\/ url of different extension/i.test(message)) {
+    return Object.assign(debuggerUnavailableError(error), error instanceof Error ? error : {});
+  }
   return RESTRICTED_ERROR_PATTERNS.some((pattern) => pattern.test(message))
     ? restrictedOriginError(operation)
     : error;
