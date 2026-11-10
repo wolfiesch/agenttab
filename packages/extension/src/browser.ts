@@ -4017,17 +4017,27 @@ export class StandardBrowserRuntime {
 
   private async ensureAttached(tabId: number): Promise<void> {
     await this.authorizeDebuggerUse(tabId);
-    const refusal = this.debuggerRefusals.get(tabId);
-    if (refusal !== undefined) {
-      // A foreign-extension frame blocks the debugger only while it lives. A transient frame, such
-      // as a password-manager autofill menu, often disappears in well under the retry interval, so a
-      // frame-caused refusal is re-checked against the live frame list. Other refusals, such as open
-      // DevTools, and an unreadable frame list keep the refusal for the full interval.
-      if (refusal.until > Date.now()) {
-        const origins = refusal.frameCaused ? await this.foreignExtensionFrameOrigins(tabId) : undefined;
-        if (origins === undefined || origins.length > 0) throw debuggerUnavailableError(refusal.reason);
+    // A foreign-extension frame blocks the debugger only while it lives. A transient frame, such as
+    // a password-manager autofill menu, often disappears in well under the retry interval, so a
+    // frame-caused refusal is re-checked against the live frame list. Other refusals, such as open
+    // DevTools, and an unreadable frame list keep the refusal for the full interval. Another caller
+    // may clear or replace the refusal while the frames are read, such as by reattaching and being
+    // refused again; the check then repeats against the current refusal instead of discarding it.
+    for (let refusal = this.debuggerRefusals.get(tabId); refusal !== undefined; ) {
+      if (refusal.until <= Date.now()) {
+        this.debuggerRefusals.delete(tabId);
+        break;
       }
+      if (!refusal.frameCaused) throw debuggerUnavailableError(refusal.reason);
+      const origins = await this.foreignExtensionFrameOrigins(tabId);
+      const current = this.debuggerRefusals.get(tabId);
+      if (current !== refusal) {
+        refusal = current;
+        continue;
+      }
+      if (origins === undefined || origins.length > 0) throw debuggerUnavailableError(refusal.reason);
       this.debuggerRefusals.delete(tabId);
+      break;
     }
     let session = this.sessions.get(tabId);
     if (session?.detachPromise) {
