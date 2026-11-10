@@ -7041,6 +7041,17 @@ describe("scripting route when Chrome refuses the debugger", () => {
     expect(second).not.toHaveProperty("debugger_unavailable_reason");
   });
 
+  test("forgets a closed tab's navigation revision", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    const published = (runtime as unknown as { navigationRevisions: Map<number, number> }).navigationRevisions;
+    await revisions.markNavigation(7);
+    await revisions.markNavigation(8);
+    expect([...published.keys()].sort()).toEqual([7, 8]);
+
+    runtime.forgetTab(7);
+    expect([...published.keys()]).toEqual([8]);
+  });
+
   test("refuses debugger-only actions before touching the page", async () => {
     const { runtime, revisions } = refusedRuntime();
     pageAgentReply = () => ({ id: 3 });
