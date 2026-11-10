@@ -93,6 +93,7 @@ class MockNativePort {
 
 let persisted: Record<string, unknown>;
 let webNavigationFrames: Array<{ frameId: number; url: string }>;
+let webNavigationFramesGate: (() => Promise<void> | undefined) | null;
 let debuggerCalls: string[];
 let tabStore: Map<number, MockTab>;
 let removedTabIds: number[];
@@ -366,6 +367,7 @@ function emitDebuggerDetach(tabId: number): void {
 function installChromeMock(): void {
   persisted = {};
   webNavigationFrames = [];
+  webNavigationFramesGate = null;
   debuggerCalls = [];
   tabStore = new Map();
   removedTabIds = [];
@@ -535,6 +537,7 @@ function installChromeMock(): void {
         onHistoryStateUpdated: { addListener() { } },
         onReferenceFragmentUpdated: { addListener() { } },
         async getAllFrames() {
+          await webNavigationFramesGate?.();
           return clone(webNavigationFrames);
         },
       },
@@ -6977,6 +6980,28 @@ describe("scripting route when Chrome refuses the debugger", () => {
     const second = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
     expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
     expect(second).not.toHaveProperty("debugger_unavailable_reason");
+  });
+
+  test("does not reattach for a caller whose frame check outlived another caller's failed reattach", async () => {
+    webNavigationFrames.push({ frameId: 1, url: `chrome-extension://foreignpasswordmgr/inject.html` });
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = () => ({ nodes: [], truncated: false });
+    await revisions.ensure(7);
+    await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+
+    webNavigationFrames.length = 0;
+    debuggerAttachError = "Another debugger is already attached to the tab with id: 7.";
+    let frameReads = 0;
+    const secondRead = Promise.withResolvers<void>();
+    webNavigationFramesGate = () => (++frameReads === 2 ? secondRead.promise : undefined);
+    const first = runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    const second = runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect((await first).debugger_unavailable_reason).toBe(debuggerAttachError);
+    expect(frameReads).toBe(2);
+
+    secondRead.resolve();
+    expect((await second).debugger_unavailable_reason).toBe(debuggerAttachError);
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
   });
 
   test("keeps a refusal without a foreign extension frame for the full retry interval", async () => {
