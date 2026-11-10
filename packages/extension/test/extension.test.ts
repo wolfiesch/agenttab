@@ -92,7 +92,7 @@ class MockNativePort {
 }
 
 let persisted: Record<string, unknown>;
-let webNavigationFrames: Array<{ frameId: number; url: string }>;
+let webNavigationFrames: Array<{ frameId: number; url: string; parentFrameId?: number; documentId?: string }>;
 let webNavigationFramesGate: (() => Promise<void> | undefined) | null;
 let debuggerCalls: string[];
 let tabStore: Map<number, MockTab>;
@@ -124,9 +124,10 @@ let debuggerCommandOverride:
 let debuggerAttachGate: Promise<void> | null;
 let debuggerAttachError: string | null;
 let pageAgentRequests: PageAgentRequest[];
-let pageAgentReply: (request: PageAgentRequest) => unknown;
+let pageAgentReply: (request: PageAgentRequest, documentId: string) => unknown;
 let mainWorldResult: unknown;
 const PAGE_AGENT_DOCUMENT = "agent-document-1";
+let pageAgentDocumentId: string;
 let completedDownloads: Array<Record<string, unknown>>;
 let debuggerDetachFailures: number;
 let debuggerAttachedTabIds: Set<number>;
@@ -367,6 +368,7 @@ function emitDebuggerDetach(tabId: number): void {
 function installChromeMock(): void {
   persisted = {};
   webNavigationFrames = [];
+  pageAgentDocumentId = PAGE_AGENT_DOCUMENT;
   webNavigationFramesGate = null;
   debuggerCalls = [];
   tabStore = new Map();
@@ -663,22 +665,29 @@ function installChromeMock(): void {
           func?: (...args: never[]) => unknown;
           args?: unknown[];
           world?: string;
+          target?: { documentIds?: string[] };
         }) {
           scriptingCallCount += 1;
+          const documentId = options.target?.documentIds?.[0] ?? PAGE_AGENT_DOCUMENT;
+          if (documentId !== PAGE_AGENT_DOCUMENT &&
+              !webNavigationFrames.some((frame) => frame.documentId === documentId)) {
+            throw new Error(`No document with id ${documentId} in tab 7`);
+          }
+          pageAgentDocumentId = documentId;
           if (Array.isArray(options.files)) {
             Reflect.set(globalThis, PAGE_AGENT_GLOBAL, {
               version: PAGE_AGENT_VERSION,
               run(request: PageAgentRequest) {
                 pageAgentRequests.push(clone(request));
-                return pageAgentReply(request);
+                return pageAgentReply(request, pageAgentDocumentId);
               },
             });
-            return [{ documentId: PAGE_AGENT_DOCUMENT }];
+            return [{ documentId }];
           }
-          if (options.world === "MAIN") return [{ result: mainWorldResult, documentId: PAGE_AGENT_DOCUMENT }];
+          if (options.world === "MAIN") return [{ result: mainWorldResult, documentId }];
           if (options.func === runPageAgentRequest) {
             const [request, version, globalName] = options.args as [PageAgentRequest, number, string];
-            return [{ result: runPageAgentRequest(request, version, globalName), documentId: PAGE_AGENT_DOCUMENT }];
+            return [{ result: runPageAgentRequest(request, version, globalName), documentId }];
           }
           return [{ result: scriptResult }];
         },
@@ -6950,6 +6959,95 @@ describe("scripting route when Chrome refuses the debugger", () => {
     expect(debuggerCalls).not.toContain("Runtime.callFunctionOn");
   });
 
+  test("discovers web iframes and uses their own controls while a foreign extension blocks CDP", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    const childDocument = "login-document-1";
+    webNavigationFrames = [
+      { frameId: 0, parentFrameId: -1, url: "https://example.com/", documentId: PAGE_AGENT_DOCUMENT },
+      { frameId: 3, parentFrameId: 0, url: "https://login.example.com/", documentId: childDocument },
+      { frameId: 4, parentFrameId: 0, url: "chrome-extension://foreignpasswordmgr/private", documentId: "foreign" },
+    ];
+    let selected = false;
+    pageAgentReply = (request, documentId) => {
+      if (request.op === "snapshot") return {
+        nodes: [{ id: 3, role: "button", name: documentId === childDocument ? "Email sign-in" : "Play" }],
+      };
+      if (request.op === "describe") return { tag: "BUTTON", type: "button", text: "Email sign-in" };
+      if (request.op === "act") selected = documentId === childDocument;
+      if (request.op === "inspect_selector") return {
+        count: selected && documentId === childDocument ? 1 : 0,
+        state: selected && documentId === childDocument ? { connected: true, visible: true } : undefined,
+      };
+      return { id: 3 };
+    };
+    const revision = await revisions.ensure(7);
+    const top = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(top.frames).toEqual([
+      { frame_id: "scripting:top", url: "https://example.com/" },
+      { frame_id: "scripting:3", parent_frame_id: "scripting:top", url: "https://login.example.com/" },
+    ]);
+    const child = await runtime.snapshot(TASK_A, 7, { mode: "accessibility", frame_id: "scripting:3" });
+    expect(child).toMatchObject({ frame_id: "scripting:3", nodes: [{ name: "Email sign-in" }] });
+    const ref = String((child.nodes as Array<Record<string, unknown>>)[0]?.ref);
+    await runtime.act(TASK_A, 7, revision, [{ kind: "click", ref }]);
+    expect(await runtime.wait(7, {
+      condition: { kind: "selector", frame_id: "scripting:3", value: "#email", state: "visible" },
+      timeout_ms: 1_000,
+    })).toMatchObject({ matched: true });
+    selected = false;
+    await runtime.act(TASK_A, 7, revision, [{ kind: "click", selector: "#email", frame_id: "scripting:3" }]);
+    expect(selected).toBe(true);
+    expect(focusedWindowUpdates).toEqual([]);
+  });
+
+  test("keeps iframe refs pinned across child navigation and refuses cross-frame or foreign-frame use", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    webNavigationFrames = [
+      { frameId: 3, parentFrameId: 0, url: "https://login.example.com/", documentId: "login-before" },
+      { frameId: 4, parentFrameId: 0, url: "chrome-extension://foreignpasswordmgr/private", documentId: "foreign" },
+    ];
+    pageAgentReply = () => ({ nodes: [{ id: 3, role: "button", name: "Email sign-in" }] });
+    const revision = await revisions.ensure(7);
+    const snapshot = await runtime.snapshot(TASK_A, 7, { mode: "accessibility", frame_id: "scripting:3" });
+    const ref = String((snapshot.nodes as Array<Record<string, unknown>>)[0]?.ref);
+    await expect(runtime.act(TASK_A, 7, revision, [{ kind: "click", ref, frame_id: "scripting:top" }]))
+      .rejects.toMatchObject({ code: "stale_ref" });
+    webNavigationFrames[0]!.documentId = "login-after";
+    await expect(runtime.act(TASK_A, 7, revision, [{ kind: "click", ref }]))
+      .rejects.toMatchObject({ code: "stale_ref" });
+    await expect(runtime.snapshot(TASK_A, 7, { mode: "accessibility", frame_id: "scripting:4" }))
+      .rejects.toMatchObject({ code: "frame_not_found" });
+    expect(pageAgentRequests.some((request) => request.op === "act")).toBe(false);
+  });
+
+  test("rejects an iframe outline if the document changes during capture", async () => {
+    const { runtime } = refusedRuntime();
+    webNavigationFrames = [
+      { frameId: 3, parentFrameId: 0, url: "https://login.example.com/", documentId: "login-before" },
+    ];
+    pageAgentReply = (request) => {
+      if (request.op === "snapshot") webNavigationFrames[0]!.documentId = "login-after";
+      return { nodes: [{ id: 3, role: "button", name: "Email sign-in" }] };
+    };
+    await expect(runtime.snapshot(TASK_A, 7, { mode: "accessibility", frame_id: "scripting:3" }))
+      .rejects.toMatchObject({ code: "stale_ref" });
+  });
+
+  test("keeps a foreign-frame debugger error distinct from a restricted top-level origin", () => {
+    expect(normalizeRestrictedOriginError(new Error(REFUSAL), "inspect the page"))
+      .toMatchObject({ code: "debugger_unavailable", reason: REFUSAL });
+    expect(normalizeRestrictedOriginError(new Error("Cannot access a chrome:// URL"), "inspect the page"))
+      .toMatchObject({ code: "browser_restricted_origin" });
+    const interrupted = Object.assign(new Error(REFUSAL), {
+      outcome: "unknown", failedActionIndex: 1, completedActions: [{ kind: "click", completed: true }],
+    });
+    expect(normalizeRestrictedOriginError(interrupted, "interact with the page"))
+      .toMatchObject({
+        code: "debugger_unavailable", outcome: "unknown", failedActionIndex: 1,
+        completedActions: [{ kind: "click", completed: true }],
+      });
+  });
+
   test("names only the origin of the embedded foreign extension frame blocking the debugger", async () => {
     webNavigationFrames.push(
       { frameId: 1, url: `chrome-extension://foreignpasswordmgr/inline/menu.html?token=secret#field` },
@@ -6997,7 +7095,6 @@ describe("scripting route when Chrome refuses the debugger", () => {
     const first = runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
     const second = runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
     expect((await first).debugger_unavailable_reason).toBe(debuggerAttachError);
-    expect(frameReads).toBe(2);
 
     secondRead.resolve();
     expect((await second).debugger_unavailable_reason).toBe(debuggerAttachError);

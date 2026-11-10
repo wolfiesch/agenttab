@@ -100,7 +100,7 @@ interface TabWork {
   closed: boolean;
   end(): void;
 }
-// Scripting-route refs always name the tab's top document.
+// Scripting-route frame IDs are separate from CDP IDs; refs also pin Chrome's document ID.
 const SCRIPTING_FRAME_ID = "scripting:top";
 /** CDP object group holding the email code targets for one fill; released after the page call. */
 const EMAIL_CODE_OBJECT_GROUP = "agenttab-email-code";
@@ -1096,8 +1096,36 @@ export class StandardBrowserRuntime {
     }
   }
 
+  private async scriptingFrames(tabId: number): Promise<chrome.webNavigation.GetAllFrameResultDetails[]> {
+    try {
+      return (await chrome.webNavigation.getAllFrames({ tabId }) ?? [])
+        .filter((frame) => automationRoute(frame.url) === "full");
+    } catch {
+      return [];
+    }
+  }
+
+  private async scriptingFrame(
+    tabId: number,
+    frameId?: string,
+  ): Promise<{ frameId: string; documentId?: string }> {
+    if (frameId === undefined || frameId === SCRIPTING_FRAME_ID) return { frameId: SCRIPTING_FRAME_ID };
+    const match = /^scripting:([1-9]\d*)$/.exec(frameId);
+    if (match === null || !Number.isSafeInteger(Number(match[1]))) {
+      throw Object.assign(new Error("Take a new snapshot for this route's frame IDs"), { code: "frame_unavailable" });
+    }
+    const frame = (await this.scriptingFrames(tabId)).find((candidate) => candidate.frameId === Number(match[1]));
+    if (frame === undefined) {
+      throw Object.assign(new Error("The requested web frame is no longer available"), { code: "frame_not_found" });
+    }
+    if (typeof frame.documentId !== "string") {
+      throw Object.assign(new Error("Chrome did not expose the requested frame's document ID"), { code: "frame_unavailable" });
+    }
+    return { frameId, documentId: frame.documentId };
+  }
+
   /**
-   * Runs one request against the scripting page agent in the tab's top
+   * Runs one request against the scripting page agent in a permitted
    * document, installing the agent on first use. `documentId` pins the request
    * to the document a ref was minted in; Chrome refuses it once that document
    * is gone.
@@ -1165,16 +1193,30 @@ export class StandardBrowserRuntime {
     const pageRevision = await this.revisions.current(tabId);
     const maxNodes = typeof params.max_nodes === "number" ? params.max_nodes : 1000;
     const maxDepth = typeof params.max_depth === "number" ? params.max_depth : 50;
+    const requestedFrameId = typeof params.frame_id === "string" ? params.frame_id : undefined;
     const root = typeof params.root_ref === "string"
-      ? await this.resolveTarget(tabId, { pageRevision, taskId, ref: params.root_ref })
+      ? await this.resolveTarget(tabId, { pageRevision, taskId, ref: params.root_ref, frameId: requestedFrameId })
       : undefined;
+    const frame = root ?? await this.scriptingFrame(tabId, requestedFrameId);
     const { value, documentId } = await this.runPageAgent(tabId, {
       op: "snapshot",
       max_nodes: maxNodes,
       max_depth: maxDepth,
       ...(root !== undefined ? { root_id: root.backendNodeId } : {}),
       ...(params.query !== undefined ? { query: params.query as AccessibilityQuery } : {}),
-    }, root?.documentId);
+    }, frame.documentId);
+    const webFrames = await this.scriptingFrames(tabId);
+    if (frame.frameId !== SCRIPTING_FRAME_ID && frame.documentId !== undefined &&
+        !webFrames.some((entry) => entry.documentId === frame.documentId)) {
+      throw Object.assign(new Error("Frame changed while its accessibility outline was captured"), { code: "stale_ref" });
+    }
+    const frames = webFrames.slice(0, 256).map((entry) => ({
+      frame_id: entry.frameId === 0 ? SCRIPTING_FRAME_ID : `scripting:${entry.frameId}`,
+      ...(entry.parentFrameId >= 0 ? {
+        parent_frame_id: entry.parentFrameId === 0 ? SCRIPTING_FRAME_ID : `scripting:${entry.parentFrameId}`,
+      } : {}),
+      url: entry.url,
+    }));
     await this.assertScriptingRevision(tabId, pageRevision, "Page changed while the accessibility outline was captured");
     const outline = isRecord(value) ? value : {};
     const nodes = (Array.isArray(outline.nodes) ? outline.nodes.filter(isRecord) : []).map(({ id, ...node }) => ({
@@ -1184,7 +1226,7 @@ export class StandardBrowserRuntime {
             tabId,
             backendNodeId: id,
             documentId,
-            frameId: SCRIPTING_FRAME_ID,
+            frameId: frame.frameId,
             pageRevision,
             taskId,
             route: "scripting",
@@ -1196,6 +1238,9 @@ export class StandardBrowserRuntime {
     return {
       tab_id: tabId,
       page_revision: pageRevision,
+      frame_id: frame.frameId,
+      frames,
+      ...(webFrames.length > 256 ? { frames_truncated: true, frames_limit: 256 } : {}),
       mode: "accessibility",
       nodes,
       truncated: outline.truncated === true,
@@ -1287,13 +1332,14 @@ export class StandardBrowserRuntime {
 
   private async scriptingConditionMatched(tabId: number, condition: Record<string, unknown>): Promise<boolean> {
     const pageRevision = await this.revisions.current(tabId);
+    const frame = await this.scriptingFrame(tabId, typeof condition.frame_id === "string" ? condition.frame_id : undefined);
     let matched: boolean;
     if (condition.kind === "text") {
-      const [injected] = await chrome.scripting.executeScript({
-        target: { tabId },
+      const [injected] = await this.inDocument(frame.documentId, () => chrome.scripting.executeScript({
+        target: frame.documentId === undefined ? { tabId } : { tabId, documentIds: [frame.documentId] },
         func: (value: string) => (document.documentElement.textContent ?? "").includes(value),
         args: [String(condition.value ?? "")],
-      });
+      }));
       matched = injected?.result === true;
     } else {
       const selector = condition.kind === "selector" ? condition.value : condition.selector;
@@ -1302,7 +1348,7 @@ export class StandardBrowserRuntime {
           code: "invalid_request",
         });
       }
-      const { value } = await this.runPageAgent(tabId, { op: "inspect_selector", selector });
+      const { value } = await this.runPageAgent(tabId, { op: "inspect_selector", selector }, frame.documentId);
       const inspected = isRecord(value) ? value : {};
       const count = typeof inspected.count === "number" ? inspected.count : 0;
       if (count > 1) {
@@ -1320,6 +1366,8 @@ export class StandardBrowserRuntime {
       else if (state === "enabled") matched = observed.enabled === true;
       else matched = observed.connected === true;
     }
+    if (frame.documentId !== undefined &&
+        (await this.scriptingFrame(tabId, frame.frameId)).documentId !== frame.documentId) return false;
     return matched && (await this.revisions.current(tabId)) === pageRevision;
   }
 
@@ -1476,9 +1524,9 @@ export class StandardBrowserRuntime {
       );
     }
     const rootBinding = await targetRefs.lookup(params.root_ref);
-    if (frameId === undefined && (rootBinding === null || rootBinding.route === "scripting")) {
+    if (rootBinding === null || rootBinding.route === "scripting") {
       const reason = await this.scriptingRouteReason(tabId);
-      if (reason !== undefined || rootBinding?.route === "scripting") {
+      if (reason !== undefined || rootBinding?.route === "scripting" || frameId?.startsWith("scripting:")) {
         return assertDeliverableSnapshot(await this.scriptingAccessibilitySnapshot(taskId, tabId, params, reason));
       }
     }
@@ -2445,9 +2493,11 @@ export class StandardBrowserRuntime {
       ? Math.min(params.max_bytes, SNAPSHOT_TEXT_MAX_BYTES)
       : 256_000;
     const frameId = typeof params.frame_id === "string" ? params.frame_id : undefined;
-    const reason = frameId === undefined ? await this.scriptingRouteReason(tabId) : undefined;
-    const before = reason === undefined ? await this.pageIdentity(tabId, frameId) : undefined;
-    const topBefore = frameId === undefined ? before : await this.pageIdentity(tabId);
+    const reason = await this.scriptingRouteReason(tabId);
+    const useScripting = reason !== undefined || frameId?.startsWith("scripting:") === true;
+    const scriptingFrame = useScripting ? await this.scriptingFrame(tabId, frameId) : undefined;
+    const before = useScripting ? undefined : await this.pageIdentity(tabId, frameId);
+    const topBefore = useScripting || frameId === undefined ? before : await this.pageIdentity(tabId);
     const pageRevision = topBefore === undefined
       ? await this.revisions.current(tabId)
       : await this.revisions.observeDocument(tabId, topBefore.documentId, topBefore.loaderId);
@@ -2464,10 +2514,12 @@ export class StandardBrowserRuntime {
       return snapshotMode === "text" ? target.textContent ?? "" : target.outerHTML;
     };
     let result: unknown;
-    if (frameId === undefined) {
-      const [captured] = await chrome.scripting.executeScript({
-        target: { tabId }, func: readContent, args: [mode, selector, selectorMatch],
-      });
+    if (frameId === undefined || scriptingFrame !== undefined) {
+      const documentId = scriptingFrame?.documentId;
+      const [captured] = await this.inDocument(documentId, () => chrome.scripting.executeScript({
+        target: documentId === undefined ? { tabId } : { tabId, documentIds: [documentId] },
+        func: readContent, args: [mode, selector, selectorMatch],
+      }));
       result = captured.result;
     } else {
       const frame = await this.frameDocument(tabId, frameId);
@@ -2490,7 +2542,11 @@ export class StandardBrowserRuntime {
       }
       result = captured.result.value;
     }
-    if (reason !== undefined) {
+    if (useScripting) {
+      if (scriptingFrame?.documentId !== undefined &&
+          (await this.scriptingFrame(tabId, scriptingFrame.frameId)).documentId !== scriptingFrame.documentId) {
+        throw Object.assign(new Error("Frame changed while its content was captured"), { code: "stale_ref" });
+      }
       await this.assertScriptingRevision(tabId, pageRevision, `Page changed while the ${mode} snapshot was captured`);
     } else {
       const after = await this.pageIdentity(tabId, frameId);
@@ -2518,7 +2574,7 @@ export class StandardBrowserRuntime {
         tab_id: tabId,
         page_revision: pageRevision,
         ...(frameId !== undefined ? { frame_id: frameId } : {}),
-        ...(reason !== undefined ? scriptingRouteFields(reason) : {}),
+        ...(useScripting ? scriptingRouteFields(reason) : {}),
         mode,
         content,
         truncated: contentBytes < bytes.length,
@@ -3306,8 +3362,8 @@ export class StandardBrowserRuntime {
     if (kind === "url") return (await chrome.tabs.get(tabId)).url === condition.value;
     if (
       (kind === "text" || kind === "selector" || kind === "value") &&
-      condition.frame_id === undefined &&
-      await this.scriptingRouteReason(tabId) !== undefined
+      (await this.scriptingRouteReason(tabId) !== undefined ||
+        typeof condition.frame_id === "string" && condition.frame_id.startsWith("scripting:"))
     ) {
       return this.scriptingConditionMatched(tabId, condition);
     }
@@ -3500,9 +3556,10 @@ export class StandardBrowserRuntime {
       });
     }
     if (typeof selector === "string") {
-      const reason = request.frameId === undefined ? await this.scriptingRouteReason(tabId) : undefined;
-      if (reason !== undefined) {
-        const { value, documentId } = await this.runPageAgent(tabId, { op: "select", selector });
+      const reason = await this.scriptingRouteReason(tabId);
+      if (reason !== undefined || request.frameId?.startsWith("scripting:")) {
+        const frame = await this.scriptingFrame(tabId, request.frameId);
+        const { value, documentId } = await this.runPageAgent(tabId, { op: "select", selector }, frame.documentId);
         if (!isRecord(value) || typeof value.id !== "number") {
           throw Object.assign(new Error("Selected target could not be resolved"), { code: "action_failed" });
         }
@@ -3510,7 +3567,7 @@ export class StandardBrowserRuntime {
           tabId,
           backendNodeId: value.id,
           documentId,
-          frameId: SCRIPTING_FRAME_ID,
+          frameId: frame.frameId,
           pageRevision: request.pageRevision,
           taskId: request.taskId ?? "",
           route: "scripting",
