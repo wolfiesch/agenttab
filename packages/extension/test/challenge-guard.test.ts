@@ -854,3 +854,16 @@ describe("probeSurfaceEvidence", () => {
     expect(probe(element("BUTTON", null, blocked), [])).toEqual({ hit: false, frames: [] });
   });
 });
+
+describe("forgetTab", () => {
+  test("drops the closed tab's recorded challenge scan revision and keeps other tabs'", async () => {
+    const runtime = newRuntime();
+    const scanned = (runtime as unknown as { challengeScanRevisions: Map<number, number> }).challengeScanRevisions;
+    await openEpisode(runtime, turnstileActive());
+    scanned.set(OTHER_TAB, 1);
+    expect([...scanned.keys()].sort()).toEqual([TAB, OTHER_TAB].sort());
+
+    runtime.forgetTab(TAB);
+    expect([...scanned.keys()]).toEqual([OTHER_TAB]);
+  });
+});

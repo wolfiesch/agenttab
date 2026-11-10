@@ -834,6 +834,7 @@ export class StandardBrowserRuntime {
    */
   forgetTab(tabId: number): void {
     this.navigationRevisions.delete(tabId);
+    this.challengeScanRevisions.delete(tabId);
   }
 
   /**
