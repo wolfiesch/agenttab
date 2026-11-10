@@ -375,6 +375,19 @@ function dispatchPointer(element: Element, kind: PageAgentPointerKind): unknown 
 }
 
 function fillCredential(element: Element, value: string, kind: string): unknown {
+  let sameOrigin = false;
+  try {
+    const doc = element.ownerDocument;
+    sameOrigin = doc.defaultView?.top?.location.origin === doc.location.origin;
+  } catch {
+    // A cross-origin or sandboxed parent is not authorized for credential fills.
+  }
+  if (!sameOrigin) {
+    return agentError(
+      "cross_origin_credentials_forbidden",
+      "Credentials cannot be filled in a cross-origin frame without frame-specific authorization",
+    );
+  }
   const isInput = element instanceof HTMLInputElement;
   const isTextarea = element instanceof HTMLTextAreaElement;
   if (!isInput && !isTextarea) return agentError("action_failed", "Credential target is not an input");

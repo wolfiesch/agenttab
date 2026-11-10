@@ -4,12 +4,12 @@ import type { EmailCodePageExpectation } from "./email-code-page";
 /**
  * Contract between the extension worker and the scripting page agent, the
  * route AgentTab uses when Chrome refuses its debugger for a tab. The agent
- * lives in the extension's isolated world of the tab's top document, so it
+ * lives in the extension's isolated world of a permitted web document, so it
  * shares the DOM with the page but not the page's JavaScript globals.
  */
 
-/** Bump whenever a request or response shape changes, so a stale agent reinstalls. */
-export const PAGE_AGENT_VERSION = 5;
+/** Bump for request/response or security-boundary changes, so a stale agent reinstalls. */
+export const PAGE_AGENT_VERSION = 6;
 /** Bundled agent script, injected with `chrome.scripting.executeScript({ files })`. */
 export const PAGE_AGENT_FILE = "page-agent.js";
 

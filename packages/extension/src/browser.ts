@@ -1890,7 +1890,7 @@ export class StandardBrowserRuntime {
         ref: field.ref,
       });
       if (target.route === "scripting") {
-        // Scripting refs always name the top document, so no frame-origin check applies.
+        // The pinned page agent checks the document's origin against the top frame before writing.
         scripted = true;
         await this.runPageAgent(tabId, {
           op: "fill_credential", id: target.backendNodeId, value: field.value, kind: field.kind,

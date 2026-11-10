@@ -6929,6 +6929,71 @@ describe("scripting route when Chrome refuses the debugger", () => {
     }
   });
 
+  test.each(["same-origin", "cross-origin", "unreadable-parent"] as const)(
+    "credential fills enforce the pinned document's origin before writing (%s)",
+    async (scope) => {
+      const origin = "https://login.example.com";
+      const doc = {
+        location: { origin },
+        defaultView: {
+          get top() {
+            if (scope === "unreadable-parent") throw new Error("Blocked cross-origin parent access");
+            return { location: { origin: scope === "cross-origin" ? "https://other.example.com" : origin } };
+          },
+        },
+        querySelectorAll: () => [input],
+      };
+      class CredentialInput extends EventTarget {
+        readonly ownerDocument = doc;
+        readonly isConnected = true;
+        readonly type = "password";
+        readonly events: string[] = [];
+        focused = false;
+        stored = "";
+        get value(): string { return this.stored; }
+        set value(value: string) { this.stored = value; }
+        getAttribute(name: string): string | null { return name === "autocomplete" ? "current-password" : null; }
+        focus(): void { this.focused = true; }
+        override dispatchEvent(event: Event): boolean {
+          this.events.push(event.type);
+          return super.dispatchEvent(event);
+        }
+      }
+      const input = new CredentialInput();
+      const globals = new Map(
+        ["document", "HTMLInputElement", "HTMLTextAreaElement", PAGE_AGENT_GLOBAL]
+          .map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const),
+      );
+      Reflect.set(globalThis, "document", doc);
+      Reflect.set(globalThis, "HTMLInputElement", CredentialInput);
+      Reflect.set(globalThis, "HTMLTextAreaElement", class {});
+      Reflect.deleteProperty(globalThis, PAGE_AGENT_GLOBAL);
+      try {
+        installPageAgent();
+        const selected = await runPageAgentRequest({ op: "select", selector: "input" }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL) as { id: number };
+        const result = await runPageAgentRequest({
+          op: "fill_credential", id: selected.id, kind: "password", value: "fixture-password",
+        }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL);
+        if (scope === "same-origin") {
+          expect(result).toBeUndefined();
+          expect(input.value).toBe("fixture-password");
+          expect(input.focused).toBe(true);
+          expect(input.events).toEqual(["input", "change"]);
+        } else {
+          expect(result).toMatchObject({ agenttab_error: { code: "cross_origin_credentials_forbidden" } });
+          expect(input.value).toBe("");
+          expect(input.focused).toBe(false);
+          expect(input.events).toEqual([]);
+        }
+      } finally {
+        for (const [key, descriptor] of globals) {
+          if (descriptor === undefined) Reflect.deleteProperty(globalThis, key);
+          else Object.defineProperty(globalThis, key, descriptor);
+        }
+      }
+    },
+  );
+
   test("snapshots and acts through the page agent without re-attaching", async () => {
     const { runtime, revisions } = refusedRuntime();
     tabStore.set(7, { id: 7, windowId: 1, groupId: -1, active: true });
