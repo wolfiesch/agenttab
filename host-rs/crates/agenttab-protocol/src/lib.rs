@@ -3756,14 +3756,38 @@ mod tests {
         ));
 
         for (value, accepted) in [
-            (json!({"kind": "click", "selector": "canvas", "x": 0.25, "y": 0.75}), true),
-            (json!({"kind": "click", "selector": "button", "frame_id": "frame-1"}), true),
-            (json!({"kind": "click", "selector": "canvas", "x": 0.25}), false),
-            (json!({"kind": "click", "selector": "canvas", "y": 0.75}), false),
-            (json!({"kind": "click", "selector": "canvas", "x": -0.01, "y": 0.75}), false),
-            (json!({"kind": "click", "selector": "canvas", "x": 0.25, "y": 1.0}), false),
-            (json!({"kind": "click", "selector": "canvas", "frame_id": "frame-1", "x": 0.25, "y": 0.75}), false),
-            (json!({"kind": "click", "ref": "7:opaque", "selector": "canvas", "x": 0.25, "y": 0.75}), false),
+            (
+                json!({"kind": "click", "selector": "canvas", "x": 0.25, "y": 0.75}),
+                true,
+            ),
+            (
+                json!({"kind": "click", "selector": "button", "frame_id": "frame-1"}),
+                true,
+            ),
+            (
+                json!({"kind": "click", "selector": "canvas", "x": 0.25}),
+                false,
+            ),
+            (
+                json!({"kind": "click", "selector": "canvas", "y": 0.75}),
+                false,
+            ),
+            (
+                json!({"kind": "click", "selector": "canvas", "x": -0.01, "y": 0.75}),
+                false,
+            ),
+            (
+                json!({"kind": "click", "selector": "canvas", "x": 0.25, "y": 1.0}),
+                false,
+            ),
+            (
+                json!({"kind": "click", "selector": "canvas", "frame_id": "frame-1", "x": 0.25, "y": 0.75}),
+                false,
+            ),
+            (
+                json!({"kind": "click", "ref": "7:opaque", "selector": "canvas", "x": 0.25, "y": 0.75}),
+                false,
+            ),
         ] {
             let parsed = RpcRequest::parse(request(
                 "browser_act",
