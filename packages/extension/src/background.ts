@@ -916,13 +916,18 @@ chrome.tabs.onRemoved.addListener((removedTabId: number) => {
   for (const releaseWaiter of tabLoadWaiters.get(removedTabId) ?? []) releaseWaiter();
   for (const watch of navigationWatches.get(removedTabId) ?? []) watch.markLoaded();
   runAfterStart(async () => {
-    // Queued after any `complete` handler for this tab, so a late handler cannot re-add it.
-    processedTabLoads.delete(removedTabId);
-    const owner = await ownership.taskIdForTab(removedTabId);
-    if (!owner && !browser.tracksTab(removedTabId)) return;
-    await handoff.cancelForTab(removedTabId);
-    await browser.detach(removedTabId);
-    await ownership.revoke(removedTabId, "tab_removed");
+    try {
+      // Queued after any `complete` handler for this tab, so a late handler cannot re-add it.
+      processedTabLoads.delete(removedTabId);
+      const owner = await ownership.taskIdForTab(removedTabId);
+      if (!owner && !browser.tracksTab(removedTabId)) return;
+      await handoff.cancelForTab(removedTabId);
+      await browser.detach(removedTabId);
+      await ownership.revoke(removedTabId, "tab_removed");
+    } finally {
+      // After the revoke, which publishes a last revision change, and for tabs released earlier.
+      browser.forgetTab(removedTabId);
+    }
   });
 });
 chrome.tabs.onUpdated.addListener((updatedTabId, changeInfo) => {

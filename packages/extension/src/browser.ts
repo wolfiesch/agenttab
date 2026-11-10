@@ -829,6 +829,14 @@ export class StandardBrowserRuntime {
   }
 
   /**
+   * Drops per-tab state that outlives ownership, once a closed tab's cleanup has run. Closing a
+   * tab revokes ownership, which publishes a final revision change, so this must come after that.
+   */
+  forgetTab(tabId: number): void {
+    this.navigationRevisions.delete(tabId);
+  }
+
+  /**
    * Arms target-scoped Page download correlation immediately before a
    * download-capable action is dispatched. The opaque cursor is task-bound.
    */
