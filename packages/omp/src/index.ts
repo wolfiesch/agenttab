@@ -36,13 +36,14 @@ import {
 import type { ToolMethod } from "./tool-method";
 
 
+/** The subset of OMP's injected `pi.zod` (omptype's Zod-like builder) this extension uses. */
 interface SchemaNode {
   int(): SchemaNode;
-  lt(value: number): SchemaNode;
   max(value: number): SchemaNode;
   min(value: number): SchemaNode;
   optional(): SchemaNode;
   refine(check: (value: readonly unknown[]) => boolean, message: string): SchemaNode;
+  refine(check: (value: number) => boolean, message: string): SchemaNode;
   regex(pattern: RegExp): SchemaNode;
   strict(): SchemaNode;
 }
@@ -204,8 +205,9 @@ const DEFINITIONS: ReadonlyArray<{
         const expect_download = z.boolean().optional();
         const value = z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS);
         const gesture = z.enum(["click", "double_click", "context_click"]);
-        // Canvas-relative click: CSS fractions of the selected element's content box.
-        const fraction = z.number().min(0).lt(1);
+        // Canvas-relative click: CSS fractions of the selected element's content box, in [0, 1).
+        // OMP's pi.zod has no .lt(); max(1) bounds the schema and refine excludes 1 itself.
+        const fraction = z.number().min(0).max(1).refine((n: number) => n < 1, "must be less than 1");
         const press = {
           kind: z.literal("press"),
           frame_id,
