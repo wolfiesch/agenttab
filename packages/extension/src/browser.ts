@@ -634,6 +634,12 @@ export class StandardBrowserRuntime {
     (tabId, method, params, sessionId) => this.send(tabId, method, params, false, sessionId),
   );
   private readonly debuggerRefusals = new Map<number, { reason: string; until: number; frameCaused: boolean }>();
+  /**
+   * Latest page revision published per tab. An attach captures it before calling Chrome so a
+   * refusal answered after a navigation, which already cleared the refusal, is not recorded for
+   * the new page.
+   */
+  private readonly navigationRevisions = new Map<number, number>();
   /** Page revision of the last completed challenge scan, per tab. */
   private readonly challengeScanRevisions = new Map<number, number>();
   /** Live `load`/`url` waits per tab; navigation events are recorded only for these tabs. */
@@ -757,7 +763,8 @@ export class StandardBrowserRuntime {
         }
       },
     );
-    this.revisions.onChange((tabId) => {
+    this.revisions.onChange((tabId, pageRevision) => {
+      this.navigationRevisions.set(tabId, pageRevision);
       this.debuggerRefusals.delete(tabId);
       return this.invalidateStagedDialogs(tabId);
     });
@@ -1023,7 +1030,7 @@ export class StandardBrowserRuntime {
    * call. A navigation or the retry interval clears it; a refusal caused by a
    * foreign-extension frame also clears once that frame leaves the tab.
    */
-  private async refuseDebugger(tabId: number, cause: unknown): Promise<Error> {
+  private async refuseDebugger(tabId: number, cause: unknown, navigationRevision: number | undefined): Promise<Error> {
     let reason = cause instanceof Error ? cause.message : String(cause);
     let frameCaused = false;
     if (/extension/i.test(reason)) {
@@ -1033,7 +1040,11 @@ export class StandardBrowserRuntime {
         reason += ` (blocked by embedded extension frame${origins.length === 1 ? "" : "s"}: ${origins.join(", ")})`;
       }
     }
-    this.debuggerRefusals.set(tabId, { reason, until: Date.now() + DEBUGGER_REFUSAL_RETRY_MS, frameCaused });
+    // A navigation while Chrome answered the attach or the frames were read cleared the refusal
+    // for the old page; the new page gets its own attach attempt.
+    if (this.navigationRevisions.get(tabId) === navigationRevision) {
+      this.debuggerRefusals.set(tabId, { reason, until: Date.now() + DEBUGGER_REFUSAL_RETRY_MS, frameCaused });
+    }
     return debuggerUnavailableError(reason);
   }
 
@@ -4054,13 +4065,14 @@ export class StandardBrowserRuntime {
       await this.authorizeDebuggerUse(tabId);
       this.debuggerCandidates.add(tabId);
       await this.recordDebuggerCandidate(tabId);
+      const navigationRevision = this.navigationRevisions.get(tabId);
       try {
         await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
       } catch (error) {
         if (error instanceof Error && /no tab with given id/i.test(error.message)) throw error;
         // Chrome refuses the debugger when another extension's frame is on the
         // page or another client, such as open DevTools, holds the tab.
-        throw await this.refuseDebugger(tabId, error);
+        throw await this.refuseDebugger(tabId, error, navigationRevision);
       }
       session.attached = true;
       // A renderer paused by a JavaScript dialog that opened while no session was attached never
@@ -4131,7 +4143,7 @@ export class StandardBrowserRuntime {
         }
         // AgentTab's own coded failures, such as a revoked task binding, keep their meaning.
         if (isRecord(error) && typeof error.code === "string") throw error;
-        throw await this.refuseDebugger(tabId, error);
+        throw await this.refuseDebugger(tabId, error, navigationRevision);
       } finally {
         clearTimeout(timer);
         session.dialogWaiters.delete(wake);

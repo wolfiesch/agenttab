@@ -6992,6 +6992,30 @@ describe("scripting route when Chrome refuses the debugger", () => {
     expect(second.debugger_unavailable_reason).toBe("Another debugger is already attached to the tab with id: 7.");
   });
 
+  test("does not keep a refusal Chrome answered after the tab navigated", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    debuggerAttachError = "Another debugger is already attached to the tab with id: 7.";
+    const attachGate = Promise.withResolvers<void>();
+    debuggerAttachGate = attachGate.promise;
+    pageAgentReply = () => ({ nodes: [], truncated: false });
+    await revisions.ensure(7);
+    const first = runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    for (let turn = 0; turn < 50 && !debuggerCalls.includes("attach"); turn += 1) await flushPromiseQueue();
+    expect(debuggerCalls).toContain("attach");
+
+    await revisions.markNavigation(7);
+    attachGate.resolve();
+    await first;
+
+    debuggerAttachGate = null;
+    debuggerAttachError = null;
+    debuggerCommandOverride = (method) =>
+      method === "Accessibility.getFullAXTree" ? { nodes: [] } : undefined;
+    const second = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
+    expect(second).not.toHaveProperty("debugger_unavailable_reason");
+  });
+
   test("refuses debugger-only actions before touching the page", async () => {
     const { runtime, revisions } = refusedRuntime();
     pageAgentReply = () => ({ id: 3 });
