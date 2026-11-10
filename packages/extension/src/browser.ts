@@ -89,6 +89,17 @@ const DEBUGGER_INIT_TIMEOUT_MS = 10_000;
 // A refused debugger is retried after this interval or the tab's next navigation. A refusal caused
 // by an embedded foreign-extension frame is also retried as soon as that frame is gone.
 const DEBUGGER_REFUSAL_RETRY_MS = 30_000;
+/**
+ * One in-flight operation on a tab whose result must not outlive what happened to the tab meanwhile.
+ * It exists only while the operation runs, so it holds no state for tabs that are idle or closed.
+ */
+interface TabWork {
+  /** The tab's page revision changed since the operation began. */
+  navigated: boolean;
+  /** The tab closed and its cleanup ran since the operation began. */
+  closed: boolean;
+  end(): void;
+}
 // Scripting-route refs always name the tab's top document.
 const SCRIPTING_FRAME_ID = "scripting:top";
 /** CDP object group holding the email code targets for one fill; released after the page call. */
@@ -634,12 +645,8 @@ export class StandardBrowserRuntime {
     (tabId, method, params, sessionId) => this.send(tabId, method, params, false, sessionId),
   );
   private readonly debuggerRefusals = new Map<number, { reason: string; until: number; frameCaused: boolean }>();
-  /**
-   * Latest page revision published per tab. An attach captures it before calling Chrome so a
-   * refusal answered after a navigation, which already cleared the refusal, is not recorded for
-   * the new page.
-   */
-  private readonly navigationRevisions = new Map<number, number>();
+  /** In-flight operations per tab; see `TabWork`. */
+  private readonly tabWork = new Map<number, Set<TabWork>>();
   /** Page revision of the last completed challenge scan, per tab. */
   private readonly challengeScanRevisions = new Map<number, number>();
   /** Live `load`/`url` waits per tab; navigation events are recorded only for these tabs. */
@@ -763,8 +770,8 @@ export class StandardBrowserRuntime {
         }
       },
     );
-    this.revisions.onChange((tabId, pageRevision) => {
-      this.navigationRevisions.set(tabId, pageRevision);
+    this.revisions.onChange((tabId) => {
+      for (const work of this.tabWork.get(tabId) ?? []) work.navigated = true;
       this.debuggerRefusals.delete(tabId);
       return this.invalidateStagedDialogs(tabId);
     });
@@ -828,12 +835,28 @@ export class StandardBrowserRuntime {
     return this.sessions.has(tabId) || this.debuggerCandidates.has(tabId);
   }
 
+  private beginTabWork(tabId: number): TabWork {
+    const works = this.tabWork.get(tabId) ?? new Set<TabWork>();
+    const work: TabWork = {
+      navigated: false,
+      closed: false,
+      end: () => {
+        works.delete(work);
+        if (works.size === 0 && this.tabWork.get(tabId) === works) this.tabWork.delete(tabId);
+      },
+    };
+    works.add(work);
+    this.tabWork.set(tabId, works);
+    return work;
+  }
+
   /**
-   * Drops per-tab state that outlives ownership, once a closed tab's cleanup has run. Closing a
-   * tab revokes ownership, which publishes a final revision change, so this must come after that.
+   * Drops per-tab state that outlives ownership, once a closed tab's cleanup has run, and marks the
+   * tab's in-flight operations closed so they do not write it back. Closing a tab revokes ownership,
+   * which publishes a final revision change, so this must come after that.
    */
   forgetTab(tabId: number): void {
-    this.navigationRevisions.delete(tabId);
+    for (const work of this.tabWork.get(tabId) ?? []) work.closed = true;
     this.challengeScanRevisions.delete(tabId);
   }
 
@@ -1039,7 +1062,7 @@ export class StandardBrowserRuntime {
    * call. A navigation or the retry interval clears it; a refusal caused by a
    * foreign-extension frame also clears once that frame leaves the tab.
    */
-  private async refuseDebugger(tabId: number, cause: unknown, navigationRevision: number | undefined): Promise<Error> {
+  private async refuseDebugger(tabId: number, cause: unknown, work: TabWork): Promise<Error> {
     let reason = cause instanceof Error ? cause.message : String(cause);
     let frameCaused = false;
     if (/extension/i.test(reason)) {
@@ -1051,7 +1074,7 @@ export class StandardBrowserRuntime {
     }
     // A navigation while Chrome answered the attach or the frames were read cleared the refusal
     // for the old page; the new page gets its own attach attempt.
-    if (this.navigationRevisions.get(tabId) === navigationRevision) {
+    if (!work.navigated) {
       this.debuggerRefusals.set(tabId, { reason, until: Date.now() + DEBUGGER_REFUSAL_RETRY_MS, frameCaused });
     }
     return debuggerUnavailableError(reason);
@@ -4080,18 +4103,20 @@ export class StandardBrowserRuntime {
       return;
     }
 
+    // `work` flags a navigation while the attach runs, so a refusal Chrome answers after one is not
+    // recorded for the new page; the new page gets its own attach attempt.
+    const work = this.beginTabWork(tabId);
     const attaching = (async () => {
       await this.authorizeDebuggerUse(tabId);
       this.debuggerCandidates.add(tabId);
       await this.recordDebuggerCandidate(tabId);
-      const navigationRevision = this.navigationRevisions.get(tabId);
       try {
         await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
       } catch (error) {
         if (error instanceof Error && /no tab with given id/i.test(error.message)) throw error;
         // Chrome refuses the debugger when another extension's frame is on the
         // page or another client, such as open DevTools, holds the tab.
-        throw await this.refuseDebugger(tabId, error, navigationRevision);
+        throw await this.refuseDebugger(tabId, error, work);
       }
       session.attached = true;
       // A renderer paused by a JavaScript dialog that opened while no session was attached never
@@ -4162,7 +4187,7 @@ export class StandardBrowserRuntime {
         }
         // AgentTab's own coded failures, such as a revoked task binding, keep their meaning.
         if (isRecord(error) && typeof error.code === "string") throw error;
-        throw await this.refuseDebugger(tabId, error, navigationRevision);
+        throw await this.refuseDebugger(tabId, error, work);
       } finally {
         clearTimeout(timer);
         session.dialogWaiters.delete(wake);
@@ -4172,6 +4197,7 @@ export class StandardBrowserRuntime {
     try {
       await attaching;
     } finally {
+      work.end();
       if (this.sessions.get(tabId) === session) session.attachPromise = undefined;
     }
   }
@@ -4385,6 +4411,7 @@ export class StandardBrowserRuntime {
     tabId: number,
   ): Promise<{ event?: ChallengeEvent; episodes: ChallengeEpisode[] } | undefined> {
     if (!challengeStoreAvailable()) return undefined;
+    const tabWork = this.beginTabWork(tabId);
     try {
       const tab = await chrome.tabs.get(tabId);
       if (automationRoute(tab.pendingUrl ?? tab.url) !== "full") return undefined;
@@ -4416,10 +4443,12 @@ export class StandardBrowserRuntime {
           newId: newChallengeId,
         }),
       );
-      this.challengeScanRevisions.set(tabId, pageRevision);
+      if (!tabWork.closed) this.challengeScanRevisions.set(tabId, pageRevision);
       return { ...(event !== undefined ? { event } : {}), episodes };
     } catch {
       return undefined;
+    } finally {
+      tabWork.end();
     }
   }
 
