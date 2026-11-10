@@ -35,11 +35,22 @@
         "ref": { "$ref": "#/$defs/ref" },
         "selector": { "$ref": "#/$defs/selector" },
         "frame_id": { "$ref": "#/$defs/frame_id" },
+        "x": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "Fraction across the selected top-frame element's CSS content box; requires selector and y, never ref or frame_id" },
+        "y": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "description": "Fraction down the selected top-frame element's CSS content box; requires selector and x, never ref or frame_id" },
         "expect_download": { "type": "boolean", "default": false }
       },
       "oneOf": [
-        { "required": ["ref"] },
-        { "required": ["selector"] }
+        { "required": ["ref"], "not": { "required": ["selector"] } },
+        { "required": ["selector"], "not": { "required": ["ref"] } }
+      ],
+      "allOf": [
+        {
+          "if": { "anyOf": [{ "required": ["x"] }, { "required": ["y"] }] },
+          "then": {
+            "required": ["selector", "x", "y"],
+            "not": { "anyOf": [{ "required": ["ref"] }, { "required": ["frame_id"] }] }
+          }
+        }
       ],
       "additionalProperties": false
     },

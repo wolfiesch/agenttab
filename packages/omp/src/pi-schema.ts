@@ -29,6 +29,7 @@ const bookmarkTitle = () => Type.String({ maxLength: 1024 });
 const bookmarkIndex = () => Type.Integer({ minimum: 0, maximum: 100_000 });
 const resultLimit = (options: { default?: number } = {}) => Type.Integer({ minimum: 1, maximum: 100, ...options });
 const timeMs = () => Type.Number({ minimum: 0 });
+const fraction = () => Type.Number({ minimum: 0, exclusiveMaximum: 1 });
 
 const schemas: Record<ToolMethod, unknown> = {
   browser_open: Type.Union([
@@ -57,6 +58,7 @@ const schemas: Record<ToolMethod, unknown> = {
     actions: Type.Array(Type.Union([
       object({ kind: stringEnum(["click", "double_click", "context_click"]), ref: ref(), frame_id: Type.Optional(ref()), expect_download: Type.Optional(Type.Boolean()) }),
       object({ kind: stringEnum(["click", "double_click", "context_click"]), selector: selector(), frame_id: Type.Optional(ref()), expect_download: Type.Optional(Type.Boolean()) }),
+      object({ kind: Type.Literal("click"), selector: selector(), x: fraction(), y: fraction() }),
       object({ kind: Type.Literal("hover"), ref: ref(), frame_id: Type.Optional(ref()) }),
       object({ kind: Type.Literal("hover"), selector: selector(), frame_id: Type.Optional(ref()) }),
       object({ kind: Type.Literal("press"), ref: ref(), frame_id: Type.Optional(ref()), expect_download: Type.Optional(Type.Boolean()), key: stringEnum(STANDARD_PRESS_KEYS), modifiers: Type.Optional(Type.Array(stringEnum(["Alt", "Control", "Meta", "Shift"]), { maxItems: 4, uniqueItems: true })) }),

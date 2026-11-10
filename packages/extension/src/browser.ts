@@ -184,6 +184,22 @@ function validateKeyboardAction(action: Record<string, unknown>): void {
     throw Object.assign(new Error(invalid.agenttab_invalid_request), { code: "invalid_request" });
   }
 }
+/** Validates a selector-canvas point; relative clicks stay off the DOM synthetic-click path. */
+function relativePoint(action: Record<string, unknown>): { x: number; y: number } | undefined {
+  if (action.kind !== "click" || action.x === undefined && action.y === undefined) return undefined;
+  if (action.frame_id !== undefined) {
+    throw Object.assign(new Error("Relative points are supported only in the top frame"), { code: "invalid_request" });
+  }
+  if (typeof action.selector !== "string" || action.ref !== undefined ||
+      typeof action.x !== "number" || !Number.isFinite(action.x) || action.x < 0 || action.x >= 1 ||
+      typeof action.y !== "number" || !Number.isFinite(action.y) || action.y < 0 || action.y >= 1) {
+    throw Object.assign(new Error("Relative click requires selector and finite x/y fractions in [0, 1)"), {
+      code: "invalid_request",
+    });
+  }
+  return { x: action.x, y: action.y };
+}
+
 /**
  * Name the failing step of a multi-action batch and carry the results of the steps that ran.
  * Earlier steps already changed the page, so a failure after them can never be `not_started`.
@@ -1658,6 +1674,7 @@ export class StandardBrowserRuntime {
       if (!isRecord(action) || typeof action.kind !== "string") {
         throw Object.assign(new Error("Each browser action requires a kind"), { code: "invalid_request" });
       }
+      relativePoint(action);
       validated.push(action);
     }
     const openDialog = this.sessions.get(tabId)?.dialog;
@@ -1715,6 +1732,7 @@ export class StandardBrowserRuntime {
             });
           }
         }
+        relativePoint(action);
         validateKeyboardAction(action);
         const guardClass = classifyGuardedAction(action);
         const challenge = guardClass === "none"
@@ -3041,6 +3059,17 @@ export class StandardBrowserRuntime {
       ...(typeof action.frame_id === "string" ? { frameId: action.frame_id } : {}),
       actionKind: String(kind),
     });
+    // Relative selector points use trusted input; DOM synthetic clicks are not allowed.
+    const fraction = relativePoint(action);
+    if (fraction !== undefined) {
+      if (target.route === "scripting") {
+        throw Object.assign(new Error("Relative points require debugger mouse input; no synthetic click fallback"), { code: "debugger_unavailable" });
+      }
+      await this.revealTarget(tabId, target);
+      await this.pointer.announce(tabId, intent ?? "Click at canvas-relative point");
+      await this.clickRelativeTarget(tabId, target, fraction);
+      return { kind, completed: true, ...downloadResult };
+    }
     const backendNodeId = target.backendNodeId;
     // Mouse gestures land at the target's on-screen point, so bring it into view first.
     if (POINTER_GESTURE_KINDS.has(String(kind)) && target.route !== "scripting") await this.revealTarget(tabId, target);
@@ -3790,6 +3819,64 @@ export class StandardBrowserRuntime {
         }, false, target.sessionId).catch(() => undefined);
       }
     }
+  }
+
+  /** Converts a normalized top-frame content-box point into viewport coordinates. */
+  private async relativeTargetPoint(
+    tabId: number,
+    target: ResolvedTarget,
+    fraction: { x: number; y: number },
+  ): Promise<{ x: number; y: number }> {
+    if (target.sessionId !== undefined) {
+      throw Object.assign(new Error("Relative points are supported only in the top frame"), { code: "invalid_request" });
+    }
+    const box = await this.send(tabId, "DOM.getBoxModel", { backendNodeId: target.backendNodeId }, false, target.sessionId);
+    const content = isRecord(box.model) && Array.isArray(box.model.content) ? box.model.content : [];
+    if (content.length !== 8 || content.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+      throw Object.assign(new Error("Relative target has no visible content box"), { code: "action_failed" });
+    }
+    const left = Math.min(content[0], content[6]);
+    const top = Math.min(content[1], content[3]);
+    const width = Math.abs(content[2] - content[0]);
+    const height = Math.abs(content[7] - content[1]);
+    if (!(width > 0 && height > 0)) {
+      throw Object.assign(new Error("Relative target has no visible content box"), { code: "action_failed" });
+    }
+    const point = { x: left + width * fraction.x, y: top + height * fraction.y };
+    const metrics = await this.send(tabId, "Page.getLayoutMetrics", {});
+    const viewport = isRecord(metrics.cssLayoutViewport) ? metrics.cssLayoutViewport : {};
+    const scrollX = typeof viewport.pageX === "number" ? viewport.pageX : 0;
+    const scrollY = typeof viewport.pageY === "number" ? viewport.pageY : 0;
+    const widthLimit = typeof viewport.clientWidth === "number" ? viewport.clientWidth : 0;
+    const heightLimit = typeof viewport.clientHeight === "number" ? viewport.clientHeight : 0;
+    if (point.x < 0 || point.y < 0 || point.x >= widthLimit || point.y >= heightLimit) {
+      throw Object.assign(new Error("Relative target point is outside the visible viewport"), { code: "action_failed" });
+    }
+    const hit = await this.pointer.whileConcealed(tabId, () => this.send(tabId, "DOM.getNodeForLocation", {
+      x: Math.round(point.x + scrollX), y: Math.round(point.y + scrollY), includeUserAgentShadowDOM: true,
+    }));
+    if (hit.backendNodeId !== target.backendNodeId) {
+      throw Object.assign(new Error("Another element obscures the relative pointer target"), { code: "action_failed" });
+    }
+    return point;
+  }
+
+  /** Sends trusted, background press/release input at a top-frame canvas point. */
+  private async clickRelativeTarget(
+    tabId: number,
+    target: ResolvedTarget,
+    fraction: { x: number; y: number },
+  ): Promise<void> {
+    const point = await this.relativeTargetPoint(tabId, target, fraction);
+    await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...point, button: "none", buttons: 0 });
+    await this.afterInputDispatched(async () => {
+      const after = await this.relativeTargetPoint(tabId, target, fraction);
+      if (after.x !== point.x || after.y !== point.y) {
+        throw Object.assign(new Error("Relative pointer target moved before the gesture completed"), { code: "action_failed" });
+      }
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...point, button: "left", buttons: 1, clickCount: 1 });
+      await this.send(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...point, button: "left", buttons: 0, clickCount: 1 });
+    });
   }
 
   private async pointerTargetPoint(

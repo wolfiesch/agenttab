@@ -566,6 +566,12 @@ pub enum BrowserAction {
         selector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame_id: Option<String>,
+        /// Fraction across the selected top-frame element's CSS content box, in [0, 1).
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "x")]
+        x: Option<f64>,
+        /// Fraction down the selected top-frame element's CSS content box, in [0, 1).
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "y")]
+        y: Option<f64>,
         #[serde(default)]
         expect_download: bool,
     },
@@ -1488,6 +1494,28 @@ impl MethodParams {
 
 fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), ProtocolError> {
     match action {
+        BrowserAction::Click {
+            r#ref,
+            selector,
+            frame_id,
+            x,
+            y,
+            ..
+        } if x.is_some() || y.is_some() => {
+            require(
+                method,
+                x.is_some() && y.is_some() && r#ref.is_none() && frame_id.is_none(),
+                "relative coordinates require click with selector and both x/y, without ref",
+            )?;
+            for value in [*x, *y].into_iter().flatten() {
+                require(
+                    method,
+                    value.is_finite() && (0.0..1.0).contains(&value),
+                    "click x/y must be finite fractions in [0, 1)",
+                )?;
+            }
+            validate_target(method, r#ref, selector, frame_id, "relative click")
+        }
         BrowserAction::Click {
             r#ref,
             selector,
@@ -3726,6 +3754,24 @@ mod tests {
                     ] if sel1 == "button.submit" && sel2 == "input.search" && t1 == "agenttab" && sel3 == "input.email" && t2 == "test@example.com"
                 )
         ));
+
+        for (value, accepted) in [
+            (json!({"kind": "click", "selector": "canvas", "x": 0.25, "y": 0.75}), true),
+            (json!({"kind": "click", "selector": "button", "frame_id": "frame-1"}), true),
+            (json!({"kind": "click", "selector": "canvas", "x": 0.25}), false),
+            (json!({"kind": "click", "selector": "canvas", "y": 0.75}), false),
+            (json!({"kind": "click", "selector": "canvas", "x": -0.01, "y": 0.75}), false),
+            (json!({"kind": "click", "selector": "canvas", "x": 0.25, "y": 1.0}), false),
+            (json!({"kind": "click", "selector": "canvas", "frame_id": "frame-1", "x": 0.25, "y": 0.75}), false),
+            (json!({"kind": "click", "ref": "7:opaque", "selector": "canvas", "x": 0.25, "y": 0.75}), false),
+        ] {
+            let parsed = RpcRequest::parse(request(
+                "browser_act",
+                json!({"tab_id": 7, "expected_page_revision": 1, "actions": [value]}),
+                true,
+            ));
+            assert_eq!(parsed.is_ok(), accepted);
+        }
 
         for action in [
             json!({"kind": "click"}),

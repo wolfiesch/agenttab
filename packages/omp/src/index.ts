@@ -38,6 +38,7 @@ import type { ToolMethod } from "./tool-method";
 
 interface SchemaNode {
   int(): SchemaNode;
+  lt(value: number): SchemaNode;
   max(value: number): SchemaNode;
   min(value: number): SchemaNode;
   optional(): SchemaNode;
@@ -203,6 +204,8 @@ const DEFINITIONS: ReadonlyArray<{
         const expect_download = z.boolean().optional();
         const value = z.string().max(STANDARD_ACTION_VALUE_MAX_CHARS);
         const gesture = z.enum(["click", "double_click", "context_click"]);
+        // Canvas-relative click: CSS fractions of the selected element's content box.
+        const fraction = z.number().min(0).lt(1);
         const press = {
           kind: z.literal("press"),
           frame_id,
@@ -217,6 +220,7 @@ const DEFINITIONS: ReadonlyArray<{
         const action = z.union([
           z.object({ kind: gesture, ref, frame_id, expect_download }).strict(),
           z.object({ kind: gesture, selector, frame_id, expect_download }).strict(),
+          z.object({ kind: z.literal("click"), selector, x: fraction, y: fraction }).strict(),
           z.object({ kind: z.literal("hover"), ref, frame_id }).strict(),
           z.object({ kind: z.literal("hover"), selector, frame_id }).strict(),
           z.object({ ...press, ref }).strict(),
