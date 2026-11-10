@@ -65,6 +65,7 @@ let localStore: Record<string, unknown>;
 let sessionStore: Record<string, unknown>;
 let factsFor: (scanNumber: number) => ChallengePageFacts;
 let factsScans: number;
+let factsGate: Promise<void> | null;
 let scanTimes: number[];
 let focusProbes: number;
 let focusEvidence: SurfaceEvidence | undefined;
@@ -96,6 +97,7 @@ function installChromeMock(): void {
   sessionStore = {};
   factsFor = clean;
   factsScans = 0;
+  factsGate = null;
   scanTimes = [];
   focusProbes = 0;
   focusEvidence = { hit: false, frames: [] };
@@ -207,6 +209,7 @@ function installChromeMock(): void {
           if (details.func.name === "collectChallengeFacts") {
             factsScans += 1;
             scanTimes.push(Date.now());
+            await factsGate;
             return [{ result: structuredClone(factsFor(factsScans)) }];
           }
           if (details.func.name === "probeSurfaceEvidence") {
@@ -865,5 +868,21 @@ describe("forgetTab", () => {
 
     runtime.forgetTab(TAB);
     expect([...scanned.keys()]).toEqual([OTHER_TAB]);
+  });
+
+  test("a scan still running when its tab closes does not record a revision for it", async () => {
+    const runtime = newRuntime();
+    const scanned = (runtime as unknown as { challengeScanRevisions: Map<number, number> }).challengeScanRevisions;
+    const gate = Promise.withResolvers<void>();
+    factsGate = gate.promise;
+    factsFor = () => turnstileActive();
+    const scan = runtime.scanChallengeEpisodes(TASK, TAB);
+    for (let turn = 0; turn < 50 && factsScans === 0; turn += 1) await Promise.resolve();
+    expect(factsScans).toBe(1);
+
+    runtime.forgetTab(TAB);
+    gate.resolve();
+    expect((await scan)?.event?.state).toBe("active");
+    expect(scanned.size).toBe(0);
   });
 });
