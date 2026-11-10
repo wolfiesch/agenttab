@@ -4462,7 +4462,10 @@ export class StandardBrowserRuntime {
     target: ResolvedTarget,
   ): Promise<Containment> {
     if (target.route === "scripting") {
-      // Scripting refs always name the top document, so the target has no frame ancestry, and the
+      // Without the debugger there is no frame tree, and a cross-origin iframe cannot see its embedding
+      // element, so a scripting target below the top document has unknowable ancestry. Unknown counts as inside.
+      if (target.frameId !== SCRIPTING_FRAME_ID) return "unknown";
+      // The top document has no frame ancestry, and the
       // page agent probes the element without the debugger Chrome refused.
       const page = await this.runPageAgent(
         tabId,
