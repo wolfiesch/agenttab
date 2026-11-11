@@ -282,9 +282,9 @@ function snapshot(registry: Registry, maxNodes: number, maxDepth: number, rootId
   return { nodes: nodes.slice(0, maxNodes), truncated };
 }
 
-function describe(element: Element, requestedValue: string | null): unknown {
+function describe(element: Element, requestedValue: string | null, allowSensitive = false): unknown {
   const { sensitiveField, associated, accessible } = sensitiveFieldState.call(element);
-  if (requestedValue !== null && sensitiveField) return { agenttab_sensitive_field: true };
+  if (requestedValue !== null && sensitiveField && !allowSensitive) return { agenttab_sensitive_field: true };
   const html = element as Partial<HTMLInputElement> & Partial<HTMLSelectElement>;
   const form = html.form ?? null;
   const option = html.options && requestedValue !== null
@@ -424,12 +424,12 @@ async function run(registry: Registry, request: PageAgentRequest): Promise<unkno
     }
     case "describe": {
       const element = lookup(registry, request.id);
-      return isAgentError(element) ? element : describe(element, request.requested_value);
+      return isAgentError(element) ? element : describe(element, request.requested_value, request.allow_sensitive === true);
     }
     case "act": {
       const element = lookup(registry, request.id);
       if (isAgentError(element)) return element;
-      if (request.kind !== "click" && sensitiveFieldState.call(element).sensitiveField) {
+      if (request.kind !== "click" && request.allow_sensitive !== true && sensitiveFieldState.call(element).sensitiveField) {
         return { agenttab_sensitive_field: true };
       }
       if (request.kind === "click") return captureWindowRequests(element, () => dispatchDomClick.call(element));

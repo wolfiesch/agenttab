@@ -356,19 +356,19 @@ function assertAction(value: unknown): Record<string, unknown> {
       assertTarget(action, "hover");
       return action;
     case "press":
-      assertExactObject(action, ["kind", "key"], ["ref", "selector", "frame_id", "expect_download", "modifiers"], "press action");
+      assertExactObject(action, ["kind", "key"], ["ref", "selector", "frame_id", "expect_download", "modifiers", "allow_sensitive"], "press action");
       assertTarget(action, "press");
       assertExpectDownload(action, "press");
       assertPressChord(action);
       return action;
     case "type":
     case "fill":
-      assertExactObject(action, ["kind", "text"], ["ref", "selector", "frame_id"], `${action.kind} action`);
+      assertExactObject(action, ["kind", "text"], ["ref", "selector", "frame_id", "allow_sensitive"], `${action.kind} action`);
       assertTarget(action, action.kind);
       assertBoundedString(action.text, `${action.kind}.text`, 0, 2_048);
       return action;
     case "select":
-      assertExactObject(action, ["kind", "ref", "value"], ["frame_id"], "select action");
+      assertExactObject(action, ["kind", "ref", "value"], ["frame_id", "allow_sensitive"], "select action");
       assertBoundedString(action.ref, "select.ref", 1, 256);
       assertFrameId(action.frame_id, "select.frame_id");
       assertBoundedString(action.value, "select.value", 0, 2_048);

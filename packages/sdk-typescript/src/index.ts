@@ -18,6 +18,8 @@ export const ACT_INTENT_MAX_CHARS = 120;
 export const ACT_INTENT_GUIDANCE = `Optional \`intent\` (one line, up to ${ACT_INTENT_MAX_CHARS} characters) states the batch's purpose and becomes the on-screen pointer caption, for example "Open the bookmarks folder"; never put secrets or field values in it.`;
 /** Tool-description sentence that teaches agents to answer an open JavaScript dialog, such as "Leave site?". */
 export const ACT_DIALOG_GUIDANCE = "A result, or a dialog_open error's details, may carry `dialog` (type beforeunload is Chrome's \"Leave site?\" prompt); the page stays paused until a dialog action answers it: accept to leave or confirm, dismiss to stay or cancel.";
+/** Tool-description sentence that teaches agents the sensitive-field opt-in on write actions. */
+export const ACT_SENSITIVE_GUIDANCE = "Password, OTP, and payment fields refuse press/type/fill/select by default; pass `allow_sensitive: true` on the action to write an agent-supplied value (snapshot values stay redacted).";
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_WAIT_TIMEOUT_MS = 30_000;
 export const DEFAULT_BROWSER_HANDOFF_TIMEOUT_MS = 300_000;
@@ -168,9 +170,9 @@ export type BrowserAction =
   | ({ kind: "click" | "double_click" | "context_click" } & DownloadTarget)
   | ({ kind: "click" } & CanvasRelativeTarget)
   | ({ kind: "hover" } & Target)
-  | ({ kind: "press"; key: BrowserPressKey; modifiers?: BrowserPressModifier[] } & DownloadTarget)
-  | ({ kind: "type" | "fill"; text: string } & Target)
-  | ({ kind: "select"; ref: string; value: string } & FrameScoped)
+  | ({ kind: "press"; key: BrowserPressKey; modifiers?: BrowserPressModifier[]; allow_sensitive?: boolean } & DownloadTarget)
+  | ({ kind: "type" | "fill"; text: string; allow_sensitive?: boolean } & Target)
+  | ({ kind: "select"; ref: string; value: string; allow_sensitive?: boolean } & FrameScoped)
   | ({ kind: "scroll"; delta_x: number; delta_y: number; ref?: string } & FrameScoped)
   | ({ kind: "drag"; ref: string; target_ref: string } & FrameScoped)
   | { kind: "navigate"; url: string; expect_download?: boolean }

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   ACT_DIALOG_GUIDANCE,
   ACT_INTENT_GUIDANCE,
+  ACT_SENSITIVE_GUIDANCE,
   ACT_INTENT_MAX_CHARS,
   AgentTabClient,
   AgentTabError,
@@ -198,7 +199,7 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_act",
       label: "Browser Act",
-      description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${ACT_INTENT_GUIDANCE} ${ACT_DIALOG_GUIDANCE} ${CHALLENGE_GUIDANCE.summary}`,
+      description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${ACT_INTENT_GUIDANCE} ${ACT_DIALOG_GUIDANCE} ${ACT_SENSITIVE_GUIDANCE} ${CHALLENGE_GUIDANCE.summary}`,
       approval: "write",
       schema: (z) => {
         const ref = z.string().min(1).max(256);
@@ -219,6 +220,8 @@ const DEFINITIONS: ReadonlyArray<{
             .max(4)
             .refine((values) => new Set(values).size === values.length, "modifiers must be unique")
             .optional(),
+          // Opt-in: act on a sensitive field (password, OTP, payment). Default false keeps the handoff gate.
+          allow_sensitive: z.boolean().optional(),
         };
         const files = z.array(z.string().min(1).max(512)).min(1).max(4);
         const action = z.union([
@@ -229,11 +232,11 @@ const DEFINITIONS: ReadonlyArray<{
           z.object({ kind: z.literal("hover"), selector, frame_id }).strict(),
           z.object({ ...press, ref }).strict(),
           z.object({ ...press, selector }).strict(),
-          z.object({ kind: z.literal("type"), ref, frame_id, text: value }).strict(),
-          z.object({ kind: z.literal("type"), selector, frame_id, text: value }).strict(),
-          z.object({ kind: z.literal("fill"), ref, frame_id, text: value }).strict(),
-          z.object({ kind: z.literal("fill"), selector, frame_id, text: value }).strict(),
-          z.object({ kind: z.literal("select"), ref, frame_id, value }).strict(),
+          z.object({ kind: z.literal("type"), ref, frame_id, text: value, allow_sensitive: z.boolean().optional() }).strict(),
+          z.object({ kind: z.literal("type"), selector, frame_id, text: value, allow_sensitive: z.boolean().optional() }).strict(),
+          z.object({ kind: z.literal("fill"), ref, frame_id, text: value, allow_sensitive: z.boolean().optional() }).strict(),
+          z.object({ kind: z.literal("fill"), selector, frame_id, text: value, allow_sensitive: z.boolean().optional() }).strict(),
+          z.object({ kind: z.literal("select"), ref, frame_id, value, allow_sensitive: z.boolean().optional() }).strict(),
           z.object({
             kind: z.literal("scroll"),
             ref: ref.optional(),
