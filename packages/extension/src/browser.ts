@@ -309,12 +309,15 @@ interface DocumentResponse {
   headers: Record<string, string>;
 }
 
-/** One armed capture of the `Authorization` header a tab sends. */
+/** One armed capture of the `Authorization` header a tab sends to a listed origin. */
 interface SessionCapture {
-  origin: string;
+  /** Origins the owner listed; only requests to one of these can satisfy the capture. */
+  origins: string[];
   header: string;
   deadline: number;
   value?: string;
+  /** Destination origin of the request that produced `value`. */
+  origin?: string;
   /** Wakes the waiting read as soon as the header arrives, or with undefined on timeout. */
   settle?: (value: string | undefined) => void;
 }
@@ -769,11 +772,16 @@ export class StandardBrowserRuntime {
             } catch {
               requestOrigin = undefined;
             }
-            if (requestOrigin === armed.origin && isRecord(params.request.headers)) {
+            if (
+              requestOrigin !== undefined &&
+              armed.origins.includes(requestOrigin) &&
+              isRecord(params.request.headers)
+            ) {
               for (const [name, value] of Object.entries(params.request.headers)) {
                 if (name.toLowerCase() !== "authorization" || typeof value !== "string") continue;
                 if (value.length > SESSION_CAPTURE_MAX_CHARS) continue;
                 armed.value = value;
+                armed.origin = requestOrigin;
                 armed.header = "authorization";
                 const settle = armed.settle;
                 armed.settle = undefined;
@@ -2180,23 +2188,8 @@ export class StandardBrowserRuntime {
     await this.authorizeDebuggerUse(tabId);
     await this.revisions.assertExpected(tabId, request.expected_page_revision);
     await this.requireFullAutomationRoute(tabId, "capture session credentials");
-    const assertOrigin = async (): Promise<void> => {
-      const tab = await chrome.tabs.get(tabId);
-      let origin: string | undefined;
-      try {
-        origin = new URL(tab.pendingUrl ?? tab.url ?? "").origin;
-      } catch {
-        origin = undefined;
-      }
-      if (origin !== request.expected_origin) {
-        throw Object.assign(new Error("The tab is no longer on the verified origin"), {
-          code: "session_capture_page_mismatch",
-        });
-      }
-    };
-    await assertOrigin();
     const armed: SessionCapture = {
-      origin: request.expected_origin,
+      origins: [...request.allowed_origins],
       header: "authorization",
       deadline: Date.now() + request.timeout_ms,
     };
@@ -2209,14 +2202,17 @@ export class StandardBrowserRuntime {
         await this.send(tabId, "Page.reload", { ignoreCache: false });
       }
       const value = await this.awaitSessionCapture(armed, armed.deadline);
-      if (value === undefined) {
+      if (value === undefined || armed.origin === undefined) {
         throw Object.assign(new Error("The tab sent no authenticated request in time"), {
           code: "session_capture_not_observed",
         });
       }
-      // A navigation during the capture would attribute the value to another origin.
-      await assertOrigin();
-      return { value, header: armed.header, page_revision: await this.revisions.current(tabId) };
+      return {
+        value,
+        header: armed.header,
+        origin: armed.origin,
+        page_revision: await this.revisions.current(tabId),
+      };
     } finally {
       this.sessionCaptures.delete(tabId);
     }

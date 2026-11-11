@@ -639,7 +639,7 @@ export function parseSecretReadParams(value: unknown): SecretReadRequest {
 export type SessionSecretReadRequest = {
   tab_id: number;
   expected_page_revision: number;
-  expected_origin: string;
+  allowed_origins: string[];
   timeout_ms: number;
 };
 
@@ -647,7 +647,7 @@ export type SessionSecretReadRequest = {
 export function parseSessionSecretReadParams(value: unknown): SessionSecretReadRequest {
   const params = assertExactObject(
     value,
-    ["tab_id", "expected_page_revision", "expected_origin", "timeout_ms"],
+    ["tab_id", "expected_page_revision", "allowed_origins", "timeout_ms"],
     [],
     "browser_session_secret_read parameters",
   );
@@ -655,10 +655,25 @@ export function parseSessionSecretReadParams(value: unknown): SessionSecretReadR
   if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1_000 || timeout > 60_000) {
     commandError("timeout_ms must be an integer between 1000 and 60000");
   }
+  const allowed = params.allowed_origins;
+  if (!Array.isArray(allowed) || allowed.length === 0 || allowed.length > 64) {
+    commandError("allowed_origins must be a list of origins");
+  }
+  const origins = allowed.map((entry) => {
+    const origin = assertBoundedString(entry, "allowed origin", 8, 2048);
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      commandError("allowed_origins entries must be absolute origins");
+    }
+    if (parsed.origin !== origin) commandError("allowed_origins entries must be bare origins");
+    return origin;
+  });
   return {
     tab_id: assertTabId(params.tab_id),
     expected_page_revision: assertRevision(params.expected_page_revision),
-    expected_origin: assertBoundedString(params.expected_origin, "expected_origin", 1, 2048),
+    allowed_origins: origins,
     timeout_ms: timeout,
   };
 }

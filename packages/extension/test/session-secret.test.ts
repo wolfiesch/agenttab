@@ -4,7 +4,7 @@ import { parseSessionSecretReadParams } from "../src/protocol";
 const VALID = {
   tab_id: 4,
   expected_page_revision: 9,
-  expected_origin: "https://stage.example",
+  allowed_origins: ["https://api.stage.example", "https://stage.example"],
   timeout_ms: 15_000,
 };
 
@@ -21,7 +21,10 @@ describe("parseSessionSecretReadParams", () => {
       { ...VALID, timeout_ms: 999 },
       { ...VALID, timeout_ms: 60_001 },
       { ...VALID, timeout_ms: 15_000.5 },
-      { ...VALID, expected_origin: "" },
+      { ...VALID, allowed_origins: [] },
+      { ...VALID, allowed_origins: ["https://api.stage.example/path"] },
+      { ...VALID, allowed_origins: ["not-an-origin"] },
+      { ...VALID, expected_origin: "https://stage.example" },
     ]) {
       expect(() => parseSessionSecretReadParams(params)).toThrow();
     }

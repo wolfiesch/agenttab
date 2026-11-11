@@ -286,13 +286,16 @@ off until enabled with exact origins:
 ```
 
 List exact origins, not patterns: scheme, host, and port when it is not the
-scheme default. `timeout_ms` must be 1000 through 60000. Call
+scheme default, and list the origin the app sends its API requests to rather
+than the page's own origin. `timeout_ms` must be 1000 through 60000. Call
 `browser_credentials` with `action: "capture_session"`, the owned `tab_id`, the
 current `expected_page_revision`, and an uppercase `secret_name`. The tab must
-stay on a listed origin. A quiet tab is reloaded once so the app repeats its
-own authenticated requests; if none carries an `Authorization` header, the call
-fails with `session_capture_not_observed`. The result has `status: "stored"`,
-`origin`, `header`, `characters`, and `sha256_prefix`, never the value.
+stay on the same page revision, and only requests it sends to a listed origin
+are considered. A quiet tab is reloaded once so the app repeats its own
+authenticated requests; if none of those requests carries an `Authorization`
+header, the call fails with `session_capture_not_observed`. The result has
+`status: "stored"`, the destination `origin`, `header`, `characters`, and
+`sha256_prefix`, never the value.
 
 ## Migration from Chrome Bridge v1.0.1
 

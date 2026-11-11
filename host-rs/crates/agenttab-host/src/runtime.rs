@@ -1850,21 +1850,23 @@ impl Runtime {
         else {
             unreachable!()
         };
-        let origin = match self.credential_url(*tab_id) {
-            Ok(url) => url.origin().ascii_serialization(),
-            Err(error) => return RpcResponse::failure(request_id, Outcome::NotStarted, error),
-        };
         let policy = self.guardrails.session_capture_policy();
-        if !policy.allows(&origin) {
+        let allowed_origins: Vec<String> = policy
+            .origins
+            .iter()
+            .filter_map(|entry| Url::parse(entry.trim()).ok())
+            .map(|url| url.origin().ascii_serialization())
+            .collect();
+        if allowed_origins.is_empty() {
             return RpcResponse::failure(
                 request_id,
                 Outcome::NotStarted,
                 RpcError::new(
                     "session_capture_origin_denied",
-                    "That origin is not listed for session credential capture",
+                    "No origin is listed for session credential capture",
                 )
                 .with_recovery(
-                    "Add the exact origin to session_capture.origins in AgentTab's managed local policy.",
+                    "Add the exact API origins to session_capture.origins in AgentTab's managed local policy.",
                 ),
             );
         }
@@ -1875,7 +1877,7 @@ impl Runtime {
             json!({
                 "tab_id": tab_id,
                 "expected_page_revision": expected_page_revision,
-                "expected_origin": origin,
+                "allowed_origins": allowed_origins,
                 "timeout_ms": policy.timeout_ms,
             }),
             self.guardrails.native_origin_policy(*tab_id),
@@ -1892,7 +1894,11 @@ impl Runtime {
         };
         // Reloading restarts the document, so any failure after the reload began
         // is reported as unknown rather than as an untouched page.
-        let (value, page_revision, header) = match (native.outcome, native.result, native.error) {
+        let (value, page_revision, header, origin) = match (
+            native.outcome,
+            native.result,
+            native.error,
+        ) {
             (Outcome::Completed, Some(result), None) => {
                 let value = result.get("value").and_then(Value::as_str);
                 let page_revision = result.get("page_revision").and_then(Value::as_u64);
@@ -1900,9 +1906,26 @@ impl Runtime {
                     .get("header")
                     .and_then(Value::as_str)
                     .unwrap_or("authorization");
-                match (value, page_revision) {
-                    (Some(value), Some(page_revision)) => {
-                        (value.to_owned(), page_revision, header.to_owned())
+                let origin = result.get("origin").and_then(Value::as_str);
+                match (value, page_revision, origin) {
+                    (Some(value), Some(page_revision), Some(origin)) if policy.allows(origin) => (
+                        value.to_owned(),
+                        page_revision,
+                        header.to_owned(),
+                        origin.to_owned(),
+                    ),
+                    (Some(_), Some(_), Some(_)) => {
+                        return RpcResponse::failure(
+                            request_id,
+                            Outcome::Unknown,
+                            RpcError::new(
+                                "session_capture_origin_denied",
+                                "The captured request went to an origin that is not listed",
+                            )
+                            .with_recovery(
+                                "Add the exact origin to session_capture.origins in AgentTab's managed local policy.",
+                            ),
+                        );
                     }
                     _ => {
                         return RpcResponse::failure(
@@ -5586,6 +5609,7 @@ mod tests {
             let (temp, store, runtime, connection, native) = secret_capture_runtime(Ok(json!({
                 "value": CAPTURED,
                 "header": "authorization",
+                "origin": "https://allowed.test",
                 "page_revision": 7,
             })));
 
@@ -5611,7 +5635,7 @@ mod tests {
                     json!({
                         "tab_id": 3,
                         "expected_page_revision": 7,
-                        "expected_origin": "https://allowed.test",
+                        "allowed_origins": ["https://allowed.test"],
                         "timeout_ms": 5_000,
                     })
                 )
@@ -5626,15 +5650,16 @@ mod tests {
 
         #[test]
         fn session_capture_refuses_an_origin_the_policy_does_not_list() {
-            let (temp, store, runtime, connection, native) = secret_capture_runtime_with_origins(
-                Ok(json!({"value": CAPTURED, "page_revision": 7})),
-                &["https://elsewhere.test"],
-            );
+            let (temp, store, runtime, connection, native) = secret_capture_runtime(Ok(json!({
+                "value": CAPTURED,
+                "origin": "https://elsewhere.test",
+                "page_revision": 7,
+            })));
 
             let response = runtime.handle(&connection, session_capture_request("session-denied"));
-            assert_eq!(response["outcome"], "not_started");
+            assert_eq!(response["outcome"], "unknown");
             assert_eq!(response["error"]["code"], "session_capture_origin_denied");
-            assert!(native.calls.lock().is_empty());
+            assert_eq!(native.calls.lock().len(), 1);
             assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 1);
             assert!(!tree_contains(temp.path(), CAPTURED.as_bytes()));
         }
@@ -5643,6 +5668,7 @@ mod tests {
         fn session_capture_rejects_a_value_that_is_not_a_header() {
             let (temp, store, runtime, connection, _native) = secret_capture_runtime(Ok(json!({
                 "value": "sk short",
+                "origin": "https://allowed.test",
                 "page_revision": 7,
             })));
 
