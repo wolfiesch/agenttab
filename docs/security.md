@@ -69,6 +69,14 @@ The extension refuses cross-origin frames, editable password inputs, and fields 
 
 Capture runs without a popup review. Each capture is recorded in the local audit store with its secret name, origin, and overwrite flag, so the owner can review it after the fact.
 
+## Session credential capture
+
+Session capture is disabled by default and is separate from `secret_capture`. When the owner enables `session_capture` with an explicit origin list, `browser_credentials` with `action: "capture_session"` reads the `Authorization` header the owned tab itself sends to that origin and stores it through the same configured sink. This covers API work whose credential exists only in the signed-in app's own requests, where no page displays a key and no token can be minted over plain HTTP.
+
+The host derives the origin from the task tab, so a request cannot name one. An origin not listed verbatim in `session_capture.origins` is refused with `session_capture_origin_denied`, and a tab that navigates away during the read fails with `session_capture_page_mismatch`. Values must be 16 to 4096 printable ASCII characters without control characters or surrounding whitespace; any other value is refused with `session_capture_value_invalid` before the sink runs.
+
+The extension observes the request through the `Network` domain on the debugger session it already opens. When the tab sends no authenticated request within one second, the extension reloads it once so the app repeats its own signed-in requests. A tab that still sends no `Authorization` header before `timeout_ms` fails with `session_capture_not_observed`. The value travels only to the sink: it never enters the agent's context, the RPC result, logs, or the audit store. The result carries the secret name, origin, header name, character count, SHA-256 prefix, and page revision, and each capture is audited with its name, origin, and overwrite flag.
+
 ## Permissions
 
 The manifest declares `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, `alarms`, `bookmarks`, `history`, `sessions`, `downloads`, `webNavigation`, `idle`, and `notifications`, with `<all_urls>` host access. Chrome does not permit `debugger` in `optional_permissions`, so it is a required install-time permission. `scripting` remains optional: the popup requests it when automation is enabled and removes it when automation is turned off. `cookies`, `contentSettings`, and `activeTab` are not requested.

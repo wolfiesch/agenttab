@@ -43,6 +43,8 @@ pub enum GuardrailLoadError {
     InvalidEmailCodePolicy(String),
     #[error("invalid secret capture policy: {0}")]
     InvalidSecretCapturePolicy(String),
+    #[error("invalid session capture policy: {0}")]
+    InvalidSessionCapturePolicy(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +70,67 @@ impl Default for OnePasswordPolicy {
         }
     }
 }
+/// Origin-scoped permission to copy one `Authorization` header out of an
+/// owned tab. Disabled unless the policy both enables it and names the exact
+/// origins, so a default install cannot reach the capability.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionCapturePolicy {
+    pub enabled: bool,
+    pub origins: Vec<String>,
+    pub timeout_ms: u64,
+}
+
+impl Default for SessionCapturePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            origins: Vec::new(),
+            timeout_ms: 15_000,
+        }
+    }
+}
+
+impl SessionCapturePolicy {
+    /// True only when the policy is enabled and the exact origin is listed.
+    pub fn allows(&self, origin: &str) -> bool {
+        self.enabled
+            && self.origins.iter().any(|entry| {
+                Url::parse(entry.trim())
+                    .map(|url| url.origin().ascii_serialization() == origin)
+                    .unwrap_or(false)
+            })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1_000..=60_000).contains(&self.timeout_ms) {
+            return Err("timeout_ms must be between 1000 and 60000".into());
+        }
+        for (index, entry) in self.origins.iter().enumerate() {
+            let position = index + 1;
+            let url = Url::parse(entry.trim())
+                .map_err(|_| format!("origins entry {position} is not an absolute URL"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(format!("origins entry {position} must use http or https"));
+            }
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.path() != "/"
+            {
+                return Err(format!(
+                    "origins entry {position} must be a bare scheme and host, without credentials, path, query, or fragment"
+                ));
+            }
+            if url.host_str().unwrap_or_default().is_empty() {
+                return Err(format!("origins entry {position} must name a host"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Policy {
@@ -81,6 +144,7 @@ struct Policy {
     one_password: OnePasswordPolicy,
     email_codes: EmailCodePolicy,
     secret_capture: SecretCapturePolicy,
+    session_capture: SessionCapturePolicy,
 }
 
 impl Default for Policy {
@@ -95,6 +159,7 @@ impl Default for Policy {
             one_password: OnePasswordPolicy::default(),
             email_codes: EmailCodePolicy::default(),
             secret_capture: SecretCapturePolicy::default(),
+            session_capture: SessionCapturePolicy::default(),
             redact_patterns: Vec::new(),
         }
     }
@@ -168,6 +233,10 @@ impl Guardrails {
             .secret_capture
             .validate()
             .map_err(GuardrailLoadError::InvalidSecretCapturePolicy)?;
+        policy
+            .session_capture
+            .validate()
+            .map_err(GuardrailLoadError::InvalidSessionCapturePolicy)?;
         let mut patterns = vec![
             r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}\b".to_string(),
             r"\b\d{3}-\d{2}-\d{4}\b".to_string(),
@@ -205,6 +274,10 @@ impl Guardrails {
         &self.policy.secret_capture
     }
 
+    pub fn session_capture_policy(&self) -> &SessionCapturePolicy {
+        &self.policy.session_capture
+    }
+
     pub fn authorize(&self, method: RpcMethod, params: &MethodParams) -> Result<(), RpcError> {
         if method == RpcMethod::BrowserDeveloper && !self.policy.developer_enabled {
             return Err(RpcError::new(
@@ -238,6 +311,19 @@ impl Guardrails {
                     )
                     .with_recovery(
                         "Enable secret_capture with an absolute sink executable in AgentTab's managed local policy.",
+                    ));
+                }
+            } else if matches!(
+                params,
+                MethodParams::Credentials(BrowserCredentialsParams::CaptureSession { .. })
+            ) {
+                if !self.policy.session_capture.enabled {
+                    return Err(RpcError::new(
+                        "session_capture_disabled",
+                        "Session credential capture is disabled by AgentTab policy",
+                    )
+                    .with_recovery(
+                        "Enable session_capture with the exact origins in AgentTab's managed local policy.",
                     ));
                 }
             } else if !self.policy.one_password.enabled {
@@ -911,6 +997,63 @@ mod tests {
             Guardrails::from_policy(unnamed),
             Err(GuardrailLoadError::InvalidSecretCapturePolicy(_))
         ));
+    }
+
+    #[test]
+    fn session_capture_is_disabled_by_default_and_origin_scoped_when_enabled() {
+        let request = MethodParams::Credentials(BrowserCredentialsParams::CaptureSession {
+            tab_id: 7,
+            expected_page_revision: 3,
+            secret_name: "SESSION_TOKEN".into(),
+            overwrite: false,
+        });
+        assert_eq!(
+            Guardrails::defaults()
+                .authorize(RpcMethod::BrowserCredentials, &request)
+                .unwrap_err()
+                .code,
+            "session_capture_disabled"
+        );
+        let enabled: Policy = serde_json::from_value(json!({
+            "session_capture": {
+                "enabled": true,
+                "origins": ["https://stage.example", "https://api.example:8443"]
+            }
+        }))
+        .unwrap();
+        let guardrails = Guardrails::from_policy(enabled).unwrap();
+        guardrails
+            .authorize(RpcMethod::BrowserCredentials, &request)
+            .unwrap();
+        let policy = guardrails.session_capture_policy();
+        assert!(policy.allows("https://stage.example"));
+        assert!(policy.allows("https://api.example:8443"));
+        assert!(!policy.allows("https://api.example"));
+        assert!(!policy.allows("http://stage.example"));
+        assert!(!policy.allows("https://stage.example.evil.test"));
+    }
+
+    #[test]
+    fn invalid_session_capture_policy_fails_load_without_echoing_entries() {
+        for origins in [
+            json!(["https://stage.example/settings"]),
+            json!(["ftp://stage.example"]),
+            json!(["https://user:s3cret@stage.example"]),
+        ] {
+            let policy: Policy = serde_json::from_value(json!({
+                "session_capture": { "enabled": true, "origins": origins }
+            }))
+            .unwrap();
+            let error = Guardrails::from_policy(policy).unwrap_err();
+            assert!(matches!(
+                error,
+                GuardrailLoadError::InvalidSessionCapturePolicy(_)
+            ));
+            let rendered = error.to_string();
+            assert!(!rendered.contains("settings"), "{rendered}");
+            assert!(!rendered.contains("s3cret"), "{rendered}");
+            assert!(!rendered.contains("stage.example"), "{rendered}");
+        }
     }
 
     #[test]

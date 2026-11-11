@@ -330,14 +330,14 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_credentials",
       label: "Browser Credentials",
-      description: "Prefer this before human handoff. 1Password: prepare, then fill or next with a URL-matching Login without exposing its values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use Browser Act for explicit submission; you may complete verification on entering the final character. Capture: when a page shows a new API key or token, use capture with the ref of the element showing it and a secret_name to store it in the owner's secret store instead of clicking Copy; the result returns its length and sha256_prefix, never the value.",
+      description: "Prefer this before human handoff. 1Password: prepare, then fill or next with a URL-matching Login without exposing its values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use Browser Act for explicit submission; you may complete verification on entering the final character. Capture: when a page shows a new API key or token, use capture with the ref of the element showing it and a secret_name to store it in the owner's secret store instead of clicking Copy; the result returns its length and sha256_prefix, never the value. Session capture: use capture_session to store the Authorization header the tab itself sends to a policy-listed origin, for API work that cannot mint a token over plain HTTP; a quiet tab is reloaded once, and the value never returns.",
       approval: "write",
       // One flat object covers every action: OpenAI-compatible providers reject a root union.
       // Core enforces each action's exact fields: credential_token for fill and next, and only
       // message_id, recipient, purpose, and unique otp_refs for fill_email; source_ref,
-      // secret_name, and overwrite for capture.
+      // secret_name, and overwrite for capture; secret_name and overwrite for capture_session.
       schema: (z) => z.object({
-        action: z.enum(["prepare", "fill", "next", "fill_email", "capture"]),
+        action: z.enum(["prepare", "fill", "next", "fill_email", "capture", "capture_session"]),
         tab_id: z.number().int().min(0),
         expected_page_revision: z.number().int().min(0),
         credential_token: z.string().min(32).max(256).optional(),

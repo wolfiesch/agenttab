@@ -157,6 +157,13 @@ const schemas: Record<ToolMethod, unknown> = {
       secret_name: Type.String({ minLength: 1, maxLength: SECRET_NAME_MAX_CHARS, pattern: SECRET_NAME_PATTERN }),
       overwrite: Type.Optional(Type.Boolean()),
     }),
+    object({
+      action: Type.Literal("capture_session"),
+      tab_id: Type.Integer({ minimum: 0 }),
+      expected_page_revision: Type.Integer({ minimum: 0 }),
+      secret_name: Type.String({ minLength: 1, maxLength: SECRET_NAME_MAX_CHARS, pattern: SECRET_NAME_PATTERN }),
+      overwrite: Type.Optional(Type.Boolean()),
+    }),
   ]),
   browser_profile: Type.Union([
     object({

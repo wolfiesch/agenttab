@@ -152,6 +152,17 @@ pub fn is_capturable(value: &str) -> bool {
         && value.bytes().all(|byte| matches!(byte, b'!'..=b'~'))
 }
 
+/// One `Authorization` header value: printable ASCII including the single
+/// space a scheme such as `Bearer` needs, still without control characters.
+/// A captured header is stored whole so a consumer can replay it verbatim.
+pub fn is_capturable_header(value: &str) -> bool {
+    let trimmed = value.trim();
+    (MIN_SECRET_CHARS..=MAX_SECRET_CHARS).contains(&value.len())
+        && value == trimmed
+        && trimmed.bytes().all(|byte| matches!(byte, b' '..=b'~'))
+        && !trimmed.is_empty()
+}
+
 /// Leading hex of the value's SHA-256, for comparing against the stored copy.
 pub fn fingerprint(value: &str) -> String {
     let mut digest = format!("{:x}", Sha256::digest(value.as_bytes()));
@@ -324,5 +335,29 @@ mod tests {
         }
         assert!(!is_capturable(&"k".repeat(MAX_SECRET_CHARS + 1)));
         assert_eq!(fingerprint(VALUE).len(), FINGERPRINT_HEX_CHARS);
+    }
+
+    #[test]
+    fn capturable_headers_keep_spaces_but_reject_surrounding_whitespace() {
+        assert!(is_capturable_header("Bearer eyJhbGciOiJIUzI1NiJ9.abc"));
+        assert!(is_capturable_header("Basic dXNlcjpwYXNz"));
+        for value in [
+            "short token",
+            " Bearer spaced-token",
+            "Bearer spaced-token ",
+            "Bearer\ttabbed-token",
+            "Bearer newline\ntoken",
+            "Bearer café-token",
+        ] {
+            assert!(!is_capturable_header(value), "{value:?}");
+        }
+        assert!(!is_capturable_header(&format!(
+            "Bearer {}",
+            "k".repeat(MAX_SECRET_CHARS)
+        )));
+        assert!(is_capturable_header(&format!(
+            "Bearer {}",
+            "k".repeat(MAX_SECRET_CHARS - 7)
+        )));
     }
 }

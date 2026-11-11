@@ -19,6 +19,7 @@ import {
   randomToken,
   type EmailCodeFillRequest,
   type SecretReadRequest,
+  type SessionSecretReadRequest,
   sha256Hex,
   type StagedCommit,
   type StagedDialog,
@@ -113,6 +114,8 @@ const CHALLENGE_POLL_MS = 500;
 /** Response headers the detector may keep from a main-document response, lowercase. */
 const CHALLENGE_RESPONSE_HEADERS: readonly string[] = ["cf-mitigated", "x-amzn-waf-action", "retry-after"];
 const DOCUMENT_RESPONSE_LIMIT = 8;
+/** Mirrors the host's `secret_capture::MAX_SECRET_CHARS` so an oversized header never leaves the tab. */
+const SESSION_CAPTURE_MAX_CHARS = 4096;
 const CHALLENGE_FRAME_LIMIT = 256;
 const CHALLENGE_SELECTORS = catalogSelectors(CHALLENGE_CATALOG);
 const CHALLENGE_TOKEN_SELECTORS = catalogTokenSelectors(CHALLENGE_CATALOG);
@@ -304,6 +307,16 @@ interface DocumentResponse {
   loaderId: string;
   status: number;
   headers: Record<string, string>;
+}
+
+/** One armed capture of the `Authorization` header a tab sends. */
+interface SessionCapture {
+  origin: string;
+  header: string;
+  deadline: number;
+  value?: string;
+  /** Wakes the waiting read as soon as the header arrives, or with undefined on timeout. */
+  settle?: (value: string | undefined) => void;
 }
 
 interface DebugSession {
@@ -669,6 +682,8 @@ export class StandardBrowserRuntime {
   private readonly challengeScanRevisions = new Map<number, number>();
   /** Live `load`/`url` waits per tab; navigation events are recorded only for these tabs. */
   private readonly navigationObservations = new Map<number, Set<NavigationObservation>>();
+  /** Armed session-credential captures; one per tab, cleared when the read finishes. */
+  private readonly sessionCaptures = new Map<number, SessionCapture>();
 
   constructor(
     private readonly revisions: RevisionTracker,
@@ -745,6 +760,28 @@ export class StandardBrowserRuntime {
         } else if (method === "Network.requestWillBeSent" && typeof params.requestId === "string") {
           session.inflight.add(params.requestId);
           session.lastNetworkActivity = Date.now();
+          const armed = this.sessionCaptures.get(source.tabId);
+          if (armed !== undefined && armed.value === undefined && isRecord(params.request)) {
+            const requestUrl = typeof params.request.url === "string" ? params.request.url : "";
+            let requestOrigin: string | undefined;
+            try {
+              requestOrigin = new URL(requestUrl).origin;
+            } catch {
+              requestOrigin = undefined;
+            }
+            if (requestOrigin === armed.origin && isRecord(params.request.headers)) {
+              for (const [name, value] of Object.entries(params.request.headers)) {
+                if (name.toLowerCase() !== "authorization" || typeof value !== "string") continue;
+                if (value.length > SESSION_CAPTURE_MAX_CHARS) continue;
+                armed.value = value;
+                armed.header = "authorization";
+                const settle = armed.settle;
+                armed.settle = undefined;
+                settle?.(value);
+                break;
+              }
+            }
+          }
         } else if (
           (method === "Network.loadingFinished" || method === "Network.loadingFailed") &&
           typeof params.requestId === "string"
@@ -2127,6 +2164,74 @@ export class StandardBrowserRuntime {
     await assertOrigin();
     await this.revisions.assertExpected(tabId, pageRevision);
     return { value: read.value, page_revision: pageRevision };
+  }
+
+  /**
+   * Copies the `Authorization` header the tab sends, for the host's secret
+   * store. The value goes only to the host; refusals carry fixed codes and
+   * never echo it. A quiet tab is reloaded once so its own signed-in requests
+   * run again; a request already in flight serves without a reload.
+   */
+  async readSessionSecret(
+    taskId: string,
+    tabId: number,
+    request: SessionSecretReadRequest,
+  ): Promise<Record<string, unknown>> {
+    await this.authorizeDebuggerUse(tabId);
+    await this.revisions.assertExpected(tabId, request.expected_page_revision);
+    await this.requireFullAutomationRoute(tabId, "capture session credentials");
+    const assertOrigin = async (): Promise<void> => {
+      const tab = await chrome.tabs.get(tabId);
+      let origin: string | undefined;
+      try {
+        origin = new URL(tab.pendingUrl ?? tab.url ?? "").origin;
+      } catch {
+        origin = undefined;
+      }
+      if (origin !== request.expected_origin) {
+        throw Object.assign(new Error("The tab is no longer on the verified origin"), {
+          code: "session_capture_page_mismatch",
+        });
+      }
+    };
+    await assertOrigin();
+    const armed: SessionCapture = {
+      origin: request.expected_origin,
+      header: "authorization",
+      deadline: Date.now() + request.timeout_ms,
+    };
+    this.sessionCaptures.set(tabId, armed);
+    try {
+      const grace = Math.min(1_000, request.timeout_ms);
+      if ((await this.awaitSessionCapture(armed, Date.now() + grace)) === undefined) {
+        // Reloading restarts the document, so the app issues its own signed-in
+        // requests again instead of waiting for user activity.
+        await this.send(tabId, "Page.reload", { ignoreCache: false });
+      }
+      const value = await this.awaitSessionCapture(armed, armed.deadline);
+      if (value === undefined) {
+        throw Object.assign(new Error("The tab sent no authenticated request in time"), {
+          code: "session_capture_not_observed",
+        });
+      }
+      // A navigation during the capture would attribute the value to another origin.
+      await assertOrigin();
+      return { value, header: armed.header, page_revision: await this.revisions.current(tabId) };
+    } finally {
+      this.sessionCaptures.delete(tabId);
+    }
+  }
+
+  /** Resolves with the captured value, or undefined once `until` passes. */
+  private awaitSessionCapture(armed: SessionCapture, until: number): Promise<string | undefined> {
+    if (armed.value !== undefined) return Promise.resolve(armed.value);
+    const waiter = Promise.withResolvers<string | undefined>();
+    armed.settle = waiter.resolve;
+    const timer = setTimeout(() => waiter.resolve(undefined), Math.max(0, until - Date.now()));
+    return waiter.promise.finally(() => {
+      clearTimeout(timer);
+      if (armed.settle === waiter.resolve) armed.settle = undefined;
+    });
   }
 
   /** The tab, including any navigation in flight, is on the exact approved origin and pathname. */

@@ -7964,3 +7964,97 @@ describe("email code fill runtime", () => {
     }
   }
 });
+
+describe("session credential capture runtime", () => {
+  const ORIGIN = "https://console.example";
+  const TOKEN = "Bearer $$SESSIONTOKEN_0123456789abcdef$$";
+
+  /** Resolves queued microtasks so timer advances reach the pending awaits. */
+  async function flush(): Promise<void> {
+    for (let turn = 0; turn < 40; turn += 1) await Promise.resolve();
+  }
+
+  async function advance(milliseconds: number): Promise<void> {
+    vi.advanceTimersByTime(milliseconds);
+    await flush();
+  }
+
+  function request(tabId: number, pageRevision: number, origin = ORIGIN) {
+    return {
+      tab_id: tabId,
+      expected_page_revision: pageRevision,
+      expected_origin: origin,
+      timeout_ms: 5_000,
+    };
+  }
+
+  /** Emits the tab's own request while the reload command runs, as a live tab would. */
+  function emitOnReload(tabId: number, headers: Record<string, string>): string[] {
+    const reloads: string[] = [];
+    debuggerCommandOverride = (method) => {
+      if (method === "Page.reload") {
+        reloads.push(method);
+        emitDebuggerEvent(tabId, "Network.requestWillBeSent", {
+          requestId: `req-session-${tabId}`,
+          request: { url: `${ORIGIN}/api/session`, method: "GET", headers },
+        });
+      }
+      return undefined;
+    };
+    return reloads;
+  }
+
+  test("captures the Authorization header after reloading a quiet tab once", async () => {
+    vi.useFakeTimers();
+    try {
+      tabStore.set(77, { id: 77, windowId: 1, groupId: -1, active: true, url: `${ORIGIN}/session` });
+      const reloads = emitOnReload(77, { Authorization: TOKEN, Accept: "application/json" });
+      const revisions = new RevisionTracker();
+      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+      const revision = await revisions.ensure(77);
+
+      const pending = runtime.readSessionSecret(TASK_A, 77, request(77, revision));
+      await advance(0);
+      await advance(1_100);
+
+      expect(await pending).toEqual({ value: TOKEN, header: "authorization", page_revision: revision });
+      expect(reloads).toEqual(["Page.reload"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("times out when the tab only sends unauthenticated requests and never persists them", async () => {
+    vi.useFakeTimers();
+    try {
+      tabStore.set(78, { id: 78, windowId: 1, groupId: -1, active: true, url: `${ORIGIN}/session` });
+      const reloads = emitOnReload(78, { Accept: "application/json" });
+      const revisions = new RevisionTracker();
+      const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+      const revision = await revisions.ensure(78);
+
+      const failure: unknown = runtime.readSessionSecret(TASK_A, 78, request(78, revision))
+        .catch((error: unknown) => error);
+      await advance(0);
+      await advance(1_100);
+      await advance(5_000);
+
+      expect(await failure).toMatchObject({ code: "session_capture_not_observed" });
+      expect(reloads).toEqual(["Page.reload"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("refuses a tab on another origin before reloading it", async () => {
+    tabStore.set(79, { id: 79, windowId: 1, groupId: -1, active: true, url: "https://elsewhere.example/session" });
+    const reloads = emitOnReload(79, { Authorization: TOKEN });
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const revision = await revisions.ensure(79);
+
+    await expect(runtime.readSessionSecret(TASK_A, 79, request(79, revision)))
+      .rejects.toMatchObject({ code: "session_capture_page_mismatch" });
+    expect(reloads).toEqual([]);
+  });
+});
