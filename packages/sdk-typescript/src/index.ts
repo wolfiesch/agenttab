@@ -39,6 +39,9 @@ export const EMAIL_CODE_RECIPIENT_MAX_CHARS = 320;
 // One printable-ASCII addr-spec without whitespace, controls, or `@<>,;` inside either part.
 export const EMAIL_CODE_RECIPIENT_PATTERN = "^[!-+\\--:=?A-~]{1,64}@[!-+\\--:=?A-~]{1,255}$";
 export const EMAIL_CODE_MAX_REFS = 12;
+// browser_credentials capture destination name; mirrors the same schema.
+export const SECRET_NAME_PATTERN = "^[A-Z][A-Z0-9_]*$";
+export const SECRET_NAME_MAX_CHARS = 128;
 
 export const STANDARD_PRESS_KEYS = [
   "ArrowUp",
@@ -238,6 +241,14 @@ export type BrowserCredentialsParams =
     recipient: string;
     purpose: BrowserEmailCodePurpose;
     otp_refs: string[];
+  }
+  | {
+    action: "capture";
+    tab_id: number;
+    expected_page_revision: number;
+    source_ref: string;
+    secret_name: string;
+    overwrite?: boolean;
   };
 
 export type BrowserEmailCodePurpose = (typeof EMAIL_CODE_PURPOSES)[number];

@@ -9,6 +9,8 @@ import {
   EMAIL_CODE_RECIPIENT_PATTERN,
   SCREENSHOT_MAX_BYTES,
   SCREENSHOT_MAX_DIMENSION,
+  SECRET_NAME_MAX_CHARS,
+  SECRET_NAME_PATTERN,
   SNAPSHOT_TEXT_MAX_BYTES,
   STANDARD_ACTION_VALUE_MAX_CHARS,
   STANDARD_PRESS_KEYS,
@@ -146,6 +148,14 @@ const schemas: Record<ToolMethod, unknown> = {
       }),
       purpose: stringEnum(EMAIL_CODE_PURPOSES),
       otp_refs: Type.Array(ref(), { minItems: 1, maxItems: EMAIL_CODE_MAX_REFS, uniqueItems: true }),
+    }),
+    object({
+      action: Type.Literal("capture"),
+      tab_id: Type.Integer({ minimum: 0 }),
+      expected_page_revision: Type.Integer({ minimum: 0 }),
+      source_ref: ref(),
+      secret_name: Type.String({ minLength: 1, maxLength: SECRET_NAME_MAX_CHARS, pattern: SECRET_NAME_PATTERN }),
+      overwrite: Type.Optional(Type.Boolean()),
     }),
   ]),
   browser_profile: Type.Union([

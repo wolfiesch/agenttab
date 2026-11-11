@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod native;
 pub mod paths;
 pub mod runtime;
+pub mod secret_capture;
 pub mod server;
 pub mod task;
 

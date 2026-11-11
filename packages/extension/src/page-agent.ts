@@ -17,6 +17,7 @@ import {
 import { sensitiveFieldState } from "./sensitive-field";
 import { accessibilityMatcher, type AccessibilityQuery } from "./accessibility-query";
 import { fillEmailCodeInPage } from "./email-code-page";
+import { readSecretSource } from "./secret-read";
 
 // Work bound so a snapshot of a pathological document stays responsive.
 const SNAPSHOT_INSPECT_LIMIT = 25_000;
@@ -483,6 +484,10 @@ async function run(registry: Registry, request: PageAgentRequest): Promise<unkno
         elements.push(element);
       }
       return fillEmailCodeInPage(elements, request.values, request.expectation, sensitiveFieldState);
+    }
+    case "read_secret": {
+      const element = lookup(registry, request.id);
+      return isAgentError(element) ? element : readSecretSource.call(element);
     }
     case "surface": {
       const element = lookup(registry, request.id);

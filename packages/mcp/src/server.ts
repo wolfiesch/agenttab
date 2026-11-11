@@ -190,7 +190,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_credentials",
-    description: "Prefer this before human handoff. 1Password: prepare, then fill or next with an origin-matching Login without exposing values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use browser_act for explicit submission; you may complete verification on entering the final character.",
+    description: "Prefer this before human handoff. 1Password: prepare, then fill or next with an origin-matching Login without exposing values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use browser_act for explicit submission; you may complete verification on entering the final character. Capture: when a page shows a new API key or token, use capture with the ref of the element showing it and a secret_name to store it in the owner's secret store instead of clicking Copy; the result returns its length and sha256_prefix, never the value.",
     inputSchema: schema(credentialsSchema),
   },
   {

@@ -59,6 +59,14 @@ Trusted forwarding requires an exact `relay_senders` address and an allowed orig
 
 [^email-mask]: A compatible mask is not proof of an exact recipient on its own. Acceptance also requires the exact managed grant and a fresh authenticated message for that recipient; it does not override password, MFA, passkey, or human-challenge safeguards.
 
+## Secret capture
+
+Secret capture is disabled by default. When the owner enables `secret_capture` in the managed local policy, `browser_credentials` with `action: "capture"` reads the API key or token that one element on an owned HTTPS (or loopback HTTP) tab displays and passes it on standard input to the owner-configured sink program, such as a keychain or secret-manager CLI. The value never enters the agent's context, the RPC result, logs, or the audit store. The result carries only the secret name, origin, character count, a 12-hex-digit SHA-256 prefix for later comparison, and the page revision.
+
+The extension refuses cross-origin frames, editable password inputs, and fields marked with a password `autocomplete` token, so capture cannot lift the account's own password. The tab must stay on the same origin and page revision through the read. The host accepts only 16 to 4096 printable ASCII characters without spaces and refuses any other value before running the sink. The sink receives the name only through the single `{name}` argument the policy declares; it is never run through a shell. Replacing an existing name requires `overwrite: true` and a configured `overwrite_arguments` list, and a sink exit status of 3 reports that the name already exists.
+
+Capture runs without a popup review. Each capture is recorded in the local audit store with its secret name, origin, and overwrite flag, so the owner can review it after the fact.
+
 ## Permissions
 
 The manifest declares `nativeMessaging`, `debugger`, `tabs`, `tabGroups`, `storage`, `alarms`, `bookmarks`, `history`, `sessions`, `downloads`, `webNavigation`, `idle`, and `notifications`, with `<all_urls>` host access. Chrome does not permit `debugger` in `optional_permissions`, so it is a required install-time permission. `scripting` remains optional: the popup requests it when automation is enabled and removes it when automation is turned off. `cookies`, `contentSettings`, and `activeTab` are not requested.

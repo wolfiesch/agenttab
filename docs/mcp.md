@@ -164,6 +164,15 @@ mask repeated consistently on the page, provided no conflicting full address
 that could match the mask is shown. It fills directly without popup review.
 Missing or incompatible recipient evidence fails before any write.
 
+When a page displays a newly created API key or token, use
+`action: "capture"` with `tab_id`, `expected_page_revision`, `source_ref` for
+the element that shows it, `secret_name` (uppercase letters, digits, and `_`,
+starting with a letter), and optional `overwrite`. The host stores the value
+through the owner's configured sink and returns `status: "stored"` with the
+name, origin, `characters`, `sha256_prefix`, `overwrite`, and `page_revision`,
+never the value. Capture is disabled by default; see
+[setup](setup.md#secret-capture).
+
 Call `browser_handoff` with `operation: "request"` when credential preparation returns `needs_user`, the bounded candidates fail, or the site requires a passkey, security key, CAPTCHA, payment secret, account recovery, or unsupported verification. The request records an advisory notice for that exact task tab and returns its `notice_id`; it does not pause the scheduler, focus or activate the tab, open the popup, or block any browser operation for any task. Chrome shows a system notification with the prompt, and the popup lists the notice with an optional Open tab and Dismiss control for the user. Clicking the notification focuses the noticed tab, like Open tab. When the notice stops being open, AgentTab removes its notification. A user who cannot find the tab can click the notification; an agent cannot focus the tab itself.
 
 The agent then tells the user in its own chat what to finish, waits for the user to report back, and verifies the page itself with a fresh snapshot or wait. When the step looks done, it calls `resolve` with the `notice_id`; when a provided completion condition has not been met, `resolve` fails with `completion_not_met` and the notice stays open. `dismiss` drops the reminder without claiming success, and `status` re-reads one notice. Terminal operations are idempotent and scoped server-side to the authenticated task. Expiry only retires the reminder; it never cancels work or fabricates success.

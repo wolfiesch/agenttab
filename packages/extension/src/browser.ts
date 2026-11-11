@@ -18,6 +18,7 @@ import {
   SNAPSHOT_TEXT_MAX_BYTES,
   randomToken,
   type EmailCodeFillRequest,
+  type SecretReadRequest,
   sha256Hex,
   type StagedCommit,
   type StagedDialog,
@@ -64,6 +65,7 @@ import {
   sanitizeEmailCodeFailure,
 } from "./email-code-fill";
 import type { EmailCodePageExpectation } from "./email-code-page";
+import { readSecretSource } from "./secret-read";
 import {
   PAGE_AGENT_FILE,
   PAGE_AGENT_GLOBAL,
@@ -2082,6 +2084,48 @@ export class StandardBrowserRuntime {
       const staleBeforeWrite = isRecord(error) && error.code === "stale_ref";
       throw sanitizeEmailCodeFailure(error, writeAttempted && !staleBeforeWrite ? "unknown" : "not_started");
     }
+  }
+
+  /**
+   * Reads the secret one element displays, for the host's secret store. The
+   * tab must still be on the origin the host verified, at the expected
+   * revision. The value goes only to the host; refusals carry fixed codes.
+   */
+  async readSecret(taskId: string, tabId: number, request: SecretReadRequest): Promise<Record<string, unknown>> {
+    await this.authorizeDebuggerUse(tabId);
+    const pageRevision = await this.revisions.assertExpected(tabId, request.expected_page_revision);
+    await this.requireFullAutomationRoute(tabId, "capture secrets");
+    const assertOrigin = async (): Promise<void> => {
+      const tab = await chrome.tabs.get(tabId);
+      let origin: string | undefined;
+      try {
+        origin = new URL(tab.pendingUrl ?? tab.url ?? "").origin;
+      } catch {
+        origin = undefined;
+      }
+      if (origin !== request.expected_origin) {
+        throw Object.assign(new Error("The tab is no longer on the verified origin"), {
+          code: "secret_capture_page_mismatch",
+        });
+      }
+    };
+    await assertOrigin();
+    const target = await this.resolveTarget(tabId, { taskId, pageRevision, ref: request.ref });
+    const read = target.route === "scripting"
+      ? (await this.runPageAgent(tabId, { op: "read_secret", id: target.backendNodeId }, target.documentId)).value
+      : await this.callOnNode(tabId, target.backendNodeId, readSecretSource.toString(), [], false, target);
+    if (isRecord(read) && typeof read.agenttab_secret_error === "string") {
+      throw Object.assign(new Error("The element cannot be captured"), { code: read.agenttab_secret_error });
+    }
+    if (!isRecord(read) || typeof read.value !== "string") {
+      throw Object.assign(new Error("The element returned no readable value"), {
+        code: "secret_capture_source_invalid",
+      });
+    }
+    // A navigation during the read would attribute the value to another page.
+    await assertOrigin();
+    await this.revisions.assertExpected(tabId, pageRevision);
+    return { value: read.value, page_revision: pageRevision };
   }
 
   /** The tab, including any navigation in flight, is on the exact approved origin and pathname. */

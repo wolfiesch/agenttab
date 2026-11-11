@@ -41,6 +41,7 @@ const MAX_EMAIL_LOCAL_PART_CHARS: usize = 64;
 const MAX_EMAIL_DOMAIN_CHARS: usize = 255;
 const MAX_EMAIL_CODE_REFS: usize = 12;
 const EMAIL_CODE_PURPOSES: [&str; 2] = ["signup", "email_sign_in"];
+const MAX_SECRET_NAME_CHARS: usize = 128;
 
 pub const RPC_SCHEMA_ASSETS: &[(&str, &str)] = &[
     (
@@ -894,6 +895,17 @@ pub enum BrowserCredentialsParams {
         purpose: String,
         otp_refs: Vec<String>,
     },
+    /// Copies one secret the page displays into the owner's configured secret
+    /// store. The value crosses only the private extension-to-host channel; the
+    /// request names the destination, never the value.
+    Capture {
+        tab_id: u64,
+        expected_page_revision: u64,
+        source_ref: String,
+        secret_name: String,
+        #[serde(default)]
+        overwrite: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1452,6 +1464,20 @@ impl MethodParams {
                     )?;
                 }
             }
+            Self::Credentials(BrowserCredentialsParams::Capture {
+                source_ref,
+                secret_name,
+                ..
+            }) => {
+                require_len(method, source_ref, 1, MAX_REF_CHARS, "source_ref")?;
+                require(
+                    method,
+                    is_secret_name(secret_name),
+                    format!(
+                        "secret_name must be 1 to {MAX_SECRET_NAME_CHARS} characters: an uppercase letter, then uppercase letters, digits, or underscores"
+                    ),
+                )?;
+            }
             Self::Profile(params) => params.validate(method)?,
             Self::Commit(params) => require_len(
                 method,
@@ -1782,6 +1808,15 @@ fn is_challenge_id(value: &str) -> bool {
 fn is_email_message_id(value: &str) -> bool {
     (1..=MAX_EMAIL_MESSAGE_ID_CHARS).contains(&value.len())
         && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// An environment-variable style name. Mirrors the public `secret_name` pattern.
+fn is_secret_name(value: &str) -> bool {
+    (1..=MAX_SECRET_NAME_CHARS).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_uppercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 /// One addr-spec of printable ASCII without whitespace, control characters,
@@ -3606,6 +3641,83 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!({"$ref": "#/$defs/email_code"})));
+    }
+
+    #[test]
+    fn credential_capture_carries_a_destination_name_and_never_a_value() {
+        let params = json!({
+            "action": "capture",
+            "tab_id": 4,
+            "expected_page_revision": 9,
+            "source_ref": "e12",
+            "secret_name": "VESPPER_API_KEY",
+        });
+        let (_, parsed) =
+            RpcRequest::parse(request("browser_credentials", params.clone(), true)).unwrap();
+        assert!(matches!(
+            &parsed,
+            MethodParams::Credentials(BrowserCredentialsParams::Capture {
+                tab_id: 4,
+                expected_page_revision: 9,
+                source_ref,
+                secret_name,
+                overwrite: false,
+            }) if source_ref == "e12" && secret_name == "VESPPER_API_KEY"
+        ));
+        for name in [
+            "",
+            "lower",
+            "1KEY",
+            "_KEY",
+            "KEY-NAME",
+            "KEY NAME",
+            &"K".repeat(129),
+        ] {
+            let mut invalid = params.clone();
+            invalid["secret_name"] = json!(name);
+            assert!(
+                RpcRequest::parse(request("browser_credentials", invalid, true)).is_err(),
+                "capture accepted secret_name {name:?}"
+            );
+        }
+        for (field, value) in [
+            ("value", json!("sk-live-secret")),
+            ("credential_token", json!("t".repeat(32))),
+        ] {
+            let mut extra = params.clone();
+            extra[field] = value;
+            assert!(
+                RpcRequest::parse(request("browser_credentials", extra, true)).is_err(),
+                "capture accepted extra field {field}"
+            );
+        }
+        let mut empty_ref = params;
+        empty_ref["source_ref"] = json!("");
+        assert!(RpcRequest::parse(request("browser_credentials", empty_ref, true)).is_err());
+    }
+
+    #[test]
+    fn credential_capture_schema_branch_matches_runtime_bounds() {
+        let schema: Value = serde_json::from_str(
+            RPC_SCHEMA_ASSETS
+                .iter()
+                .find_map(|(name, schema)| (*name == "browser_credentials").then_some(*schema))
+                .unwrap(),
+        )
+        .unwrap();
+        let branch = schema.pointer("/$defs/secret_capture").unwrap();
+        assert_eq!(branch["additionalProperties"], json!(false));
+        let properties = branch["properties"].as_object().unwrap();
+        assert_eq!(properties["action"], json!({"const": "capture"}));
+        assert_eq!(
+            properties["secret_name"]["maxLength"],
+            json!(MAX_SECRET_NAME_CHARS)
+        );
+        assert!(is_secret_name("A") && is_secret_name(&"A".repeat(MAX_SECRET_NAME_CHARS)));
+        assert!(schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"$ref": "#/$defs/secret_capture"})));
     }
 
     #[test]
