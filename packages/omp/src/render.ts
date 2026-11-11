@@ -269,6 +269,9 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
     }
     case "browser_credentials": {
       const action = fieldString(args, "action") ?? "prepare";
+      if (action === "capture") {
+        return { title: "Capture secret to store", meta: fieldString(args, "secret_name") ?? "value stays hidden" };
+      }
       if (action === "fill_email") {
         return { title: "Fill email verification code", meta: "code stays hidden" };
       }
@@ -526,6 +529,7 @@ function summarizeResult(
         const count = fieldNumber(result, "candidate_count") ?? 0;
         return `${count} matching login${count === 1 ? "" : "s"} ready`;
       }
+      if (credentialStatus === "stored") return "Secret stored";
       if (credentialStatus === "filled") return result.filled_email_code === true ? "Email code filled" : "Credentials filled";
       return credentialStatus ? humanize(credentialStatus) : "Credential action completed";
     }

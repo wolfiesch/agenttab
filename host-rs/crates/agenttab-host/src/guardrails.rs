@@ -1,4 +1,5 @@
 use crate::email_codes::EmailCodePolicy;
+use crate::secret_capture::SecretCapturePolicy;
 use agenttab_protocol::{
     BrowserAction, BrowserCredentialsParams, BrowserOpenParams, BrowserProfileParams, MethodParams,
     NativeOriginPolicy, RpcError, RpcMethod,
@@ -40,6 +41,8 @@ pub enum GuardrailLoadError {
     InvalidOnePasswordPolicy(String),
     #[error("invalid email code policy: {0}")]
     InvalidEmailCodePolicy(String),
+    #[error("invalid secret capture policy: {0}")]
+    InvalidSecretCapturePolicy(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,6 +80,7 @@ struct Policy {
     redact_patterns: Vec<String>,
     one_password: OnePasswordPolicy,
     email_codes: EmailCodePolicy,
+    secret_capture: SecretCapturePolicy,
 }
 
 impl Default for Policy {
@@ -90,6 +94,7 @@ impl Default for Policy {
             dlp_max_file_bytes: DEFAULT_DLP_MAX_FILE_BYTES,
             one_password: OnePasswordPolicy::default(),
             email_codes: EmailCodePolicy::default(),
+            secret_capture: SecretCapturePolicy::default(),
             redact_patterns: Vec::new(),
         }
     }
@@ -159,6 +164,10 @@ impl Guardrails {
             .email_codes
             .validate()
             .map_err(GuardrailLoadError::InvalidEmailCodePolicy)?;
+        policy
+            .secret_capture
+            .validate()
+            .map_err(GuardrailLoadError::InvalidSecretCapturePolicy)?;
         let mut patterns = vec![
             r"(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}\b".to_string(),
             r"\b\d{3}-\d{2}-\d{4}\b".to_string(),
@@ -192,6 +201,10 @@ impl Guardrails {
         &self.policy.email_codes
     }
 
+    pub fn secret_capture_policy(&self) -> &SecretCapturePolicy {
+        &self.policy.secret_capture
+    }
+
     pub fn authorize(&self, method: RpcMethod, params: &MethodParams) -> Result<(), RpcError> {
         if method == RpcMethod::BrowserDeveloper && !self.policy.developer_enabled {
             return Err(RpcError::new(
@@ -212,6 +225,19 @@ impl Guardrails {
                     )
                     .with_recovery(
                         "Enable email_codes with an exact grant in AgentTab's managed local policy.",
+                    ));
+                }
+            } else if matches!(
+                params,
+                MethodParams::Credentials(BrowserCredentialsParams::Capture { .. })
+            ) {
+                if !self.policy.secret_capture.enabled {
+                    return Err(RpcError::new(
+                        "secret_capture_disabled",
+                        "Secret capture is disabled by AgentTab policy",
+                    )
+                    .with_recovery(
+                        "Enable secret_capture with an absolute sink executable in AgentTab's managed local policy.",
                     ));
                 }
             } else if !self.policy.one_password.enabled {
@@ -836,6 +862,55 @@ mod tests {
                 .code,
             "credential_provider_disabled"
         );
+    }
+
+    #[test]
+    fn secret_capture_is_gated_separately_and_requires_a_valid_sink() {
+        let (prepare, _) = credentials_requests();
+        let capture = MethodParams::Credentials(BrowserCredentialsParams::Capture {
+            tab_id: 4,
+            expected_page_revision: 9,
+            source_ref: "e3".into(),
+            secret_name: "SERVICE_API_KEY".into(),
+            overwrite: false,
+        });
+        assert_eq!(
+            Guardrails::defaults()
+                .authorize(RpcMethod::BrowserCredentials, &capture)
+                .unwrap_err()
+                .code,
+            "secret_capture_disabled"
+        );
+        // Absolute on every platform; the sink is never run here.
+        let sink = std::env::temp_dir().join("store-secret");
+        let capture_only: Policy = serde_json::from_value(json!({
+            "one_password": { "enabled": false },
+            "secret_capture": {
+                "enabled": true,
+                "executable": sink,
+                "arguments": ["--no-overwrite", "{name}"]
+            }
+        }))
+        .unwrap();
+        let capture_only = Guardrails::from_policy(capture_only).unwrap();
+        assert!(capture_only
+            .authorize(RpcMethod::BrowserCredentials, &capture)
+            .is_ok());
+        assert_eq!(
+            capture_only
+                .authorize(RpcMethod::BrowserCredentials, &prepare)
+                .unwrap_err()
+                .code,
+            "credential_provider_disabled"
+        );
+        let unnamed: Policy = serde_json::from_value(json!({
+            "secret_capture": { "enabled": true, "executable": sink }
+        }))
+        .unwrap();
+        assert!(matches!(
+            Guardrails::from_policy(unnamed),
+            Err(GuardrailLoadError::InvalidSecretCapturePolicy(_))
+        ));
     }
 
     #[test]

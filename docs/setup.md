@@ -234,6 +234,39 @@ ambiguous messages fail closed. Existing password, MFA, and human-verification
 handoff requirements remain unchanged. Load matching host and extension
 builds and start a fresh adapter session when adding this action.
 
+## Secret capture
+
+Secret capture is opt-in. It stores an API key or token that a page displays
+once, for example right after you create it, in your own secret store without
+the value passing through the agent. Add `secret_capture` to the owner-only
+policy, preserving any other settings:
+
+```json
+{
+  "secret_capture": {
+    "enabled": true,
+    "executable": "/absolute/path/to/secret-cli",
+    "arguments": ["add", "--from-stdin", "--no-overwrite", "{name}"],
+    "overwrite_arguments": ["add", "--from-stdin", "{name}"],
+    "timeout_ms": 60000
+  }
+}
+```
+
+The sink reads the value from standard input, stores it under the name, and
+exits 0. It should exit 3 when the name already exists and overwriting was not
+requested. Each argument list needs exactly one `{name}` item; omit
+`overwrite_arguments` to refuse every overwrite. `timeout_ms` must be 1000
+through 85000. Chrome starts the native host with a minimal `PATH`, so the
+sink must resolve any tools it calls on its own. Reload the extension to
+restart the native host after a policy change.
+
+Call `browser_credentials` with `action: "capture"`, the owned `tab_id`,
+current `expected_page_revision`, the `source_ref` of the element that shows
+the value, and an uppercase `secret_name` such as `SERVICE_API_KEY`. Add
+`overwrite: true` only to replace an existing secret. The result has
+`status: "stored"`, the name, origin, `characters`, and `sha256_prefix`.
+
 ## Migration from Chrome Bridge v1.0.1
 
 AgentTab v2 is side-by-side and recoverable:

@@ -20,6 +20,7 @@ export type NativeMethod =
   | "agenttab.close"
   | "browser_credentials_fill"
   | "browser_email_code_fill"
+  | "browser_secret_read"
   | "commit_review_bind"
   | "commit_review_abandon";
 
@@ -36,6 +37,7 @@ const CORE_METHODS: Record<NativeMethod, true> = {
   "agenttab.close": true,
   browser_credentials_fill: true,
   browser_email_code_fill: true,
+  browser_secret_read: true,
   commit_review_bind: true,
   commit_review_abandon: true,
 };
@@ -609,6 +611,29 @@ function assertCommitReviewParams(
   return params;
 }
 
+export type SecretReadRequest = {
+  tab_id: number;
+  expected_page_revision: number;
+  expected_origin: string;
+  ref: string;
+};
+
+/** Validates the internal secret read the host issues for browser_credentials capture. */
+export function parseSecretReadParams(value: unknown): SecretReadRequest {
+  const params = assertExactObject(
+    value,
+    ["tab_id", "expected_page_revision", "expected_origin", "ref"],
+    [],
+    "browser_secret_read parameters",
+  );
+  return {
+    tab_id: assertTabId(params.tab_id),
+    expected_page_revision: assertRevision(params.expected_page_revision),
+    expected_origin: assertBoundedString(params.expected_origin, "expected_origin", 1, 2048),
+    ref: assertBoundedString(params.ref, "ref", 1, 256),
+  };
+}
+
 function assertCredentialFillParams(value: unknown): Record<string, unknown> {
   const params = assertExactObject(
     value,
@@ -897,6 +922,8 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
       return assertCredentialFillParams(value);
     case "browser_email_code_fill":
       return parseEmailCodeFillParams(value);
+    case "browser_secret_read":
+      return parseSecretReadParams(value);
     case "commit_review_bind":
     case "commit_review_abandon":
       return assertCommitReviewParams(value, method);

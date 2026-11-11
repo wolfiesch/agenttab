@@ -11,6 +11,7 @@ use crate::journal::{
 use crate::lifecycle::Lifecycle;
 use crate::native::{NativeError, NativeEventResult, NativeEventSink, NativeTransport};
 use crate::paths::AgentTabPaths;
+use crate::secret_capture;
 use crate::task::ConnectionContext;
 use agenttab_protocol::{
     AgenttabFinishParams, BrowserAction, BrowserCommitParams, BrowserCredentialsParams,
@@ -34,6 +35,7 @@ const RESPONSE_TASK_BINDING_RESERVE: usize = 512;
 const CLOSE_TASK_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TAB_STAGED_EFFECT: &str = "Close an AgentTab-owned browser tab";
 const EMAIL_CODE_NATIVE_TIMEOUT: Duration = Duration::from_secs(30);
+const SECRET_CAPTURE_NATIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum RuntimeBuildError {
@@ -1418,6 +1420,11 @@ impl Runtime {
                 tab_id,
                 expected_page_revision,
             }
+            | BrowserCredentialsParams::Capture {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
             | BrowserCredentialsParams::FillEmail {
                 tab_id,
                 expected_page_revision,
@@ -1434,8 +1441,14 @@ impl Runtime {
                 ..
             } => (*tab_id, *expected_page_revision),
         };
-        if matches!(params, BrowserCredentialsParams::FillEmail { .. }) {
-            return self.dispatch_email_code(connection_id, task_id, request_id, params);
+        match params {
+            BrowserCredentialsParams::FillEmail { .. } => {
+                return self.dispatch_email_code(connection_id, task_id, request_id, params);
+            }
+            BrowserCredentialsParams::Capture { .. } => {
+                return self.dispatch_secret_capture(connection_id, task_id, request_id, params);
+            }
+            _ => {}
         }
         let host = match self.credential_host(tab_id) {
             Ok(host) => host,
@@ -1482,7 +1495,8 @@ impl Runtime {
                 ..
             } => (credential_token, username_ref, password_ref, otp_ref, true),
             BrowserCredentialsParams::Prepare { .. }
-            | BrowserCredentialsParams::FillEmail { .. } => unreachable!(),
+            | BrowserCredentialsParams::FillEmail { .. }
+            | BrowserCredentialsParams::Capture { .. } => unreachable!(),
         };
         let selection = match self.credentials.select(
             credential_token,
@@ -1687,6 +1701,126 @@ impl Runtime {
         }
     }
 
+    /// Reads one displayed secret over the private extension channel and hands
+    /// it to the configured sink. Only the name, origin, length, and a digest
+    /// prefix leave this function.
+    fn dispatch_secret_capture(
+        &self,
+        connection_id: Uuid,
+        task_id: Uuid,
+        request_id: &str,
+        params: &BrowserCredentialsParams,
+    ) -> RpcResponse {
+        let BrowserCredentialsParams::Capture {
+            tab_id,
+            expected_page_revision,
+            source_ref,
+            secret_name,
+            overwrite,
+        } = params
+        else {
+            unreachable!()
+        };
+        let origin = match self.credential_url(*tab_id) {
+            Ok(url) => url.origin().ascii_serialization(),
+            Err(error) => return RpcResponse::failure(request_id, Outcome::NotStarted, error),
+        };
+        let native = match self.native.dispatch(
+            connection_id,
+            task_id,
+            "browser_secret_read",
+            json!({
+                "tab_id": tab_id,
+                "expected_page_revision": expected_page_revision,
+                "expected_origin": origin,
+                "ref": source_ref,
+            }),
+            self.guardrails.native_origin_policy(*tab_id),
+            SECRET_CAPTURE_NATIVE_TIMEOUT,
+        ) {
+            Ok(native) => native,
+            Err(error) => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::NotStarted,
+                    secret_read_error(native_error_code(&error)),
+                );
+            }
+        };
+        // Reading never changes the page, so every read failure is not_started.
+        let (value, page_revision) = match (native.outcome, native.result, native.error) {
+            (Outcome::Completed, Some(result), None) => match (
+                result.get("value").and_then(Value::as_str),
+                result.get("page_revision").and_then(Value::as_u64),
+            ) {
+                (Some(value), Some(page_revision)) => (value.to_owned(), page_revision),
+                _ => {
+                    return RpcResponse::failure(
+                        request_id,
+                        Outcome::NotStarted,
+                        secret_read_error("secret_capture_read_failed"),
+                    );
+                }
+            },
+            (_, _, Some(error)) => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::NotStarted,
+                    secret_read_error(&error.code),
+                );
+            }
+            _ => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::NotStarted,
+                    secret_read_error("secret_capture_read_failed"),
+                );
+            }
+        };
+        if !secret_capture::is_capturable(&value) {
+            return RpcResponse::failure(
+                request_id,
+                Outcome::NotStarted,
+                RpcError::new(
+                    "secret_capture_value_invalid",
+                    format!(
+                        "The element must show one token of {} to {} printable ASCII characters without spaces",
+                        secret_capture::MIN_SECRET_CHARS,
+                        secret_capture::MAX_SECRET_CHARS
+                    ),
+                )
+                .with_recovery(
+                    "Pass the ref of the element that shows only the secret, such as its code block or read-only input.",
+                ),
+            );
+        }
+        if let Err(error) = secret_capture::store(
+            self.guardrails.secret_capture_policy(),
+            secret_name,
+            &value,
+            *overwrite,
+        ) {
+            return RpcResponse::failure(
+                request_id,
+                error.outcome(),
+                RpcError::new(error.code(), error.message()).with_recovery(error.recovery()),
+            );
+        }
+        RpcResponse::success(
+            request_id,
+            Outcome::Completed,
+            json!({
+                "status": "stored",
+                "secret_name": secret_name,
+                "origin": origin,
+                "characters": value.len(),
+                "sha256_prefix": secret_capture::fingerprint(&value),
+                "overwrite": overwrite,
+                "page_revision": page_revision,
+            }),
+        )
+    }
+
     fn credential_host(&self, tab_id: u64) -> Result<String, RpcError> {
         let url = self.credential_url(tab_id)?;
         Ok(url
@@ -1816,6 +1950,11 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
                 ..
             }
             | BrowserCredentialsParams::Next {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
+            | BrowserCredentialsParams::Capture {
                 tab_id,
                 expected_page_revision,
                 ..
@@ -2015,6 +2154,43 @@ fn email_code_fill_response(
             email_code_input_error("email_code_fill_failed"),
         ),
     }
+}
+
+/// Read failures keep only an allowlisted code and fixed text.
+fn secret_read_error(code: &str) -> RpcError {
+    let code = match code {
+        "invalid_request"
+        | "stale_revision"
+        | "stale_ref"
+        | "secret_capture_page_mismatch"
+        | "secret_capture_source_invalid"
+        | "secret_capture_source_forbidden"
+        | "cross_origin_credentials_forbidden"
+        | "browser_restricted_origin"
+        | "frame_unavailable"
+        | "frame_not_found"
+        | "debugger_detached"
+        | "extension_disconnected"
+        | "extension_timeout"
+        | "ownership_denied"
+        | "ownership_revoked"
+        | "permissions_required"
+        | "paused"
+        | "origin_denied"
+        | "native_protocol_error"
+        | "native_transport_error" => code,
+        _ => "secret_capture_read_failed",
+    };
+    let recovery = match code {
+        "secret_capture_source_invalid" => {
+            "Pass the ref of the element that shows only the secret, such as its code block or read-only input."
+        }
+        "secret_capture_source_forbidden" => {
+            "Account password fields cannot be captured; capture the displayed key instead."
+        }
+        _ => "Take a fresh snapshot of this tab and retry with the current revision and ref.",
+    };
+    RpcError::new(code, "AgentTab could not read the secret from the page").with_recovery(recovery)
 }
 
 // Only codes cross this boundary. Native messages, recovery text, and details may echo the code.
@@ -5079,5 +5255,221 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64
+    }
+
+    /// Capture tests run a shell-script secret store.
+    #[cfg(unix)]
+    mod secret_capture_tests {
+        use super::*;
+
+        const CAPTURED: &str = "tok-live-capture-0123456789abcdef";
+
+        /// The extension's private read channel with one scripted reply: a read
+        /// result, or a refusal whose message echoes the secret.
+        struct SecretReadNative {
+            calls: Mutex<Vec<(String, Value)>>,
+            reply: Result<Value, &'static str>,
+        }
+
+        impl NativeTransport for SecretReadNative {
+            fn dispatch(
+                &self,
+                _connection_id: Uuid,
+                _task_id: Uuid,
+                method: &str,
+                params: Value,
+                _origin_policy: Option<NativeOriginPolicy>,
+                _timeout: Duration,
+            ) -> Result<NativeResponse, NativeError> {
+                self.calls.lock().push((method.to_owned(), params));
+                let (outcome, result, error) = match &self.reply {
+                    Ok(result) => (Outcome::Completed, Some(result.clone()), None),
+                    Err(code) => (
+                        Outcome::NotStarted,
+                        None,
+                        Some(RpcError::new(*code, format!("page showed {CAPTURED}"))),
+                    ),
+                };
+                Ok(NativeResponse {
+                    protocol: agenttab_protocol::NATIVE_PROTOCOL.into(),
+                    version: PROTOCOL_VERSION,
+                    kind: NativeResponseKind::Response,
+                    request_id: Uuid::new_v4(),
+                    outcome,
+                    result,
+                    error,
+                    staged: None,
+                })
+            }
+        }
+
+        /// A runtime whose secret store is a script writing each value to
+        /// `<store>/<name>`, refusing existing names unless run with `--force`.
+        fn secret_capture_runtime(
+            reply: Result<Value, &'static str>,
+        ) -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            Arc<Runtime>,
+            Arc<ConnectionContext>,
+            Arc<SecretReadNative>,
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+            let store = tempfile::tempdir().unwrap();
+            let sink = store.path().join("sink.sh");
+            std::fs::write(
+            &sink,
+            format!(
+                "#!/bin/sh\ntarget='{}'/\"$2\"\nif [ -e \"$target\" ] && [ \"$1\" != --force ]; then exit 3; fi\ncat > \"$target\"\n",
+                store.path().display()
+            ),
+        )
+        .unwrap();
+            std::fs::set_permissions(&sink, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AgentTabPaths::from_root(temp.path().join("agenttab"));
+            paths.prepare().unwrap();
+            std::fs::write(
+                &paths.policy_file,
+                serde_json::to_vec(&json!({
+                    "secret_capture": {
+                        "enabled": true,
+                        "executable": sink,
+                        "arguments": ["--new", "{name}"],
+                        "overwrite_arguments": ["--force", "{name}"],
+                        "timeout_ms": 5_000,
+                    },
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let lifecycle = Arc::new(Lifecycle::default());
+            lifecycle.begin_reconciliation();
+            lifecycle.complete_reconciliation(false);
+            let native = Arc::new(SecretReadNative {
+                calls: Mutex::new(Vec::new()),
+                reply,
+            });
+            let runtime = Runtime::open(&paths, lifecycle, native.clone()).unwrap();
+            let (connection, _) = runtime
+                .connect(ConnectionInit {
+                    protocol: RPC_PROTOCOL.into(),
+                    version: PROTOCOL_VERSION,
+                    kind: ConnectKind::Connect,
+                    conversation_id: None,
+                    resume_capability: None,
+                })
+                .unwrap();
+            own_tab(&runtime, &connection, 7);
+            (temp, store, runtime, connection, native)
+        }
+
+        fn capture_request(request_id: &str, overwrite: bool) -> Value {
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": request_id,
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_credentials",
+                "params": {
+                    "action": "capture",
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "source_ref": "e4",
+                    "secret_name": "SERVICE_API_KEY",
+                    "overwrite": overwrite,
+                }
+            })
+        }
+
+        #[test]
+        fn secret_capture_stores_the_value_without_returning_or_persisting_it() {
+            let (temp, store, runtime, connection, native) =
+                secret_capture_runtime(Ok(json!({"value": CAPTURED, "page_revision": 7})));
+
+            let response = runtime.handle(&connection, capture_request("capture-new", false));
+            assert_eq!(response["outcome"], "completed", "{response}");
+            assert_eq!(
+                response["result"],
+                json!({
+                    "status": "stored",
+                    "secret_name": "SERVICE_API_KEY",
+                    "origin": "https://allowed.test",
+                    "characters": CAPTURED.len(),
+                    "sha256_prefix": secret_capture::fingerprint(CAPTURED),
+                    "overwrite": false,
+                    "page_revision": 7,
+                })
+            );
+            assert_eq!(
+                native.calls.lock()[0],
+                (
+                    "browser_secret_read".to_owned(),
+                    json!({
+                        "tab_id": 3,
+                        "expected_page_revision": 7,
+                        "expected_origin": "https://allowed.test",
+                        "ref": "e4",
+                    })
+                )
+            );
+            assert_eq!(
+                std::fs::read_to_string(store.path().join("SERVICE_API_KEY")).unwrap(),
+                CAPTURED
+            );
+
+            let existing = runtime.handle(&connection, capture_request("capture-again", false));
+            assert_eq!(existing["outcome"], "not_started");
+            assert_eq!(existing["error"]["code"], "secret_capture_name_exists");
+            let replaced = runtime.handle(&connection, capture_request("capture-replace", true));
+            assert_eq!(replaced["outcome"], "completed", "{replaced}");
+
+            let audit = std::fs::read_to_string(temp.path().join("agenttab/audit.jsonl")).unwrap();
+            let stored: Vec<Value> = audit
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter_map(|record| record.get("secret_capture").cloned())
+                .collect();
+            assert_eq!(
+                stored,
+                vec![
+                    json!({"secret_name": "SERVICE_API_KEY", "origin": "https://allowed.test", "overwrite": false}),
+                    json!({"secret_name": "SERVICE_API_KEY", "origin": "https://allowed.test", "overwrite": true}),
+                ]
+            );
+            assert!(!tree_contains(temp.path(), CAPTURED.as_bytes()));
+            for response in [response, existing, replaced] {
+                assert!(!response.to_string().contains(CAPTURED));
+            }
+        }
+
+        #[test]
+        fn secret_capture_refusals_keep_fixed_text_and_never_reach_the_sink() {
+            for (reply, expected) in [
+                (
+                    Err("secret_capture_source_forbidden"),
+                    "secret_capture_source_forbidden",
+                ),
+                (Err("stale_ref"), "stale_ref"),
+                (Err("page_specific_failure"), "secret_capture_read_failed"),
+                (
+                    Ok(json!({"value": "sk short", "page_revision": 7})),
+                    "secret_capture_value_invalid",
+                ),
+                (
+                    Ok(json!({"page_revision": 7})),
+                    "secret_capture_read_failed",
+                ),
+            ] {
+                let (temp, store, runtime, connection, _) = secret_capture_runtime(reply);
+                let response =
+                    runtime.handle(&connection, capture_request("capture-refused", false));
+                assert_eq!(response["outcome"], "not_started", "{response}");
+                assert_eq!(response["error"]["code"], expected);
+                assert!(!response.to_string().contains(CAPTURED));
+                assert!(!store.path().join("SERVICE_API_KEY").exists());
+                assert!(!tree_contains(temp.path(), CAPTURED.as_bytes()));
+            }
+        }
     }
 }

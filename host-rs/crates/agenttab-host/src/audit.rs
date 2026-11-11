@@ -87,6 +87,18 @@ impl AuditLog {
                 record["operation"] = Value::String(operation.to_string());
             }
         }
+        // A stored capture names its destination and source so the owner can
+        // review every capture after the fact; the value never reaches audit.
+        if let Some(result) = entry.result.filter(|result| {
+            entry.method == RpcMethod::BrowserCredentials
+                && result.get("status").and_then(Value::as_str) == Some("stored")
+        }) {
+            record["secret_capture"] = json!({
+                "secret_name": result.get("secret_name"),
+                "origin": result.get("origin"),
+                "overwrite": result.get("overwrite"),
+            });
+        }
         if let Some(challenge) = challenge_summary(&entry) {
             record["challenge"] = challenge;
         }

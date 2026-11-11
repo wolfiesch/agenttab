@@ -12,6 +12,7 @@ import {
   failed,
   needsUser,
   parseEmailCodeFillParams,
+  parseSecretReadParams,
   PROFILE_STAGE_TAB_ID,
   type NativeDispatchCommand,
   type NativeOriginPolicy,
@@ -593,6 +594,16 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
       } catch (error) {
         throw sanitizeEmailCodeFailure(error, invoked ? "unknown" : "not_started");
       }
+    }
+    if (command.method === "browser_secret_read") {
+      // The result carries the secret to the host only; the host keeps just the error code.
+      const request = parseSecretReadParams(params);
+      const result = await scheduler.enqueueTab(command.task_id, request.tab_id, async () => {
+        await ownership.assertOwned(command.task_id, request.tab_id);
+        await assertCurrentOrigin(request.tab_id, command.origin_policy);
+        return browser.readSecret(command.task_id, request.tab_id, request);
+      });
+      return completed(command.request_id, result);
     }
     const targetTabId = tabId(params);
     if (command.method === "browser_snapshot" || command.method === "browser_wait") {

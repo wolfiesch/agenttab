@@ -9,7 +9,7 @@ import type { EmailCodePageExpectation } from "./email-code-page";
  */
 
 /** Bump for request/response or security-boundary changes, so a stale agent reinstalls. */
-export const PAGE_AGENT_VERSION = 6;
+export const PAGE_AGENT_VERSION = 7;
 /** Bundled agent script, injected with `chrome.scripting.executeScript({ files })`. */
 export const PAGE_AGENT_FILE = "page-agent.js";
 
@@ -28,6 +28,7 @@ export type PageAgentRequest =
   | { op: "geometry"; selector?: string }
   | { op: "fill_credential"; id: number; value: string; kind: string }
   | { op: "email_code_fill"; ids: number[]; values: string[]; expectation: EmailCodePageExpectation }
+  | { op: "read_secret"; id: number }
   | { op: "surface"; id: number; selectors: string[] };
 
 export interface PageAgentError {

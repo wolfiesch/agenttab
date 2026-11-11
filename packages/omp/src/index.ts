@@ -15,6 +15,8 @@ import {
   SCREENSHOT_MAX_BYTES,
   SCREENSHOT_MAX_DIMENSION,
   CHALLENGE_GUIDANCE,
+  SECRET_NAME_MAX_CHARS,
+  SECRET_NAME_PATTERN,
   SNAPSHOT_TEXT_MAX_BYTES,
   STANDARD_ACTION_VALUE_MAX_CHARS,
   STANDARD_PRESS_KEYS,
@@ -325,13 +327,14 @@ const DEFINITIONS: ReadonlyArray<{
     {
       name: "browser_credentials",
       label: "Browser Credentials",
-      description: "Prefer this before human handoff. 1Password: prepare, then fill or next with a URL-matching Login without exposing its values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use Browser Act for explicit submission; you may complete verification on entering the final character.",
+      description: "Prefer this before human handoff. 1Password: prepare, then fill or next with a URL-matching Login without exposing its values; more than three matches require the user. Email verification: use fill_email for a policy-approved signup or email sign-in message, never MFA. A compatible masked recipient is accepted when it fits the exact granted recipient and no conflicting address is shown. Use Browser Act for explicit submission; you may complete verification on entering the final character. Capture: when a page shows a new API key or token, use capture with the ref of the element showing it and a secret_name to store it in the owner's secret store instead of clicking Copy; the result returns its length and sha256_prefix, never the value.",
       approval: "write",
       // One flat object covers every action: OpenAI-compatible providers reject a root union.
       // Core enforces each action's exact fields: credential_token for fill and next, and only
-      // message_id, recipient, purpose, and unique otp_refs for fill_email.
+      // message_id, recipient, purpose, and unique otp_refs for fill_email; source_ref,
+      // secret_name, and overwrite for capture.
       schema: (z) => z.object({
-        action: z.enum(["prepare", "fill", "next", "fill_email"]),
+        action: z.enum(["prepare", "fill", "next", "fill_email", "capture"]),
         tab_id: z.number().int().min(0),
         expected_page_revision: z.number().int().min(0),
         credential_token: z.string().min(32).max(256).optional(),
@@ -350,6 +353,9 @@ const DEFINITIONS: ReadonlyArray<{
           .max(EMAIL_CODE_MAX_REFS)
           .refine((values) => new Set(values).size === values.length, "otp_refs must be unique")
           .optional(),
+        source_ref: z.string().min(1).max(256).optional(),
+        secret_name: z.string().max(SECRET_NAME_MAX_CHARS).regex(new RegExp(SECRET_NAME_PATTERN)).optional(),
+        overwrite: z.boolean().optional(),
       }).strict(),
     },
     {
