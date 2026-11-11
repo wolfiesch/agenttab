@@ -881,11 +881,13 @@ mod tests {
                 .code,
             "secret_capture_disabled"
         );
+        // Absolute on every platform; the sink is never run here.
+        let sink = std::env::temp_dir().join("store-secret");
         let capture_only: Policy = serde_json::from_value(json!({
             "one_password": { "enabled": false },
             "secret_capture": {
                 "enabled": true,
-                "executable": "/usr/local/bin/store-secret",
+                "executable": sink,
                 "arguments": ["--no-overwrite", "{name}"]
             }
         }))
@@ -902,7 +904,7 @@ mod tests {
             "credential_provider_disabled"
         );
         let unnamed: Policy = serde_json::from_value(json!({
-            "secret_capture": { "enabled": true, "executable": "/usr/local/bin/store-secret" }
+            "secret_capture": { "enabled": true, "executable": sink }
         }))
         .unwrap();
         assert!(matches!(
