@@ -3,6 +3,7 @@ import { stdin, stdout } from "node:process";
 import {
   ACT_DIALOG_GUIDANCE,
   ACT_INTENT_GUIDANCE,
+  ACT_SENSITIVE_GUIDANCE,
   AgentTabClient,
   AgentTabError,
   AgentTabTransportError,
@@ -170,7 +171,7 @@ export const STANDARD_TOOLS: readonly Tool[] = [
   },
   {
     name: "browser_act",
-    description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${ACT_INTENT_GUIDANCE} ${ACT_DIALOG_GUIDANCE} ${CHALLENGE_GUIDANCE.summary}`,
+    description: `Run an ordered batch of typed actions against one task-owned tab and page revision. ${ACT_INTENT_GUIDANCE} ${ACT_DIALOG_GUIDANCE} ${ACT_SENSITIVE_GUIDANCE} ${CHALLENGE_GUIDANCE.summary}`,
     inputSchema: schema(actSchema),
   },
   {

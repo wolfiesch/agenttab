@@ -31,6 +31,8 @@ Standard mode has no raw CDP method, arbitrary JavaScript API, raw cookie or sto
 
 Passkeys, security keys, CAPTCHA, payment secrets, account recovery, and unsupported verification require `browser_handoff`. The human completes the step in Chrome; no secret is placed in an AgentTab request.
 
+`browser_act` refuses `press`, `type`, `fill`, and `select` on a sensitive field (password, one-time code, or payment input) with `sensitive_field_requires_handoff` by default. An agent that holds the value itself, for example a password it generated during signup, may set `allow_sensitive: true` on that one action to write it. The opt-in never reveals a field's value: snapshots keep sensitive values redacted, and it does not unlock 1Password items, passkeys, or CAPTCHA.
+
 ## 1Password credential broker
 
 The broker is available unless `policy.json` sets `one_password.enabled` to `false`. The host derives the current origin from its verified task-tab inventory, queries only 1Password Login items, and accepts an item only when a URL on that item matches the current host or a recognized authentication subdomain of the same registrable domain. Item titles and unrelated fields do not authorize a match.

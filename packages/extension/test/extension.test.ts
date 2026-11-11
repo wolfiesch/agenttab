@@ -3535,6 +3535,64 @@ describe("page revision monotonicity", () => {
     expect((await readState()).stagedCommits).toEqual({});
   });
 
+  test("allow_sensitive permits agent-supplied text into sensitive fields on the debugger route", async () => {
+    const mutationDeclarations: string[] = [];
+    const sensitiveAllows: boolean[] = [];
+    debuggerCommandOverride = (method, params) => {
+      const declaration = String(params.functionDeclaration ?? "");
+      if (
+        method === "Runtime.callFunctionOn" &&
+        declaration.includes("const f=this.form")
+      ) {
+        const target = {
+          form: null,
+          labels: [],
+          options: [],
+          ownerDocument: { getElementById() { return null; } },
+          tagName: "INPUT",
+          innerText: "",
+          textContent: "",
+          id: "",
+          getAttribute(name: string) {
+            return name === "type" ? "password" : "";
+          },
+        };
+        const fn = Function(`return (${declaration})`)() as (
+          this: typeof target,
+          requestedValue: string | null,
+          allowSensitive: boolean,
+        ) => unknown;
+        const args = Array.isArray(params.arguments) ? params.arguments : [];
+        const requestedValue = isRecord(args[0]) ? args[0].value ?? null : null;
+        const allowSensitive = isRecord(args[1]) && args[1].value === true;
+        sensitiveAllows.push(allowSensitive);
+        return { result: { value: fn.call(target, requestedValue === null ? null : String(requestedValue), allowSensitive) } };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        mutationDeclarations.push(declaration);
+        return { result: { value: undefined } };
+      }
+      return undefined;
+    };
+    const revisions = new RevisionTracker();
+    const runtime = new StandardBrowserRuntime(revisions, async () => undefined, () => undefined, async () => undefined);
+    const pageRevision = await revisions.ensure(63);
+    const ref = mintedRef(TASK_A, 63, pageRevision, 22);
+
+    await expect(
+      runtime.act(TASK_A, 63, pageRevision, [{ kind: "fill", ref, text: "secret" }]),
+    ).rejects.toMatchObject({ code: "sensitive_field_requires_handoff" });
+    expect(sensitiveAllows).toEqual([false]);
+    expect(mutationDeclarations).toEqual([]);
+
+    const acted = await runtime.act(TASK_A, 63, pageRevision, [
+      { kind: "fill", ref, text: "secret", allow_sensitive: true },
+    ]);
+    expect(acted.result?.actions).toMatchObject([{ kind: "fill", completed: true }]);
+    expect(sensitiveAllows).toEqual([false, true]);
+    expect(mutationDeclarations.some((declaration) => !declaration.includes("agenttab_sensitive_field"))).toBe(true);
+  });
+
   test("does not treat autofill-suppressed or merely similar fields as sensitive", () => {
     const field = (attributes: Record<string, string>, label = "") => ({
       tagName: "INPUT",
@@ -7242,6 +7300,114 @@ describe("scripting route when Chrome refuses the debugger", () => {
       runtime.act(TASK_A, 7, revision, [{ kind: "fill", selector: "#card", text: "4242" }]),
     ).rejects.toMatchObject({ code: "sensitive_field_requires_handoff" });
     expect(pageAgentRequests.some((request) => request.op === "act")).toBe(false);
+  });
+
+  test("allow_sensitive flows to the page agent on the scripting route", async () => {
+    const { runtime, revisions } = refusedRuntime();
+    pageAgentReply = (request) => {
+      if (request.op === "describe") {
+        return request.allow_sensitive === true
+          ? { tag: "INPUT", type: "password" }
+          : { agenttab_sensitive_field: true };
+      }
+      if (request.op === "act") return { applied: request.allow_sensitive === true };
+      return { id: 3 };
+    };
+    const revision = await revisions.ensure(7);
+
+    await expect(
+      runtime.act(TASK_A, 7, revision, [{ kind: "fill", selector: "input", text: "secret" }]),
+    ).rejects.toMatchObject({ code: "sensitive_field_requires_handoff" });
+    expect(pageAgentRequests.some((request) => request.op === "act")).toBe(false);
+
+    const acted = await runtime.act(TASK_A, 7, revision, [
+      { kind: "fill", selector: "input", text: "secret", allow_sensitive: true },
+    ]);
+    expect(acted.result?.actions).toMatchObject([{ kind: "fill", completed: true }]);
+    expect(pageAgentRequests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ op: "describe", allow_sensitive: true }),
+      expect.objectContaining({ op: "act", kind: "fill", allow_sensitive: true }),
+    ]));
+  });
+
+  test("the page agent fills a sensitive field only when allow_sensitive is set", async () => {
+    const doc = {
+      location: { origin: "https://signup.example.com" },
+      querySelectorAll: () => [input],
+      documentElement: { children: [] },
+      activeElement: null,
+      getElementById: () => null,
+    };
+    class PasswordInput extends EventTarget {
+      readonly localName = "input";
+      readonly ownerDocument = doc;
+      readonly isConnected = true;
+      readonly type = "password";
+      readonly tagName = "INPUT";
+      readonly id = "";
+      readonly innerText = "";
+      readonly textContent = "";
+      readonly labels: never[] = [];
+      readonly form = null;
+      readonly events: string[] = [];
+      stored = "";
+      get value(): string { return this.stored; }
+      set value(value: string) { this.stored = value; }
+      getAttribute(name: string): string | null { return name === "type" ? "password" : null; }
+      hasAttribute(): boolean { return false; }
+      checkVisibility(): boolean { return true; }
+      focus(): void { /* no-op */ }
+      override dispatchEvent(event: Event): boolean {
+        this.events.push(event.type);
+        return super.dispatchEvent(event);
+      }
+    }
+    const input = new PasswordInput();
+    class FakeInputEvent extends Event {
+      constructor(type: string, init?: EventInit) { super(type, init); }
+    }
+    const globals = new Map(
+      ["document", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "InputEvent", PAGE_AGENT_GLOBAL]
+        .map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const),
+    );
+    Reflect.set(globalThis, "document", doc);
+    Reflect.set(globalThis, "HTMLInputElement", PasswordInput);
+    Reflect.set(globalThis, "HTMLTextAreaElement", class {});
+    Reflect.set(globalThis, "HTMLElement", PasswordInput);
+    Reflect.set(globalThis, "InputEvent", FakeInputEvent);
+    Reflect.deleteProperty(globalThis, PAGE_AGENT_GLOBAL);
+    try {
+      installPageAgent();
+      const selected = await runPageAgentRequest({ op: "select", selector: "input" }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL) as { id: number };
+      expect(typeof selected.id).toBe("number");
+
+      const refused = await runPageAgentRequest({
+        op: "act", id: selected.id, kind: "fill", text: "secret",
+      }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL);
+      expect(refused).toEqual({ agenttab_sensitive_field: true });
+      expect(input.value).toBe("");
+
+      const filled = await runPageAgentRequest({
+        op: "act", id: selected.id, kind: "fill", text: "secret", allow_sensitive: true,
+      }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL);
+      expect(filled).toBeUndefined();
+      expect(input.value).toBe("secret");
+      expect(input.events).toEqual(["input", "change"]);
+
+      const describedRefused = await runPageAgentRequest({
+        op: "describe", id: selected.id, requested_value: "secret",
+      }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL);
+      expect(describedRefused).toEqual({ agenttab_sensitive_field: true });
+      const described = await runPageAgentRequest({
+        op: "describe", id: selected.id, requested_value: "secret", allow_sensitive: true,
+      }, PAGE_AGENT_VERSION, PAGE_AGENT_GLOBAL);
+      expect(described).toMatchObject({ tag: "INPUT", type: "password" });
+    } finally {
+      for (const [key, descriptor] of globals) {
+        if (descriptor === undefined) Reflect.deleteProperty(globalThis, key);
+        else Object.defineProperty(globalThis, key, descriptor);
+      }
+    }
   });
 
   test("evaluates selector waits through the page agent", async () => {

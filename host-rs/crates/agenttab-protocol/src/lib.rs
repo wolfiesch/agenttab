@@ -616,6 +616,9 @@ pub enum BrowserAction {
         key: PressKey,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         modifiers: Vec<PressModifier>,
+        /// Opt-in: permit acting on a sensitive (password/OTP/card) field.
+        #[serde(default)]
+        allow_sensitive: bool,
     },
     Type {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -625,6 +628,9 @@ pub enum BrowserAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame_id: Option<String>,
         text: String,
+        /// Opt-in: permit acting on a sensitive (password/OTP/card) field.
+        #[serde(default)]
+        allow_sensitive: bool,
     },
     Fill {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -634,12 +640,18 @@ pub enum BrowserAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame_id: Option<String>,
         text: String,
+        /// Opt-in: permit acting on a sensitive (password/OTP/card) field.
+        #[serde(default)]
+        allow_sensitive: bool,
     },
     Select {
         r#ref: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frame_id: Option<String>,
         value: String,
+        /// Opt-in: permit acting on a sensitive (password/OTP/card) field.
+        #[serde(default)]
+        allow_sensitive: bool,
     },
     Scroll {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1581,12 +1593,14 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             selector,
             frame_id,
             text,
+            ..
         }
         | BrowserAction::Fill {
             r#ref,
             selector,
             frame_id,
             text,
+            ..
         } => {
             validate_target(method, r#ref, selector, frame_id, "text action")?;
             require_len(method, text, 0, MAX_ACTION_TEXT_CHARS, "text")
@@ -1595,6 +1609,7 @@ fn validate_action(method: RpcMethod, action: &BrowserAction) -> Result<(), Prot
             r#ref,
             frame_id,
             value,
+            ..
         } => {
             require_ref(method, r#ref)?;
             validate_optional_frame_id(method, frame_id)?;

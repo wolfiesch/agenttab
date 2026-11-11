@@ -20,8 +20,8 @@ export type PageAgentRequest =
   | { op: "snapshot"; max_nodes: number; max_depth: number; root_id?: number; query?: AccessibilityQuery }
   | { op: "select"; selector: string }
   | { op: "probe"; id: number }
-  | { op: "describe"; id: number; requested_value: string | null }
-  | { op: "act"; id: number; kind: PageAgentActionKind; text?: string; key?: string; modifiers?: string[] }
+  | { op: "describe"; id: number; requested_value: string | null; allow_sensitive?: boolean }
+  | { op: "act"; id: number; kind: PageAgentActionKind; text?: string; key?: string; modifiers?: string[]; allow_sensitive?: boolean }
   | { op: "pointer"; id: number; kind: PageAgentPointerKind }
   | { op: "scroll"; id: number; delta_x: number; delta_y: number }
   | { op: "inspect_selector"; selector: string }

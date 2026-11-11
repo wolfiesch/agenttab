@@ -121,7 +121,8 @@
           "items": { "enum": ["Alt", "Control", "Meta", "Shift"] },
           "maxItems": 4,
           "uniqueItems": true
-        }
+        },
+        "allow_sensitive": { "type": "boolean", "default": false }
       },
       "oneOf": [
         { "required": ["ref"] },
@@ -137,7 +138,8 @@
         "ref": { "$ref": "#/$defs/ref" },
         "selector": { "$ref": "#/$defs/selector" },
         "frame_id": { "$ref": "#/$defs/frame_id" },
-        "text": { "type": "string", "maxLength": 2048 }
+        "text": { "type": "string", "maxLength": 2048 },
+        "allow_sensitive": { "type": "boolean", "default": false }
       },
       "oneOf": [
         { "required": ["ref"] },
@@ -153,7 +155,8 @@
         "ref": { "$ref": "#/$defs/ref" },
         "selector": { "$ref": "#/$defs/selector" },
         "frame_id": { "$ref": "#/$defs/frame_id" },
-        "text": { "type": "string", "maxLength": 2048 }
+        "text": { "type": "string", "maxLength": 2048 },
+        "allow_sensitive": { "type": "boolean", "default": false }
       },
       "oneOf": [
         { "required": ["ref"] },
@@ -168,7 +171,8 @@
         "kind": { "const": "select" },
         "ref": { "$ref": "#/$defs/ref" },
         "frame_id": { "$ref": "#/$defs/frame_id" },
-        "value": { "type": "string", "maxLength": 2048 }
+        "value": { "type": "string", "maxLength": 2048 },
+        "allow_sensitive": { "type": "boolean", "default": false }
       },
       "additionalProperties": false
     },

@@ -1332,6 +1332,7 @@ export class StandardBrowserRuntime {
           ? {
             key: String(action.key ?? ""),
             modifiers: Array.isArray(action.modifiers) ? action.modifiers.map(String) : [],
+            allow_sensitive: action.allow_sensitive === true,
           }
           : {}),
       }, target.documentId));
@@ -3026,9 +3027,11 @@ export class StandardBrowserRuntime {
         : action?.kind === "press"
           ? String(action.key ?? "")
           : null;
+    const allowSensitive = action?.allow_sensitive === true;
     if (target?.route === "scripting") {
       const { value } = await this.runPageAgent(tabId, {
         op: "describe", id: backendNodeId, requested_value: requestedValue,
+        allow_sensitive: allowSensitive,
       }, target.documentId);
       if (!isRecord(value)) throw Object.assign(new Error("Snapshot ref no longer resolves"), { code: "stale_ref" });
       return { ...value, backend_node_id: backendNodeId, frame_id: target.frameId, document_id: target.documentId };
@@ -3043,8 +3046,8 @@ export class StandardBrowserRuntime {
     const described = await this.send(tabId, "Runtime.callFunctionOn", {
       objectId: resolved.object.objectId,
       functionDeclaration:
-        `function(requestedValue){${SENSITIVE_FIELD_CHECK}if(requestedValue!==null&&sensitiveField){return {agenttab_sensitive_field:true}}const f=this.form;const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_option_label:option?[option.label,option.textContent].filter(Boolean).join(' ').trim():null}}`,
-      arguments: [{ value: requestedValue }],
+        `function(requestedValue,allowSensitive){${SENSITIVE_FIELD_CHECK}if(requestedValue!==null&&sensitiveField&&!allowSensitive){return {agenttab_sensitive_field:true}}const f=this.form;const option=this.options&&requestedValue!==null?Array.from(this.options).find(candidate=>String(candidate.value)===requestedValue):null;return {tag:this.tagName,role:this.getAttribute('role'),text:[this.innerText,this.textContent].filter(Boolean).join(' '),aria_label:this.getAttribute('aria-label'),title:this.getAttribute('title'),name:this.getAttribute('name'),id:this.id,type:this.getAttribute('type'),autocomplete:this.getAttribute('autocomplete'),href:this.getAttribute('href'),form_action:f&&f.action,form_method:f&&f.method,form_enctype:f&&f.enctype,associated_labels:associated,accessible_labels:accessible,requested_option_label:option?[option.label,option.textContent].filter(Boolean).join(' ').trim():null}}`,
+      arguments: [{ value: requestedValue }, { value: allowSensitive }],
       returnByValue: true,
     }, false, target?.sessionId);
     if (!isRecord(described.result) || !isRecord(described.result.value)) {
@@ -3203,7 +3206,7 @@ export class StandardBrowserRuntime {
             backendNodeId,
             kind === "click"
               ? pageGestureActionDeclaration(dispatchDomClick)
-              : pageGestureActionDeclaration(dispatchDomPress, DOM_SENSITIVE_ACTION_PRELUDE),
+              : pageGestureActionDeclaration(dispatchDomPress, action.allow_sensitive === true ? "" : DOM_SENSITIVE_ACTION_PRELUDE),
             kind === "click" ? [] : [{ value: action.key }, { value: action.modifiers ?? [] }],
             true,
             target,
@@ -3241,7 +3244,7 @@ export class StandardBrowserRuntime {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        pageDomActionDeclaration(dispatchDomType, DOM_SENSITIVE_ACTION_PRELUDE),
+        pageDomActionDeclaration(dispatchDomType, action.allow_sensitive === true ? "" : DOM_SENSITIVE_ACTION_PRELUDE),
         [{ value: String(action.text ?? "") }],
         true,
         target,
@@ -3250,7 +3253,7 @@ export class StandardBrowserRuntime {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        pageDomActionDeclaration(dispatchDomFill, DOM_SENSITIVE_ACTION_PRELUDE),
+        pageDomActionDeclaration(dispatchDomFill, action.allow_sensitive === true ? "" : DOM_SENSITIVE_ACTION_PRELUDE),
         [{ value: String(action.text ?? "") }],
         true,
         target,
@@ -3259,7 +3262,7 @@ export class StandardBrowserRuntime {
       await this.callOnNode(
         tabId,
         backendNodeId,
-        pageDomActionDeclaration(dispatchDomSelect, DOM_SENSITIVE_ACTION_PRELUDE),
+        pageDomActionDeclaration(dispatchDomSelect, action.allow_sensitive === true ? "" : DOM_SENSITIVE_ACTION_PRELUDE),
         [{ value: String(action.value ?? "") }],
         true,
         target,
@@ -3368,11 +3371,12 @@ export class StandardBrowserRuntime {
     this.assertScriptingSupports(tabId, action.kind);
     const id = target.backendNodeId;
     const kind = action.kind;
+    const allowSensitive = action.allow_sensitive === true;
     let request: PageAgentRequest;
     if (kind === "type" || kind === "fill") {
-      request = { op: "act", id, kind, text: String(action.text ?? "") };
+      request = { op: "act", id, kind, text: String(action.text ?? ""), allow_sensitive: allowSensitive };
     } else if (kind === "select") {
-      request = { op: "act", id, kind, text: String(action.value ?? "") };
+      request = { op: "act", id, kind, text: String(action.value ?? ""), allow_sensitive: allowSensitive };
     } else if (kind === "scroll") {
       request = { op: "scroll", id, delta_x: Number(action.delta_x ?? 0), delta_y: Number(action.delta_y ?? 0) };
     } else if (kind === "hover" || kind === "double_click" || kind === "context_click") {
