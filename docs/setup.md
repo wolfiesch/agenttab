@@ -242,12 +242,15 @@ the value passing through the agent. Add `secret_capture` to the owner-only
 policy, preserving any other settings:
 
 ```json
-secret_capture:
-  enabled: true
-  executable: /absolute/path/to/secret-cli
-  arguments: ["add", "--from-stdin", "--no-overwrite", "{name}"]
-  overwrite_arguments: ["add", "--from-stdin", "{name}"]
-  timeout_ms: 60000
+{
+  "secret_capture": {
+    "enabled": true,
+    "executable": "/absolute/path/to/secret-cli",
+    "arguments": ["add", "--from-stdin", "--no-overwrite", "{name}"],
+    "overwrite_arguments": ["add", "--from-stdin", "{name}"],
+    "timeout_ms": 60000
+  }
+}
 ```
 
 The sink reads the value from standard input, stores it under the name, and

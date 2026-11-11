@@ -219,7 +219,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    const VALUE: &str = "sk-test-0123456789abcdef";
+    const VALUE: &str = "tok-test-0123456789abcdef";
 
     /// A sink that appends `name=value` to `store`, refusing an existing name
     /// unless invoked with `--force`.

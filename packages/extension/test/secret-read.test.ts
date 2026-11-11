@@ -49,14 +49,14 @@ const read = (element: FakeElement): unknown => readSecretSource.call(element as
 describe("readSecretSource", () => {
   test("reads displayed text and read-only key fields, trimmed", () => {
     const code = new FakeElement();
-    code.innerText = "\n  sk-live-0123456789abcdef  \n";
-    expect(read(code)).toEqual({ value: "sk-live-0123456789abcdef" });
+    code.innerText = "\n  tok-live-0123456789abcdef  \n";
+    expect(read(code)).toEqual({ value: "tok-live-0123456789abcdef" });
 
     const masked = new FakeInput();
     masked.type = "password";
     masked.readOnly = true;
-    masked.value = "sk-live-0123456789abcdef";
-    expect(read(masked)).toEqual({ value: "sk-live-0123456789abcdef" });
+    masked.value = "tok-live-0123456789abcdef";
+    expect(read(masked)).toEqual({ value: "tok-live-0123456789abcdef" });
 
     const textarea = new FakeTextarea();
     textarea.value = " token-0123456789abcdef ";
@@ -77,7 +77,7 @@ describe("readSecretSource", () => {
 
   test("refuses cross-origin frames and controls without a single displayed value", () => {
     const framed = new FakeElement();
-    framed.innerText = "sk-live-0123456789abcdef";
+    framed.innerText = "tok-live-0123456789abcdef";
     framed.ownerDocument = {
       location: { origin: "https://widget.example" },
       defaultView: { top: { location: { origin: "https://console.example" } } },

@@ -5262,7 +5262,7 @@ mod tests {
     mod secret_capture_tests {
         use super::*;
 
-        const CAPTURED: &str = "sk-live-capture-0123456789abcdef";
+        const CAPTURED: &str = "tok-live-capture-0123456789abcdef";
 
         /// The extension's private read channel with one scripted reply: a read
         /// result, or a refusal whose message echoes the secret.

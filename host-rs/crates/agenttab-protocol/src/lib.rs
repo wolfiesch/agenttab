@@ -3681,7 +3681,7 @@ mod tests {
             );
         }
         for (field, value) in [
-            ("value", json!("sk-live-secret")),
+            ("value", json!("tok-live-secret")),
             ("credential_token", json!("t".repeat(32))),
         ] {
             let mut extra = params.clone();
