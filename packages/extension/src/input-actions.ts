@@ -6,6 +6,7 @@ const TEXT_INPUT_TYPES: Readonly<Record<string, true>> = {
   url: true,
   tel: true,
   number: true,
+  password: true,
 };
 const UNSUPPORTED_FILL_INPUT_TYPES: Readonly<Record<string, true>> = {
   button: true,

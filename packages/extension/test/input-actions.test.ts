@@ -531,6 +531,21 @@ describe("background DOM input actions", () => {
       restore();
     }
   });
+
+  test("types into and edits a password input like a text input", async () => {
+    const restore = installDomConstructors();
+    try {
+      const password = new TestInput();
+      password.type = "password";
+      const passwordNode: Element = password as unknown as Element;
+      expect(await dispatchDomType.call(passwordNode, "hunter2")).toBeUndefined();
+      expect(password.value).toBe("hunter2");
+      expect(dispatchDomPress.call(passwordNode, "Backspace")).toBeUndefined();
+      expect(password.value).toBe("hunter");
+    } finally {
+      restore();
+    }
+  });
 });
 
 class CaptureElement {
