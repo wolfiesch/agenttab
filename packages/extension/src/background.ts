@@ -13,6 +13,7 @@ import {
   needsUser,
   parseEmailCodeFillParams,
   parseSecretReadParams,
+  parseSessionSecretReadParams,
   PROFILE_STAGE_TAB_ID,
   type NativeDispatchCommand,
   type NativeOriginPolicy,
@@ -602,6 +603,16 @@ async function dispatch(command: NativeDispatchCommand): Promise<NativeResponse>
         await ownership.assertOwned(command.task_id, request.tab_id);
         await assertCurrentOrigin(request.tab_id, command.origin_policy);
         return browser.readSecret(command.task_id, request.tab_id, request);
+      });
+      return completed(command.request_id, result);
+    }
+    if (command.method === "browser_session_secret_read") {
+      // The result carries the header to the host only; the host keeps just the error code.
+      const request = parseSessionSecretReadParams(params);
+      const result = await scheduler.enqueueTab(command.task_id, request.tab_id, async () => {
+        await ownership.assertOwned(command.task_id, request.tab_id);
+        await assertCurrentOrigin(request.tab_id, command.origin_policy);
+        return browser.readSessionSecret(command.task_id, request.tab_id, request);
       });
       return completed(command.request_id, result);
     }

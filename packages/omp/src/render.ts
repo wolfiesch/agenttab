@@ -272,6 +272,9 @@ function describeCall(method: ToolMethod, args: Record<string, unknown>): { titl
       if (action === "capture") {
         return { title: "Capture secret to store", meta: fieldString(args, "secret_name") ?? "value stays hidden" };
       }
+      if (action === "capture_session") {
+        return { title: "Capture session credential", meta: fieldString(args, "secret_name") ?? "header stays hidden" };
+      }
       if (action === "fill_email") {
         return { title: "Fill email verification code", meta: "code stays hidden" };
       }

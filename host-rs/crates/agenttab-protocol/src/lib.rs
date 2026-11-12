@@ -918,6 +918,17 @@ pub enum BrowserCredentialsParams {
         #[serde(default)]
         overwrite: bool,
     },
+    /// Copies the `Authorization` header of one same-origin request the tab
+    /// makes after a reload into the owner's configured secret store. The
+    /// origin is derived from the tab, never from the request, and the value
+    /// crosses only the private extension-to-host channel.
+    CaptureSession {
+        tab_id: u64,
+        expected_page_revision: u64,
+        secret_name: String,
+        #[serde(default)]
+        overwrite: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1482,6 +1493,15 @@ impl MethodParams {
                 ..
             }) => {
                 require_len(method, source_ref, 1, MAX_REF_CHARS, "source_ref")?;
+                require(
+                    method,
+                    is_secret_name(secret_name),
+                    format!(
+                        "secret_name must be 1 to {MAX_SECRET_NAME_CHARS} characters: an uppercase letter, then uppercase letters, digits, or underscores"
+                    ),
+                )?;
+            }
+            Self::Credentials(BrowserCredentialsParams::CaptureSession { secret_name, .. }) => {
                 require(
                     method,
                     is_secret_name(secret_name),
@@ -3733,6 +3753,65 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!({"$ref": "#/$defs/secret_capture"})));
+    }
+
+    #[test]
+    fn session_capture_carries_only_a_destination_name() {
+        let params = json!({
+            "action": "capture_session",
+            "tab_id": 4,
+            "expected_page_revision": 9,
+            "secret_name": "VESPPER_SESSION_TOKEN",
+        });
+        let (_, parsed) =
+            RpcRequest::parse(request("browser_credentials", params.clone(), true)).unwrap();
+        assert!(matches!(
+            &parsed,
+            MethodParams::Credentials(BrowserCredentialsParams::CaptureSession {
+                tab_id: 4,
+                expected_page_revision: 9,
+                secret_name,
+                overwrite: false,
+            }) if secret_name == "VESPPER_SESSION_TOKEN"
+        ));
+        for (field, value) in [
+            ("value", json!("tok-live-secret")),
+            ("source_ref", json!("e12")),
+            ("origin", json!("https://stage.example")),
+        ] {
+            let mut extra = params.clone();
+            extra[field] = value;
+            assert!(
+                RpcRequest::parse(request("browser_credentials", extra, true)).is_err(),
+                "capture_session accepted extra field {field}"
+            );
+        }
+        let mut invalid = params;
+        invalid["secret_name"] = json!("lower");
+        assert!(RpcRequest::parse(request("browser_credentials", invalid, true)).is_err());
+    }
+
+    #[test]
+    fn session_capture_schema_branch_matches_runtime_bounds() {
+        let schema: Value = serde_json::from_str(
+            RPC_SCHEMA_ASSETS
+                .iter()
+                .find_map(|(name, schema)| (*name == "browser_credentials").then_some(*schema))
+                .unwrap(),
+        )
+        .unwrap();
+        let branch = schema.pointer("/$defs/session_capture").unwrap();
+        assert_eq!(branch["additionalProperties"], json!(false));
+        let properties = branch["properties"].as_object().unwrap();
+        assert_eq!(properties["action"], json!({"const": "capture_session"}));
+        assert_eq!(
+            properties["secret_name"]["maxLength"],
+            json!(MAX_SECRET_NAME_CHARS)
+        );
+        assert!(schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"$ref": "#/$defs/session_capture"})));
     }
 
     #[test]

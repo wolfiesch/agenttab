@@ -1430,6 +1430,11 @@ impl Runtime {
                 expected_page_revision,
                 ..
             }
+            | BrowserCredentialsParams::CaptureSession {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
             | BrowserCredentialsParams::Fill {
                 tab_id,
                 expected_page_revision,
@@ -1447,6 +1452,9 @@ impl Runtime {
             }
             BrowserCredentialsParams::Capture { .. } => {
                 return self.dispatch_secret_capture(connection_id, task_id, request_id, params);
+            }
+            BrowserCredentialsParams::CaptureSession { .. } => {
+                return self.dispatch_session_capture(connection_id, task_id, request_id, params);
             }
             _ => {}
         }
@@ -1496,7 +1504,8 @@ impl Runtime {
             } => (credential_token, username_ref, password_ref, otp_ref, true),
             BrowserCredentialsParams::Prepare { .. }
             | BrowserCredentialsParams::FillEmail { .. }
-            | BrowserCredentialsParams::Capture { .. } => unreachable!(),
+            | BrowserCredentialsParams::Capture { .. }
+            | BrowserCredentialsParams::CaptureSession { .. } => unreachable!(),
         };
         let selection = match self.credentials.select(
             credential_token,
@@ -1821,6 +1830,172 @@ impl Runtime {
         )
     }
 
+    /// Copies the `Authorization` header one owned tab sends after a reload to
+    /// the configured sink. The origin comes from the verified tab inventory and
+    /// must match the policy list; only the name, origin, header name, length,
+    /// and a digest prefix leave this function.
+    fn dispatch_session_capture(
+        &self,
+        connection_id: Uuid,
+        task_id: Uuid,
+        request_id: &str,
+        params: &BrowserCredentialsParams,
+    ) -> RpcResponse {
+        let BrowserCredentialsParams::CaptureSession {
+            tab_id,
+            expected_page_revision,
+            secret_name,
+            overwrite,
+        } = params
+        else {
+            unreachable!()
+        };
+        let policy = self.guardrails.session_capture_policy();
+        let allowed_origins: Vec<String> = policy
+            .origins
+            .iter()
+            .filter_map(|entry| Url::parse(entry.trim()).ok())
+            .map(|url| url.origin().ascii_serialization())
+            .collect();
+        if allowed_origins.is_empty() {
+            return RpcResponse::failure(
+                request_id,
+                Outcome::NotStarted,
+                RpcError::new(
+                    "session_capture_origin_denied",
+                    "No origin is listed for session credential capture",
+                )
+                .with_recovery(
+                    "Add the exact API origins to session_capture.origins in AgentTab's managed local policy.",
+                ),
+            );
+        }
+        let native = match self.native.dispatch(
+            connection_id,
+            task_id,
+            "browser_session_secret_read",
+            json!({
+                "tab_id": tab_id,
+                "expected_page_revision": expected_page_revision,
+                "allowed_origins": allowed_origins,
+                "timeout_ms": policy.timeout_ms,
+            }),
+            self.guardrails.native_origin_policy(*tab_id),
+            SECRET_CAPTURE_NATIVE_TIMEOUT,
+        ) {
+            Ok(native) => native,
+            Err(error) => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::NotStarted,
+                    secret_read_error(native_error_code(&error)),
+                );
+            }
+        };
+        // Reloading restarts the document, so any failure after the reload began
+        // is reported as unknown rather than as an untouched page.
+        let (value, page_revision, header, origin) = match (
+            native.outcome,
+            native.result,
+            native.error,
+        ) {
+            (Outcome::Completed, Some(result), None) => {
+                let value = result.get("value").and_then(Value::as_str);
+                let page_revision = result.get("page_revision").and_then(Value::as_u64);
+                let header = result
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .unwrap_or("authorization");
+                let origin = result.get("origin").and_then(Value::as_str);
+                match (value, page_revision, origin) {
+                    (Some(value), Some(page_revision), Some(origin)) if policy.allows(origin) => (
+                        value.to_owned(),
+                        page_revision,
+                        header.to_owned(),
+                        origin.to_owned(),
+                    ),
+                    (Some(_), Some(_), Some(_)) => {
+                        return RpcResponse::failure(
+                            request_id,
+                            Outcome::Unknown,
+                            RpcError::new(
+                                "session_capture_origin_denied",
+                                "The captured request went to an origin that is not listed",
+                            )
+                            .with_recovery(
+                                "Add the exact origin to session_capture.origins in AgentTab's managed local policy.",
+                            ),
+                        );
+                    }
+                    _ => {
+                        return RpcResponse::failure(
+                            request_id,
+                            Outcome::Unknown,
+                            secret_read_error("session_capture_read_failed"),
+                        );
+                    }
+                }
+            }
+            (_, _, Some(error)) => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::Unknown,
+                    secret_read_error(&error.code),
+                );
+            }
+            _ => {
+                return RpcResponse::failure(
+                    request_id,
+                    Outcome::Unknown,
+                    secret_read_error("session_capture_read_failed"),
+                );
+            }
+        };
+        if !secret_capture::is_capturable_header(&value) {
+            return RpcResponse::failure(
+                request_id,
+                Outcome::Unknown,
+                RpcError::new(
+                    "session_capture_value_invalid",
+                    format!(
+                        "The captured header must be {} to {} printable ASCII characters without control characters",
+                        secret_capture::MIN_SECRET_CHARS,
+                        secret_capture::MAX_SECRET_CHARS
+                    ),
+                )
+                .with_recovery(
+                    "Confirm the tab still holds an authenticated session and retry while the app is signed in.",
+                ),
+            );
+        }
+        if let Err(error) = secret_capture::store(
+            self.guardrails.secret_capture_policy(),
+            secret_name,
+            &value,
+            *overwrite,
+        ) {
+            return RpcResponse::failure(
+                request_id,
+                error.outcome(),
+                RpcError::new(error.code(), error.message()).with_recovery(error.recovery()),
+            );
+        }
+        RpcResponse::success(
+            request_id,
+            Outcome::Completed,
+            json!({
+                "status": "stored",
+                "secret_name": secret_name,
+                "origin": origin,
+                "header": header,
+                "characters": value.len(),
+                "sha256_prefix": secret_capture::fingerprint(&value),
+                "overwrite": overwrite,
+                "page_revision": page_revision,
+            }),
+        )
+    }
+
     fn credential_host(&self, tab_id: u64) -> Result<String, RpcError> {
         let url = self.credential_url(tab_id)?;
         Ok(url
@@ -1940,6 +2115,11 @@ fn requested_tab(params: &MethodParams) -> Option<(u64, Option<u64>)> {
                 expected_page_revision,
             }
             | BrowserCredentialsParams::FillEmail {
+                tab_id,
+                expected_page_revision,
+                ..
+            }
+            | BrowserCredentialsParams::CaptureSession {
                 tab_id,
                 expected_page_revision,
                 ..
@@ -2163,6 +2343,7 @@ fn secret_read_error(code: &str) -> RpcError {
         | "stale_revision"
         | "stale_ref"
         | "secret_capture_page_mismatch"
+        | "session_capture_not_observed"
         | "secret_capture_source_invalid"
         | "secret_capture_source_forbidden"
         | "cross_origin_credentials_forbidden"
@@ -2187,6 +2368,12 @@ fn secret_read_error(code: &str) -> RpcError {
         }
         "secret_capture_source_forbidden" => {
             "Account password fields cannot be captured; capture the displayed key instead."
+        }
+        "session_capture_not_observed" => {
+            "Reload the signed-in tab, or trigger one authenticated request in the app, then retry."
+        }
+        "secret_capture_page_mismatch" => {
+            "The tab left the capture origin; reopen the app tab on the allowed origin and retry."
         }
         _ => "Take a fresh snapshot of this tab and retry with the current revision and ref.",
     };
@@ -5314,6 +5501,19 @@ mod tests {
             Arc<ConnectionContext>,
             Arc<SecretReadNative>,
         ) {
+            secret_capture_runtime_with_origins(reply, &["https://allowed.test"])
+        }
+
+        fn secret_capture_runtime_with_origins(
+            reply: Result<Value, &'static str>,
+            session_origins: &[&str],
+        ) -> (
+            tempfile::TempDir,
+            tempfile::TempDir,
+            Arc<Runtime>,
+            Arc<ConnectionContext>,
+            Arc<SecretReadNative>,
+        ) {
             use std::os::unix::fs::PermissionsExt;
             let store = tempfile::tempdir().unwrap();
             let sink = store.path().join("sink.sh");
@@ -5337,6 +5537,11 @@ mod tests {
                         "executable": sink,
                         "arguments": ["--new", "{name}"],
                         "overwrite_arguments": ["--force", "{name}"],
+                        "timeout_ms": 5_000,
+                    },
+                    "session_capture": {
+                        "enabled": true,
+                        "origins": session_origins,
                         "timeout_ms": 5_000,
                     },
                 }))
@@ -5380,6 +5585,98 @@ mod tests {
                     "overwrite": overwrite,
                 }
             })
+        }
+
+        fn session_capture_request(request_id: &str) -> Value {
+            json!({
+                "protocol": RPC_PROTOCOL,
+                "version": PROTOCOL_VERSION,
+                "request_id": request_id,
+                "idempotency_key": Uuid::now_v7(),
+                "method": "browser_credentials",
+                "params": {
+                    "action": "capture_session",
+                    "tab_id": 3,
+                    "expected_page_revision": 7,
+                    "secret_name": "SESSION_TOKEN",
+                    "overwrite": false,
+                }
+            })
+        }
+
+        #[test]
+        fn session_capture_stores_the_header_without_returning_it() {
+            let (temp, store, runtime, connection, native) = secret_capture_runtime(Ok(json!({
+                "value": CAPTURED,
+                "header": "authorization",
+                "origin": "https://allowed.test",
+                "page_revision": 7,
+            })));
+
+            let response = runtime.handle(&connection, session_capture_request("session-capture"));
+            assert_eq!(response["outcome"], "completed", "{response}");
+            assert_eq!(
+                response["result"],
+                json!({
+                    "status": "stored",
+                    "secret_name": "SESSION_TOKEN",
+                    "origin": "https://allowed.test",
+                    "header": "authorization",
+                    "characters": CAPTURED.len(),
+                    "sha256_prefix": secret_capture::fingerprint(CAPTURED),
+                    "overwrite": false,
+                    "page_revision": 7,
+                })
+            );
+            assert_eq!(
+                native.calls.lock()[0],
+                (
+                    "browser_session_secret_read".to_owned(),
+                    json!({
+                        "tab_id": 3,
+                        "expected_page_revision": 7,
+                        "allowed_origins": ["https://allowed.test"],
+                        "timeout_ms": 5_000,
+                    })
+                )
+            );
+            assert_eq!(
+                std::fs::read_to_string(store.path().join("SESSION_TOKEN")).unwrap(),
+                CAPTURED
+            );
+            assert!(!tree_contains(temp.path(), CAPTURED.as_bytes()));
+            assert!(!response.to_string().contains(CAPTURED));
+        }
+
+        #[test]
+        fn session_capture_refuses_an_origin_the_policy_does_not_list() {
+            let (temp, store, runtime, connection, native) = secret_capture_runtime(Ok(json!({
+                "value": CAPTURED,
+                "origin": "https://elsewhere.test",
+                "page_revision": 7,
+            })));
+
+            let response = runtime.handle(&connection, session_capture_request("session-denied"));
+            assert_eq!(response["outcome"], "unknown");
+            assert_eq!(response["error"]["code"], "session_capture_origin_denied");
+            assert_eq!(native.calls.lock().len(), 1);
+            assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 1);
+            assert!(!tree_contains(temp.path(), CAPTURED.as_bytes()));
+        }
+
+        #[test]
+        fn session_capture_rejects_a_value_that_is_not_a_header() {
+            let (temp, store, runtime, connection, _native) = secret_capture_runtime(Ok(json!({
+                "value": "sk short",
+                "origin": "https://allowed.test",
+                "page_revision": 7,
+            })));
+
+            let response = runtime.handle(&connection, session_capture_request("session-invalid"));
+            assert_eq!(response["outcome"], "unknown");
+            assert_eq!(response["error"]["code"], "session_capture_value_invalid");
+            assert_eq!(std::fs::read_dir(store.path()).unwrap().count(), 1);
+            assert!(!tree_contains(temp.path(), b"sk short"));
         }
 
         #[test]

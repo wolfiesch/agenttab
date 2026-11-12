@@ -251,6 +251,13 @@ export type BrowserCredentialsParams =
     source_ref: string;
     secret_name: string;
     overwrite?: boolean;
+  }
+  | {
+    action: "capture_session";
+    tab_id: number;
+    expected_page_revision: number;
+    secret_name: string;
+    overwrite?: boolean;
   };
 
 export type BrowserEmailCodePurpose = (typeof EMAIL_CODE_PURPOSES)[number];

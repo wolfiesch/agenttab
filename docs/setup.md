@@ -267,6 +267,36 @@ the value, and an uppercase `secret_name` such as `SERVICE_API_KEY`. Add
 `overwrite: true` only to replace an existing secret. The result has
 `status: "stored"`, the name, origin, `characters`, and `sha256_prefix`.
 
+## Session credential capture
+
+Some APIs accept only a token the signed-in app already sends, so no key exists
+on a page to capture. Session capture stores the tab's `Authorization` header
+instead. It is separate from `secret_capture`, reuses the same sink, and stays
+off until enabled with exact origins:
+
+```json
+{
+  "secret_capture": { "enabled": true, "executable": "/absolute/path/to/secret-cli", "arguments": ["add", "--from-stdin", "--no-overwrite", "{name}"] },
+  "session_capture": {
+    "enabled": true,
+    "origins": ["https://stage.example", "https://api.example:8443"],
+    "timeout_ms": 15000
+  }
+}
+```
+
+List exact origins, not patterns: scheme, host, and port when it is not the
+scheme default, and list the origin the app sends its API requests to rather
+than the page's own origin. `timeout_ms` must be 1000 through 60000. Call
+`browser_credentials` with `action: "capture_session"`, the owned `tab_id`, the
+current `expected_page_revision`, and an uppercase `secret_name`. The tab must
+stay on the same page revision, and only requests it sends to a listed origin
+are considered. A quiet tab is reloaded once so the app repeats its own
+authenticated requests; if none of those requests carries an `Authorization`
+header, the call fails with `session_capture_not_observed`. The result has
+`status: "stored"`, the destination `origin`, `header`, `characters`, and
+`sha256_prefix`, never the value.
+
 ## Migration from Chrome Bridge v1.0.1
 
 AgentTab v2 is side-by-side and recoverable:

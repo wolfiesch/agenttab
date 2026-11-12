@@ -21,6 +21,7 @@ export type NativeMethod =
   | "browser_credentials_fill"
   | "browser_email_code_fill"
   | "browser_secret_read"
+  | "browser_session_secret_read"
   | "commit_review_bind"
   | "commit_review_abandon";
 
@@ -38,6 +39,7 @@ const CORE_METHODS: Record<NativeMethod, true> = {
   browser_credentials_fill: true,
   browser_email_code_fill: true,
   browser_secret_read: true,
+  browser_session_secret_read: true,
   commit_review_bind: true,
   commit_review_abandon: true,
 };
@@ -634,6 +636,48 @@ export function parseSecretReadParams(value: unknown): SecretReadRequest {
   };
 }
 
+export type SessionSecretReadRequest = {
+  tab_id: number;
+  expected_page_revision: number;
+  allowed_origins: string[];
+  timeout_ms: number;
+};
+
+/** Validates the internal session-secret read the host issues for browser_credentials capture_session. */
+export function parseSessionSecretReadParams(value: unknown): SessionSecretReadRequest {
+  const params = assertExactObject(
+    value,
+    ["tab_id", "expected_page_revision", "allowed_origins", "timeout_ms"],
+    [],
+    "browser_session_secret_read parameters",
+  );
+  const timeout = params.timeout_ms;
+  if (typeof timeout !== "number" || !Number.isInteger(timeout) || timeout < 1_000 || timeout > 60_000) {
+    commandError("timeout_ms must be an integer between 1000 and 60000");
+  }
+  const allowed = params.allowed_origins;
+  if (!Array.isArray(allowed) || allowed.length === 0 || allowed.length > 64) {
+    commandError("allowed_origins must be a list of origins");
+  }
+  const origins = allowed.map((entry) => {
+    const origin = assertBoundedString(entry, "allowed origin", 8, 2048);
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      commandError("allowed_origins entries must be absolute origins");
+    }
+    if (parsed.origin !== origin) commandError("allowed_origins entries must be bare origins");
+    return origin;
+  });
+  return {
+    tab_id: assertTabId(params.tab_id),
+    expected_page_revision: assertRevision(params.expected_page_revision),
+    allowed_origins: origins,
+    timeout_ms: timeout,
+  };
+}
+
 function assertCredentialFillParams(value: unknown): Record<string, unknown> {
   const params = assertExactObject(
     value,
@@ -924,6 +968,8 @@ function validateParams(method: NativeMethod, value: unknown): Record<string, un
       return parseEmailCodeFillParams(value);
     case "browser_secret_read":
       return parseSecretReadParams(value);
+    case "browser_session_secret_read":
+      return parseSessionSecretReadParams(value);
     case "commit_review_bind":
     case "commit_review_abandon":
       return assertCommitReviewParams(value, method);
