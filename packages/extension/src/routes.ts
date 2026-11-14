@@ -6,6 +6,9 @@ const RESTRICTED_ERROR_PATTERNS = [
   /cannot access contents of (?:the )?url/i,
 ];
 
+/** Chrome's answer when another extension's frame is on the page, refusing or ending a debugger session. */
+export const FOREIGN_EXTENSION_FRAME_REFUSAL = /cannot access a chrome-extension:\/\/ url of different extension/i;
+
 export function automationRoute(rawUrl: string | undefined): AutomationRoute {
   if (rawUrl === undefined || rawUrl.length === 0) return "tab_only";
   let url: URL;
@@ -71,7 +74,7 @@ export function debuggerUnavailableError(cause: unknown, operation?: string): Er
 export function normalizeRestrictedOriginError(error: unknown, operation: string): unknown {
   if (typeof error === "object" && error !== null && typeof Reflect.get(error, "code") === "string") return error;
   const message = error instanceof Error ? error.message : String(error);
-  if (/cannot access a chrome-extension:\/\/ url of different extension/i.test(message)) {
+  if (FOREIGN_EXTENSION_FRAME_REFUSAL.test(message)) {
     return Object.assign(debuggerUnavailableError(error), error instanceof Error ? error : {});
   }
   return RESTRICTED_ERROR_PATTERNS.some((pattern) => pattern.test(message))
