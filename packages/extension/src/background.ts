@@ -1089,7 +1089,7 @@ async function handlePopupMessage(
         prompt: notice.prompt,
         status: notice.status,
         started_at_ms: notice.startedAtMs,
-        expires_at_ms: notice.expiresAtMs,
+        ...(notice.expiresAtMs === undefined ? {} : { expires_at_ms: notice.expiresAtMs }),
       })),
       paused: state.paused,
       developer_mode: state.developerMode,

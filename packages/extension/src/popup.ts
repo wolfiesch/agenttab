@@ -28,7 +28,7 @@ interface NoticeView {
   prompt: string;
   status: string;
   startedAtMs: number;
-  expiresAtMs: number;
+  expiresAtMs?: number;
 }
 
 interface UiState {
@@ -190,7 +190,7 @@ function parseNotice(value: Record<string, unknown>): NoticeView | null {
     typeof value.tab_id !== "number" ||
     typeof value.status !== "string" ||
     typeof value.started_at_ms !== "number" ||
-    typeof value.expires_at_ms !== "number"
+    (value.expires_at_ms !== undefined && typeof value.expires_at_ms !== "number")
   ) {
     return null;
   }
@@ -203,7 +203,7 @@ function parseNotice(value: Record<string, unknown>): NoticeView | null {
       : "Finish the requested step in the task tab, then tell the agent.",
     status: value.status,
     startedAtMs: value.started_at_ms,
-    expiresAtMs: value.expires_at_ms,
+    ...(typeof value.expires_at_ms === "number" ? { expiresAtMs: value.expires_at_ms } : {}),
   };
 }
 
@@ -393,9 +393,13 @@ function renderNotice(notice: NoticeView): HTMLLIElement {
   const prompt = document.createElement("strong");
   prompt.textContent = notice.prompt;
   const expiry = document.createElement("small");
-  const seconds = Math.max(0, Math.ceil((notice.expiresAtMs - Date.now()) / 1_000));
-  const countdown = seconds === 1 ? "1 second" : `${seconds} seconds`;
-  expiry.textContent = `Tab ${notice.tabId} · Reminder expires in ${countdown}`;
+  if (notice.expiresAtMs === undefined) {
+    expiry.textContent = `Tab ${notice.tabId} · Open until you finish or dismiss it`;
+  } else {
+    const seconds = Math.max(0, Math.ceil((notice.expiresAtMs - Date.now()) / 1_000));
+    const countdown = seconds === 1 ? "1 second" : `${seconds} seconds`;
+    expiry.textContent = `Tab ${notice.tabId} · Reminder expires in ${countdown}`;
+  }
   const actions = document.createElement("div");
   actions.className = "notice-actions";
   const dismiss = document.createElement("button");
