@@ -1134,11 +1134,13 @@ export class StandardBrowserRuntime {
    */
   private async refuseDebugger(tabId: number, cause: unknown, work: TabWork): Promise<Error> {
     let reason = cause instanceof Error ? cause.message : String(cause);
-    // Chrome's message alone proves the cause: the frame list often omits frames inside shadow roots.
-    const frameCaused = FOREIGN_EXTENSION_FRAME_REFUSAL.test(reason);
-    if (frameCaused) {
+    let frameCaused = false;
+    if (FOREIGN_EXTENSION_FRAME_REFUSAL.test(reason)) {
+      // Only a frame the frame list shows earns the per-command re-check; an unseen one keeps the
+      // full retry interval, and the next attach removes foreign frames again regardless.
       const origins = await this.foreignExtensionFrameOrigins(tabId);
       if (origins !== undefined && origins.length > 0) {
+        frameCaused = true;
         reason += ` (blocked by embedded extension frame${origins.length === 1 ? "" : "s"}: ${origins.join(", ")})`;
       }
     }
@@ -4353,9 +4355,11 @@ export class StandardBrowserRuntime {
 
   /**
    * Removes other extensions' frames, such as a password manager's inline menu, from every frame of
-   * the tab, and returns how many were removed. Zero when the tab cannot be scripted.
+   * the tab, and returns how many were removed. Zero when the tab cannot be scripted. The task's
+   * ownership of the tab is re-checked first, since callers reach this after other awaits.
    */
   private async stripForeignExtensionFrames(tabId: number): Promise<number> {
+    await this.authorizeDebuggerUse(tabId);
     const ownOrigin = chrome.runtime.getURL("/").replace(/\/$/, "");
     try {
       const results = await chrome.scripting.executeScript({
@@ -4381,6 +4385,7 @@ export class StandardBrowserRuntime {
       if (!(error instanceof Error) || !FOREIGN_EXTENSION_FRAME_REFUSAL.test(error.message)) throw error;
       if (await this.stripForeignExtensionFrames(tabId) === 0) throw error;
     }
+    await this.authorizeDebuggerUse(tabId);
     await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
   }
 
@@ -4452,6 +4457,8 @@ export class StandardBrowserRuntime {
         await this.attachDebugger(tabId);
       } catch (error) {
         if (error instanceof Error && /no tab with given id/i.test(error.message)) throw error;
+        // AgentTab's own coded failures, such as a binding revoked during the frame removal, keep their meaning.
+        if (isRecord(error) && typeof error.code === "string") throw error;
         // Chrome refuses the debugger when another extension's frame is on the
         // page or another client, such as open DevTools, holds the tab.
         throw await this.refuseDebugger(tabId, error, work);
