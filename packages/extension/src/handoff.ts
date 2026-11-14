@@ -10,7 +10,6 @@ import { bindChallengeNotice, challengeStoreAvailable, readTaskEpisodes } from "
 const HANDOFF_ALARM = "agenttab-handoff-timeout";
 /** System notification ids are this prefix plus the notice id, so a click maps back to its notice. */
 const NOTIFICATION_PREFIX = "agenttab-handoff:";
-const DEFAULT_TIMEOUT_MS = 300_000;
 const MAX_NOTICES = 100;
 /** Seconds without input before Chrome reports the user as idle. */
 const IDLE_DETECTION_SECONDS = 60;
@@ -40,7 +39,7 @@ function noticeResult(notice: HandoffNotice): Record<string, unknown> {
     prompt: notice.prompt,
     status: notice.status,
     started_at_ms: notice.startedAtMs,
-    expires_at_ms: notice.expiresAtMs,
+    ...(notice.expiresAtMs === undefined ? {} : { expires_at_ms: notice.expiresAtMs }),
   };
 }
 
@@ -203,13 +202,12 @@ export class HandoffController {
     originGuard?: () => Promise<void>,
   ): Promise<Record<string, unknown>> {
     const tabId = params.tab_id;
-    const timeoutMs = params.timeout_ms === undefined ? DEFAULT_TIMEOUT_MS : params.timeout_ms;
+    const timeoutMs = params.timeout_ms;
     const completion = params.completion;
     if (
       !Number.isInteger(tabId) ||
       typeof params.prompt !== "string" ||
-      !Number.isInteger(timeoutMs) ||
-      Number(timeoutMs) < 1 ||
+      (timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || Number(timeoutMs) < 1)) ||
       (completion !== undefined && !this.validCompletion(completion))
     ) {
       throw Object.assign(new Error("Invalid browser_handoff request parameters"), { code: "invalid_request" });
@@ -241,7 +239,7 @@ export class HandoffController {
       ...(completion === undefined ? {} : { completion: completion as NoticeCompletion }),
       status: "open",
       startedAtMs,
-      expiresAtMs: startedAtMs + Number(timeoutMs),
+      ...(timeoutMs === undefined ? {} : { expiresAtMs: startedAtMs + Number(timeoutMs) }),
     };
     await mutateState((state) => {
       if (state.paused) throw new NotStartedError("paused", "AgentTab is paused");
@@ -337,7 +335,9 @@ export class HandoffController {
     const now = Date.now();
     await mutateState((state) => {
       for (const notice of Object.values(state.notices)) {
-        if (notice.status === "open" && notice.expiresAtMs <= now) notice.status = "expired";
+        if (notice.status === "open" && notice.expiresAtMs !== undefined && notice.expiresAtMs <= now) {
+          notice.status = "expired";
+        }
       }
       this.trimNotices(state.notices);
     });
@@ -390,11 +390,9 @@ export class HandoffController {
    */
   private async settle(): Promise<void> {
     const notices = (await readState()).notices;
-    const nextExpiry = Object.values(notices)
-      .filter((notice) => notice.status === "open")
-      .reduce<number | undefined>((earliest, notice) =>
-        earliest === undefined || notice.expiresAtMs < earliest ? notice.expiresAtMs : earliest,
-      undefined);
+    const expiries = Object.values(notices).flatMap((notice) =>
+      notice.status === "open" && notice.expiresAtMs !== undefined ? [notice.expiresAtMs] : []);
+    const nextExpiry = expiries.length > 0 ? Math.min(...expiries) : undefined;
     await chrome.alarms.clear(HANDOFF_ALARM);
     if (nextExpiry !== undefined) chrome.alarms.create(HANDOFF_ALARM, { when: nextExpiry });
     const shown = await chrome.notifications?.getAll().catch(() => undefined);

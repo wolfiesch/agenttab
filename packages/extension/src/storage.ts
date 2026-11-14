@@ -47,7 +47,8 @@ export interface HandoffNotice {
   completion?: NoticeCompletion;
   status: NoticeStatus;
   startedAtMs: number;
-  expiresAtMs: number;
+  /** Absent: the notice stays open until resolved, dismissed, or its tab or task ends. */
+  expiresAtMs?: number;
 }
 
 export interface AutomationCleanupRecord {
@@ -141,7 +142,7 @@ function parseNotice(value: unknown, noticeId: string): HandoffNotice | null {
     typeof notice.prompt !== "string" ||
     !["open", "resolved", "dismissed", "expired"].includes(String(notice.status)) ||
     !finiteInteger(notice.startedAtMs) ||
-    !finiteInteger(notice.expiresAtMs, notice.startedAtMs as number) ||
+    (notice.expiresAtMs !== undefined && !finiteInteger(notice.expiresAtMs, notice.startedAtMs as number)) ||
     (completion !== undefined &&
       completion !== null &&
       ((completion.kind !== "url" && completion.kind !== "selector" && completion.kind !== "challenge_cleared") ||

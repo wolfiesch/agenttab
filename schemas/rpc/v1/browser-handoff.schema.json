@@ -35,7 +35,12 @@
           },
           "additionalProperties": false
         },
-        "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 900000, "default": 300000 }
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 900000,
+          "description": "Reminder expiry. Omit to keep the notice open until it is resolved or dismissed or its tab or task ends."
+        }
       },
       "additionalProperties": false
     },

@@ -842,8 +842,9 @@ pub enum BrowserHandoffParams {
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         completion: Option<HandoffCompletion>,
-        #[serde(default = "default_handoff_timeout")]
-        timeout_ms: u64,
+        /// Reminder expiry. Absent: the notice stays open until resolved, dismissed, or its tab or task ends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     Status {
         notice_id: String,
@@ -854,10 +855,6 @@ pub enum BrowserHandoffParams {
     Dismiss {
         notice_id: String,
     },
-}
-
-fn default_handoff_timeout() -> u64 {
-    300_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1378,7 +1375,7 @@ impl MethodParams {
                 require_len(method, prompt, 1, MAX_HANDOFF_PROMPT_CHARS, "prompt")?;
                 require(
                     method,
-                    (1_000..=900_000).contains(timeout_ms),
+                    timeout_ms.is_none_or(|timeout_ms| (1_000..=900_000).contains(&timeout_ms)),
                     "timeout_ms must be between 1000 and 900000",
                 )?;
                 match completion {
@@ -3321,7 +3318,7 @@ mod tests {
         assert!(matches!(
             request_params,
             MethodParams::Handoff(BrowserHandoffParams::Request {
-                timeout_ms: 300_000,
+                timeout_ms: None,
                 completion: Some(HandoffCompletion::Selector { value }),
                 ..
             }) if value == "body"

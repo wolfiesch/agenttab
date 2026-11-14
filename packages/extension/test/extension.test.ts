@@ -4432,6 +4432,42 @@ describe("advisory handoff notices", () => {
     expect(scrubbed).toEqual([31]);
   });
 
+  test("keeps a notice without timeout_ms open and arms expiry only for a timed notice", async () => {
+    await seedTask(TASK_A, [32, 33]);
+    const scheduler = new MutationScheduler();
+    const revisions = new RevisionTracker();
+    const ownership = new OwnershipLedger(scheduler, revisions, () => undefined);
+    const handoff = new HandoffController(scheduler, revisions, ownership);
+
+    const lasting = await handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 32,
+      expected_page_revision: await revisions.ensure(32),
+      prompt: "Create the API key",
+    });
+    expect(lasting).not.toHaveProperty("expires_at_ms");
+    expect(alarmCreates.filter((alarm) => alarm.name === HANDOFF_ALARM)).toEqual([]);
+
+    const timed = await handoff.request(TASK_A, {
+      operation: "request",
+      tab_id: 33,
+      expected_page_revision: await revisions.ensure(33),
+      prompt: "Approve the sign-in",
+      timeout_ms: 60_000,
+    });
+    expect(timed.expires_at_ms).toBe(Number(timed.started_at_ms) + 60_000);
+    expect(alarmCreates.filter((alarm) => alarm.name === HANDOFF_ALARM).at(-1)?.when).toBe(Number(timed.expires_at_ms));
+
+    await mutateState((state) => {
+      const stored = state.notices[String(timed.notice_id)];
+      if (stored) stored.expiresAtMs = stored.startedAtMs;
+    });
+    await handoff.expire();
+    expect((await handoff.status(TASK_A, String(timed.notice_id))).status).toBe("expired");
+    expect(await handoff.status(TASK_A, String(lasting.notice_id))).toMatchObject({ status: "open" });
+    expect(shownNotifications.has(`agenttab-handoff:${lasting.notice_id}`)).toBe(true);
+  });
+
   test("waits for admitted same-tab work before detaching for human interaction", async () => {
     await seedTask(TASK_A, [37]);
     const scheduler = new MutationScheduler();

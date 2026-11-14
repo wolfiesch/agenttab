@@ -2202,7 +2202,8 @@ fn dispatch_timeout(params: &MethodParams) -> Duration {
             Duration::from_millis(timeout_ms.saturating_add(5_000))
         }
         MethodParams::Handoff(BrowserHandoffParams::Request { timeout_ms, .. }) => {
-            Duration::from_millis(timeout_ms.saturating_add(5_000))
+            // A request can wait for the tab's in-flight work before posting its notice.
+            Duration::from_millis(timeout_ms.unwrap_or(300_000).saturating_add(5_000))
         }
         _ => Duration::from_secs(30),
     }
@@ -3854,8 +3855,7 @@ mod tests {
             "prompt": "Complete the browser step",
             "completion": {"kind": "selector", "value": "body"},
         });
-        let mut expected_request_params = request_params.clone();
-        expected_request_params["timeout_ms"] = json!(300_000);
+        let expected_request_params = request_params.clone();
         assert_eq!(
             handoff("request-notice", request_params.clone())["outcome"],
             "completed"
