@@ -10,7 +10,13 @@ import {
   pageGestureActionDeclaration,
   validatePressChord,
 } from "./input-actions";
-import { automationRoute, debuggerUnavailableError, restrictedOriginError } from "./routes";
+import {
+  automationRoute,
+  debuggerUnavailableError,
+  FOREIGN_EXTENSION_FRAME_REFUSAL,
+  restrictedOriginError,
+} from "./routes";
+import { removeForeignExtensionFrames } from "./foreign-frames";
 import { isRecord } from "./type-guards";
 import { targetRefs, type ResolvedTarget } from "./target-resolution";
 import {
@@ -1123,12 +1129,15 @@ export class StandardBrowserRuntime {
    * Records a debugger refusal so later commands use the scripting route
    * without re-attaching, which would flash Chrome's debugging banner on every
    * call. A navigation or the retry interval clears it; a refusal caused by a
-   * foreign-extension frame also clears once that frame leaves the tab.
+   * foreign-extension frame also clears once that frame leaves the tab or
+   * AgentTab removes it.
    */
   private async refuseDebugger(tabId: number, cause: unknown, work: TabWork): Promise<Error> {
     let reason = cause instanceof Error ? cause.message : String(cause);
     let frameCaused = false;
-    if (/extension/i.test(reason)) {
+    if (FOREIGN_EXTENSION_FRAME_REFUSAL.test(reason)) {
+      // Only a frame the frame list shows earns the per-command re-check; an unseen one keeps the
+      // full retry interval, and the next attach removes foreign frames again regardless.
       const origins = await this.foreignExtensionFrameOrigins(tabId);
       if (origins !== undefined && origins.length > 0) {
         frameCaused = true;
@@ -4344,13 +4353,49 @@ export class StandardBrowserRuntime {
     return [...origins];
   }
 
+  /**
+   * Removes other extensions' frames, such as a password manager's inline menu, from every frame of
+   * the tab, and returns how many were removed. Zero when the tab cannot be scripted. The task's
+   * ownership of the tab is re-checked first, since callers reach this after other awaits.
+   */
+  private async stripForeignExtensionFrames(tabId: number): Promise<number> {
+    await this.authorizeDebuggerUse(tabId);
+    const ownOrigin = chrome.runtime.getURL("/").replace(/\/$/, "");
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: removeForeignExtensionFrames,
+        args: [ownOrigin],
+      });
+      return results.reduce((total, entry) => total + (typeof entry.result === "number" ? entry.result : 0), 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Attaches the debugger. When Chrome refuses because another extension's frame is on the page,
+   * removes those frames once and retries, so an autofill overlay cannot cost the tab trusted input.
+   */
+  private async attachDebugger(tabId: number): Promise<void> {
+    try {
+      await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error) || !FOREIGN_EXTENSION_FRAME_REFUSAL.test(error.message)) throw error;
+      if (await this.stripForeignExtensionFrames(tabId) === 0) throw error;
+    }
+    await this.authorizeDebuggerUse(tabId);
+    await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+  }
+
   private async ensureAttached(tabId: number): Promise<void> {
     await this.authorizeDebuggerUse(tabId);
-    // A foreign-extension frame blocks the debugger only while it lives. A transient frame, such as
-    // a password-manager autofill menu, often disappears in well under the retry interval, so a
-    // frame-caused refusal is re-checked against the live frame list. Other refusals, such as open
-    // DevTools, and an unreadable frame list keep the refusal for the full interval. Another caller
-    // may clear or replace the refusal while the frames are read, such as by reattaching and being
+    // A foreign-extension frame blocks the debugger only while it lives. AgentTab removes such frames
+    // from the tab, and a transient one, such as a password-manager autofill menu, often disappears on
+    // its own, so a frame-caused refusal is re-checked against the live frame list. Other refusals,
+    // such as open DevTools, and an unreadable frame list keep the refusal for the full interval.
+    // Another caller may clear or replace the refusal meanwhile, such as by reattaching and being
     // refused again; the check then repeats against the current refusal instead of discarding it.
     for (let refusal = this.debuggerRefusals.get(tabId); refusal !== undefined; ) {
       if (refusal.until <= Date.now()) {
@@ -4358,7 +4403,8 @@ export class StandardBrowserRuntime {
         break;
       }
       if (!refusal.frameCaused) throw debuggerUnavailableError(refusal.reason);
-      const origins = await this.foreignExtensionFrameOrigins(tabId);
+      const removed = await this.stripForeignExtensionFrames(tabId);
+      const origins = removed > 0 ? [] : await this.foreignExtensionFrameOrigins(tabId);
       const current = this.debuggerRefusals.get(tabId);
       if (current !== refusal) {
         refusal = current;
@@ -4408,9 +4454,11 @@ export class StandardBrowserRuntime {
       this.debuggerCandidates.add(tabId);
       await this.recordDebuggerCandidate(tabId);
       try {
-        await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION);
+        await this.attachDebugger(tabId);
       } catch (error) {
         if (error instanceof Error && /no tab with given id/i.test(error.message)) throw error;
+        // AgentTab's own coded failures, such as a binding revoked during the frame removal, keep their meaning.
+        if (isRecord(error) && typeof error.code === "string") throw error;
         // Chrome refuses the debugger when another extension's frame is on the
         // page or another client, such as open DevTools, holds the tab.
         throw await this.refuseDebugger(tabId, error, work);

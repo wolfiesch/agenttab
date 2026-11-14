@@ -28,6 +28,7 @@ import {
 } from "../src/page-agent-protocol";
 import { installPageAgent } from "../src/page-agent";
 import { sensitiveFieldState } from "../src/sensitive-field";
+import { removeForeignExtensionFrames } from "../src/foreign-frames";
 
 const LEGACY_TASKS_KEY = "chromeBridgeTaskSessions";
 const LEGACY_PREFERENCES_KEY = "chromeBridgePreferences";
@@ -123,6 +124,7 @@ let debuggerCommandOverride:
   | null;
 let debuggerAttachGate: Promise<void> | null;
 let debuggerAttachError: string | null;
+let foreignFrameRemoval: () => number;
 let pageAgentRequests: PageAgentRequest[];
 let pageAgentReply: (request: PageAgentRequest, documentId: string) => unknown;
 let mainWorldResult: unknown;
@@ -400,6 +402,7 @@ function installChromeMock(): void {
   debuggerCommandOverride = null;
   debuggerAttachGate = null;
   debuggerAttachError = null;
+  foreignFrameRemoval = () => 0;
   pageAgentRequests = [];
   pageAgentReply = () => ({});
   mainWorldResult = [];
@@ -685,6 +688,7 @@ function installChromeMock(): void {
             return [{ documentId }];
           }
           if (options.world === "MAIN") return [{ result: mainWorldResult, documentId }];
+          if (options.func === removeForeignExtensionFrames) return [{ result: foreignFrameRemoval(), frameId: 0 }];
           if (options.func === runPageAgentRequest) {
             const [request, version, globalName] = options.args as [PageAgentRequest, number, string];
             return [{ result: runPageAgentRequest(request, version, globalName), documentId }];
@@ -7246,6 +7250,68 @@ describe("scripting route when Chrome refuses the debugger", () => {
     const second = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
     expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
     expect(second).not.toHaveProperty("debugger_unavailable_reason");
+  });
+
+  test("removes the blocking foreign extension frame and attaches on the retry", async () => {
+    webNavigationFrames.push({ frameId: 1, url: `chrome-extension://foreignpasswordmgr/inline/menu.html` });
+    const { runtime, revisions } = refusedRuntime();
+    foreignFrameRemoval = () => {
+      webNavigationFrames.length = 0;
+      debuggerAttachError = null;
+      return 1;
+    };
+    debuggerCommandOverride = (method) =>
+      method === "Accessibility.getFullAXTree" ? { nodes: [] } : undefined;
+    await revisions.ensure(7);
+    const snapshot = await runtime.snapshot(TASK_A, 7, { mode: "accessibility" });
+    expect(debuggerCalls.filter((call) => call === "attach")).toHaveLength(2);
+    expect(snapshot).not.toHaveProperty("debugger_unavailable_reason");
+  });
+
+  test("removes other extensions' frames inside closed shadow roots and keeps its own and web frames", () => {
+    class FakeElement {
+      removed = false;
+      constructor(readonly children: FakeElement[] = [], readonly closedRoot: FakeRoot | null = null) {}
+      get shadowRoot(): null { return null; }
+      remove(): void { this.removed = true; }
+    }
+    class FakeFrame extends FakeElement {
+      constructor(readonly src: string) { super(); }
+    }
+    class FakeRoot {
+      constructor(readonly children: FakeElement[]) {}
+      querySelectorAll(): FakeElement[] {
+        const all: FakeElement[] = [];
+        const walk = (elements: FakeElement[]) => {
+          for (const element of elements) {
+            all.push(element);
+            walk(element.children);
+          }
+        };
+        walk(this.children);
+        return all;
+      }
+    }
+    const own = "chrome-extension://agenttabid";
+    const menu = new FakeFrame("chrome-extension://foreignpasswordmgr/inline/menu.html");
+    const ownFrame = new FakeFrame(`${own}/overlay.html`);
+    const webFrame = new FakeFrame("https://checkout.example/frame");
+    const topLevelForeign = new FakeFrame("chrome-extension://otherext/inject.html");
+    const host = new FakeElement([], new FakeRoot([new FakeElement([menu])]));
+    const page = new FakeRoot([host, ownFrame, webFrame, topLevelForeign]);
+    const globals = { HTMLElement: FakeElement, HTMLIFrameElement: FakeFrame, HTMLFrameElement: class {}, document: page };
+    const previous = Object.fromEntries(Object.keys(globals).map((key) => [key, Reflect.get(globalThis, key)]));
+    const chromeGlobal = Reflect.get(globalThis, "chrome") as Record<string, unknown>;
+    const previousDom = chromeGlobal.dom;
+    Object.assign(globalThis, globals);
+    chromeGlobal.dom = { openOrClosedShadowRoot: (element: FakeElement) => element.closedRoot };
+    try {
+      expect(removeForeignExtensionFrames(own)).toBe(2);
+    } finally {
+      Object.assign(globalThis, previous);
+      chromeGlobal.dom = previousDom;
+    }
+    expect([menu.removed, topLevelForeign.removed, ownFrame.removed, webFrame.removed]).toEqual([true, true, false, false]);
   });
 
   test("does not reattach for a caller whose frame check outlived another caller's failed reattach", async () => {
