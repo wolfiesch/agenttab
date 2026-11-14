@@ -342,68 +342,56 @@ test("OMP session switch finalizes the current browser task", async () => {
   expect(closed).toBe(true);
 });
 
-test("OMP terminal agent turn finalizes an orphaned browser task after the grace period", async () => {
+test("OMP terminal agent turn leaves the browser task and its tabs open", async () => {
   const tools: Array<Record<string, unknown>> = [];
   const handlers = new Map<string, (event: Record<string, unknown>) => void | Promise<void>>();
   const finishes: unknown[] = [];
   let closed = false;
-  let resolveCleanup!: () => void;
-  const cleanupCompleted = new Promise<void>((resolve) => {
-    resolveCleanup = resolve;
-  });
-  let scheduled: (() => void) | undefined;
+  const client = {
+    connection: { task_id: "task-turn-end" },
+    get closed() {
+      return closed;
+    },
+    request: async () => ({
+      ok: true,
+      outcome: "completed",
+      request_id: "request-turn-end",
+      result: { tabs: [] },
+    }),
+    finishTask: async (params: unknown) => {
+      finishes.push(params);
+      return { finished: true, disposition: "auto", closed_tab_ids: [31], retained_tab_ids: [] };
+    },
+    close: () => {
+      closed = true;
+    },
+  } as unknown as AgentTabClient;
+  makeExtension(async () => client)({
+    zod,
+    registerTool: (tool: Record<string, unknown>) => tools.push(tool),
+    on: (event: string, handler: (event: Record<string, unknown>) => void | Promise<void>) =>
+      handlers.set(event, handler),
+  } as unknown as AgentApi);
+  await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
+
+  // A turn that ends while waiting on the user (handoff, copy, review) must not close its tabs,
+  // now or after any delay the adapter schedules.
+  const scheduled: Array<() => void> = [];
   const originalSetTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = ((callback: () => void, delayMs?: number) => {
-    expect(delayMs).toBe(5 * 60_000);
-    scheduled = callback;
+  globalThis.setTimeout = ((callback: () => void) => {
+    scheduled.push(callback);
     return { unref() { } } as NodeJS.Timeout;
   }) as typeof setTimeout;
   try {
-    const client = {
-      connection: { task_id: "task-orphan-cleanup" },
-      get closed() {
-        return closed;
-      },
-      request: async () => ({
-        ok: true,
-        outcome: "completed",
-        request_id: "request-orphan-cleanup",
-        result: { tabs: [] },
-      }),
-      finishTask: async (params: unknown) => {
-        finishes.push(params);
-        return {
-          finished: true,
-          disposition: "auto",
-          closed_tab_ids: [31],
-          retained_tab_ids: [],
-        };
-      },
-      close: () => {
-        closed = true;
-        resolveCleanup();
-      },
-    } as unknown as AgentTabClient;
-    makeExtension(async () => client)({
-      zod,
-      registerTool: (tool: Record<string, unknown>) => tools.push(tool),
-      on: (
-        event: "session_before_switch" | "session_shutdown" | "agent_end",
-        handler: (event: Record<string, unknown>) => void | Promise<void>,
-      ) => handlers.set(event, handler),
-    } as unknown as AgentApi);
-    await executeTool(tools.find((tool) => tool.name === "browser_tabs"));
-
     await handlers.get("agent_end")?.({ willContinue: false });
-    expect(scheduled).toBeDefined();
-    scheduled?.();
-    await cleanupCompleted;
-
-    expect(finishes).toEqual([{ disposition: "auto", keep_tab_ids: [] }]);
-    expect(closed).toBe(true);
   } finally {
     globalThis.setTimeout = originalSetTimeout;
   }
+  for (const callback of scheduled) callback();
+  await Promise.resolve();
+
+  expect(finishes).toEqual([]);
+  expect(closed).toBe(false);
 });
 test("OMP forwards long-operation timeouts for SDK deadline selection", async () => {
   const { tools, calls } = register(false);

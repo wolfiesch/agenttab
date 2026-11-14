@@ -69,7 +69,7 @@ export interface AgentApi {
   setLabel?(label: string): void;
   registerTool(tool: Record<string, unknown>): void;
   on?(
-    event: "session_before_switch" | "session_shutdown" | "agent_end",
+    event: "session_before_switch" | "session_shutdown",
     handler: (event: Record<string, unknown>) => void | Promise<void>,
   ): void;
 }
@@ -544,19 +544,11 @@ export function makeExtension(clientFactory?: ClientFactory) {
     let client: AgentTabClient | undefined;
     let connecting: Promise<AgentTabClient> | undefined;
     let taskId: string | undefined;
-    const ORPHAN_GRACE_MS = 5 * 60_000;
-    let orphanTimer: NodeJS.Timeout | undefined;
-    const cancelOrphanCleanup = () => {
-      if (orphanTimer === undefined) return;
-      clearTimeout(orphanTimer);
-      orphanTimer = undefined;
-    };
     const finishCurrentTask = async (
       disposition: "auto" | "close" | "keep" = "auto",
       keepTabIds: number[] = [],
       closeConnection = false,
     ) => {
-      cancelOrphanCleanup();
       const current = client ?? (connecting === undefined ? undefined : await connecting);
       if (current === undefined || current.closed) return undefined;
       try {
@@ -574,18 +566,8 @@ export function makeExtension(clientFactory?: ClientFactory) {
         if (closeConnection && client === current) client = undefined;
       }
     };
-    const armOrphanCleanup = () => {
-      cancelOrphanCleanup();
-      if (client === undefined || client.closed) return;
-      orphanTimer = setTimeout(() => {
-        orphanTimer = undefined;
-        void finishCurrentTask("auto", [], true).catch(() => undefined);
-      }, ORPHAN_GRACE_MS);
-      orphanTimer.unref?.();
-    };
     const invocationKeys = new InvocationIdempotencyKeys();
     const getClient = async (context?: ToolExecutionContext): Promise<AgentTabClient> => {
-      cancelOrphanCleanup();
       if (client !== undefined && !client.closed) return client;
       const pending = connecting ??= connectClient(context);
       try {
@@ -687,9 +669,6 @@ export function makeExtension(clientFactory?: ClientFactory) {
     };
     for (const definition of DEFINITIONS) register(definition);
     if (process.env.AGENTTAB_DEVELOPER === "1") register(DEVELOPER);
-    pi.on?.("agent_end", (event) => {
-      if (event.willContinue !== true) armOrphanCleanup();
-    });
     pi.on?.("session_before_switch", async () => {
       await finishCurrentTask("auto", [], true);
       defaultConnection = undefined;
